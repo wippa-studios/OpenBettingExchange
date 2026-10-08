@@ -88,6 +88,10 @@ check('T6 toFractional', () => {
   assert.strictEqual(O.toFractional(1.2), '1/5');
   assert.strictEqual(O.toFractional(1.05), '1/20');
   assert.strictEqual(O.toFractional(1.01), '1/50');
+  // Sub-tick prices (1 < p < 1.01) label as the bottom tick's fraction —
+  // never the flatly wrong '1/1' this used to return.
+  assert.strictEqual(O.toFractional(1.005), '1/50');
+  assert.strictEqual(O.toFractional(1.0099), '1/50');
   assert.strictEqual(O.toFractional(6.0), '5/1');
   assert.strictEqual(O.toFractional(4.0), '3/1');
   assert.strictEqual(O.toFractional(1.0), null);
@@ -98,6 +102,13 @@ check('T7 impliedProb', () => {
   assert.strictEqual(O.impliedProb(2.0), 0.5);
   assert.strictEqual(O.impliedProb(4.0), 0.25);
   assert.ok(near(O.impliedProb(1.25), 0.8));
+  // Guards: zero/negative/non-finite input has no implied probability —
+  // fail fast rather than answering Infinity/-x/NaN.
+  assert.throws(() => O.impliedProb(0), /finite number > 0/);
+  assert.throws(() => O.impliedProb(-2), /finite number > 0/);
+  assert.throws(() => O.impliedProb(NaN), /finite number > 0/);
+  assert.throws(() => O.impliedProb(Infinity), /finite number > 0/);
+  assert.throws(() => O.impliedProb('2'), /finite number > 0/); // no coercion
 });
 
 // T8: overround (book margin).
@@ -106,6 +117,12 @@ check('T8 overround', () => {
   assert.ok(near(O.overround([2.5, 3.4, 2.9]), 0.0389, 1e-3)); // ~3.9% book
   assert.ok(near(O.overround([2.0, 2.0]), 0)); // fair two-way
   assert.ok(O.overround([1.01, 1.01]) > 0.9);
+  // Guards: an empty book is an error, not a "-1" that reads as free money;
+  // each price is validated through impliedProb's contract.
+  assert.throws(() => O.overround([]), /non-empty array/);
+  assert.throws(() => O.overround('nope'), /non-empty array/);
+  assert.throws(() => O.overround([2.0, 0]), /impliedProb/);
+  assert.throws(() => O.overround([2.0, -1]), /impliedProb/);
 });
 
 // T9: validTick discriminator.
@@ -125,6 +142,16 @@ check('T10 range safety', () => {
     const p = O.snapToTick(c / 100);
     assert.ok(p >= 1.01 && p <= 1000, `range at ${c}`);
     assert.strictEqual(O.validTick(p), true, `valid at ${c}`);
+  }
+});
+
+// T11: snapToTick fails fast on non-finite / non-number input instead of
+// silently mapping garbage to 1.01 (the cheapest price on the board). Finite
+// out-of-range values still CLAMP — that documented ladder behaviour is
+// distinct from garbage and stays pinned by T3 (-3 → 1.01, 5000 → 1000).
+check('T11 snapToTick throws on non-finite input', () => {
+  for (const bad of [NaN, Infinity, -Infinity, '2.5', null, undefined]) {
+    assert.throws(() => O.snapToTick(bad), /finite number/, `snapToTick(${String(bad)})`);
   }
 });
 

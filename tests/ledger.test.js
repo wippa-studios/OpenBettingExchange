@@ -1,6 +1,12 @@
 // ledger.test.js — wallet integrity: deposits, escrow/release, settlement.
 // Run: node tests/ledger.test.js   (plain assert, no deps)
 'use strict';
+// Hermeticity: pin the money knobs before anything loads lib/config, so an
+// ambient .env can never change what these examples assert.
+process.env.COMMISSION_RATE = '0.025';
+process.env.MIN_STAKE_CENTS = '100';
+process.env.MAX_STAKE_CENTS = '100000';
+process.env.FAUCET_MAX_CENTS = '100000';
 const assert = require('assert');
 const { openStore } = require('../lib/store');
 const A = require('../lib/auth');

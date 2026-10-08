@@ -8,9 +8,9 @@
     console.error('[admin] window.OB missing — app.js must load first');
     return;
   }
-  const { api, toast, fmt, price2, esc, whenText, state, refreshAll } = OB;
-
-  let cache = { sports: [], events: [], stats: { markets: [] } };
+  // Destructure EXACTLY what this file uses — window.OB is deliberately
+  // narrowed to this list (app.js S6), so anything else is undefined here.
+  const { api, toast, fmt, price2, esc, attr, state, refreshAll, openOverlay, closeOverlay } = OB;
 
   async function render(page) {
     if (!(state.user && state.user.is_admin)) {
@@ -43,7 +43,6 @@
     body.innerHTML = '<div class="empty">Loading…</div>';
     try {
       const { markets } = await api('GET', '/api/admin/stats');
-      cache.stats = { markets };
       if (!markets.length) {
         body.innerHTML = '<div class="empty">No markets</div>';
         return;
@@ -62,10 +61,10 @@
           <td>${
             m.status === 'settled'
               ? '<span class="muted">settled</span>'
-              : `<button class="btn sm" data-toggle="${m.id}" data-status="${m.status === 'open' ? 'suspended' : 'open'}">${
+              : `<button class="btn sm" data-toggle="${attr(m.id)}" data-status="${m.status === 'open' ? 'suspended' : 'open'}">${
                   m.status === 'open' ? 'Suspend' : 'Restore'
                 }</button>
-                 <button class="btn sm primary" data-settle="${m.id}">Settle</button>`
+                 <button class="btn sm primary" data-settle="${attr(m.id)}">Settle</button>`
           }</td>
         </tr>`
           )
@@ -116,27 +115,38 @@
     }
     const overlay = document.createElement('div');
     overlay.className = 'modal';
+    // S4: a real dialog. It registers on app.js's overlay stack, so Escape
+    // closes THIS dialog (the global handler routes through the topmost
+    // overlay — it used to only know #authModal), Tab stays inside it, and
+    // focus returns to the button that opened it.
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
     overlay.innerHTML = `
       <div class="box">
-        <h3>Settle ${esc(market.name)}</h3>
-        <p class="muted" style="margin-top:0">${whenText(market.settled_at) ? '' : 'Pick the winning runner, or void the market (everyone is refunded).'}</p>
-        <div id="sdWinners">
+        <h3 id="sdTitle">Settle ${esc(market.name)}</h3>
+        <p class="muted hint">${
+          // W6: whenText(market.settled_at) is ALWAYS truthy ('—' for null),
+          // which hid the instruction on the desk's most consequential dialog.
+          market.settled_at ? '' : 'Pick the winning runner, or void the market (everyone is refunded).'
+        }</p>
+        <div id="sdWinners" role="group" aria-label="Winning runner">
           ${book
             .map(
-              (s) => `<label class="optrow"><input type="radio" name="winner" value="${s.selection_id}" /> ${esc(
+              (s) => `<label class="optrow"><input type="radio" name="winner" value="${attr(s.selection_id)}" /> ${esc(
                 s.name
               )} <span class="muted tn">LTP ${price2(s.ltp)}</span></label>`
             )
             .join('')}
         </div>
         <label class="optrow"><input type="checkbox" id="sdVoid" /> Void market (refund all stakes)</label>
-        <div class="row" style="margin-top:12px">
-          <button class="btn primary" id="sdGo" style="flex:1">Settle</button>
+        <div class="row mt">
+          <button class="btn primary grow" id="sdGo">Settle</button>
           <button class="btn" id="sdCancel">Cancel</button>
         </div>
       </div>`;
     document.body.appendChild(overlay);
-    const close = () => overlay.remove();
+    openOverlay(overlay); // Escape + focus trap + focus return, via the stack
+    const close = () => closeOverlay(overlay);
     overlay.addEventListener('click', (e) => {
       if (e.target === overlay) close();
     });
@@ -173,12 +183,11 @@
     try {
       const sports = (await api('GET', '/api/sports')).sports;
       const events = (await api('GET', '/api/events')).events;
-      cache = { sports, events, stats: cache.stats };
-      const sportOpts = sports.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join('');
-      const eventOpts = events.map((e) => `<option value="${e.id}">${esc(e.name)}</option>`).join('');
+      const sportOpts = sports.map((s) => `<option value="${attr(s.id)}">${esc(s.name)}</option>`).join('');
+      const eventOpts = events.map((e) => `<option value="${attr(e.id)}">${esc(e.name)}</option>`).join('');
       const marketOpts = events
         .filter((e) => e.markets.length)
-        .map((e) => `<optgroup label="${esc(e.name)}">${e.markets.map((m) => `<option value="${m.id}">${esc(m.name)}</option>`).join('')}</optgroup>`)
+        .map((e) => `<optgroup label="${esc(e.name)}">${e.markets.map((m) => `<option value="${attr(m.id)}">${esc(m.name)}</option>`).join('')}</optgroup>`)
         .join('');
       body.innerHTML = `
         <div class="creategrid">
@@ -253,7 +262,7 @@
         }
         try {
           const { competitions } = await api('GET', `/api/admin/competitions?sport_id=${encodeURIComponent(sid)}`);
-          compSel.innerHTML = '<option value="">—</option>' + competitions.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
+          compSel.innerHTML = '<option value="">—</option>' + competitions.map((c) => `<option value="${attr(c.id)}">${esc(c.name)}</option>`).join('');
         } catch {
           compSel.innerHTML = '<option value="">—</option>';
         }

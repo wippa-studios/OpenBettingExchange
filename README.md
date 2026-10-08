@@ -109,7 +109,8 @@ browser (public/ — plain HTML/CSS/classic JS, no build step)
 
 The dependencies run one way: `match → ledger → tx`, with `settle` and
 `cashout` on top of `match`. There is no ORM, no migration tool, and no runtime
-dependency beyond Express (Playwright is dev-only, for the browser suite) — the
+dependency beyond Express and `pg` (the odds feed's recorder client — Playwright
+is dev-only, for the browser suite) — the
 data model is one readable SQL file of 13 tables. Read
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the reasoning.
 
@@ -122,7 +123,7 @@ asserted by a test.
 | --- | --- | --- |
 | Money is integer **cents**; one `Math.round` per liability, payout and fee | no drift, no two-round disagreements | `ledger`, `settle`, `store` |
 | A back freezes its stake; a lay freezes `(price−1) × stake` at its own price | a layer's risk must be reserved before matching | `match` (E1) |
-| A lay matched at `P ≤ own Q` releases `(Q−P) × fill` | the escrow must end up equal to what the match owes | `match` (E3, E5) |
+| A lay fill of `f` at `P` keeps `round((P−1)·f)` frozen and adjusts the order's tracked remainder escrow so the wallet holds exactly that plus `round((Q−1)·remainder)` — releasing the difference, or topping up the rare 1¢ | settlement can never release more than is frozen; no cent is stranded | `match` (E3, E5, E14–E18) |
 | A back taker sweeps resting lays `Q ≥ P` highest-first; a lay taker sweeps rests `P ≤ Q` lowest-first | the taker gets the best available price | `match` (E4, E5) |
 | Fills execute at the **resting** order's price | the resting orderer's price is the market's price | `match` (E1) |
 | FIFO within a price level (`id` tiebreak) | price-time priority, not insertion luck | `match` (E13) |
@@ -188,9 +189,9 @@ a bad value **aborts the launch** rather than failing later.
 ## Development
 
 ```bash
-npm test            # 126 checks, 15 suites — unit + API integration, fully offline
-npm run test:smoke  # 33 checks — live end-to-end against a real server
-npm run test:ui     # 24 checks — real Chromium via Playwright (board + admin desk)
+npm test            # 196 checks, 17 suites — unit + API integration, fully offline
+npm run test:smoke  # 32 checks — live end-to-end against a real server
+npm run test:ui     # 44 checks — real Chromium via Playwright (board + admin desk)
 ```
 
 The suite is dependency-free: plain `assert`, numbered examples, no framework,
@@ -207,7 +208,7 @@ Contributing, house conventions and where to add things:
 
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
-public/    frontend (no build)     tests/      11 unit/API suites + smoke + browser
+public/    frontend (no build)     tests/      17 unit/API suites + smoke + browser
 docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```
 

@@ -56,8 +56,8 @@ sees a conversion the engine would not agree with.
 
 ## Placing an order
 
-1. A session is required; the selection and its market must be `open`, the
-   event must not be `completed`.
+1. A session is required; `selection_id` must be an integer; the selection and
+   its market must be `open`, the event must not be `completed`.
 2. Stake must be an **integer number of cents** within
    `[MIN_STAKE_CENTS, MAX_STAKE_CENTS]`. Strings and floats are rejected at the
    boundary (`Number("100")` and `Number(true)` are not stakes).
@@ -70,7 +70,8 @@ An order is a **limit order**: it takes liquidity immediately at the resting
 prices, and the rest sits on the book until cancelled or settled. It is never
 filled at your limit price if better resting liquidity exists.
 
-*Tests:* `tests/match.test.js` (E9 validation), `tests/tx.test.js` (X6
+*Tests:* `tests/match.test.js` (E9 validation, E24 off-ladder snap,
+E25 stake bounds, E26 selection id + suspension), `tests/tx.test.js` (X6
 all-or-nothing).
 
 ## Matching
@@ -95,27 +96,71 @@ taker's price or some midpoint.
 
 *Tests:* `tests/match.test.js` — E1 (resting price stands), E2 (partial fill),
 E4 (back sweep highest-first), E5 (lay sweep lowest-first), E13 (FIFO within a
-level), E6 (self-match guard), E11 (aggregation and ordering).
+level), E6 (self-match guard), E11 (aggregation and ordering), E19 (self-match
+guard, back-taker side), E20 (lay-taker FIFO).
 
 ## Escrow
 
 Funds move in two directions, and escrow is what stops either side spending money
-twice:
+twice. Each order row tracks its own escrow in `orders.frozen_cents`: the escrow
+held against the order's **unmatched remainder** — exactly what a cancel (or
+settlement's auto-cancel) releases. The **matched** part's liability stays
+frozen in the wallet on top of that column until settlement releases it.
 
 | Event | Backer | Layer |
 | --- | --- | --- |
 | Place a back | freeze `stake` | — |
-| Place a lay @ Q | — | freeze `(Q − 1) × stake` |
-| Match a lay at resting `P ≤ Q` | — | release `(Q − P) × fill`, leaving `(P − 1) × fill` frozen |
-| Cancel the remainder | release the remainder | release `(price − 1) × remainder` |
-| Settle | consume `stake` | consume `(P − 1) × stake` |
+| Place a lay @ Q | — | freeze `round((Q − 1) × stake)` |
+| A lay fills `f` at match price `P` (own price `Q`) | — | keep `round((P−1)·f)` + `round((Q−1)·remainder)` frozen; release the difference, or top up the rare 1¢ |
+| Cancel the remainder | release `orders.frozen_cents` | release `orders.frozen_cents` |
+| Settle | consume `stake` | consume `round((P−1)·stake)` |
+
+Why a fill re-derives no formula: placement, matching and settlement each round
+a liability **once** (house rule), and three independently rounded formulas do
+not compose — `round((Q−1)·S) − round((Q−P)·f)` lands one cent above or below
+`round((P−1)·f)` for perfectly reachable stakes. The old release rule
+`(Q−P)×fill` could therefore leave the wallet one cent short of what
+settlement had to release (a permanent "Settlement integrity error") or one
+cent over (stranded forever). Instead, each lay fill makes the layer's wallet
+hold **exactly** this fill's settlement liability plus the still-unmatched
+remainder's placement liability:
+
+```
+delta = frozen_cents − ( round((P−1)·f) + round((Q−1)·remainder) )
+delta > 0 → release(delta)          delta < 0 → escrow(−delta)   // a 1¢ top-up
+```
+
+The invariant — **the wallet always holds each order's matched liability plus
+its tracked remainder escrow** — is the contract: settlement can never release
+more than is frozen, no cent is ever stranded, and after a settle or a void
+every participant's `frozen_cents` returns to exactly `0`.
+
+Worked examples (all asserted by tests):
+
+- Lay 150 @ 1.04, fully matched at 1.03. Placement freezes
+  `round(0.04 × 150) = 6`. The fill's settlement liability is
+  `round(0.03 × 150) = round(4.5) = 5`, remainder 0 — so the fill releases
+  `6 − 5 = 1` and keeps 5 frozen. Settlement later releases exactly 5. (The
+  old `(Q−P)×fill` rule would have released `round(1.5) = 2` and left the
+  market permanently unsettleable.)
+- Lay 100 @ 1.51, filled 50 @ 1.01 then 50 @ 1.51. Placement freezes 51.
+  First fill: keep `round(0.01 × 50) = 1` + remainder escrow
+  `round(0.51 × 50) = round(25.5) = 26` → release `51 − 27 = 24`. Second
+  fill: keep `26`, remainder 0 → nothing to move. Frozen 27 = 1 + 26 =
+  exactly what settlement releases.
+- When a single fill's target exceeds what the one placement rounding froze
+  (lay 100 @ 1.51, a 50-fill at its own price: `26 + 26 > 51`), the engine
+  tops the escrow up by that cent **at fill time** rather than ever letting
+  the wallet fall short of settlement.
 
 `available = balance − frozen`. A user can never place an order their available
 balance cannot cover, and `frozen_cents` can never go negative (guarded in
 `lib/ledger.js` and again by a database `CHECK`).
 
-*Tests:* `tests/ledger.test.js` (L2–L3), `tests/match.test.js` (E3, E7, E8),
-`tests/store.test.js` (D3).
+*Tests:* `tests/ledger.test.js` (L2–L3), `tests/match.test.js` (E3, E5, E7, E8,
+E12, E14–E23), `tests/settle.test.js` (S12–S16, S19, and the S20 tick × stake
+property sweep asserting frozen ≥ Σ settlement releases and frozen → 0 after
+settle/void), `tests/store.test.js` (D3, D7 migration).
 
 ## Settlement
 
@@ -147,7 +192,7 @@ cannot be settled again.
 commission and nothing else. This is asserted end-to-end in `tests/smoke.sh`
 (`100000 − 375 = 99625` across two players).
 
-*Tests:* `tests/settle.test.js` (S1–S11), `tests/smoke.sh` (conservation),
+*Tests:* `tests/settle.test.js` (S1–S20), `tests/smoke.sh` (conservation),
 `tests/api.test.js` (settled market frozen).
 
 ## Commission
@@ -172,9 +217,9 @@ commission. Voiding is visible in the wallet as a `refund` transaction and in
 history as a settlement with zero P&L.
 
 A void refunds the liability **at the match price**, which is what the escrow
-actually froze. A layer who offered at 2.10 and matched at 2.00 was refunded
-1500, not 1100, because the extra 100 was already released when the better fill
-happened.
+actually froze. A layer who offered 10000 @ 2.10 and matched at 2.00 is
+refunded 10000, not 11000, because the extra 1000 was already released when
+the better fill happened.
 
 *Tests:* `tests/settle.test.js` (S4, S10).
 
@@ -210,7 +255,7 @@ value  = 10526 − 10000 = 526      (i.e. $5.26, the house formula 100 × (2.0�
 ```
 
 The hedge is a lay of 10526 @ 1.90, which escrows `round(0.9 × 10526) = 9473`.
-After it, the position pays 3333 if the runner wins and 3333 if it loses — green
+After it, the position pays 527 if the runner wins and 526 if it loses — green
 to within the single cent of rounding, and the trader's 526 is guaranteed.
 
 If the hedge cannot fill **completely**, the whole cash-out is rolled back and

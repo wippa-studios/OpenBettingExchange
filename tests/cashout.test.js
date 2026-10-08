@@ -1,6 +1,12 @@
 // cashout.test.js — green-up close at top of book (house paper_math formulas).
 // Run: node tests/cashout.test.js   (plain assert, no deps)
 'use strict';
+// Hermeticity: pin the money knobs before anything loads lib/config, so an
+// ambient .env can never change what these examples assert.
+process.env.COMMISSION_RATE = '0.025';
+process.env.MIN_STAKE_CENTS = '100';
+process.env.MAX_STAKE_CENTS = '100000';
+process.env.FAUCET_MAX_CENTS = '100000';
 const assert = require('assert');
 const { openStore } = require('../lib/store');
 const A = require('../lib/auth');

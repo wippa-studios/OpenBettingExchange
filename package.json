@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node --no-warnings server.js",
     "seed": "node --no-warnings lib/seed.js",
-    "test": "node tests/config.test.js && node tests/feed.test.js && FEED_ENABLED=true FEED_DATABASE_URL=postgresql://feed:feed@127.0.0.1:59999/offline node tests/feed_nav.test.js && node tests/feed_outage.test.js && node tests/odds.test.js && node tests/store.test.js && node tests/seed.test.js && node tests/auth.test.js && node tests/ledger.test.js && node tests/tx.test.js && node tests/match.test.js && node tests/settle.test.js && node tests/cashout.test.js && node tests/api.test.js",
+    "test": "node tests/run_all.js",
     "test:smoke": "./tests/smoke.sh",
     "test:ui": "node tests/ui_test.mjs"
   },

@@ -1,21 +1,60 @@
-/* OpenBookmaker — dark house palette, Betfair-style ladder board. */
+/* OpenBookmaker — light house palette: white ground, black text, grey accent.
+   Typeface: Inter (self-hosted) as the stand-in for Canva Sans, which is a
+   proprietary Canva font and cannot be redistributed. Inter is the closest
+   freely-available grotesque with the same tight, tall x-height feel.
+   Tracking is -100 (i.e. -0.1em) on display type, per the house style. */
+
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/inter-400.woff2') format('woff2');
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/inter-500.woff2') format('woff2');
+  font-weight: 500; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/inter-700.woff2') format('woff2');
+  font-weight: 700; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/inter-800.woff2') format('woff2');
+  font-weight: 800; font-style: normal; font-display: swap;
+}
+
 :root {
-  --bg: #070707;
-  --bg2: #0c0c0c;
-  --card: #111;
-  --card2: #161616;
-  --line: #252525;
-  --line2: #333;
-  --text: #e8e8e8;
-  --muted: #9a9a9a;
-  --green: #4ade80;
-  --green-bg: rgba(74, 222, 128, 0.12);
-  --red: #f87171;
-  --red-bg: rgba(248, 113, 113, 0.12);
-  --amber: #fde68a;
-  --blue: #93c5fd;
-  --blue-bg: rgba(147, 197, 253, 0.12);
-  --radius: 10px;
+  --bg: #ffffff;
+  --bg2: #f7f7f8;
+  --card: #ffffff;
+  --card2: #f5f5f6;
+  --line: #e6e6e8;
+  --line2: #d3d3d7;
+  --text: #0a0a0b;
+  --muted: #6b6b73;
+  --accent: #b9b9c0;          /* light grey accent */
+  --accent-bg: #f0f0f2;
+  /* Back is blue, lay is PINK. These two hues are the functional identity of the
+     board: a ladder where the sides are not instantly distinguishable is
+     unreadable, so they are never allowed to be "near enough". */
+  --blue: #1b5fd9;
+  --blue-bg: #e8f0fe;
+  --blue-line: #c3dafb;
+  --pink: #d6147a;
+  --pink-bg: #fdecf4;
+  --pink-line: #f8c8de;
+  /* Loss/profit and error states stay red/green — a different axis from side. */
+  --red: #c2261f;
+  --red-bg: #fdeceb;
+  --green: #0f7a3d;
+  --green-bg: #e6f5ec;
+  --radius: 8px;
+  /* One source of truth for the sticky header's height: the fixed rail and the
+     sticky slip column both hang off it, and hard-coding 47px/58px in three
+     places meant a header tweak silently mis-aligned them. */
+  --header-h: 47px;
 }
 
 * { box-sizing: border-box; }
@@ -25,13 +64,15 @@ html, body {
   padding: 0;
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font: 400 14px/1.45 'Inter', -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: var(--bg2); }
-::-webkit-scrollbar-thumb { background: #333; border-radius: 6px; }
-::-webkit-scrollbar-thumb:hover { background: #3a3a3a; }
+::-webkit-scrollbar-thumb { background: #d4d4d8; border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: #bdbdc2; }
 
 /* ── header ─────────────────────────────────────────────────────────── */
 header {
@@ -40,34 +81,37 @@ header {
   z-index: 20;
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 10px 18px;
-  background: var(--bg2);
+  gap: 18px;
+  padding: 9px 18px;
+  background: var(--bg);
   border-bottom: 1px solid var(--line);
 }
 header .logo {
-  font-weight: 800;
-  font-size: 16px;
-  letter-spacing: 0.08em;
-  color: var(--amber);
-  white-space: nowrap;
+  display: block;
+  height: 20px;
+  width: auto;
+  object-fit: contain;
 }
-header .logo span { color: var(--text); }
-header nav { display: flex; gap: 4px; flex: 1; }
+header .logo img { height: 100%; width: auto; display: block; }
+header nav { display: flex; gap: 2px; flex: 1; }
 header nav button {
   background: transparent;
   border: 0;
   color: var(--muted);
-  padding: 7px 12px;
-  border-radius: 8px;
+  padding: 7px 13px;
+  border-radius: 6px;
   cursor: pointer;
-  font: inherit;
+  font: 500 14px/1 inherit;
 }
-header nav button:hover { color: var(--text); background: var(--card2); }
-header nav button.active { color: var(--amber); background: var(--card); }
+header nav button:hover { color: var(--text); background: var(--bg2); }
+header nav button.active {
+  color: var(--text);
+  background: var(--accent-bg);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
 header .balance {
   font-variant-numeric: tabular-nums;
-  color: var(--amber);
+  color: var(--text);
   font-weight: 700;
   white-space: nowrap;
 }
@@ -75,9 +119,173 @@ header .balance small { color: var(--muted); font-weight: 400; }
 header .balance.frozen small { color: var(--red); }
 header .who { color: var(--muted); white-space: nowrap; }
 
-/* ── layout ─────────────────────────────────────────────────────────── */
-main { display: flex; gap: 14px; padding: 14px 18px 40px; align-items: flex-start; }
+/* Hamburger: only rendered below 1000px, where it opens the race rail —
+   in feed mode the tree is the ONLY navigation surface. */
+#navToggle {
+  display: none;
+  flex: none;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  width: 34px;
+  height: 30px;
+  padding: 6px;
+  background: none;
+  border: 1px solid var(--line2);
+  border-radius: 6px;
+  cursor: pointer;
+}
+#navToggle .bar { display: block; height: 2px; width: 100%; background: var(--text); border-radius: 1px; }
+#navToggle:hover { border-color: var(--accent); }
+
+/* ── layout: fixed left rail, then main, then the slip column ─────────── */
+/* The rail is a real navigation surface (A-Z sports + quick links), not a
+   filter strip, so it is fixed and the board scrolls beside it. */
+#sidebar {
+  position: fixed;
+  top: var(--header-h);
+  left: 0;
+  bottom: 0;
+  width: 178px;
+  border-right: 1px solid var(--line);
+  background: var(--bg);
+  overflow-y: auto;
+  padding: 10px 0 20px;
+  z-index: 10;
+}
+/* Seeded mode has no tree data; app.js hides the rail so it cannot show a
+   permanent "No sports" placeholder. */
+#sidebar[hidden] { display: none; }
+.sidegroup { margin-bottom: 14px; }
+.sidehead {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 0 10px 5px;
+}
+.sideitem {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-left: 2px solid transparent;
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+.sideitem:hover { background: var(--bg2); }
+.sideitem.on { border-left-color: var(--text); background: var(--accent-bg); font-weight: 500; }
+
+/* Deep tree: sport > country > track > meeting > race, each level indented and
+   only the active path expanded. A flat list of ~200 races would be unusable. */
+.sportslist { max-height: none; overflow-y: auto; }
+.treeitem {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-left: 2px solid transparent;
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.treeitem:hover { background: var(--bg2); }
+.treeitem .t { overflow: hidden; text-overflow: ellipsis; }
+/* Disclosure caret: a right-pointing triangle that rotates when open. */
+.treeitem .caret {
+  flex: none;
+  width: 0; height: 0;
+  border-left: 4px solid var(--line2);
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transition: transform 0.15s ease;
+  margin-right: 1px;
+}
+.treeitem .caret.open { transform: rotate(90deg); }
+.treeitem.sport { font-weight: 700; font-size: 13px; }
+.treeitem.country { padding-left: 18px; }
+.treeitem.comp { padding-left: 28px; }
+.treeitem.meeting { padding-left: 38px; color: var(--muted); }
+.treeitem.meeting.cur, .treeitem.meeting .caret.open + .t { color: var(--text); }
+.treeitem.cur { border-left-color: var(--text); background: var(--accent-bg); }
+.treeitem.race { padding-left: 48px; font-variant-numeric: tabular-nums; }
+.treeitem.race .t { color: var(--muted); flex: none; width: 34px; }
+.treeitem.race .n { overflow: hidden; text-overflow: ellipsis; }
+.treeitem.race.on { background: var(--text); color: #fff; border-left-color: var(--text); }
+.treeitem.race.on .t, .treeitem.race.on .n { color: #fff; }
+.treeitem.race .dot { margin-left: auto; flex: none; }
+.sideltr { font-size: 9px; color: var(--line2); padding: 6px 10px 2px; font-weight: 700; }
+
+main {
+  display: flex;
+  gap: 12px;
+  padding: 12px 14px 40px;
+  align-items: flex-start;
+  margin-left: 178px;
+}
 #page { flex: 1; min-width: 0; }
+#slipwrap { width: 300px; flex: none; position: sticky; top: calc(var(--header-h) + 11px); }
+.cashout { width: 100%; margin-bottom: 8px; font-weight: 700; }
+
+/* Global search sits in the header and opens a dropdown under itself. */
+.searchwrap { position: relative; flex: 0 1 300px; }
+#globalSearch {
+  width: 100%;
+  background: var(--bg2);
+  border: 1px solid var(--line2);
+  border-radius: 5px;
+  padding: 5px 9px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+}
+#globalSearch:focus { outline: 2px solid var(--accent); outline-offset: -1px; background: var(--bg); }
+#searchResults {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--card);
+  border: 1px solid var(--line2);
+  border-radius: 6px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.12);
+  z-index: 25;
+}
+.srow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+.srow:last-child { border-bottom: 0; }
+.srow:hover { background: var(--bg2); }
+.srow .m { color: var(--muted); font-size: 11px; margin-left: auto; text-align: right; }
+.srow .k { font-size: 9px; font-weight: 700; text-transform: uppercase; color: var(--muted); flex: none; }
+.sempty { padding: 10px; color: var(--muted); font-size: 12px; }
 
 /* ── cards / tables ─────────────────────────────────────────────────── */
 .card {
@@ -87,7 +295,13 @@ main { display: flex; gap: 14px; padding: 14px 18px 40px; align-items: flex-star
   padding: 12px 14px;
   margin-bottom: 12px;
 }
-.card h3 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.card h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--muted);
+}
 .row { display: flex; align-items: center; gap: 10px; }
 .spacer { flex: 1; }
 .muted { color: var(--muted); }
@@ -97,75 +311,196 @@ a:hover { text-decoration: underline; }
 
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
-th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+th { color: var(--muted); font-weight: 700; font-size: 11px; text-transform: uppercase; }
 tr:last-child td { border-bottom: 0; }
 
 /* ── buttons ────────────────────────────────────────────────────────── */
 button { font: inherit; cursor: pointer; }
 .btn {
-  background: var(--card2);
+  background: var(--bg);
   border: 1px solid var(--line2);
   color: var(--text);
   padding: 7px 14px;
-  border-radius: 8px;
+  border-radius: 6px;
+  font-weight: 500;
 }
-.btn:hover { border-color: var(--muted); }
-.btn.primary { background: var(--amber); border-color: var(--amber); color: #111; font-weight: 700; }
-.btn.primary:hover { filter: brightness(1.06); }
+.btn:hover { border-color: var(--accent); background: var(--bg2); }
+/* Primary is black-on-white inverted, not a colour: the accent is grey. */
+.btn.primary {
+  background: var(--text);
+  border-color: var(--text);
+  color: #fff;
+  font-weight: 700;
+}
+.btn.primary:hover { background: #2a2a2d; border-color: #2a2a2d; }
 .btn.green { background: var(--green-bg); border-color: var(--green); color: var(--green); }
 .btn.red { background: var(--red-bg); border-color: var(--red); color: var(--red); }
-.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .btn.sm { padding: 4px 10px; font-size: 12px; }
 
-/* ── market ladder (Betfair style) ──────────────────────────────────── */
-/* .ladder is a stack of rows; each .lrow is one selection laid out as
-   [3 back cells | runner | 3 lay cells]. A single 3-column grid on .ladder
-   would wrap each selection across three rows — the row wrapper is what
-   keeps the runner centred. */
-.ladder { display: block; }
+/* ── market ladder ──────────────────────────────────────────────────── */
+/* DENSITY IS THE POINT, and the shape is fixed by the spec:
+   [ RUNNER | 3 blue BACK | 3 pink LAY ] — runner first, then depth outward.
+   Every cell carries TWO stacked numbers: the odds large on top, the available
+   liquidity small beneath. The outer cells are the next-best prices further down
+   the queue, which is what makes the board read as depth rather than a list. */
+.ladder {
+  display: block;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
 .lrow {
   display: grid;
-  grid-template-columns: 1fr 92px 1fr;
-  gap: 2px 8px;
+  /* Exactly 7 columns: RUNNER | 3 back | 3 lay. Both the header row and every
+     price row must consume all seven or the labels drift out of alignment. */
+  grid-template-columns:
+    minmax(150px, 1.6fr)          /* runner */
+    repeat(3, minmax(70px, 1fr))  /* back, best nearest the runner */
+    repeat(3, minmax(70px, 1fr)); /* lay,  best nearest the runner */
   align-items: stretch;
-  padding: 2px 0;
+  border-bottom: 1px solid var(--line);
 }
-.lrow.lhdr { padding-bottom: 4px; }
-.lstack { display: flex; flex-direction: column; gap: 2px; }
+.lrow:last-child { border-bottom: 0; }
+.lrow:hover { background: #fafafb; }
+
+/* The two price stacks are horizontal 3-up grids. Kept as .lstack so the DOM and
+   the geometry tests still address the same nodes. */
+.lstack {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-column: span 3;
+  /* A single explicit row. Without it the browser derives one row per cell and
+     the levels stack vertically — which is the exact 157px-per-runner problem
+     this layout replaced. `grid-auto-flow: column` plus the explicit row below
+     keeps every level on one line. */
+  grid-auto-flow: column;
+  grid-template-rows: minmax(38px, auto);
+  gap: 1px;
+  padding: 2px;
+}
+.lstack:empty { display: none; }
+
+/* Two stacked numbers: odds on top (the value), liquidity below (the depth).
+   Price cells are <button>s (keyboard users can bet) — the font/alignment
+   resets below keep them rendering identically to the old <div> cells. */
 .lcell {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 5px 4px;
-  border-radius: 6px;
+  gap: 0;
+  min-height: 38px;
+  padding: 3px 4px;
+  border-radius: 3px;
   cursor: pointer;
   border: 1px solid transparent;
   transition: background 0.4s ease;
+  white-space: nowrap;
+  overflow: hidden;
+  min-width: 0;
+  font: inherit;
+  text-align: center;
 }
-.lcell { width: 100%; }
-.lcell .p { font-weight: 700; font-variant-numeric: tabular-nums; }
-.lcell .s { font-size: 11px; opacity: 0.75; font-variant-numeric: tabular-nums; }
+.lcell:focus-visible { outline: 2px solid var(--text); outline-offset: -2px; }
+/* Feed mode renders its prices display-only: the cells are disabled buttons
+   and must not read as broken. */
+.lcell:disabled { cursor: default; }
+.lcell:disabled:focus-visible { outline: none; }
+.lcell .p {
+  font-weight: 700;
+  font-size: 15px;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+.lcell .s {
+  font-size: 10px;
+  line-height: 1.2;
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+  overflow: hidden;
+}
 .lcell.back { background: var(--blue-bg); color: var(--blue); }
-.lcell.lay { background: var(--red-bg); color: var(--red); }
+.lcell.lay { background: var(--pink-bg); color: var(--pink); }
 .lcell[data-bet]:hover { border-color: currentColor; }
-.lcell.empty { background: transparent; cursor: default; color: var(--line2); }
+.lcell.empty { background: transparent; cursor: default; color: #d4d4d8; }
 .lcell.flash-up { background: var(--green-bg); color: var(--green); }
 .lcell.flash-down { background: var(--red-bg); color: var(--red); }
-.lmid { text-align: center; display: flex; flex-direction: column; justify-content: center; }
-.lmid .ltp { font-variant-numeric: tabular-nums; font-weight: 700; }
-.lmid .nm { font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hdr { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); text-align: center; padding: 2px; }
+/* A padding cell for a side with fewer than three levels. Collapsing it (rather
+   than showing a dash) keeps the live price in the column nearest the runner,
+   which is where a trader's eye starts — a leading blank would push the price
+   out to the page edge. */
+.lcell.blank { display: none; }
+/* Column placement for a side's live cells.
+   Back's best price sits in the RIGHTMOST column of the back group and lay's
+   best in the LEFTMOST of the lay group, so the two best prices meet in the
+   middle of the row with no dead column between them. Depth runs outward.
+   All three positions are pinned: an auto-placed third cell lands on an occupied
+   column and wraps to a second line, which broke the row. `.blank` padding
+   cells are display:none, and CSS cannot infer which children are real prices,
+   so the live ones are parked explicitly. */
+.lstack.atright > .lcell:not(.blank):nth-child(1) { grid-column: 3; grid-row: 1; }
+.lstack.atright > .lcell:not(.blank):nth-child(2) { grid-column: 2; grid-row: 1; }
+.lstack.atright > .lcell:not(.blank):nth-child(3) { grid-column: 1; grid-row: 1; }
+.lstack.atleft  > .lcell:not(.blank):nth-child(1) { grid-column: 1; grid-row: 1; }
+.lstack.atleft  > .lcell:not(.blank):nth-child(2) { grid-column: 2; grid-row: 1; }
+.lstack.atleft  > .lcell:not(.blank):nth-child(3) { grid-column: 3; grid-row: 1; }
+
+/* Runner column: name left, last traded price right. */
+.lmid {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 4px 12px;
+  border-right: 1px solid var(--line2);
+}
+.lmid .nm {
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lmid .ltp { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--muted); font-size: 12px; flex: none; }
+
+/* Header row mirrors the price grid exactly so labels sit over their columns. */
+.lrow.lhdr { background: var(--bg2); border-bottom: 1px solid var(--line2); }
+.hdr {
+  grid-column: span 3;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-align: center;
+  padding: 5px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.hdr.mid {
+  grid-column: auto;
+  justify-content: flex-start;
+  padding-left: 12px;
+  color: var(--text);
+}
 .hdr.b { color: var(--blue); }
-.hdr.l { color: var(--red); }
+.hdr.l { color: var(--pink); }
+.hdr.depth { color: var(--line2); }
+/* Outer cells are the next prices down the queue: present but visually
+   recessed, so the best price stays the thing your eye lands on. */
+.lcell.depth { opacity: 0.72; }
 
 .event { padding: 8px 0 12px; border-bottom: 1px solid var(--line); }
 .event:last-child { border-bottom: 0; }
 .mkt { margin-top: 10px; }
-.mkthead { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.mkthead { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin-bottom: 6px; flex-wrap: wrap; }
 .sportbar { display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 18px 0; }
 .sportbar .chip { cursor: pointer; }
-.sportbar .chip.on { color: var(--amber); border-color: var(--amber); }
+.sportbar .chip.on { color: var(--text); border-color: var(--accent); background: var(--accent-bg); }
 
 .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
 .poscard { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 10px; background: var(--card2); }
@@ -174,39 +509,37 @@ button { font: inherit; cursor: pointer; }
 .pnlchip { border: 1px solid var(--line2); border-radius: 999px; padding: 2px 8px; font-size: 12px; font-variant-numeric: tabular-nums; }
 .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 240px; }
 .wgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
-.wgrid .muted { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+.wgrid .muted { display: block; font-size: 10px; text-transform: uppercase; }
 .wbig { font-size: 20px; font-weight: 700; }
 .side { font-weight: 700; }
 .side.back { color: var(--blue); }
-.side.lay { color: var(--red); }
+.side.lay { color: var(--pink); }
 
 .evmeta { display: flex; gap: 10px; align-items: baseline; margin-bottom: 10px; flex-wrap: wrap; }
 .evmeta .nm { font-size: 15px; font-weight: 700; }
-.evmeta .comp { color: var(--muted); font-size: 12px; }
-.evmeta .when { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.evmeta .comp, .evmeta .when { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 
 .chip {
   display: inline-block;
   padding: 2px 8px;
   border-radius: 999px;
   font-size: 11px;
+  font-weight: 500;
   border: 1px solid var(--line2);
   color: var(--muted);
+  background: var(--bg);
 }
 /* Chips are <button>s in the sport filter — without this they render with the
-   browser's default light button face and the label disappears. */
-button.chip { background: var(--card2); font-family: inherit; cursor: pointer; }
-button.chip:hover { border-color: var(--muted); color: var(--text); }
-.chip.open { color: var(--green); border-color: var(--green); }
-.chip.suspended { color: var(--amber); border-color: var(--amber); }
+   browser's default button face and the label disappears. */
+button.chip { font-family: inherit; cursor: pointer; }
+button.chip:hover { border-color: var(--accent); color: var(--text); }
+.chip.open { color: var(--green); border-color: var(--green); background: var(--green-bg); }
+.chip.suspended { color: var(--muted); border-color: var(--accent); background: var(--accent-bg); }
 .chip.settled { color: var(--muted); }
-.chip.live { color: var(--red); border-color: var(--red); }
+.chip.live { color: var(--pink); border-color: var(--pink); background: var(--pink-bg); }
 
 /* ── bet slip ───────────────────────────────────────────────────────── */
 #slip {
-  width: 330px;
-  position: sticky;
-  top: 70px;
   background: var(--card);
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -214,23 +547,31 @@ button.chip:hover { border-color: var(--muted); color: var(--text); }
   max-height: calc(100vh - 90px);
   overflow-y: auto;
 }
-#slip h3 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+#slip h3 { margin: 0 0 8px; font-size: 12px; font-weight: 700; text-transform: uppercase; color: var(--muted); }
 .sliprow { border-top: 1px solid var(--line); padding: 10px 0; }
 .sliprow:first-child { border-top: 0; }
 .sliphead { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
 .sliphead .muted { font-size: 11px; }
 #slip .rm { color: var(--red); cursor: pointer; background: none; border: 0; font-size: 17px; line-height: 1; padding: 0 4px; }
 .slipgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
-#slip label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; display: block; margin-bottom: 3px; }
-#slip input {
+
+#slip input, form.inline input, form.inline select, .creategrid input, .creategrid select,
+#authModal input {
   width: 100%;
-  background: var(--bg2);
+  background: var(--bg);
   border: 1px solid var(--line2);
   color: var(--text);
   padding: 6px 8px;
   border-radius: 6px;
   font: inherit;
   font-variant-numeric: tabular-nums;
+}
+#slip input:focus, form.inline input:focus, form.inline select:focus,
+.creategrid input:focus, .creategrid select:focus, #authModal input:focus,
+#globalSearch:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
 }
 #slip .prev { font-variant-numeric: tabular-nums; margin: 8px 0; color: var(--muted); font-size: 12px; }
 #slip .stepper { display: flex; gap: 4px; align-items: center; }
@@ -240,15 +581,6 @@ button.chip:hover { border-color: var(--muted); color: var(--text); }
 
 /* ── forms ──────────────────────────────────────────────────────────── */
 form.inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
-form.inline label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; display: block; margin-bottom: 3px; }
-form.inline input, form.inline select {
-  background: var(--bg2);
-  border: 1px solid var(--line2);
-  color: var(--text);
-  padding: 6px 8px;
-  border-radius: 6px;
-  font: inherit;
-}
 
 /* ── toast ──────────────────────────────────────────────────────────── */
 #toast {
@@ -257,93 +589,137 @@ form.inline input, form.inline select {
   left: 50%;
   transform: translateX(-50%);
   z-index: 30;
-  background: var(--card2);
-  border: 1px solid var(--line2);
-  border-radius: 8px;
+  background: var(--text);
+  color: #fff;
+  border-radius: 6px;
   padding: 8px 16px;
   display: none;
   max-width: 80vw;
+  font-weight: 500;
 }
 #toast.show { display: block; }
-#toast.ok { border-color: var(--green); color: var(--green); }
-#toast.err { border-color: var(--red); color: var(--red); }
+#toast.ok { background: var(--green); }
+#toast.err { background: var(--red); }
 
 /* ── auth modal ─────────────────────────────────────────────────────── */
-#authModal {
+#authModal, .modal {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.6);
+  background: rgba(10, 10, 11, 0.4);
+  backdrop-filter: blur(2px);
   display: none;
   align-items: center;
   justify-content: center;
   z-index: 40;
 }
-#authModal.show { display: flex; }
-#authModal .box {
+#authModal.show, .modal { display: flex; }
+#authModal .box, .modal .box {
   width: 340px;
+  max-width: 92vw;
   background: var(--card);
   border: 1px solid var(--line2);
   border-radius: var(--radius);
   padding: 18px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.14);
 }
 #authModal h3 { margin: 0 0 12px; }
-#authModal input {
-  width: 100%;
-  background: var(--bg2);
-  border: 1px solid var(--line2);
-  color: var(--text);
-  padding: 8px;
-  border-radius: 6px;
-  font: inherit;
-  margin-bottom: 10px;
-}
+#authModal input { margin-bottom: 10px; padding: 8px; }
 
 .empty { color: var(--muted); padding: 14px 0; text-align: center; }
 .win { color: var(--green); }
 .loss { color: var(--red); }
 
-/* ── admin desk + modal ─────────────────────────────────────────────── */
+/* ── admin desk ─────────────────────────────────────────────────────── */
 .creategrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }
 .creategrid .card { margin: 0; display: flex; flex-direction: column; gap: 6px; }
-.creategrid label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
-.creategrid input, .creategrid select {
-  background: var(--bg2);
-  border: 1px solid var(--line2);
-  color: var(--text);
-  padding: 6px 8px;
-  border-radius: 6px;
-  font: inherit;
-  width: 100%;
-}
-.modal {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.65);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 50;
-}
-.modal .box {
-  width: 360px;
-  max-width: 92vw;
-  background: var(--card);
-  border: 1px solid var(--line2);
-  border-radius: var(--radius);
-  padding: 16px;
-}
+.modal { z-index: 50; }
 .modal h3 { margin: 0 0 10px; }
 .optrow { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
 .optrow .muted { margin-left: auto; font-size: 11px; }
 
+.fnote { font-size: 11px; min-height: 15px; }
+
+/* Repeated inline style="" attributes from index.html / app.js / admin.js
+   collected as classes — CSP-friendly and greppable. */
+.row.center { justify-content: center; }
+.row.mt { margin: 12px 0; }
+.btn.grow { flex: 1; }
+.fineprint { font-size: 12px; margin-bottom: 0; }
+.hint { margin-top: 0; }
+.fieldlabel {
+  display: block;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  margin: 4px 0 2px;
+}
+
+.dot { width: 6px; height: 6px; border-radius: 50%; background: var(--red); }
+
+/* ── races ────────────────────────────────────────────────────────────── */
+/* ONE race on screen at a time, chosen in the tree — the way a bookmaker shows
+   a market. A page of stacked race cards is not the same product. */
+.racecard { padding: 0; overflow: hidden; }
+.racecard .mkthead {
+  margin: 0;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg2);
+  gap: 8px;
+  align-items: center;
+}
+.race-time {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--text);
+  flex: none;
+}
+.race-name { font-weight: 700; color: var(--text); font-size: 14px; }
+.race-evt { color: var(--muted); font-size: 12px; }
+.racecard .mkthead .age { font-size: 11px; }
+.racenote { padding: 6px 10px; font-size: 12px; border-bottom: 1px solid var(--line); background: #fcfcfd; }
+/* The feed-mode gate note: rendered where the slip would open, since feed
+   prices cannot build bets (see app.js bindLadder / addToSlip). */
+.racenote.feednote { background: var(--accent-bg); color: var(--muted); font-weight: 500; }
+
+/* Book percentage in the ladder header: "BACK ALL 147.0%". This is the summed
+   implied probability of the best price on that side. */
+.hdr .pct { font-variant-numeric: tabular-nums; margin-left: 4px; opacity: 0.9; }
+
+/* A price carried from an earlier frame is real but not live, so it is dimmed
+   and dotted rather than hidden — hiding it makes the ladder look broken. */
+.lcell.carried { opacity: 0.55; }
+.lcell.carried .p { text-decoration: underline dotted; }
+
 @media (prefers-reduced-motion: reduce) {
-  .ladder .cell { transition: none; }
   * { transition: none !important; }
 }
 
+/* ── narrow screens ───────────────────────────────────────────────────── */
+/* Below 1000px the rail becomes a collapsible drawer instead of vanishing:
+   in feed mode the tree is the ONLY navigation, and hiding it stranded
+   tablet users with no way to change race. The header's #navToggle drives it;
+   picking a race (or Escape) closes it again. */
+@media (max-width: 1000px) {
+  #navToggle { display: inline-flex; }
+  #sidebar {
+    z-index: 15; /* above the board, below the header and modals */
+    width: 240px;
+    transform: translateX(-102%);
+    transition: transform 0.2s ease;
+  }
+  body.nav-open #sidebar {
+    transform: translateX(0);
+    box-shadow: 24px 0 48px rgba(0, 0, 0, 0.18);
+  }
+  main { margin-left: 0; }
+  .searchwrap { display: none; }
+}
 @media (max-width: 900px) {
   main { flex-direction: column; }
-  #slip { width: 100%; position: static; }
+  #slipwrap { width: 100%; position: static; }
+  header { gap: 10px; padding: 8px 12px; }
+  header .logo { height: 17px; }
+  main { padding: 12px 12px 32px; }
 }
-
-.fnote { font-size: 11px; min-height: 15px; }

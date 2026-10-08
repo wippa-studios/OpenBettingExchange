@@ -62,4 +62,19 @@ check('C5 DB_PATH resolution', () => {
   assert.strictEqual(abs.DB_PATH, '/tmp/abs.db');
 });
 
+// C6: seeded-credential overrides pass through verbatim — no trimming, no
+// charset policy (a password is whatever the operator says it is);
+// unset or empty → null, meaning "use the seeded demo defaults".
+check('C6 ADMIN_PASSWORD / DEMO_PASSWORD passthrough', () => {
+  assert.strictEqual(load().ADMIN_PASSWORD, null);
+  assert.strictEqual(load().DEMO_PASSWORD, null);
+  assert.strictEqual(load({ ADMIN_PASSWORD: 'hunter2' }).ADMIN_PASSWORD, 'hunter2');
+  assert.strictEqual(load({ DEMO_PASSWORD: ' demo pw ' }).DEMO_PASSWORD, ' demo pw ');
+  assert.strictEqual(load({ ADMIN_PASSWORD: '' }).ADMIN_PASSWORD, null);
+  assert.strictEqual(load({ DEMO_PASSWORD: 'x', ADMIN_PASSWORD: 'y' }).DEMO_PASSWORD, 'x');
+  // values from a .env file arrive as strings; keep non-strings stringified
+  assert.strictEqual(load({ ADMIN_PASSWORD: 12345 }).ADMIN_PASSWORD, '12345');
+  assert.strictEqual(load({ ADMIN_PASSWORD: null }).ADMIN_PASSWORD, null);
+});
+
 console.log(`\nconfig.test.js: ${passed} checks passed`);

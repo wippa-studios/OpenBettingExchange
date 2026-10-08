@@ -43,6 +43,29 @@ const check = async (name, fn) => {
   };
   const cookieOf = (r) => (r.setCookie.find((c) => c.startsWith('ob_session=')) || '').split(';')[0];
 
+  // SSE reader helper: returns an awaitable that resolves true once a frame
+  // `event: <name>` has arrived on the stream (bounded by a timeout so a
+  // missing broadcast fails fast instead of hanging the suite).
+  const sseWaiter = (reader) => {
+    const dec = new TextDecoder();
+    let buf = '';
+    return (name, ms = 5000) => {
+      const scan = async () => {
+        for (;;) {
+          if (buf.includes(`event: ${name}\n`)) return true;
+          const { value, done } = await reader.read();
+          if (done) return false;
+          buf += dec.decode(value, { stream: true });
+        }
+      };
+      const timeout = new Promise((_, reject) => {
+        const t = setTimeout(() => reject(new Error(`timed out waiting for SSE "event: ${name}"`)), ms);
+        if (t.unref) t.unref();
+      });
+      return Promise.race([scan(), timeout]);
+    };
+  };
+
   try {
     // ── register + auto-login ──────────────────────────────────────────
     await check('register → 201 + session cookie + user', async () => {
@@ -218,7 +241,9 @@ const check = async (name, fn) => {
       assert.strictEqual(snap.status, 200);
       assert.ok([2.74, 2.76].includes(snap.json.decimal), `snapped to ${snap.json.decimal}`);
       assert.strictEqual((await j('GET', '/api/format/abc')).status, 400);
-      assert.strictEqual((await j('GET', '/api/format/0.5')).status, 200); // clamps to 1.01
+      const clamped = await j('GET', '/api/format/0.5');
+      assert.strictEqual(clamped.status, 200);
+      assert.strictEqual(clamped.json.decimal, 1.01); // clamped UP to the ladder floor — assert the body, not just 200
     });
 
     // ── admin stats carry the per-market overround ──────────────────────
@@ -261,6 +286,215 @@ const check = async (name, fn) => {
       const { value } = await reader.read();
       assert.ok(new TextDecoder().decode(value).includes('retry:'));
       await reader.cancel();
+    });
+
+    // ── W1: a malformed cookie escape must not 500 the whole request ──────
+    await check('malformed cookie escape never 500s (sibling-app cookie)', async () => {
+      const r = await j('GET', '/api/sports', { cookie: 'ob_session=%; other=%%' });
+      assert.strictEqual(r.status, 200);
+      assert.ok(Array.isArray(r.json.sports));
+    });
+
+    // ── Bearer tokens authenticate exactly like the session cookie ────────
+    await check('Bearer token authenticates without a cookie', async () => {
+      const login = await j('POST', '/api/auth/login', { body: { username: 'alice', password: 'secret1' } });
+      const token = cookieOf(login).split('=')[1];
+      assert.ok(token.length >= 32, 'opaque token');
+      const res = await fetch(`${base}/api/me`, { headers: { authorization: `Bearer ${token}` } });
+      assert.strictEqual(res.status, 200);
+      const body = await res.json();
+      assert.strictEqual(body.user.username, 'alice');
+    });
+
+    // ── S6: the feed board limit clamps to [1, 500] (pure helper) ────────
+    await check('feed board limit clamps to [1, 500]', () => {
+      assert.strictEqual(srv.clampFeedLimit('abc', 60), 60); // junk → default
+      assert.strictEqual(srv.clampFeedLimit(undefined, 60), 60); // absent → default
+      assert.strictEqual(srv.clampFeedLimit(0, 60), 1); // clamped up
+      assert.strictEqual(srv.clampFeedLimit(-5, 60), 1);
+      assert.strictEqual(srv.clampFeedLimit(2.9, 60), 2); // floored
+      assert.strictEqual(srv.clampFeedLimit(250, 60), 250);
+      assert.strictEqual(srv.clampFeedLimit(99999, 60), 500); // clamped down
+      assert.strictEqual(srv.clampFeedLimit('42', 60), 42); // query values are strings
+    });
+
+    // ── S4: non-integer :id params answer 400 before any query runs ──────
+    await check('non-integer :id params answer 400 on every route', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      assert.strictEqual((await j('GET', '/api/markets/abc/book')).status, 400);
+      assert.strictEqual((await j('GET', '/api/markets/12.5/book')).status, 400);
+      assert.strictEqual((await j('POST', '/api/orders/xyz/cancel', { cookie: alice })).status, 400);
+      assert.strictEqual((await j('POST', '/api/markets/1.5/cashout', { cookie: alice })).status, 400);
+      assert.strictEqual((await j('PATCH', '/api/admin/markets/abc', { body: { status: 'open' }, cookie: admin })).status, 400);
+      assert.strictEqual((await j('POST', '/api/admin/markets/abc/settle', { body: { void: true }, cookie: admin })).status, 400);
+    });
+
+    // ── role guards on the settle route (the desk's most consequential call)
+    await check('settle route: 401 anonymous, 403 non-admin', async () => {
+      const anon = await j('POST', `/api/admin/markets/${marketId}/settle`, { body: { void: true } });
+      assert.strictEqual(anon.status, 401);
+      const forbidden = await j('POST', `/api/admin/markets/${marketId}/settle`, { body: { void: true }, cookie: alice });
+      assert.strictEqual(forbidden.status, 403);
+    });
+
+    // ── S5: starts_at must be ISO-8601 (the admin form sends "2030-01-01 12:00")
+    let sseEventId = null;
+    let sseMarketId = null;
+    let sseSelId = null;
+    await check('admin event requires an ISO-8601 starts_at', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      const sport = (await j('GET', '/api/sports')).json.sports[0];
+      const garbage = await j('POST', '/api/admin/events', { body: { sport_id: sport.id, name: 'No Time FC', starts_at: 'next tuesday' }, cookie: admin });
+      assert.strictEqual(garbage.status, 400);
+      const fake = await j('POST', '/api/admin/events', { body: { sport_id: sport.id, name: 'No Time FC', starts_at: '2030-02-31 10:00' }, cookie: admin });
+      assert.strictEqual(fake.status, 400); // Feb 31 is not a date
+      const good = await j('POST', '/api/admin/events', { body: { sport_id: sport.id, name: 'SSE Test FC', starts_at: '2030-01-01 12:00' }, cookie: admin });
+      assert.strictEqual(good.status, 201);
+      sseEventId = good.json.event.id;
+    });
+
+    // ── S7: schema constraint violations map to honest 4xx codes ──────────
+    await check('SQLite constraint violations map to 409/400 at admin routes', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      const sport = (await j('GET', '/api/sports')).json.sports[0];
+      // duplicate sport slug → UNIQUE violation → 409
+      const dup = await j('POST', '/api/admin/sports', { body: { name: sport.name }, cookie: admin });
+      assert.strictEqual(dup.status, 409);
+      assert.strictEqual(dup.json.error, 'Sport slug already exists');
+      // ghost foreign keys → FK violations → 400
+      const badComp = await j('POST', '/api/admin/competitions', { body: { sport_id: 999999, name: 'Ghost League' }, cookie: admin });
+      assert.strictEqual(badComp.status, 400);
+      const badMk = await j('POST', '/api/admin/markets', { body: { event_id: 999999, name: 'Ghost Market' }, cookie: admin });
+      assert.strictEqual(badMk.status, 400);
+      const badSel = await j('POST', '/api/admin/selections', { body: { market_id: 999999, name: 'Ghost Runner' }, cookie: admin });
+      assert.strictEqual(badSel.status, 400);
+    });
+
+    // ── S11: fair_price must be finite; build a fresh market for SSE ─────
+    await check('selection rejects a non-finite fair_price; fresh market built', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      const mk = await j('POST', '/api/admin/markets', { body: { event_id: sseEventId, name: 'SSE Match Odds' }, cookie: admin });
+      assert.strictEqual(mk.status, 201);
+      sseMarketId = mk.json.market.id;
+      const badFair = await j('POST', '/api/admin/selections', { body: { market_id: sseMarketId, name: 'NaN Runner', fair_price: 'not-a-number' }, cookie: admin });
+      assert.strictEqual(badFair.status, 400);
+      assert.strictEqual(badFair.json.error, 'fair_price must be a number');
+      const sel = await j('POST', '/api/admin/selections', { body: { market_id: sseMarketId, name: 'SSE Runner', fair_price: 2.5 }, cookie: admin });
+      assert.strictEqual(sel.status, 201);
+      sseSelId = sel.json.selection.id;
+      assert.strictEqual(sel.json.selection.fair_price, 2.5);
+    });
+
+    // ── SSE broadcast: book on placement, balance on settlement ──────────
+    await check('SSE broadcasts book on place and balance on settle', async () => {
+      // Alice's OWN stream (opened with her cookie) so private frames arrive.
+      const res = await fetch(`${base}/api/stream`, { headers: { cookie: alice } });
+      assert.strictEqual(res.status, 200);
+      const reader = res.body.getReader();
+      const seen = sseWaiter(reader);
+      let reader2 = null; // assigned once the second stream opens, inside try
+      try {
+        const place = await j('POST', '/api/orders', { body: { selection_id: sseSelId, side: 'back', price: 2.5, stake_cents: 10000 }, cookie: alice });
+        assert.strictEqual(place.status, 201);
+        assert.ok(await seen('book'), 'event: book frame after placement');
+        // Bob lays into the resting back so the market has a MATCH — only
+        // matched participants reach settlement's per_user list, which is
+        // what drives the private balance broadcast.
+        const lay = await j('POST', '/api/orders', { body: { selection_id: sseSelId, side: 'lay', price: 2.5, stake_cents: 10000 }, cookie: bob });
+        assert.strictEqual(lay.status, 201);
+        assert.strictEqual(lay.json.order.status, 'fully_matched');
+        // A SECOND stream, opened after the place/match but before the
+        // settle: placement ALSO broadcasts a private 'balance' to the
+        // placer, so only a stream that connected after that moment can
+        // prove the SETTLEMENT broadcast independently.
+        const res2 = await fetch(`${base}/api/stream`, { headers: { cookie: alice } });
+        reader2 = res2.body.getReader();
+        const seen2 = sseWaiter(reader2);
+        // Capture totals before the settle (escrow never moves them), then
+        // assert the exact pot arithmetic: back 10000 @ 2.5 -> winner pot =
+        // 10000 + (2.5-1)*10000 = 25000, commission round(25000*0.025) = 625;
+        // the layer funds the pot with the (2.5-1)*10000 = 15000 liability.
+        const beforeAlice = (await j('GET', '/api/wallet', { cookie: alice })).json.balance_cents;
+        const beforeBob = (await j('GET', '/api/wallet', { cookie: bob })).json.balance_cents;
+        const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+        const settle = await j('POST', `/api/admin/markets/${sseMarketId}/settle`, { body: { winner_selection_id: sseSelId }, cookie: admin });
+        assert.strictEqual(settle.status, 200);
+        assert.strictEqual(settle.json.market.status, 'settled');
+        assert.ok(await seen2('balance'), 'event: balance frame after settlement');
+        // the win lands in alice's wallet: the backer is credited the layer's
+        // liability (2.5-1)*10000 = 15000 (her own 10000 stake only unfroze —
+        // it never left balance_cents), minus round(15000*0.025)=375 commission
+        const w = await j('GET', '/api/wallet', { cookie: alice });
+        assert.strictEqual(w.json.balance_cents, beforeAlice + 15000 - 375);
+        assert.strictEqual(w.json.frozen_cents, 0);
+        // bob funded the pot with the (2.5-1)*10000 = 15000 liability
+        const wb = await j('GET', '/api/wallet', { cookie: bob });
+        assert.strictEqual(wb.json.balance_cents, beforeBob - 15000);
+        assert.strictEqual(wb.json.frozen_cents, 0);
+      } finally {
+        await reader.cancel();
+        if (reader2) await reader2.cancel();
+      }
+    });
+
+    // ── W3: login/register rate limiting (each check pins + resets) ──────
+    await check('ten consecutive login failures lock just that username', async () => {
+      srv.resetLoginLimiter();
+      await j('POST', '/api/auth/register', { body: { username: 'rl_target', password: 'secret1' } });
+      for (let i = 0; i < 10; i++) {
+        const r = await j('POST', '/api/auth/login', { body: { username: 'rl_target', password: 'wrong-pw' } });
+        assert.strictEqual(r.status, 401, `attempt ${i + 1}/10 stays a plain 401`);
+      }
+      // locked: 429, a generic body, and a positive Retry-After
+      const locked = await j('POST', '/api/auth/login', { body: { username: 'rl_target', password: 'wrong-pw' } });
+      assert.strictEqual(locked.status, 429);
+      assert.strictEqual(locked.json.error, 'Too many failed attempts; try again later');
+      const raw = await fetch(`${base}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: 'rl_target', password: 'wrong-pw' }),
+      });
+      assert.ok(Number(raw.headers.get('retry-after')) >= 1, 'Retry-After is a positive number of seconds');
+      // the lock is per username: everyone else logs in normally
+      const admin = await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } });
+      assert.strictEqual(admin.status, 200);
+      srv.resetLoginLimiter();
+      // and the reset clears it: the correct password works again immediately
+      const ok = await j('POST', '/api/auth/login', { body: { username: 'rl_target', password: 'secret1' } });
+      assert.strictEqual(ok.status, 200);
+    });
+
+    await check('interleaved successes reset the failure counter', async () => {
+      srv.resetLoginLimiter();
+      await j('POST', '/api/auth/register', { body: { username: 'rl_inter', password: 'secret1' } });
+      for (let i = 0; i < 9; i++) {
+        await j('POST', '/api/auth/login', { body: { username: 'rl_inter', password: 'nope' } });
+      }
+      const win = await j('POST', '/api/auth/login', { body: { username: 'rl_inter', password: 'secret1' } });
+      assert.strictEqual(win.status, 200); // a success below threshold is never blocked
+      // the success reset the counter: 9 more misses still do not lock, and
+      // the correct password keeps working (without the reset this would 429)
+      for (let i = 0; i < 9; i++) {
+        await j('POST', '/api/auth/login', { body: { username: 'rl_inter', password: 'nope' } });
+      }
+      const again = await j('POST', '/api/auth/login', { body: { username: 'rl_inter', password: 'secret1' } });
+      assert.strictEqual(again.status, 200);
+      srv.resetLoginLimiter();
+    });
+
+    await check('ten failed registrations lock the calling IP', async () => {
+      srv.resetLoginLimiter();
+      const create = await j('POST', '/api/auth/register', { body: { username: 'rl_dup', password: 'secret1' } });
+      assert.strictEqual(create.status, 201); // creation is a success — resets the IP counter
+      for (let i = 0; i < 10; i++) {
+        const r = await j('POST', '/api/auth/register', { body: { username: 'rl_dup', password: 'secret1' } });
+        assert.strictEqual(r.status, 409, `duplicate attempt ${i + 1}/10 stays a plain 409`);
+      }
+      const locked = await j('POST', '/api/auth/register', { body: { username: 'rl_someone_else', password: 'secret9' } });
+      assert.strictEqual(locked.status, 429); // the IP is locked, even for a fresh username
+      srv.resetLoginLimiter();
+      const fresh = await j('POST', '/api/auth/register', { body: { username: 'rl_after', password: 'secret9' } });
+      assert.strictEqual(fresh.status, 201); // reset unblocks the shared-IP register path
     });
 
     console.log(`\napi.test.js: ${passed} checks passed`);

@@ -13,8 +13,16 @@ const CASH = require('./lib/cashout');
 const bots = require('./lib/bots');
 const drift = require('./lib/drift');
 const ODDS = require('./lib/odds');
+const FEED = require('./lib/feed');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
+// DELIBERATE demo choice (documented in .github/SECURITY.md): this app is
+// loopback-only paper money, and a crashed local dashboard is worse than a
+// possibly-inconsistent one, so stray async failures are logged and the
+// process keeps serving. This is a covenant, not an oversight — if the app
+// ever serves real accounts or non-loopback interfaces, these handlers MUST
+// become a clean shutdown (drain connections, exit non-zero, let a
+// supervisor restart).
 process.on('unhandledRejection', (err) => console.error('[unhandledRejection]', err));
 process.on('uncaughtException', (err) => console.error('[uncaughtException]', err));
 
@@ -24,6 +32,18 @@ app.disable('x-powered-by');
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'same-origin');
+  // CSP is strict because the frontend is verifiably inline-free: the only
+  // scripts are the three external tags (/ladder.js /app.js /admin.js), all
+  // styles live in /style.css, fonts are self-hosted under /fonts and the
+  // only images are /assets/*.png — so 'self' everywhere suffices (img-src
+  // keeps data: for future inline icons). Net effect: an injected inline
+  // <script>, an on*= HTML attribute or a javascript: URL is refused by the
+  // browser even if an escaping bug ever slips past esc().
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
+      "connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+  );
   next();
 });
 
@@ -47,15 +67,47 @@ app.use(express.json({ limit: '256kb' }));
 // DB + idempotent seed on first run.
 const db = openStore(config.DB_PATH);
 seedIfNeeded(db);
-// Housekeeping: drop expired sessions at boot.
+// Housekeeping: drop expired sessions at boot, and hourly while running —
+// a long-lived demo otherwise accumulates dead rows forever. The interval is
+// unref'd so it never keeps the process (or a test run) alive by itself.
 db.prepare("DELETE FROM sessions WHERE expires_at <= datetime('now')").run();
+const sessionSweeper = setInterval(() => {
+  try {
+    db.prepare("DELETE FROM sessions WHERE expires_at <= datetime('now')").run();
+  } catch {
+    /* DB closed during shutdown — nothing left to sweep */
+  }
+}, 60 * 60 * 1000);
+if (sessionSweeper.unref) sessionSweeper.unref();
+
+// ── Engine switches ────────────────────────────────────────────────────────
+// With the feed on, the recorder owns prices; bots and drift would requote
+// ladders straight over the observed Betfair book, so they are suppressed
+// regardless of their own flags. Hoisted ABOVE every use (the admin
+// selections route AND main()) so no code path can ever consult the raw
+// config flag and quote over a feed-owned market.
+const BOTS_ON = config.BOT_ENABLED && !config.FEED_ENABLED;
+const DRIFT_ON = config.DRIFT_ENABLED && !config.FEED_ENABLED;
 
 // ── Session (httpOnly cookie + Bearer fallback) ───────────────────────────
+// Cookies are host-scoped, not port-scoped: a sibling app on localhost:3000
+// can hand this dashboard a cookie it never wrote. decodeURIComponent THROWS
+// on a malformed escape ("ob_session=%"), and a throw here would 500 every
+// request — including GETs — so a bad escape falls back to the raw value
+// (which simply fails the token lookup instead of killing the request).
+function safeDecode(v) {
+  try {
+    return decodeURIComponent(v);
+  } catch {
+    return v;
+  }
+}
+
 function parseCookies(req) {
   const out = {};
   for (const part of String(req.headers.cookie || '').split(';')) {
     const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    if (i > 0) out[part.slice(0, i).trim()] = safeDecode(part.slice(i + 1).trim());
   }
   return out;
 }
@@ -81,36 +133,84 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// ── Route helpers ──────────────────────────────────────────────────────────
+// Express 4 does NOT forward async rejections to the error middleware: an
+// `await` that throws inside a route handler leaves the request hung until
+// the client gives up (no 500, no timeout — just a dangling socket). Every
+// async handler is wrapped so rejections become next(err). Express 5
+// removes the need for this; until then, aw() is the band-aid.
+const aw = (h) => (req, res, next) => Promise.resolve(h(req, res, next)).catch(next);
+
+// :id params arrive as URL strings. Number('12.5'), Number('abc') and
+// Number(undefined) produce 12.5, NaN and NaN — none are valid row ids, and
+// NaN would throw inside the SQLite binder (a 500, not a 404). Every :id
+// route goes through here: non-integers answer 400 before any query runs.
+function intId(raw) {
+  const n = Number(raw);
+  if (!Number.isInteger(n)) throw A.httpError(400, 'id must be an integer');
+  return n;
+}
+
 function sessionCookie(token) {
   return `ob_session=${token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${config.SESSION_TTL_DAYS * 86400}`;
 }
 
 // ── SSE ────────────────────────────────────────────────────────────────────
 const clients = new Set();
+// Cap on concurrent streams: each holds a socket, a file descriptor and a
+// write buffer, so a leak or a script-opening client must not multiply
+// without bound. Over the cap the endpoint answers 503 once (no SSE body)
+// — EventSource retries on its own schedule as older streams free up.
+const MAX_SSE_CLIENTS = 100;
 
 app.get('/api/stream', (req, res) => {
+  if (clients.size >= MAX_SSE_CLIENTS) return res.status(503).json({ error: 'Too many concurrent streams' });
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
   });
   res.write('retry: 3000\n\n');
+  // The viewer's identity is latched ONCE, at connect time: a stream opened
+  // while signed out stays anonymous forever, and one opened while signed in
+  // keeps receiving that user's private frames even after logout (logout only
+  // clears the cookie — frames are never re-authenticated per event).
+  // Deliberate: per-frame re-auth would cost a DB hit per broadcast, and
+  // the loopback demo accepts the stale stream. The browser tears it down on
+  // its own logout/reload anyway.
   const client = { res, userId: req.user ? req.user.id : null };
   clients.add(client);
   req.on('close', () => clients.delete(client));
 });
 
+// Drop a stream: out of the fan-out and the socket closed.
+function dropClient(c) {
+  clients.delete(c);
+  try {
+    c.res.end();
+  } catch {
+    /* already gone */
+  }
+}
+
+// Write one frame, dropping the client on failure OR backpressure. A write
+// that returns false means the socket buffer is full — the consumer has
+// stopped reading. For a broadcast fan-out the only choices are blocking
+// every client on one laggard or dropping the laggard; drop the laggard
+// (EventSource reconnects automatically).
+function writeFrame(c, payload) {
+  try {
+    if (c.res.write(payload) === false) dropClient(c);
+  } catch {
+    dropClient(c);
+  }
+}
+
 // Heartbeat: proxies and load balancers drop idle streams, and a quiet
 // exchange can look dead to the browser's EventSource.
 function startHeartbeat(ms = 15000) {
   const t = setInterval(() => {
-    for (const c of clients) {
-      try {
-        c.res.write(': hb\n\n');
-      } catch {
-        clients.delete(c);
-      }
-    }
+    for (const c of clients) writeFrame(c, ': hb\n\n');
   }, ms);
   if (t.unref) t.unref();
   return t;
@@ -132,27 +232,98 @@ function broadcast(event, data, userId = null) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const c of clients) {
     if (userId !== null && c.userId !== userId) continue;
-    try {
-      c.res.write(payload);
-    } catch {
-      clients.delete(c);
-    }
+    writeFrame(c, payload);
   }
 }
 
 // ── Auth ───────────────────────────────────────────────────────────────────
+// Brute-force guard for the two credential routes (W3). In-memory, no deps.
+// Counters are per key — the case-normalized username for login, the remote
+// IP for register — and count CONSECUTIVE FAILURES only: any success clears
+// the key, so a legitimate user who occasionally mistypes a password is
+// never locked out and successes can never accumulate toward a lock.
+//
+// At RL_MAX_FAILURES consecutive misses the key is locked for RL_LOCK_BASE_MS,
+// doubling with each further failure and capped at RL_LOCK_MAX_MS. While
+// locked, every attempt answers 429 WITHOUT touching scrypt, so a locked
+// account is cheap to defend and expensive to keep guessing at. The map is
+// process-local (a restart clears it) — right for a single-node loopback
+// demo; a multi-node deployment would need a shared store instead.
+const RL_MAX_FAILURES = 10; // consecutive failures before lockout
+const RL_LOCK_BASE_MS = 30 * 1000; // first lockout window
+const RL_LOCK_MAX_MS = 15 * 60 * 1000; // cap: further doubling outlives interest
+const rlAttempts = new Map(); // key → { fails, lockedUntil }
+
+function rlLocked(key) {
+  const a = rlAttempts.get(key);
+  return !!a && a.lockedUntil > Date.now();
+}
+
+function rlRecordFailure(key) {
+  const a = rlAttempts.get(key) || { fails: 0, lockedUntil: 0 };
+  a.fails += 1;
+  if (a.fails >= RL_MAX_FAILURES) {
+    a.lockedUntil = Date.now() + Math.min(RL_LOCK_BASE_MS * 2 ** (a.fails - RL_MAX_FAILURES), RL_LOCK_MAX_MS);
+  }
+  rlAttempts.set(key, a);
+}
+
+function rlRecordSuccess(key) {
+  rlAttempts.delete(key);
+}
+
+function rlRetryAfterSeconds(key) {
+  const a = rlAttempts.get(key);
+  return a ? Math.max(1, Math.ceil((a.lockedUntil - Date.now()) / 1000)) : 0;
+}
+
+// Test seam: clears the in-memory counters so a suite can isolate the
+// limiter. Exported for tests ONLY — no production path calls this.
+function resetLoginLimiter() {
+  rlAttempts.clear();
+}
+
+function rlTooManyAttempts(res, key) {
+  return res
+    .status(429)
+    .setHeader('Retry-After', String(rlRetryAfterSeconds(key)))
+    .json({ error: 'Too many failed attempts; try again later' });
+}
+
 app.post('/api/auth/register', (req, res) => {
   const { username, password } = req.body || {};
-  const user = A.registerUser(db, { username, password });
-  const token = A.createSession(db, user.id);
-  res.setHeader('Set-Cookie', sessionCookie(token));
-  res.status(201).json({ user });
+  // Registration abuse is account-farming or username enumeration from one
+  // machine, so the counter keys on the caller's IP.
+  const key = 'register:' + (req.socket.remoteAddress || 'unknown');
+  if (rlLocked(key)) return rlTooManyAttempts(res, key);
+  try {
+    const user = A.registerUser(db, { username, password });
+    rlRecordSuccess(key);
+    const token = A.createSession(db, user.id);
+    res.setHeader('Set-Cookie', sessionCookie(token));
+    res.status(201).json({ user });
+  } catch (e) {
+    // A refused registration (validation, duplicate username) is a failed
+    // attempt; anything else (a server fault) is not.
+    if (e && (e.status === 400 || e.status === 409)) rlRecordFailure(key);
+    throw e;
+  }
 });
 
 app.post('/api/auth/login', (req, res) => {
-  const { user, token } = A.loginUser(db, req.body || {});
-  res.setHeader('Set-Cookie', sessionCookie(token));
-  res.json({ user });
+  // Case-normalized on purpose: 'Admin', 'ADMIN' and 'admin' share one
+  // counter, so case variants cannot farm fresh guessing windows.
+  const key = 'login:' + String((req.body || {}).username || '').trim().toLowerCase();
+  if (rlLocked(key)) return rlTooManyAttempts(res, key);
+  try {
+    const { user, token } = A.loginUser(db, req.body || {});
+    rlRecordSuccess(key); // a success proves the real user — clear the slate
+    res.setHeader('Set-Cookie', sessionCookie(token));
+    res.json({ user });
+  } catch (e) {
+    if (e && e.status === 401) rlRecordFailure(key); // only auth misses count
+    throw e; // sync throw → Express forwards to the error handler
+  }
 });
 
 app.post('/api/auth/logout', (req, res) => {
@@ -176,6 +347,90 @@ app.get('/api/sports', (req, res) => {
     .all();
   res.json({ sports });
 });
+
+// Feed-backed board: markets and prices come from the betfair-market-snapshots
+// recorder's Postgres, so there is no matching book here — the ladder IS the
+// observed exchange. Shape matches /api/events so the frontend is unchanged.
+app.get('/api/feed/board', aw(async (req, res) => {
+  if (!config.FEED_ENABLED) return res.status(409).json({ error: 'Feed is disabled (set FEED_ENABLED=true)' });
+  try {
+    const markets = await FEED.fetchBoard({ limit: clampFeedLimit(req.query.limit, config.FEED_MARKET_LIMIT) });
+    res.json({ markets });
+  } catch (e) {
+    // A feed outage must not look like a 500 from the exchange itself.
+    console.error('[feed] board read failed:', e.message);
+    res.status(503).json({ error: 'Odds feed unavailable' });
+  }
+}));
+
+// Board limit clamp: a 0/negative limit would answer an empty board; a huge
+// one is unbounded work for the recorder query. Clamp to [1, 500]; junk
+// (non-numeric) falls back to the configured default rather than guessing.
+// Exported so the clamping behaviour is unit-testable without a live feed.
+function clampFeedLimit(raw, fallback) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(500, Math.max(1, Math.floor(n)));
+}
+
+// One market's ladder, by id. This is what the page prices when you pick a race
+// from the tree.
+//
+// The board above is a capped, recency-sorted list — the catalogue is 1400+
+// markets, so it cannot be the source for an arbitrary selection. Answering
+// from it anyway made a pick outside the cap render a DIFFERENT market's
+// prices, which is worse than an honest empty state.
+//
+// An id that resolves to nothing open answers 200 with `market: null`. That is
+// not a client error: the feed rotates markets away constantly, so "the race
+// you picked has closed" is an ordinary outcome the page renders as such, and
+// only a missing `id` parameter is a 400.
+app.get('/api/feed/market', aw(async (req, res) => {
+  if (!config.FEED_ENABLED) return res.status(409).json({ error: 'Feed is disabled (set FEED_ENABLED=true)' });
+  const id = req.query.id;
+  if (!id || !String(id).trim()) {
+    return res.status(400).json({ error: 'id is required' });
+  }
+  try {
+    const market = await FEED.fetchMarket(id);
+    res.json({ market: market || null });
+  } catch (e) {
+    console.error('[feed] market read failed:', e.message);
+    res.status(503).json({ error: 'Odds feed unavailable' });
+  }
+}));
+
+// Always 200, including when the feed is off: the browser probes this at boot to
+// decide which board to render, and a 409 there logs a console error on every
+// non-feed deployment (the browser suite fails a run on any console error).
+app.get('/api/feed/nav', aw(async (req, res) => {
+  if (!config.FEED_ENABLED) return res.json({ enabled: false, sports: [] });
+  try {
+    res.json({ enabled: true, sports: await FEED.fetchNav() });
+  } catch (e) {
+    console.error('[feed] nav read failed:', e.message);
+    res.status(503).json({ error: 'Odds feed unavailable' });
+  }
+}));
+
+// Feed liveness. The client-facing error is genericized at this boundary:
+// a driver failure can embed host/user detail in its message (pg errors do),
+// so the detail goes to the server log and the client gets a status that is
+// uninformative but true. Resilient to whatever health() returns OR throws —
+// including a future detail field with driver messages in it.
+app.get('/api/feed/health', aw(async (req, res) => {
+  if (!config.FEED_ENABLED) return res.status(409).json({ error: 'Feed is disabled' });
+  let h;
+  try {
+    h = await FEED.health();
+  } catch (e) {
+    console.error('[feed] health check failed:', e.message);
+    return res.status(503).json({ ok: false, error: 'Odds feed unavailable' });
+  }
+  if (h && h.ok) return res.json(h);
+  console.error('[feed] health check reported failure:', (h && (h.error || h.detail)) || '(no detail)');
+  res.status(503).json({ ok: false, error: 'Odds feed unavailable' });
+}));
 
 app.get('/api/events', (req, res) => {
   const sportSlug = req.query.sport;
@@ -229,7 +484,7 @@ app.get('/api/events', (req, res) => {
 });
 
 app.get('/api/markets/:id/book', (req, res) => {
-  const m = db.prepare('SELECT * FROM markets WHERE id = ?').get(Number(req.params.id));
+  const m = db.prepare('SELECT * FROM markets WHERE id = ?').get(intId(req.params.id));
   if (!m) return res.status(404).json({ error: 'Market not found' });
   res.json({ market: m, book: M.bookFor(db, m.id, 5) });
 });
@@ -264,7 +519,7 @@ app.get('/api/orders', requireAuth, (req, res) => {
 });
 
 app.post('/api/orders/:id/cancel', requireAuth, (req, res) => {
-  const order = M.cancelOrder(db, req.user, Number(req.params.id));
+  const order = M.cancelOrder(db, req.user, intId(req.params.id));
   broadcast('book', { market_id: order.market_id });
   broadcast('orders', {}, req.user.id);
   broadcast('balance', {}, req.user.id);
@@ -280,8 +535,9 @@ app.get('/api/positions', requireAuth, (req, res) => {
 });
 
 app.post('/api/markets/:id/cashout', requireAuth, (req, res) => {
-  const result = CASH.cashoutMarket(db, req.user, Number(req.params.id));
-  broadcast('book', { market_id: Number(req.params.id) });
+  const mid = intId(req.params.id);
+  const result = CASH.cashoutMarket(db, req.user, mid);
+  broadcast('book', { market_id: mid });
   broadcast('orders', {}, req.user.id);
   broadcast('balance', {}, req.user.id);
   res.json(result);
@@ -308,36 +564,91 @@ function slugify(name) {
   return String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
-app.post('/api/admin/sports', requireAdmin, (req, res) => {
+// ── SQLite error mapping ───────────────────────────────────────────────────
+// The admin catalogue INSERTs fail two ways: a client-correctable mistake
+// the schema itself rejects (duplicate slug, unknown foreign key — a
+// constraint violation) or a genuine server fault. Only the first kind gets
+// a fabricated 4xx message; everything else MUST fall through to next(err)
+// so it surfaces as a real 500 instead of a misleading 4xx.
+//
+// node:sqlite reports constraint violations with a numeric errcode in the
+// SQLITE_CONSTRAINT family (all extended codes share the low byte 19) and a
+// message ending in "constraint failed"; some drivers also expose a
+// 'SQLITE_CONSTRAINT*' .code string. All three signals are checked so the
+// mapping stays robust across driver versions.
+function isSqliteConstraint(e) {
+  if (!e || typeof e !== 'object') return false;
+  if (typeof e.errcode === 'number' && (e.errcode & 0xff) === 19) return true;
+  if (typeof e.code === 'string' && e.code.startsWith('SQLITE_CONSTRAINT')) return true;
+  return /constraint failed/i.test(String(e.message || ''));
+}
+
+// ── starts_at validation ───────────────────────────────────────────────────
+// ISO-8601 date or datetime, in the forms the desk actually sends:
+//   2030-01-01 | 2030-01-01T12:00 | 2030-01-01 12:00[:00[.ffffff]][Z|±HH:MM]
+// (the admin form and smoke.sh both send a SPACE-separated datetime). The
+// column stores TEXT and the board sorts it lexically, so format matters
+// beyond parseability — a non-ISO string would also sort wrong on the board.
+const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+function isIsoDateTime(s) {
+  if (!ISO_DATETIME_RE.test(s)) return false;
+  // A syntactically valid string can still be a non-date (2030-02-31) or a
+  // non-time (25:00). Date.parse is lenient — V8 rolls Feb 31 into Mar 3 —
+  // so verify the calendar by round-trip: every component must survive.
+  const [d, t] = s.split(/[T ]/);
+  const [y, mo, da] = d.split('-').map(Number);
+  let hh = 0, mi = 0, se = 0;
+  if (t) {
+    const z = t.match(/(Z|[+-]\d{2}:?\d{2})$/);
+    const body = z ? t.slice(0, z.index) : t;
+    const parts = body.split(':').map((x) => Math.floor(Number(x)));
+    hh = parts[0] ?? 0; mi = parts[1] ?? 0; se = parts[2] ?? 0;
+  }
+  const dt = new Date(Date.UTC(y, mo - 1, da, hh, mi, se));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === da
+    && dt.getUTCHours() === hh && dt.getUTCMinutes() === mi && dt.getUTCSeconds() === se;
+}
+
+app.post('/api/admin/sports', requireAdmin, (req, res, next) => {
   const name = String((req.body || {}).name || '').trim();
   if (!name) return res.status(400).json({ error: 'name required' });
   const slug = slugify(name);
   try {
     db.prepare('INSERT INTO sports (name, slug) VALUES (?, ?)').run(name, slug);
-  } catch {
+  } catch (e) {
+    // Only schema constraints get a fabricated message; anything else is a
+    // real fault and MUST surface as a 5xx, not a misleading 4xx.
+    if (!isSqliteConstraint(e)) return next(e);
     return res.status(409).json({ error: 'Sport slug already exists' });
   }
   res.status(201).json({ sport: db.prepare('SELECT * FROM sports WHERE slug = ?').get(slug) });
 });
 
-app.post('/api/admin/competitions', requireAdmin, (req, res) => {
+app.post('/api/admin/competitions', requireAdmin, (req, res, next) => {
   const { sport_id, name, country } = req.body || {};
   if (!Number.isInteger(Number(sport_id)) || !String(name || '').trim()) {
     return res.status(400).json({ error: 'sport_id and name required' });
   }
   try {
     db.prepare('INSERT INTO competitions (sport_id, name, country) VALUES (?, ?, ?)').run(Number(sport_id), String(name).trim(), country || null);
-  } catch {
+  } catch (e) {
+    if (!isSqliteConstraint(e)) return next(e);
+    // sport_id is FK-checked by the schema; a constraint here means it does
+    // not exist (name is pre-validated, so NOT NULL cannot fire).
     return res.status(400).json({ error: 'Invalid sport_id' });
   }
   const comp = db.prepare('SELECT * FROM competitions WHERE sport_id = ? AND name = ?').get(Number(sport_id), String(name).trim());
   res.status(201).json({ competition: comp });
 });
 
-app.post('/api/admin/events', requireAdmin, (req, res) => {
+app.post('/api/admin/events', requireAdmin, (req, res, next) => {
   const { sport_id, competition_id, name, starts_at } = req.body || {};
-  if (!Number.isInteger(Number(sport_id)) || !String(name || '').trim() || !String(starts_at || '').trim()) {
+  const startsAt = String(starts_at || '').trim();
+  if (!Number.isInteger(Number(sport_id)) || !String(name || '').trim() || !startsAt) {
     return res.status(400).json({ error: 'sport_id, name and starts_at required' });
+  }
+  if (!isIsoDateTime(startsAt)) {
+    return res.status(400).json({ error: 'starts_at must be an ISO-8601 date or datetime (YYYY-MM-DD[ HH:MM[:SS]])' });
   }
   const sportId = Number(sport_id);
   let compId = null;
@@ -356,48 +667,59 @@ app.post('/api/admin/events', requireAdmin, (req, res) => {
       sportId,
       compId,
       String(name).trim(),
-      String(starts_at).trim()
+      startsAt
     );
-  } catch {
-    return res.status(400).json({ error: 'Invalid sport_id/competition_id' });
+  } catch (e) {
+    if (!isSqliteConstraint(e)) return next(e);
+    // competition_id was verified above, so a constraint here is the sport FK.
+    return res.status(400).json({ error: 'Invalid sport_id' });
   }
   const ev = db.prepare('SELECT * FROM events WHERE sport_id = ? AND name = ? ORDER BY id DESC').get(sportId, String(name).trim());
   res.status(201).json({ event: ev });
 });
 
-app.post('/api/admin/markets', requireAdmin, (req, res) => {
+app.post('/api/admin/markets', requireAdmin, (req, res, next) => {
   const { event_id, name } = req.body || {};
   if (!Number.isInteger(Number(event_id)) || !String(name || '').trim()) {
     return res.status(400).json({ error: 'event_id and name required' });
   }
   try {
     db.prepare('INSERT INTO markets (event_id, name) VALUES (?, ?)').run(Number(event_id), String(name).trim());
-  } catch {
+  } catch (e) {
+    if (!isSqliteConstraint(e)) return next(e);
     return res.status(400).json({ error: 'Invalid event_id' });
   }
   const m = db.prepare('SELECT * FROM markets WHERE event_id = ? ORDER BY id DESC').get(Number(event_id));
   res.status(201).json({ market: m });
 });
 
-app.post('/api/admin/selections', requireAdmin, (req, res) => {
+app.post('/api/admin/selections', requireAdmin, (req, res, next) => {
   const { market_id, name, fair_price } = req.body || {};
   if (!Number.isInteger(Number(market_id)) || !String(name || '').trim()) {
     return res.status(400).json({ error: 'market_id and name required' });
   }
   let fair = null;
   if (fair_price !== undefined && fair_price !== null) {
-    fair = ODDS.snapToTick(Number(fair_price));
+    // NaN/Infinity must not reach snapToTick: it clamps, so garbage would
+    // silently become a ladder end and publish a tradable market with a
+    // meaningless price.
+    const fp = Number(fair_price);
+    if (!Number.isFinite(fp)) return res.status(400).json({ error: 'fair_price must be a number' });
+    fair = ODDS.snapToTick(fp);
   }
   try {
     db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, ?)').run(Number(market_id), String(name).trim(), fair);
-  } catch {
+  } catch (e) {
+    if (!isSqliteConstraint(e)) return next(e);
     return res.status(400).json({ error: 'Invalid market_id' });
   }
   const sel = db.prepare('SELECT * FROM selections WHERE market_id = ? AND name = ?').get(Number(market_id), String(name).trim());
   // A market created at runtime has no ladders until something quotes it —
   // quote immediately so new markets are tradeable (the bot's own two sides
-  // never cross, so a single runner is safe to quote).
-  if (config.BOT_ENABLED) {
+  // never cross, so a single runner is safe to quote). Gated on the
+  // EFFECTIVE switch: when the feed is on, the recorder owns prices and a
+  // bot requote would write straight over the observed book.
+  if (BOTS_ON) {
     try {
       bots.quoteMarket(db, Number(market_id));
     } catch (e) {
@@ -410,7 +732,7 @@ app.post('/api/admin/selections', requireAdmin, (req, res) => {
 app.patch('/api/admin/markets/:id', requireAdmin, (req, res) => {
   const status = (req.body || {}).status;
   if (!['open', 'suspended'].includes(status)) return res.status(400).json({ error: 'status must be open or suspended' });
-  const m = db.prepare('SELECT * FROM markets WHERE id = ?').get(Number(req.params.id));
+  const m = db.prepare('SELECT * FROM markets WHERE id = ?').get(intId(req.params.id));
   if (!m) return res.status(404).json({ error: 'Market not found' });
   if (m.status === 'settled') return res.status(409).json({ error: 'Market is settled' });
   db.prepare('UPDATE markets SET status = ? WHERE id = ?').run(status, m.id);
@@ -420,15 +742,16 @@ app.patch('/api/admin/markets/:id', requireAdmin, (req, res) => {
 
 app.post('/api/admin/markets/:id/settle', requireAdmin, (req, res) => {
   const body = req.body || {};
+  const mid = intId(req.params.id);
   // Pass the caller's values through UNCHANGED: lib/settle.js validates
   // strictly (a string "false" must not void a market, a boolean must not
   // become selection id 1). No coercion happens here on purpose.
-  const result = SET.settleMarket(db, Number(req.params.id), {
+  const result = SET.settleMarket(db, mid, {
     winner_selection_id: body.winner_selection_id === undefined ? null : body.winner_selection_id,
     void: body.void === undefined ? false : body.void,
   });
-  broadcast('book', { market_id: Number(req.params.id) });
-  broadcast('settlement', { market_id: Number(req.params.id) });
+  broadcast('book', { market_id: mid });
+  broadcast('settlement', { market_id: mid });
   for (const u of result.per_user) {
     broadcast('balance', {}, u.user_id);
     broadcast('orders', {}, u.user_id);
@@ -483,11 +806,40 @@ function errorHandler(err, req, res, next) {
 
 app.use(errorHandler);
 
+// S13: a prominent, honest boot warning while a seeded account still accepts
+// its well-known demo password. Checked against the STORED hash, so it stays
+// truthful for pre-existing databases — and stops warning exactly when the
+// operator changes the password or seeds a custom one.
+function warnDefaultCredentials() {
+  const seeded = [
+    ['admin', 'admin123', 'ADMIN_PASSWORD'],
+    ['demo', 'demo123', 'DEMO_PASSWORD'],
+  ];
+  for (const [name, pw, envVar] of seeded) {
+    const row = db.prepare('SELECT pass_hash FROM users WHERE username = ?').get(name);
+    if (!row || !A.verifyPassword(pw, row.pass_hash)) continue;
+    console.warn(
+      `[security] DEFAULT CREDENTIALS ACTIVE: user "${name}" accepts the seeded demo password.` +
+        ` Set ${envVar} (see .env.example) and re-seed, or change the password, before showing this app to anyone.`
+    );
+  }
+}
+
 function main() {
   const rolled = rollForwardEvents(db);
   if (rolled) console.log(`[board] ${rolled} past-due event(s) moved to live`);
   startHeartbeat();
-  if (config.BOT_ENABLED) {
+  // With the feed on, the recorder owns prices. Bots and drift would requote
+  // ladders every DRIFT_INTERVAL_MS straight over the observed Betfair book and
+  // the two would fight, so they are forced off rather than left to config
+  // discipline. Order still matters: the feed is a price SOURCE, not a
+  // replacement for the exchange's own machinery. (BOTS_ON/DRIFT_ON are
+  // hoisted at module scope so every route shares this exact definition.)
+  if (config.FEED_ENABLED) {
+    if (config.BOT_ENABLED) console.log('[feed] on — bots suppressed (feed owns prices)');
+    if (config.DRIFT_ENABLED) console.log('[feed] on — drift suppressed (feed owns prices)');
+  }
+  if (BOTS_ON) {
     try {
       bots.quoteAllMarkets(db);
       console.log('[bots] liquidity quoted on all open markets');
@@ -495,17 +847,34 @@ function main() {
       console.error('[bots]', e.message);
     }
   }
-  if (config.DRIFT_ENABLED) {
+  if (DRIFT_ON) {
     drift.startDrift(db, { intervalMs: config.DRIFT_INTERVAL_MS, broadcast });
     console.log('[drift] on');
+  }
+  warnDefaultCredentials();
+  if (config.FEED_ENABLED) {
+    FEED.health()
+      .then((h) => {
+        if (h.ok) {
+          console.log(
+            `[feed] odds feed connected — ${h.markets} markets, newest frame ${
+              h.age_seconds == null ? 'unknown' : `${h.age_seconds}s old`
+            }${h.stale ? ' (STALE)' : ''}`
+          );
+        } else {
+          console.error(`[feed] unreachable: ${h.error}`);
+        }
+      })
+      .catch((e) => console.error('[feed] health check failed:', e.message));
   }
   const server = app.listen(config.PORT, config.HOST, () => {
     console.log(`OpenBookmaker exchange on http://${config.HOST}:${config.PORT} (paper money only)`);
   });
   // A hung SSE connection must not keep the process alive on shutdown.
   server.on('close', closeStreams);
+  server.on('close', () => { FEED.close().catch(() => {}); });
 }
 
 if (require.main === module) main();
 
-module.exports = { app, db, broadcast, errorHandler };
+module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, resetLoginLimiter };

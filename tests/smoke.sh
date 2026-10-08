@@ -14,7 +14,17 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
-PORT="${SMOKE_PORT:-7899}"
+# A free port instead of a fixed one: a hard-coded 7899 collides with any
+# concurrently running suite or dev server and the whole smoke run dies at
+# boot. Same discovery as ui_test.mjs — bind :0, read back the port the OS
+# chose, release, let the server re-bind. An explicit SMOKE_PORT still wins
+# for targeted debugging against a known instance.
+if [ -n "${SMOKE_PORT:-}" ]; then
+  PORT="$SMOKE_PORT"
+else
+  PORT=$(node -e 'const n=require("net"),s=n.createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})') \
+    || { echo "  FAIL could not discover a free port"; exit 1; }
+fi
 BASE="http://127.0.0.1:${PORT}"
 TMP="$(mktemp -d)"
 PID=""
@@ -138,19 +148,29 @@ for asset in / /app.js /admin.js /style.css; do
   check "serves $asset" "$(status "$BASE$asset")" "200"
 done
 
-# ── 7. integrity: money is conserved minus commission ─────────────────────
-node -e '
-const {execSync}=require("child_process");
-' 2>/dev/null || true
-SUM=$(curl -s -b "$TMP/alice.jar" "$BASE/api/wallet" | pick balance_cents)
-check "no NaN leaked into the wallet" "$SUM" "64625"
+# ── 7. integrity: the wallet is clean integer cents, never NaN or float ────
+# The amount was already pinned in section 5; this checks the TYPE. A NaN
+# anywhere in the money path surfaces as null (JSON.stringify(NaN) → null)
+# or as an invalid-JSON token that JSON.parse throws on — either way the
+# check below fails instead of silently rendering "NaN" in the dashboard.
+curl -s -b "$TMP/alice.jar" "$BASE/api/wallet" | node -e '
+  let s = "";
+  process.stdin.on("data", (c) => (s += c)).on("end", () => {
+    const j = JSON.parse(s);
+    if (!Number.isInteger(j.balance_cents) || !Number.isInteger(j.frozen_cents)) {
+      console.error("not integer cents:", j.balance_cents, j.frozen_cents);
+      process.exit(1);
+    }
+  });' \
+  && ok "no NaN leaked into the wallet (balance + frozen are integers)" \
+  || bad "wallet carries a non-integer value"
 
 # ── 8. conservation: the only money that left the two players is commission ─
 TOTAL=$(node -e '
 const { execFileSync } = require("child_process");
 const a = Number(process.argv[1]), b = Number(process.argv[2]);
 process.stdout.write(String(a + b));' "$ALICE_BAL" "$BOB_BAL")
-# alice + bob started with 50000 each; 100000 + net(-325) = 99675
+# alice + bob started with 50000 each; 100000 + net(-375) = 99625
 check "money conserved (players 100000 - commission 375)" "$TOTAL" "99625"
 check "all escrow released (both frozen 0)" "$(echo "$AW" | pick frozen_cents)$(echo "$BW" | pick frozen_cents)" "00"
 # settled market must leave no open orders behind

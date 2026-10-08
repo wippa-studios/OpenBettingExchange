@@ -4,11 +4,26 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OpenBookmaker — paper-money betting exchange</title>
+  <link rel="icon" type="image/png" href="/assets/favicon.png" />
+  <meta name="theme-color" content="#ffffff" />
+  <link rel="preload" href="/fonts/inter-400.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="/fonts/inter-700.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <header>
-    <div class="logo">OPEN<span>BOOKMAKER</span></div>
+    <div class="logo"><img src="/assets/logo.png" alt="OpenBookmaker" /></div>
+    <!-- Narrow screens: opens the race rail. In feed mode the tree is the ONLY
+         navigation surface, so it cannot simply be hidden below 1000px. -->
+    <button id="navToggle" aria-expanded="false" aria-controls="sidebar" aria-label="Toggle navigation rail">
+      <span class="bar"></span><span class="bar"></span><span class="bar"></span>
+    </button>
+    <!-- Global search: jump straight to a team, runner or meeting. Searches the
+         loaded catalogue in seeded mode and the feed board in feed mode. -->
+    <div class="searchwrap">
+      <input id="globalSearch" type="search" placeholder="Search runner, meeting or track…" autocomplete="off" spellcheck="false" aria-label="Search runners, meetings or tracks" />
+      <div id="searchResults" hidden></div>
+    </div>
     <nav id="nav">
       <button data-page="markets">Exchange</button>
       <button data-page="bets">My Bets</button>
@@ -20,31 +35,51 @@
     <button class="btn sm" id="authBtn">Sign in</button>
   </header>
 
+  <!-- Left rail: the sport → country → track → meeting → race tree. This is the
+       only navigation in feed mode; there are no dropdowns. -->
+  <aside id="sidebar">
+    <div class="sidegroup">
+      <div class="sidehead">SPORTS</div>
+      <div id="sportsList" class="sportslist"></div>
+    </div>
+  </aside>
+
   <main>
     <div id="page"></div>
-    <div id="slip" hidden>
-      <h3>Bet Slip</h3>
-      <div id="slipBody"></div>
+    <div id="slipwrap">
+      <!-- Cash Out sits above the slip: it is a position-level action, not a
+           per-bet one, so it belongs with the slip rather than inside it. -->
+      <button class="btn cashout" id="cashoutBtn">Cash Out</button>
+      <div id="slip" hidden>
+        <h3>Bet Slip</h3>
+        <div id="slipBody"></div>
+      </div>
     </div>
   </main>
 
-  <div id="toast"></div>
+  <!-- role=status + aria-live so assistive tech announces toasts passively. -->
+  <div id="toast" role="status" aria-live="polite"></div>
 
-  <div id="authModal">
+  <div id="authModal" role="dialog" aria-modal="true" aria-labelledby="authTitle">
     <div class="box">
       <h3 id="authTitle">Sign in</h3>
+      <label class="fieldlabel" for="authUser">Username</label>
       <input id="authUser" placeholder="username" autocomplete="username" />
+      <label class="fieldlabel" for="authPass">Password</label>
       <input id="authPass" type="password" placeholder="password" autocomplete="current-password" />
       <div class="row">
-        <button class="btn primary" id="authGo" style="flex:1">Sign in</button>
+        <button class="btn primary grow" id="authGo">Sign in</button>
         <button class="btn" id="authSwitch">Register</button>
       </div>
-      <p class="muted" style="font-size:12px; margin-bottom:0">
+      <p class="muted fineprint">
         Paper money only. Demo: <code>demo/demo123</code> · admin: <code>admin/admin123</code>
       </p>
     </div>
   </div>
 
+  <!-- ladder.js MUST load before app.js: app.js consumes window.OBLadder for
+       the slip's tick stepper and exposure maths. -->
+  <script src="/ladder.js"></script>
   <script src="/app.js"></script>
   <script src="/admin.js"></script>
 </body>
