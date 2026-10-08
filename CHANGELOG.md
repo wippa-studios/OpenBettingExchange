@@ -6,7 +6,55 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- Optional odds feed: `lib/feed.js` reads the `betfair-market-snapshots`
+  recorder's Postgres and serves `GET /api/feed/board` + `/api/feed/health`.
+  Set `FEED_ENABLED=true` and `FEED_DATABASE_URL`; the board then shows
+  recorded Betfair prices instead of the demo bots. Bots and drift are
+  suppressed automatically, since two price sources would fight. See
+  `docs/FEED.md`.
+- `tests/feed.test.js` (15 checks) covering ladder ordering, the delta
+  carry-forward case and stale marking; `tests/feed_nav.test.js` and
+  `tests/feed_outage.test.js` pin the feed-mode contract in separate processes,
+  because `lib/config.js` and the pg pool are both built at import time.
+- Companion change in `betfair-market-snapshots`: Alembic migration `0003`
+  adds `ix_snapshots_market_pubtime_desc`. Without it, "latest snapshot per
+  market" seq-scans and sorts all of history — measured at 99,498 rows where
+  the real content was 138.
+- House-account exemption in the money invariant: `CHECK (is_bot = 1 OR
+  balance_cents >= 0)`. The house counterparty may go negative (it owes
+  `(price-1)*stake` when a bet wins and there is no matched pot to pay from);
+  every human account stays non-negative, enforced by the database.
+- Feed config: `FEED_ENABLED`, `FEED_DATABASE_URL`, `FEED_STALE_SECONDS`,
+  `FEED_MARKET_LIMIT`. A feed that is enabled without a URL, or with a
+  non-postgres URL, aborts the launch rather than failing on first request.
+
+### Added
+- Light house palette: white ground, black text, light-grey accent. Previously a
+  dark theme with an amber highlight. Primary buttons are black-on-white
+  inverted rather than a colour, so the only accent is grey.
+- Brand assets: the wordmark and favicon from `assets/`, trimmed to their ink
+  and served from `public/assets/`. Both are `<img>`s, so the logo's tight -100
+  tracking is baked into the file rather than applied in CSS.
+- Inter, self-hosted in `public/fonts/` at 400/500/700/800 (woff2, ~10kB each,
+  preloaded for the two weights used above the fold). Canva Sans is proprietary
+  and cannot be redistributed; Inter is the closest freely-available
+  substitute. No CDN dependency.
+- Bookmaker-style board navigation: sport -> country -> track -> meeting ->
+  race, from `GET /api/feed/nav`. Sport labels come from the recorder's `sports`
+  table, so the board shows "Greyhound Racing" rather than event_type_id 4339.
+- Feed mode is detected at boot from `/api/feed/nav`; a 409 falls back to the
+  seeded catalogue, so the flag is never shipped to the browser as a constant.
+- Markets with genuinely one-sided liquidity now say which side is missing
+  instead of rendering an empty column.
+
+### Changed
+- Runner names in the ladder wrap instead of truncating; the selection column
+  widened, so real names ("1. Blue and Gold") are readable.
+- The board query is set-based and resolves each `(runner, side)` to its newest
+  observation across frames. Betfair's `marketChangeMessage` carries only
+  *changed* runners, so the newest snapshot per market is a partial book;
+  reading prices from that frame alone made runners blink in and out.
 
 ## [0.2.0] - 2026-09-25
 
@@ -30,6 +78,14 @@ Nothing yet.
   changelog, issue and PR templates, `.editorconfig`, `.nvmrc`.
 - `docs/ARCHITECTURE.md`, `docs/EXCHANGE_RULES.md` and `docs/API.md`;
   `docs/screenshot.png` as the board image.
+
+### Fixed
+- `GET /api/feed/nav` no longer answers 409 when the feed is disabled. The
+  browser probes it at boot to choose a board, and the 4xx logged a console
+  error on every non-feed deployment — which failed `npm run test:ui` outright.
+  It now always answers 200 with `enabled:false` when off. A configured feed
+  whose database is down still answers 503, so a genuine outage is not mistaken
+  for "no markets today".
 
 ### Security
 - `HOST` is validated as loopback-only; a routable bind now aborts the launch.

@@ -7,7 +7,14 @@ pot.
 
 Node 22 · Express · SQLite · zero-build frontend · **paper money only**.
 
+Prices can come from a live odds feed ([`docs/FEED.md`](docs/FEED.md)) or the
+built-in demo bots.
+
 ![The OpenBookmaker exchange board showing a Betfair-style ladder](docs/screenshot.png)
+
+Light house palette (white ground, black text, grey accent), Inter self-hosted
+in place of Canva Sans, brand wordmark and favicon from `assets/`. No build step
+and no CDN: fonts, logo and icon are all served from `public/`.
 
 > **Paper money only.** Every balance is play money and there is no real-money
 > execution path, no payments and no withdrawals anywhere in this codebase.
@@ -144,6 +151,7 @@ Full reference including every parameter lives in
 | `POST` | `/api/auth/register` · `/api/auth/login` · `/api/auth/logout` | account + session |
 | `GET` | `/api/me` | you, your balance and escrow |
 | `GET` | `/api/sports` · `/api/events` · `/api/markets/:id/book` | the board and the book |
+| `GET` | `/api/feed/board` · `/api/feed/health` | board from the odds feed (when `FEED_ENABLED=true`) |
 | `POST` | `/api/orders` · `GET /api/orders` · `POST /api/orders/:id/cancel` | trade |
 | `GET` | `/api/positions` | exposure, if-win P&L, cash-out quote |
 | `POST` | `/api/markets/:id/cashout` | close a position |
@@ -169,14 +177,18 @@ a bad value **aborts the launch** rather than failing later.
 | `COMMISSION_RATE` | `0.025` | fee on net winnings |
 | `FAUCET_MAX_CENTS` | `100000` | faucet cap per deposit |
 | `MIN_STAKE_CENTS` / `MAX_STAKE_CENTS` | `100` / `100000` | order size bounds |
-| `BOT_ENABLED` / `DRIFT_ENABLED` | `true` | demo liquidity and price drift |
+| `FEED_ENABLED` | `false` | take prices from the odds feed instead of the bots |
+| `FEED_DATABASE_URL` | — | recorder Postgres URL; required when the feed is on |
+| `FEED_STALE_SECONDS` | `300` | frame age beyond which the board reports stale |
+| `FEED_MARKET_LIMIT` | `60` | markets returned to the board |
+| `BOT_ENABLED` / `DRIFT_ENABLED` | `true` | demo liquidity and price drift (ignored when the feed is on) |
 | `DRIFT_INTERVAL_MS` | `5000` | drift cadence |
 | `SESSION_TTL_DAYS` | `30` | session lifetime |
 
 ## Development
 
 ```bash
-npm test            # 96 checks, 11 suites — unit + API integration, fully offline
+npm test            # 126 checks, 15 suites — unit + API integration, fully offline
 npm run test:smoke  # 33 checks — live end-to-end against a real server
 npm run test:ui     # 24 checks — real Chromium via Playwright (board + admin desk)
 ```
@@ -196,7 +208,7 @@ Contributing, house conventions and where to add things:
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
 public/    frontend (no build)     tests/      11 unit/API suites + smoke + browser
-docs/      architecture, rules    data/       SQLite database (gitignored)
+docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```
 
 ## Known limitations
