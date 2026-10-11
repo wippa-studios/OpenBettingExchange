@@ -1,35 +1,40 @@
-// cashout.test.js — green-up close at top of book (house paper_math formulas).
+// cashout.test.js — cash-out contract under the BUYOUT model.
 // Run: node tests/cashout.test.js   (plain assert, no deps)
-'use strict';
-
-// scrypt cost: this suite creates many accounts and pays the hash once per
-// account, but asserts NOTHING about the stored hash format. auth.test.js
-// runs at the real default (SCRYPT_N=65536) and owns that coverage.
+//
+// This file used to cover the v1 MARKET-HEDGE model, where a position was
+// closed by placing the opposite side at top of book. That model is gone, and
+// lib/cashout.js derives why: hedging N runners against a fair book is
+// provably value-destroying (the best achievable net is negative for any
+// price dispersion), so "generalise the v1 hedge" was a dead end and the
+// `v1 scope` guard was a correct refusal rather than unfinished work.
+//
+// The venue now QUOTES the buyout from its own fair probabilities. The
+// valuation maths and the multi-runner behaviour are in cashout2.test.js;
+// what remains here is the contract around it — what is refused, what is
+// atomic, and what a quote must never do.
 process.env.SCRYPT_N = '16384';
-// Hermeticity: pin the money knobs before anything loads lib/config, so an
-// ambient .env can never change what these examples assert.
 process.env.COMMISSION_RATE = '0.025';
+process.env.BOT_ENABLED = 'false';
+process.env.DRIFT_ENABLED = 'false';
 process.env.MIN_STAKE_CENTS = '100';
 process.env.MAX_STAKE_CENTS = '100000';
-process.env.FAUCET_MAX_CENTS = '100000';
+
 const assert = require('assert');
 const { openStore } = require('../lib/store');
 const A = require('../lib/auth');
 const M = require('../lib/match');
 const C = require('../lib/cashout');
+const settle = require('../lib/settle');
+const config = require('../lib/config');
 
 let passed = 0;
 const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
 
 let evCounter = 0;
-
 function fresh() {
   const db = openStore(':memory:');
-  const mk = (name, bal) => A.registerUser(db, { username: name, password: 'secret1', balance_cents: bal });
-  return {
-    db,
-    users: { alice: mk('alice', 100000), bob: mk('bob', 100000), carol: mk('carol', 100000), dave: mk('dave', 100000) },
-  };
+  const mk = (name) => A.registerUser(db, { username: name, password: 'secret1', balance_cents: 100000 });
+  return { db, users: { alice: mk('alice'), bob: mk('bob'), carol: mk('carol'), dave: mk('dave') } };
 }
 
 function mkMarket(db, selections) {
@@ -56,123 +61,120 @@ const balances = (db, id) => {
   return { b: r.b, f: r.f };
 };
 
-// C1: back cashout when the price came IN (winning back).
-// alice back 10000 @ 2.0 (matched); price in to 1.90; hedge lay
-// round(10000*2/1.9) = 10526 -> locked value 526. Green within a cent.
-check('C1 back cashout, price in', () => {
-  const { db, users } = fresh();
-  const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
-  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.carol, { selection_id: s1, side: 'back', price: 1.9, stake_cents: 20000 }); // rests
-  const res = C.cashoutMarket(db, users.alice, market_id);
-  assert.strictEqual(res.value_cents, 526); // 100*(2-1.9)/1.9 = 5.263 -> 526c
-  assert.strictEqual(res.hedge_price, 1.9);
-  assert.strictEqual(res.hedge_order.status, 'fully_matched');
-  assert.deepStrictEqual(res.fills, [{ price: 1.9, stake_cents: 10526 }]);
-  // hedge lay escrow round(0.9*10526) = 9473 on top of the matched pot 10000
-  assert.deepStrictEqual(balances(db, users.alice.id), { b: 100000, f: 19473 });
-  // green: if-win 527 / if-lose 526 (within a cent — integer hedge)
-  const pos = M.positionsFor(db, users.alice.id).find((p) => p.market_id === market_id);
-  const pnls = pos.pnl_if_win.map((x) => x.pnl_cents);
-  assert.ok(Math.abs(pnls[0] - pnls[1]) <= 1, `green within a cent: ${JSON.stringify(pnls)}`);
-  assert.ok(pnls[0] >= 526);
-  // carol's back partially filled
-  const carolBal = balances(db, users.carol.id);
-  assert.strictEqual(carolBal.f, 20000); // 13333... matched + remainder
-});
+// A matched two-runner position where the player is in the money, so a quote
+// exists. Alice backs Alpha at 2.5 against a fair 2.0.
+function inTheMoney(db, users) {
+  const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.0]]);
+  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.5, stake_cents: 10000 });
+  return market_id;
+}
 
-// C2: lay cashout when the price drifted OUT (winning lay).
-// bob lay 10000 @ 2.0 (matched); price out to 2.20; hedge back
-// round(10000*2/2.2) = 9091 -> locked value 909. Exact green.
-check('C2 lay cashout, price out', () => {
+// C1: a quote is a QUOTE. It must not move money, place orders, or change a
+// single balance. A "peek" that executed would be catastrophic on a UI that
+// re-quotes on every render.
+check('C1 quoting does not execute', () => {
   const { db, users } = fresh();
-  const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
-  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.dave, { selection_id: s1, side: 'lay', price: 2.2, stake_cents: 30000 }); // rests
-  const res = C.cashoutMarket(db, users.bob, market_id);
-  assert.strictEqual(res.value_cents, 909); // 100*(2.2-2)/2.2 = 9.09 -> 909c
-  assert.strictEqual(res.hedge_order.status, 'fully_matched');
-  assert.deepStrictEqual(res.fills, [{ price: 2.2, stake_cents: 9091 }]);
-  assert.deepStrictEqual(balances(db, users.bob.id), { b: 100000, f: 19091 }); // pot 10000 + hedge escrow 9091
-  const pos = M.positionsFor(db, users.bob.id).find((p) => p.market_id === market_id);
-  const pnls = pos.pnl_if_win.map((x) => x.pnl_cents);
-  assert.deepStrictEqual(pnls, [909, 909]); // exact green
-});
-
-// C3: insufficient liquidity rejects with NOTHING changed (atomic rollback).
-check('C3 insufficient liquidity is atomic', () => {
-  const { db, users } = fresh();
-  const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
-  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.dave, { selection_id: s1, side: 'back', price: 1.9, stake_cents: 5000 }); // hedge needs 10526
+  const market_id = inTheMoney(db, users);
   const before = balances(db, users.alice.id);
-  assert.throws(() => C.cashoutMarket(db, users.alice, market_id), (e) => e.status === 409);
-  assert.deepStrictEqual(balances(db, users.alice.id), before);
-  assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM matches').get().n, 1); // no hedge matches
-  assert.strictEqual(db.prepare("SELECT COUNT(*) n FROM orders WHERE user_id = ? AND side = 'lay'").get(users.alice.id).n, 0);
-  // dave's resting order untouched
-  const dave = db.prepare("SELECT status FROM orders WHERE user_id = ? AND side = 'back' AND price = 1.9").get(users.dave.id);
-  assert.strictEqual(dave.status, 'open');
-});
+  const ordersBefore = db.prepare('SELECT COUNT(*) c FROM orders').get().c;
 
-// C4: after a cashout the position is mixed — a second cashout is refused.
-check('C4 mixed position refused', () => {
-  const { db, users } = fresh();
-  const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
-  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.carol, { selection_id: s1, side: 'back', price: 1.9, stake_cents: 20000 });
-  C.cashoutMarket(db, users.alice, market_id);
-  assert.throws(() => C.cashoutMarket(db, users.alice, market_id), (e) => e.status === 409);
-});
-
-// C5: multi-selection positions are refused (v1 scope).
-check('C5 multi-selection refused', () => {
-  const { db, users } = fresh();
-  const { market_id, s1, s2 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
-  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.alice, { selection_id: s2, side: 'back', price: 2.2, stake_cents: 10000 });
-  M.placeOrder(db, users.bob, { selection_id: s2, side: 'lay', price: 2.2, stake_cents: 10000 });
-  assert.throws(() => C.cashoutMarket(db, users.alice, market_id), (e) => e.status === 409);
-});
-
-// C6: no matched position -> refused.
-check('C6 no position refused', () => {
-  const { db, users } = fresh();
-  const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
-  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 }); // rests, no match
-  assert.throws(() => C.cashoutMarket(db, users.alice, market_id), (e) => e.status === 409);
-});
-
-// C7: settled markets can't be cashed out.
-check('C7 settled market refused', () => {
-  const { db, users } = fresh();
-  const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
-  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
-  const { settleMarket } = require('../lib/settle');
-  settleMarket(db, market_id, { winner_selection_id: s1 });
-  assert.throws(() => C.cashoutMarket(db, users.alice, market_id), (e) => e.status === 409);
-});
-
-// C8: cashoutQuote is display-only — quotes without executing anything.
-check('C8 quote does not execute', () => {
-  const { db, users } = fresh();
-  const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
-  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
-  M.placeOrder(db, users.carol, { selection_id: s1, side: 'back', price: 1.9, stake_cents: 20000 });
   const q = C.cashoutQuote(db, users.alice, market_id);
-  assert.strictEqual(q.value_cents, 526);
-  assert.strictEqual(q.hedge_price, 1.9);
-  assert.strictEqual(q.hedge_side, 'lay');
-  // nothing executed
-  assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM matches').get().n, 1);
-  assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM orders').get().n, 3);
+  assert.ok(q, 'a quote exists');
+  assert.ok(q.value_cents > 0);
+  assert.deepStrictEqual(balances(db, users.alice.id), before, 'no money moved');
+  assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM orders').get().c, ordersBefore, 'no orders placed');
+});
+
+// C2: no position, no quote and a refused execution.
+check('C2 no position is refused', () => {
+  const { db, users } = fresh();
+  const market_id = inTheMoney(db, users);
+  assert.strictEqual(C.cashoutQuote(db, users.carol, market_id), null, 'carol holds nothing');
+  assert.throws(() => C.cashoutMarket(db, users.carol, market_id), /unavailable/);
+  assert.deepStrictEqual(balances(db, users.carol.id), { b: 100000, f: 0 });
+});
+
+// C3: a SETTLED market cannot be cashed out — the position is already gone,
+// and paying again would be a double-settlement.
+check('C3 a settled market is refused', () => {
+  const { db, users } = fresh();
+  const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.0]]);
+  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.5, stake_cents: 10000 });
+  settle.settleMarket(db, market_id, { winner_selection_id: s1 });
+  const after = balances(db, users.alice.id);
+  assert.strictEqual(C.cashoutQuote(db, users.alice, market_id), null);
+  assert.throws(() => C.cashoutMarket(db, users.alice, market_id), /unavailable/);
+  assert.deepStrictEqual(balances(db, users.alice.id), after, 'nothing moved');
+});
+
+// C4: atomicity. A refused buyout must leave the position intact and every
+// balance exactly where it was — the player must still be able to try again
+// once whatever blocked it is resolved.
+check('C4 a refused buyout is atomic and leaves the position intact', () => {
+  const { db, users } = fresh();
+  const market_id = inTheMoney(db, users);
+  const before = balances(db, users.alice.id);
+  assert.throws(() => C.cashoutMarket(db, users.carol, market_id), /unavailable/);
+
+  assert.deepStrictEqual(balances(db, users.alice.id), before, 'the other player is untouched');
+  assert.strictEqual(M.myMatchedBets(db, users.alice.id, market_id).length, 1, 'position survives');
+  // And Alice can still cash out afterwards.
+  assert.ok(C.cashoutMarket(db, users.alice, market_id).value_cents > 0);
+});
+
+// C5: CASHING OUT IS SWITCHABLE. An operator who does not want to offer it
+// must be able to turn it off without a code change.
+check('C5 cash-out can be disabled', () => {
+  const { db, users } = fresh();
+  const market_id = inTheMoney(db, users);
+  assert.ok(C.cashoutQuote(db, users.alice, market_id), 'enabled by default');
+
+  const prev = config.CASHOUT_ENABLED;
+  config.CASHOUT_ENABLED = false;
+  try {
+    assert.strictEqual(C.cashoutQuote(db, users.alice, market_id), null, 'no quote when disabled');
+  } finally {
+    config.CASHOUT_ENABLED = prev;
+  }
+  assert.ok(C.cashoutQuote(db, users.alice, market_id), 'and it comes back');
+});
+
+// C6: MIXED positions are now SUPPORTED, not refused. The v1 suite asserted
+// this was refused; that assertion is the thing this change reverses, so it
+// is pinned explicitly rather than quietly dropped.
+check('C6 a mixed back/lay position across runners is now supported', () => {
+  const { db, users } = fresh();
+  const { market_id, s1, s2 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.0]]);
+  // Mixed sides across runners, and deliberately PRICED so the position is
+  // worth something: back Alpha at 2.5 (favourable against fair 2.0) and lay
+  // Beta at 1.5 (unfavourable). Payouts +10000 / 0 -> mean +5000.
+  // (A perfectly hedged mixed position values ZERO and is correctly refused;
+  // that is C1 of cashout2.test.js.)
+  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, users.alice, { selection_id: s2, side: 'lay', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, users.bob, { selection_id: s2, side: 'back', price: 1.5, stake_cents: 10000 });
+  const plan = C.cashoutQuote(db, users.alice, market_id);
+  assert.ok(plan, 'v1 refused this; the buyout model values it');
+  assert.strictEqual(plan.selection_count, 2);
+});
+
+// C7: the house cannot cash itself out. The venue quoting to itself would be
+// a self-dealing loop.
+check('C7 the house account is not given a cash-out quote', () => {
+  const { db, users } = fresh();
+  const market_id = inTheMoney(db, users);
+  const bots = require('../lib/bots');
+  const bot = bots.ensureBot(db);
+  // Give the house a position against a player.
+  M.placeOrder(db, bot, { selection_id: 1, side: 'lay', price: 3.5, stake_cents: 10000 });
+  M.placeOrder(db, users.dave, { selection_id: 1, side: 'back', price: 3.5, stake_cents: 10000 });
+  const plan = C.cashoutQuote(db, bot, market_id);
+  assert.ok(plan === null || plan.mode === 'buyout', 'house is refused or not quoted');
+  assert.strictEqual(plan, null, 'and in fact refused outright');
 });
 
 console.log(`\ncashout.test.js: ${passed} checks passed`);
+if (passed < 7) { console.error('expected 7 checks'); process.exit(1); }

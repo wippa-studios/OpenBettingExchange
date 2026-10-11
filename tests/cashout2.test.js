@@ -1,0 +1,260 @@
+// cashout2.test.js — multi-runner cash-out (venue buyout model).
+// Run: node tests/cashout2.test.js   (plain assert, no deps)
+//
+// v1 hedged against the BOOK and could not generalise past one selection —
+// lib/cashout.js derives why: hedging N runners against a fair book is
+// provably value-destroying, so the `v1 scope` guard was a correct refusal
+// rather than an unfinished feature. The model here is the one exchanges
+// actually use: the VENUE prices the position from its own fair probabilities
+// and buys it.
+//
+// The properties that matter: the quote is derived from payouts that AGREE
+// with lib/settle.js, and the buyout can never be settled twice.
+'use strict';
+
+process.env.SCRYPT_N = '16384';
+process.env.COMMISSION_RATE = '0.025';
+process.env.BOT_ENABLED = 'false';
+process.env.DRIFT_ENABLED = 'false';
+process.env.MIN_STAKE_CENTS = '100';
+process.env.MAX_STAKE_CENTS = '1000000';
+process.env.CASHOUT_MARGIN_BPS = '200';
+
+const assert = require('assert');
+const { openStore } = require('../lib/store');
+const A = require('../lib/auth');
+const M = require('./../lib/match');
+const settle = require('../lib/settle');
+const cashout = require('../lib/cashout');
+const acc = require('../lib/accounts');
+const config = require('./../lib/config');
+
+let passed = 0;
+const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+
+let n = 0;
+function fixture(selections = [['Alpha', 2.0], ['Beta', 2.0]]) {
+  const db = openStore(':memory:');
+  db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
+  const sport = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
+  n++;
+  db.prepare("INSERT INTO events (sport_id, name, starts_at) VALUES (?, ?, datetime('now','+2 hours'))").run(sport.id, `Ev ${n}`);
+  const ev = db.prepare('SELECT id FROM events WHERE name = ?').get(`Ev ${n}`);
+  db.prepare("INSERT INTO markets (event_id, name) VALUES (?, 'Match Odds')").run(ev.id);
+  const mkt = db.prepare('SELECT id FROM markets WHERE event_id=?').get(ev.id);
+  const ids = {};
+  for (const [nm, fair] of selections) {
+    db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, ?)').run(mkt.id, nm, fair);
+    ids[nm] = db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, nm).id;
+  }
+  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 1000000 });
+  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 1000000 });
+  return { db, alice, bob, marketId: mkt.id, ids };
+}
+
+const wallet = (db, id) => db.prepare('SELECT balance_cents b, frozen_cents f FROM users WHERE id=?').get(id);
+
+// C1: the quote is a VALUATION over outcomes, and it works for more than one
+// selection — which is the whole point of the change.
+check('C1 a multi-selection position is quotable', () => {
+  const { db, alice, bob, marketId, ids } = fixture();
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, alice, { selection_id: ids.Beta, side: 'back', price: 3.0, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Beta, side: 'lay', price: 3.0, stake_cents: 10000 });
+
+  const plan = cashout.cashoutQuote(db, alice, marketId);
+  assert.ok(plan, 'a plan exists');
+  assert.strictEqual(plan.selection_count, 2, 'covers BOTH selections');
+  assert.strictEqual(plan.mode, 'buyout');
+  assert.strictEqual(plan.legs, 2);
+  assert.ok(plan.value_cents > 0, 'position is worth something');
+  // Alice backed Alpha at 1.5 (fair 2.0) and Beta at 3.0 (fair 2.0): one
+  // leg ahead of fair, one behind. 50/50 fair prices.
+  // Payout if Alpha wins: +5000 (A) -10000 (B) = -5000
+  // Payout if Beta  wins: -10000 (A) +20000 (B) = +10000
+  // Fair value = 0.5*(-5000) + 0.5*(10000) = 2500
+  assert.strictEqual(plan.fair_value_cents, 2500, 'hand-computed fair value');
+  assert.strictEqual(plan.value_cents, Math.floor(2500 * 0.98), 'quoted at 2% margin');
+});
+
+// C2: OVERROUND IS REMOVED. A book summing to more than 100% must not pay the
+// player the difference — that would be a free 5% handed out by a pricing bug.
+check('C2 an overround book does not pay out the overround', () => {
+  // Two selections both at 1.9 -> implied probs sum to 1/1.9*2 = 1.0526.
+  const { db, alice, bob, marketId, ids } = fixture([['Alpha', 1.9], ['Beta', 1.9]]);
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
+  const plan = cashout.cashoutQuote(db, alice, marketId);
+  // Payout Alpha wins = +5000; Beta wins = -10000. Normalised probs are
+  // 0.5/0.5, so fair value = 0.5*5000 + 0.5*(-10000) = -2500 -> underwater,
+  // and an underwater position is refused rather than bought out at a loss.
+  assert.strictEqual(plan, null, 'underwater position gets no quote');
+});
+
+// C3: an underwater position is refused. Paying a player to take on risk they
+// did not want is how a venue hands out free money.
+check('C3 an underwater position is not bought out', () => {
+  const { db, alice, bob, marketId, ids } = fixture();
+  // Fair is 2.0, so backing at 1.2 buys a selection WORTH 2.0 at 1.2 — that is
+  // backwards. (Backing at 3.0 would be the opposite: paying 3.0 for something
+  // worth 2.0, which is in the money and correctly quotable.)
+  // Payout Alpha wins = +(1.2-1)*10000 = +2000; Beta wins = -10000
+  // fair = 0.5*2000 + 0.5*(-10000) = -4000 -> underwater.
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 1.2, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 1.2, stake_cents: 10000 });
+  assert.strictEqual(cashout.cashoutQuote(db, alice, marketId), null);
+  assert.throws(() => cashout.cashoutMarket(db, alice, marketId), /unavailable/);
+  assert.strictEqual(acc.assertConserved(db), 0);
+});
+
+// C4: an unpriced selection makes the valuation untrustworthy, so no quote.
+// Treating an unpriceable runner as "certain not to win" would produce a
+// payout that ignores a real outcome.
+check('C4 an unpriced selection suppresses the quote', () => {
+  const { db, alice, bob, marketId, ids } = fixture();
+  db.prepare('UPDATE selections SET fair_price = NULL WHERE id = ?').run(ids.Beta);
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
+  assert.strictEqual(cashout.cashoutQuote(db, alice, marketId), null, 'declines rather than guessing');
+});
+
+// C5: THE VALUATION MUST AGREE WITH SETTLEMENT. payoutsFor() is a second
+// implementation of the settlement arithmetic; a one-cent disagreement would
+// mean the quoted cash-out differs from the settlement the player was
+// avoiding — exactly the drift an exchange cannot afford.
+check('C5 quoted payouts match what settlement would actually pay', () => {
+  const { db, alice, bob, marketId, ids } = fixture();
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
+
+  const bets = M.myMatchedBets(db, alice.id, marketId);
+  const payouts = cashout.payoutsFor(bets, [ids.Alpha, ids.Beta]);
+
+  for (const selName of ['Alpha', 'Beta']) {
+    const selId = ids[selName];
+    const quote = payouts.find((p) => p.selection_id === selId).payout_cents;
+    // Settle a FRESH identical market and read the real settlement P&L.
+    const f2 = fixture();
+    M.placeOrder(f2.db, f2.alice, { selection_id: f2.ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
+    M.placeOrder(f2.db, f2.bob, { selection_id: f2.ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
+    settle.settleMarket(f2.db, f2.marketId, { winner_selection_id: selId });
+    const real = f2.db.prepare("SELECT pnl_cents p FROM settlements WHERE user_id=?").get(f2.alice.id).p;
+    assert.strictEqual(quote, real, `${selName} payout agrees with settlement`);
+  }
+});
+
+// C6: the buyout releases the player's collateral and pays the quote. The
+// stake comes back — a cash-out sells the POSITION, it does not confiscate it.
+check('C6 executing a buyout returns the stake AND pays the quote', () => {
+  const { db, alice, bob, marketId, ids } = fixture();
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
+  const plan = cashout.cashoutQuote(db, alice, marketId);
+  const before = wallet(db, alice.id);
+  assert.strictEqual(before.f, 10000, 'collateral is frozen before');
+
+  const res = cashout.cashoutMarket(db, alice, marketId);
+  const after = wallet(db, alice.id);
+  assert.strictEqual(res.value_cents, plan.value_cents, 'paid what was quoted');
+  assert.strictEqual(after.f, 0, 'collateral released');
+  assert.strictEqual(after.b, before.b + plan.value_cents, 'balance up by exactly the quote');
+  assert.strictEqual(acc.assertConserved(db), 0, 'books still balance');
+  assert.deepStrictEqual(acc.assertUserAgrees(db), []);
+});
+
+// C7: THE ONE THAT MATTERS MOST. A settled market must NOT pay the position a
+// second time. Skipping the cashout marker is a double-settlement, which is
+// not a rounding error.
+check('C7 a cashed-out position is NOT settled again', () => {
+  const { db, alice, bob, marketId, ids } = fixture();
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
+  const plan = cashout.cashoutQuote(db, alice, marketId);
+  cashout.cashoutMarket(db, alice, marketId);
+  const afterBuyout = wallet(db, alice.id);
+
+  // Now settle the market anyway, as a results feed would.
+  settle.settleMarket(db, marketId, { winner_selection_id: ids.Alpha });
+  const afterSettle = wallet(db, alice.id);
+  assert.strictEqual(afterSettle.b, afterBuyout.b, 'Alice is NOT paid twice');
+  assert.strictEqual(afterSettle.f, 0);
+  assert.strictEqual(acc.assertConserved(db), 0);
+  void plan;
+});
+
+// C8: the counterparty still settles normally. Cashing out one side must not
+// rob the other side of the match — they are owed the pot either way.
+check('C8 the counterparty is unaffected by the player cashing out', () => {
+  const { db, alice, bob, marketId, ids } = fixture();
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
+  const bobBefore = wallet(db, bob.id);
+  cashout.cashoutMarket(db, alice, marketId);
+  const bobAfterBuyout = wallet(db, bob.id);
+  assert.strictEqual(bobAfterBuyout.f, bobBefore.f, 'his collateral is untouched');
+
+  settle.settleMarket(db, marketId, { winner_selection_id: ids.Alpha });
+  const bobFinal = wallet(db, bob.id);
+  assert.strictEqual(bobFinal.f, 0, 'and he is settled normally: collateral released');
+  assert.ok(bobFinal.b < bobAfterBuyout.b, 'and pays out, since his lay lost');
+  assert.strictEqual(acc.assertConserved(db), 0);
+});
+
+// C9: resting orders in the market are cancelled so they cannot be matched
+// into a position the player no longer holds.
+check('C9 resting orders in the market are cancelled by the buyout', () => {
+  const { db, alice, bob, marketId, ids } = fixture([['Alpha', 2.0], ['Beta', 2.0], ['Gamma', 2.0]]);
+  // Three runners at fair 2.0 means each is worth 1/3. Backing at 2.5 would be
+  // UNDERWATER here (EV = 1/3*1.5s - 2/3*s < 0), so this prices at 3.5:
+  // payouts +75000 / -30000 / -30000 -> mean +5000.
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 3.5, stake_cents: 30000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 3.5, stake_cents: 30000 });
+  M.placeOrder(db, alice, { selection_id: ids.Gamma, side: 'back', price: 3.5, stake_cents: 5000 });
+  assert.strictEqual(M.openOrdersFor(db, alice.id).length, 1, 'a resting order exists');
+
+  cashout.cashoutMarket(db, alice, marketId);
+  assert.strictEqual(M.openOrdersFor(db, alice.id).length, 0, 'cancelled');
+  assert.strictEqual(wallet(db, alice.id).f, 0, 'and its escrow released');
+  assert.strictEqual(acc.assertConserved(db), 0);
+});
+
+// C10: the books stay whole through the whole flow, including a void after a
+// buyout (the case where a double-payment is most likely).
+check('C10 books balance through buyout then void', () => {
+  const { db, alice, bob, marketId, ids } = fixture();
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
+  cashout.cashoutMarket(db, alice, marketId);
+  assert.strictEqual(acc.assertConserved(db), 0);
+  settle.settleMarket(db, marketId, { void: true });
+  assert.strictEqual(acc.assertConserved(db), 0);
+  assert.deepStrictEqual(acc.assertUserAgrees(db), []);
+  // A void refunds Bob fully — he was never cashed out.
+  assert.strictEqual(wallet(db, bob.id).f, 0);
+});
+
+// C11: cashing out twice is refused, not double-paid.
+check('C11 a second cash-out of the same position is refused', () => {
+  const { db, alice, bob, marketId, ids } = fixture();
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
+  cashout.cashoutMarket(db, alice, marketId);
+  const after = wallet(db, alice.id);
+  assert.throws(() => cashout.cashoutMarket(db, alice, marketId), /unavailable/);
+  assert.deepStrictEqual(wallet(db, alice.id), after, 'nothing moved');
+  assert.strictEqual(acc.assertConserved(db), 0);
+});
+
+// C12: a player with no position gets no quote, and neither does the house.
+check('C12 no position, or the house, gets no quote', () => {
+  const { db, alice, bob, marketId, ids } = fixture();
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
+  const carol = A.registerUser(db, { username: 'carol', password: 'pw-carol-123', balance_cents: 100000 });
+  assert.strictEqual(cashout.cashoutQuote(db, carol, marketId), null, 'no position');
+  void config;
+});
+
+console.log(`\ncashout2.test.js: ${passed} checks passed`);
+if (passed < 12) { console.error('expected 12 checks'); process.exit(1); }

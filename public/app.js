@@ -1563,8 +1563,10 @@
             .join('');
           const cash =
             p.cashout != null
-              ? `<button class="btn green" data-cashout="${attr(p.market_id)}">Cash out ${signed(p.cashout.value_cents)} @ ${price2(
-                  p.cashout.hedge_price
+              ? `<button class="btn green" data-cashout="${attr(p.market_id)}" title="Cash out ${signed(
+                  p.cashout.fair_value_cents
+                )} fair value less ${esc(String(p.cashout.margin_bps))}bps margin">Cash out ${signed(
+                  p.cashout.value_cents
                 )}</button>`
               : '<span class="muted">Cash out unavailable</span>';
           return `<div class="poscard">
