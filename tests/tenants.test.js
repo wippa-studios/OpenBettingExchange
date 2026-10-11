@@ -16,6 +16,7 @@ const { openStore } = require('../lib/store');
 const A = require('../lib/auth');
 const T = require('./../lib/tenants');
 const ADM = require('../lib/admin');
+const config = require('../lib/config');
 
 let passed = 0;
 const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
@@ -210,5 +211,47 @@ check('T16 sessions record the tenant they were minted for', () => {
   assert.strictEqual(row.tenant_id, t2);
 });
 
+// T17: THE TRUST BOUNDARY. A client-declared country is not a jurisdiction.
+// With TRUST_PROXY_JURISDICTION off the header is ignored entirely — trusting
+// it would make the control defeatable by editing one header while still
+// being recorded as enforced.
+check('T17 a client-supplied country header is ignored by default', () => {
+  const { db, alice } = fixture();
+  db.prepare("UPDATE tenants SET jurisdictions = ? WHERE id=?").run(JSON.stringify(['GB']), T.defaultTenant(db).id);
+  const spoof = { headers: { 'cf-ipcountry': 'GB', 'x-jurisdiction': 'GB' } };
+  // Flag is off in this suite: nothing the client sends is evidence.
+  assert.strictEqual(config.TRUST_PROXY_JURISDICTION, false, 'precondition');
+  assert.strictEqual(T.trustedCountry(spoof), null, 'header ignored');
+  // So an allowlisted jurisdiction still cannot be claimed by asking for it.
+  assert.throws(() => A.createSession(db, alice.id, { country: T.trustedCountry(spoof) }), (e) => e.details.code === 'no-jurisdiction-supplied');
+});
+
+// T18: with the flag on, only a well-formed ISO code from the header counts.
+// A misconfigured proxy must not be able to smuggle arbitrary strings into the
+// audit trail, and the conventional "unknown" sentinels carry no information.
+check('T18 a trusted header is validated and sentinels discarded', () => {
+  const mk = (h) => {
+    const prev = config.TRUST_PROXY_JURISDICTION;
+    config.TRUST_PROXY_JURISDICTION = true;
+    try { return T.trustedCountry({ headers: h }); } finally { config.TRUST_PROXY_JURISDICTION = prev; }
+  };
+  assert.strictEqual(mk({ 'cf-ipcountry': 'gb' }), 'GB', 'normalised');
+  assert.strictEqual(mk({ 'cf-ipcountry': 'XX' }), null, 'CDN "unknown" sentinel is not a country');
+  assert.strictEqual(mk({ 'cf-ipcountry': 'T1' }), null, 'Tor exit sentinel is not a country');
+  assert.strictEqual(mk({ 'cf-ipcountry': 'GBR' }), null, 'not a two-letter code');
+  assert.strictEqual(mk({ 'cf-ipcountry': "GB'; DROP TABLE users;--" }), null, 'injection-shaped value discarded');
+  assert.strictEqual(mk({}), null, 'absent');
+});
+
+// T19: gating fails CLOSED when an allowlist is configured but no trusted
+// source exists. Blocking every login is the correct behaviour — the
+// alternative is silently disabling the control because geolocation was never
+// wired up.
+check('T19 an allowlist with no trusted source fails closed', () => {
+  const { db, alice } = fixture();
+  db.prepare("UPDATE tenants SET jurisdictions = ? WHERE id=?").run(JSON.stringify(['GB']), T.defaultTenant(db).id);
+  assert.throws(() => A.createSession(db, alice.id, { country: null }), (e) => e.status === 403 && e.details.code === 'no-jurisdiction-supplied');
+});
+
 console.log(`\ntenants.test.js: ${passed} checks passed`);
-if (passed < 16) { console.error('expected 16 checks'); process.exit(1); }
+if (passed < 19) { console.error('expected 19 checks'); process.exit(1); }

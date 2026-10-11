@@ -19,6 +19,7 @@ const AUDIT = require('./lib/audit');
 const LIMITS = require('./lib/limits');
 const RISK = require('./lib/risk');
 const PAY = require('./lib/payments');
+const TEN = require('./lib/tenants');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
 // DELIBERATE demo choice (documented in .github/SECURITY.md): this app is
@@ -309,7 +310,10 @@ app.post('/api/auth/register', (req, res) => {
   try {
     const user = A.registerUser(db, { username, password, email });
     rlRecordSuccess(key);
-    const token = A.createSession(db, user.id);
+    // Jurisdiction gate at session mint, not at bet placement. The country is
+    // read ONLY from a proxy-overwritten header, and only when the operator has
+    // asserted that is true — see lib/tenants.js trustedCountry().
+    const token = A.createSession(db, user.id, { country: TEN.trustedCountry(req) });
     res.setHeader('Set-Cookie', sessionCookie(token));
     res.status(201).json({ user });
   } catch (e) {
@@ -326,7 +330,7 @@ app.post('/api/auth/login', (req, res) => {
   const key = 'login:' + String((req.body || {}).username || '').trim().toLowerCase();
   if (rlLocked(key)) return rlTooManyAttempts(res, key);
   try {
-    const { user, token } = A.loginUser(db, req.body || {});
+    const { user, token } = A.loginUser(db, { ...(req.body || {}), country: TEN.trustedCountry(req) });
     rlRecordSuccess(key); // a success proves the real user — clear the slate
     res.setHeader('Set-Cookie', sessionCookie(token));
     res.json({ user });
@@ -787,18 +791,15 @@ app.get('/api/admin/ledger', requireAdmin, (req, res) => {
 // properties — no build step. That is why the no-build frontend survives
 // multi-tenancy rather than becoming the thing that has to be rebuilt.
 app.get('/api/branding', (req, res) => {
-  const TEN = require('./lib/tenants');
   const tenant = req.user ? TEN.ofUser(db, req.user.id) : TEN.defaultTenant(db);
   res.json({ tenant: tenant ? { id: tenant.id, slug: tenant.slug } : null, ...TEN.branding(db, tenant && tenant.id) });
 });
 
 app.get('/api/admin/tenants', requireAdmin, (req, res) => {
-  const TEN = require('./lib/tenants');
   res.json({ tenants: TEN.list(db) });
 });
 
 app.put('/api/admin/tenants/:id', requireAdmin, (req, res) => {
-  const TEN = require('./lib/tenants');
   const b = req.body || {};
   res.json(
     TEN.configure(db, {
