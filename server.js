@@ -17,6 +17,7 @@ const FEED = require('./lib/feed');
 const ADM = require('./lib/admin');
 const AUDIT = require('./lib/audit');
 const LIMITS = require('./lib/limits');
+const RISK = require('./lib/risk');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
 // DELIBERATE demo choice (documented in .github/SECURITY.md): this app is
@@ -699,6 +700,44 @@ app.put('/api/admin/users/:id/limits', requireAdmin, (req, res) => {
 app.post('/api/admin/users/:id/exclude', requireAdmin, (req, res) => {
   const { until, reason } = req.body || {};
   res.json(LIMITS.exclude(db, { actor: req.user, userId: Number(req.params.id), until: until ?? null, reason }));
+});
+
+// ── Admin: market-maker risk desk ─────────────────────────────────────────
+// A venue that cannot see its own market-maker loss is a venue that
+// discovers it by going bankrupt. The kill switch stops NEW quotes; it does
+// not cancel resting ones, so withdraw is a separate explicit action.
+app.get('/api/admin/risk', requireAdmin, (req, res) => {
+  res.json({ kill_switch: RISK.killSwitch(db), bots: RISK.desk(db, bots.riskDefaults()) });
+});
+
+app.put('/api/admin/risk/kill-switch', requireAdmin, (req, res) => {
+  res.json(RISK.setKillSwitch(db, { actor: req.user, on: !!(req.body || {}).on }));
+});
+
+app.post('/api/admin/risk/withdraw', requireAdmin, (req, res) => {
+  res.json(bots.withdrawAll(db));
+});
+
+app.put('/api/admin/risk/bots/:id', requireAdmin, (req, res) => {
+  const b = req.body || {};
+  const wrap = (req, res, next) => {
+    try {
+      res.json(
+        RISK.configure(db, {
+          actor: req.user,
+          botId: Number(req.params.id),
+          ...(b.max_liability_cents === undefined ? {} : { max_liability_cents: Number(b.max_liability_cents) }),
+          ...(b.max_daily_loss_cents === undefined ? {} : { max_daily_loss_cents: Number(b.max_daily_loss_cents) }),
+          ...(b.quote_skew === undefined ? {} : { quote_skew: Number(b.quote_skew) }),
+          ...(b.enabled === undefined ? {} : { enabled: !!b.enabled }),
+        })
+      );
+    } catch (e) {
+      if (!e.status) e.status = 400;
+      next(e);
+    }
+  };
+  wrap(req, res, next);
 });
 
 // ── SQLite error mapping ───────────────────────────────────────────────────
