@@ -18,8 +18,17 @@ const ADM = require('./lib/admin');
 const AUDIT = require('./lib/audit');
 const LIMITS = require('./lib/limits');
 const RISK = require('./lib/risk');
+// Scheduled operator work. 0 disables a job. Reconciliation defaults ON at
+// 15 minutes: it is cheap, and a control nobody runs is not a control.
+const JOBS_INTERVALS = {
+  reconcileMs: Number(process.env.RECONCILE_INTERVAL_MS || 900000),
+  resultsPollMs: Number(process.env.RESULTS_POLL_INTERVAL_MS || 60000),
+};
 const PAY = require('./lib/payments');
 const TEN = require('./lib/tenants');
+const JOBS = require('./lib/jobs');
+const RESULTS = require('./lib/results');
+const VOIDRULES = require('./lib/voidrules');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
 // DELIBERATE demo choice (documented in .github/SECURITY.md): this app is
@@ -821,6 +830,72 @@ app.put('/api/admin/tenants/:id', requireAdmin, (req, res) => {
     })
   );
 });
+
+// ── Results feed + reconciliation (operator surface) ───────────────────────
+// The automatic polling loop is wired at boot; these are the human paths for
+// inspecting held markets and closing reconciliation findings.
+app.get('/api/admin/results/void-rules', requireAdmin, (req, res) => {
+  res.json({ sports: VOIDRULES.knownSports(), rules: VOIDRULES.RULES, default: VOIDRULES.DEFAULT_RULE });
+});
+
+app.get('/api/admin/results/held', requireAdmin, (req, res) => {
+  res.json({
+    markets: db
+      .prepare(
+        `SELECT m.id, m.name AS market_name, m.hold_reason, e.name AS event_name
+           FROM markets m JOIN events e ON e.id = m.event_id
+          WHERE COALESCE(m.settlement_hold, 0) = 1 ORDER BY m.id`
+      )
+      .all(),
+  });
+});
+
+// Releasing a hold is explicit, reasoned and audited: the whole point of
+// holding a disputed market is that a machine could not decide it.
+app.post('/api/admin/results/held/:id/release', requireAdmin, (req, res) => {
+  const { decision, winner_selection_id, reason } = req.body || {};
+  res.json(
+    RESULTS.releaseHold(db, {
+      actor: req.user,
+      marketId: intId(req.params.id),
+      decision,
+      winnerSelectionId: winner_selection_id === undefined ? null : Number(winner_selection_id),
+      reason,
+    })
+  );
+});
+
+app.get('/api/admin/reconciliation/findings', requireAdmin, (req, res) => {
+  res.json({
+    findings: db
+      .prepare(
+        `SELECT f.*, u.username AS resolved_by_username
+           FROM reconciliation_findings f
+           LEFT JOIN users u ON u.id = f.resolved_by
+          ORDER BY f.resolved_at IS NOT NULL, ABS(f.drift_cents) DESC LIMIT ?`
+      )
+      .all(Number(req.query.limit) || 100),
+  });
+});
+
+app.post('/api/admin/reconciliation/findings/:id/resolve', requireAdmin, (req, res) => {
+  res.json(JOBS.resolveFinding(db, { actor: req.user, id: intId(req.params.id), reason: (req.body || {}).reason }));
+});
+
+// ── Scheduled jobs ─────────────────────────────────────────────────────────
+// Reconciliation ON A TIMER. lib/payments exposed a reconcile() report earlier
+// and nothing ran it — a control that is only invoked by hand is not a
+// control. Timers are unref'd so they never hold the process open, and each
+// skips rather than stacks if a run is still in flight.
+const jobTimers = [];
+if (JOBS_INTERVALS.reconcileMs > 0) {
+  jobTimers.push(
+    JOBS.every(JOBS_INTERVALS.reconcileMs, async () => {
+      const r = await JOBS.reconcileOnce(db);
+      if (!r.ok) console.warn(`[reconcile] ${r.findings.length} finding(s); ${r.open.length} open`);
+    })
+  );
+}
 
 // ── SQLite error mapping ───────────────────────────────────────────────────
 // The admin catalogue INSERTs fail two ways: a client-correctable mistake

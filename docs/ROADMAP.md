@@ -421,43 +421,52 @@ conversation.
 
 ## 6. Immediate next actions
 
-Reassessed after Phases 1–4 landed. The first item is now **done** and was the
-reason this list was worth writing.
+Reassessed after Phases 1–4 and the follow-on work landed. The suite is now
+**340 checks across 27 suites**, plus a live smoke script and a 58-check
+browser suite, all green.
 
-1. ~~Run the suite. 196 checks are claimed and unverified.~~ ✅ Done — and
-   grown to **301 checks across 24 suites**, plus a 33-check live smoke script
-   and a 58-check browser suite, all green.
-2. ~~Restore Phase 0.~~ ✅ Done — files tracked, repo public.
-3. **Add order idempotency.** Still the smallest high-value item outstanding.
-   A client-supplied `client_order_id`, unique per user; a repeat returns the
-   existing order rather than placing a second. At operator scale a
-   double-submit is a financial incident rather than an annoyance.
-4. **Multi-runner cash-out.** `lib/cashout.js` still returns `null` for mixed
-   or multi-selection positions (the `v1 scope` guard). Plan construction is
-   the only thing that changes; the engine primitives are there.
-5. **One real PSP adapter.** The interface and reference provider ship; the
+### Recently completed since the first plan
+
+- Order idempotency (`client_order_id`) — the smallest high-value item, now
+  the largest single behavioural change in the engine and the one whose
+  migration bug would have been invisible in CI.
+- Multi-runner cash-out — reimplemented as a **venue buyout**. The v1
+  market-hedge model was not merely incomplete, it was *provably
+  value-destroying*: hedging N runners against a fair book gives
+  `net = k(1 − 2Σ1/q) + 2Σ Payout_i/q`, whose best legal value is negative.
+  The `v1 scope` guard was a correct refusal. Derivation in `lib/cashout.js`.
+- Results feed with per-sport void rules, disputes **held** rather than
+  guessed, provenance for every outcome, and a manual release path.
+- Scheduled reconciliation with findings that persist and re-surface until a
+  human closes them with a written reason.
+- The `orders.frozen_cents` convention is now enforced mechanically by
+  `tests/guard.test.js`, verified by deliberately introducing a violating
+  `UPDATE`.
+
+### Still outstanding
+
+1. **Cash-out is an uncapped venue risk.** Phase 2 bounds the market maker, but
+   a player can now convert a position into a guaranteed house payout. This
+   should be capped in `lib/risk.js` the same way bot liability is — it is the
+   same class of unbounded loss, on a path that did not exist a week ago.
+2. **In-play / bet delay modelling.** Not started. In-play without honest delay
+   modelling is where a venue loses money to sharps.
+3. **One real PSP adapter.** The interface and reference provider ship; the
    concrete integration does not.
-6. **Scheduled reconciliation.** `reconcile()` exists and reports drift; no
-   timer invokes it. A venue that only reconciles when something breaks does
-   not know how far out it is when nothing visibly breaks.
-7. **Results feed and per-sport void rules.** `settleMarket` is already a
-   single idempotent entry point, so this is a consumer rather than a rewrite.
-   Void rules are the part that matters: a results feed that does not model
-   them settles incorrectly and the operator pays for it.
-8. **Responsible gambling surface.** Age verification, reality checks and
-   session limits. Self-exclusion is done and wired to the engine; the rest is
-   not, and the product should not be deployable to an operator who has not
+4. **Trading-side split of the results feed.** `lib/results.js` consumes an
+   injected `fetchResults`; wiring it to the odds recorder in `lib/feed.js` or
+   a provider webhook is the remaining transport choice.
+5. **Dead-heat / joint-favourite settlement.** Held today, correctly, because
+   the engine settles exactly one selection. Needs a settlement-shape change.
+6. **Responsible gambling surface.** Age verification, reality checks, session
+   limits. Self-exclusion ships and is wired to the engine; the rest does not,
+   and the product should not be deployable to an operator who has not
    configured it.
 
-### The convention is now enforced mechanically
+### The verification gap, restated
 
-Both this document and WORKSTREAMS.md named the same risk: the escrow
-invariant holds only because `orders.frozen_cents` is treated as maintained
-exclusively by the matching engine, which is a convention rather than a type.
-Both said to enforce it before other contributors arrive.
-
-✅ `tests/guard.test.js` does. An explicit allowlist of the three permitted
-writers, each with a stated reason, checked across `lib/`, `server.js` and the
-frontend. It was verified by deliberately introducing a violating `UPDATE` and
-confirming the suite fails.
-
+The money path is now covered by 340 checks including a price × stake property
+sweep, an escrow sweep, and an adversarial double-entry suite. It is still a
+**self-authored** suite. `docs/WORKSTREAMS.md` recommends an outside reading
+before real money, and that recommendation has not been discharged: the
+reviews behind Phases 1–4 were internal.
