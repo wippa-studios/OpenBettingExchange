@@ -88,12 +88,17 @@ const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
 // out that legitimately 401s and Chromium logs it — expected, not a defect.
 const pageErrors = [];
 let signedIn = false;
+// Set around a DELIBERATE 401 (proving an old password no longer works).
+// The preauth filter above cannot cover it — it keys on `signedIn` — and a
+// wrong-password login is an expected rejection, not a defect.
+let expectAuth401 = false;
 const EXPECTED_PREAUTH_401 = /401 \(Unauthorized\)/;
 page.on('pageerror', (e) => pageErrors.push(String(e)));
 page.on('console', (msg) => {
   if (msg.type() !== 'error') return;
   const text = 'console.error: ' + msg.text();
   if (!signedIn && EXPECTED_PREAUTH_401.test(msg.text())) return;
+  if (expectAuth401 && EXPECTED_PREAUTH_401.test(msg.text())) return;
   pageErrors.push(text);
 });
 
@@ -286,7 +291,13 @@ try {
   await page.fill('#slip input[data-stake]', '2');
   await page.dispatchEvent('#slip input[data-stake]', 'change');
   await page.click('#slip button.place');
-  await page.waitForSelector('#toast.show', { timeout: 10000 });
+  // Wait for the BET's toast, not merely "a toast is visible": the sign-in
+  // toast from several steps earlier is often still .show when this runs, so
+  // waitForSelector('#toast.show') would resolve instantly against it.
+  await page.waitForFunction(
+    () => /Matched|Resting/.test((document.querySelector('#toast') || {}).textContent || ''),
+    { timeout: 10000 }
+  );
   const toast = (await page.locator('#toast').textContent()) || '';
   check('placing a bet reports matched or resting', /Matched|Resting/.test(toast), `("${toast.trim()}")`);
   await page.waitForFunction(() => document.getElementById('slip').hidden, null, { timeout: 5000 });
@@ -370,6 +381,134 @@ try {
     );
     const note = (await page.locator('[data-fairnote]').textContent()) || '';
     check('american + fractional + implied shown', /\d+\/\d+/.test(note) && /implied/.test(note), `("${note.trim()}")`);
+  });
+
+  // ── accounts (2.4): register-with-email, the account panel, and the two
+  // new admin tabs. The mutations themselves are covered by admin.test.js and
+  // the live curl e2e; this scenario proves the UI surfaces actually render
+  // and that the identifier flow works in a real browser.
+  await scenario('register accepts an email; login accepts that email', async () => {
+    await page.click('#authBtn'); // sign out of admin
+    await page.waitForFunction(() => document.getElementById('authBtn').textContent === 'Sign in', null, { timeout: 10000 });
+    await page.click('#authBtn');
+    await page.waitForSelector('#authModal.show', { timeout: 5000 });
+    await page.click('#authSwitch'); // → register mode
+    await page.waitForFunction(() => document.getElementById('authEmailWrap').style.display !== 'none', null, { timeout: 5000 });
+    check('register mode reveals the email field', true);
+    await page.fill('#authUser', 'uitester');
+    await page.fill('#authEmail', 'uitester@example.com');
+    await page.fill('#authPass', 'secret1');
+    await page.click('#authGo');
+    await page.waitForSelector('#balance:not([hidden])', { timeout: 10000 });
+    check('registration completes and signs in', true);
+    await page.click('#authBtn'); // sign out
+    await page.waitForFunction(() => document.getElementById('authBtn').textContent === 'Sign in', null, { timeout: 10000 });
+    await page.click('#authBtn');
+    await page.waitForSelector('#authModal.show', { timeout: 5000 });
+    // Login mode: the email field is hidden, and the single identifier field
+    // accepts the EMAIL the account was registered with.
+    await page.waitForFunction(() => document.getElementById('authEmailWrap').style.display === 'none', null, { timeout: 5000 });
+    check('login mode hides the email field', true);
+    await page.fill('#authUser', 'uitester@example.com');
+    await page.fill('#authPass', 'secret1');
+    await page.click('#authGo');
+    await page.waitForSelector('#balance:not([hidden])', { timeout: 10000 });
+    const who = (await page.locator('#who').textContent()) || '';
+    check('sign-in by email lands in the right account', who.includes('uitester'), `(${who.trim()})`);
+  });
+
+  await scenario('account panel: sessions, and a password change that survives', async () => {
+    await page.click('#accountBtn');
+    await page.waitForSelector('#accountModal.show', { timeout: 5000 });
+    check('account panel opens as a dialog', (await page.locator('#accountModal').getAttribute('role')) === 'dialog');
+    await page.waitForFunction(
+      () => /this device/.test(document.getElementById('sessionList').textContent || ''),
+      null,
+      { timeout: 10000 }
+    );
+    check('sessions list marks the current device', true);
+    await page.fill('#pwCurrent', 'secret1');
+    await page.fill('#pwNew', 'secret2');
+    await page.click('#pwGo');
+    await page.waitForFunction(
+      () => /Password changed/.test(document.getElementById('pwNote').textContent || ''),
+      null,
+      { timeout: 10000 }
+    );
+    check('password change reports the result', true);
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 5000 });
+    // The caller's own session must still work — sign out and back in with the NEW password.
+    await page.click('#authBtn');
+    await page.waitForFunction(() => document.getElementById('authBtn').textContent === 'Sign in', null, { timeout: 10000 });
+    await page.click('#authBtn');
+    await page.waitForSelector('#authModal.show', { timeout: 5000 });
+    await page.fill('#authUser', 'uitester@example.com');
+    await page.fill('#authPass', 'secret1'); // the OLD one
+    expectAuth401 = true; // a wrong-password login is an expected 401
+    await page.click('#authGo');
+    await page.waitForFunction(
+      () => /Invalid username or password/.test(document.getElementById('toast').textContent || ''),
+      null,
+      { timeout: 10000 }
+    );
+    expectAuth401 = false;
+    check('the old password no longer works', true);
+    await page.fill('#authPass', 'secret2'); // the NEW one
+    await page.click('#authGo');
+    await page.waitForSelector('#balance:not([hidden])', { timeout: 10000 });
+    check('the new password works', true);
+  });
+
+  await scenario('admin desk: users and audit tabs', async () => {
+    await page.click('#authBtn'); // sign out of uitester
+    await page.waitForFunction(() => document.getElementById('authBtn').textContent === 'Sign in', null, { timeout: 10000 });
+    await page.click('#authBtn');
+    await page.waitForSelector('#authModal.show', { timeout: 5000 });
+    await page.fill('#authUser', 'admin');
+    await page.fill('#authPass', 'admin123');
+    await page.click('#authGo');
+    await page.waitForSelector('#navAdmin:not([hidden])', { timeout: 10000 });
+    await page.click('#nav button[data-page="admin"]');
+    await page.waitForSelector('[data-view="users"]', { timeout: 10000 });
+    await page.click('[data-view="users"]');
+    await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
+    const userRows = await page.locator('#adminBody .adm-tbl tbody tr').count();
+    check('users tab lists accounts', userRows >= 2, `(${userRows} rows)`);
+    const acts = await page.locator('#adminBody [data-act]').count();
+    check('each account row carries actions', acts >= userRows * 3, `(${acts} controls)`);
+    await page.fill('#userSearch', 'uitester');
+    await page.click('#userSearchGo');
+    await page.waitForFunction(
+      () => document.querySelectorAll('#adminBody .adm-tbl tbody tr').length === 1,
+      null,
+      { timeout: 10000 }
+    );
+    check('user search narrows by the email-registered account', true);
+    // Read the account's id from the narrowed row, so the audit filter below
+    // targets the account that actually has entries rather than a hard-coded
+    // id that depends on seed ordering.
+    const uid = ((await page.locator('#adminBody .adm-tbl tbody tr td').first().textContent()) || '').trim();
+
+    await page.click('[data-view="audit"]');
+    await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
+    const auditText = (await page.locator('#adminBody .adm-tbl tbody').textContent()) || '';
+    check('audit tab records the password change with an actor and reason', /user\.password_changed/.test(auditText), `(${auditText.slice(0, 60)}…)`);
+    await page.fill('#auditTarget', `user:${uid}`);
+    await page.click('#auditGo');
+    await page.waitForFunction(
+      // Guarded: between the click and the re-render the tbody is briefly
+      // absent, and an unguarded null read here would surface as a page error.
+      // `uid` is passed as the arg — the predicate executes in PAGE context
+      // and cannot close over this scope.
+      (id) => {
+        const tb = document.querySelector('#adminBody .adm-tbl tbody');
+        return !!tb && (tb.textContent || '').includes(`user:${id}`);
+      },
+      uid,
+      { timeout: 10000 }
+    );
+    check('audit filter narrows by target', true);
   });
 
   check('no uncaught page errors during the whole run', pageErrors.length === 0, pageErrors.join(' | '));

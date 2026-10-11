@@ -1,4 +1,4 @@
-/* OpenBookmaker — light house palette: white ground, black text, grey accent.
+/* OpenBettingExchange — light house palette: white ground, black text, grey accent.
    Typeface: Inter (self-hosted) as the stand-in for Canva Sans, which is a
    proprietary Canva font and cannot be redistributed. Inter is the closest
    freely-available grotesque with the same tight, tall x-height feel.
@@ -723,3 +723,18 @@ form.inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
   header .logo { height: 17px; }
   main { padding: 12px 12px 32px; }
 }
+
+/* ── Admin desk: accounts + audit tables ───────────────────────────────────
+   These live here rather than as style="" attributes on purpose: the app
+   ships `style-src 'self'` with no 'unsafe-inline', so an inline style is not
+   merely discouraged, it is blocked by the browser and raises a CSP console
+   error the UI test fails on. Any layout a component needs gets a rule. */
+.adm-gap { margin-bottom: 10px; }
+.adm-tbl { width: 100%; border-collapse: collapse; }
+.adm-tbl th { text-align: left; font-weight: 600; color: var(--muted); font-size: 11px; }
+.adm-tbl th, .adm-tbl td { padding: 4px 6px; }
+.adm-tbl tbody tr { border-top: 1px solid var(--line); }
+.adm-tbl .num { text-align: right; white-space: nowrap; }
+.adm-tbl .acts { text-align: right; white-space: nowrap; }
+.adm-sub { margin-top: 18px; }
+.sess-row { margin-bottom: 6px; }

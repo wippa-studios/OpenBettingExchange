@@ -1,4 +1,4 @@
-// app.js — OpenBookmaker exchange UI.
+// app.js — OpenBettingExchange exchange UI.
 //
 // House convention: ONE IIFE, ONE controlled global (window.OB) shared with
 // admin.js — no top-level bindings leak into the page scope (classic scripts
@@ -138,18 +138,21 @@
     const who = $('who');
     const btn = $('authBtn');
     const admin = $('navAdmin');
+    const acct = $('accountBtn');
     if (state.user) {
       const avail = state.user.balance_cents - state.user.frozen_cents;
       bal.hidden = false;
       bal.innerHTML =
         `<span class="tn">${fmt(avail)}</span> <small>avail · ${fmt(state.user.frozen_cents)} frozen</small>`;
-      who.textContent = state.user.username + (state.user.is_admin ? ' · admin' : '');
+      who.textContent = state.user.username + (state.user.role === 'admin' ? ' · admin' : '');
       btn.textContent = 'Sign out';
-      admin.hidden = !state.user.is_admin;
+      acct.hidden = false;
+      admin.hidden = state.user.role !== 'admin';
     } else {
       bal.hidden = true;
       who.textContent = '';
       btn.textContent = 'Sign in';
+      acct.hidden = true;
       admin.hidden = true;
     }
   }
@@ -201,8 +204,14 @@
     const i = overlayStack.findIndex((o) => o.overlay === overlay);
     let wasFocused = null;
     if (i >= 0) wasFocused = overlayStack.splice(i, 1)[0].wasFocused;
-    if (overlay.id === 'authModal') overlay.classList.remove('show');
-    else overlay.remove(); // admin dialogs are built fresh on every open
+    // Static modals (auth, account) live in index.html and are only hidden;
+    // admin dialogs are built fresh on every open, so those are removed.
+    // data-persist marks the static ones — special-casing #authModal by id was
+    // how the first one worked, and a second static modal made that invisible
+    // assumption destroy it: overlay.remove() deleted #accountModal from the
+    // DOM on the first Escape, and every later open was a null crash.
+    if (overlay.hasAttribute('data-persist') || overlay.id === 'authModal') overlay.classList.remove('show');
+    else overlay.remove();
     if (wasFocused && wasFocused.isConnected) wasFocused.focus();
   }
 
@@ -250,27 +259,133 @@
   let authMode = 'login';
   function openAuth(mode) {
     authMode = mode || 'login';
-    $('authTitle').textContent = authMode === 'login' ? 'Sign in' : 'Create account';
-    $('authGo').textContent = authMode === 'login' ? 'Sign in' : 'Register';
-    $('authSwitch').textContent = authMode === 'login' ? 'Register' : 'Sign in';
+    const registering = authMode !== 'login';
+    $('authTitle').textContent = registering ? 'Create account' : 'Sign in';
+    $('authGo').textContent = registering ? 'Register' : 'Sign in';
+    $('authSwitch').textContent = registering ? 'Sign in' : 'Register';
+    // On sign-in the identifier accepts a username OR an email, so there is
+    // only ever one field to fill. Registration adds the optional address.
+    $('authEmailWrap').style.display = registering ? '' : 'none';
+    $('authUser').placeholder = registering ? 'username' : 'username or email';
     $('authUser').value = '';
+    $('authEmail').value = '';
     $('authPass').value = '';
     openOverlay($('authModal'), $('authUser'));
   }
   const closeAuth = () => closeOverlay($('authModal'));
 
   async function submitAuth() {
-    const username = $('authUser').value.trim();
+    const identifier = $('authUser').value.trim();
     const password = $('authPass').value;
     try {
-      const path = authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
-      const r = await api('POST', path, { username, password });
-      state.user = r.user;
-      closeAuth();
-      renderHeader();
-      connectSSE(); // private balance/orders events follow the new session
-      route();
-      toast(authMode === 'login' ? `Welcome back, ${r.user.username}` : 'Account created — top up in Wallet');
+      if (authMode === 'login') {
+        // Sent as `identifier` rather than `username` so the intent is
+        // unambiguous at the server: this may well be an email address.
+        const r = await api('POST', '/api/auth/login', { identifier, password });
+        state.user = r.user;
+        closeAuth();
+        renderHeader();
+        connectSSE(); // private balance/orders events follow the new session
+        route();
+        toast(`Welcome back, ${r.user.username}`);
+      } else {
+        const email = $('authEmail').value.trim();
+        const r = await api('POST', '/api/auth/register', {
+          username: identifier,
+          password,
+          ...(email ? { email } : {}),
+        });
+        state.user = r.user;
+        closeAuth();
+        renderHeader();
+        connectSSE();
+        route();
+        toast('Account created — top up in Wallet');
+      }
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  }
+
+  // ── Account panel ─────────────────────────────────────────────────────────
+  // Change password, and see/revoke every device signed in to this account.
+  // Revoking here is the counterpart to the server revoking all OTHER sessions
+  // on a password change: the two together cover both "someone else has my
+  // password" and "someone else has my cookie".
+  async function renderSessions() {
+    const box = $('sessionList');
+    box.textContent = 'Loading…';
+    let list;
+    try {
+      list = (await api('GET', '/api/auth/sessions')).sessions;
+    } catch (e) {
+      box.textContent = e.message;
+      return;
+    }
+    if (!list.length) {
+      box.textContent = 'No active sessions.';
+      return;
+    }
+    box.textContent = '';
+    for (const s of list) {
+      const row = document.createElement('div');
+      // .sess-row instead of row.style.marginBottom — the CSP blocks inline
+      // style ATTRIBUTES, not CSSOM writes, but the house convention is no
+      // ad-hoc styling anywhere, so layout belongs in style.css either way.
+      row.className = 'row sess-row';
+      const label = document.createElement('span');
+      label.textContent =
+        `${s.current ? '● this device' : '○'} · started ${s.created_at} · expires ${s.expires_at}`;
+      const btn = document.createElement('button');
+      btn.className = 'btn sm';
+      btn.textContent = 'Sign out';
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+          await api('DELETE', `/api/auth/sessions/${encodeURIComponent(s.id)}`);
+          if (s.current) {
+            // Revoked the session this tab is using — it is gone now.
+            toast('Signed out');
+            closeOverlay($('accountModal'));
+            logout();
+          } else {
+            toast('Device signed out');
+            renderSessions();
+          }
+        } catch (e) {
+          toast(e.message, 'err');
+          btn.disabled = false;
+        }
+      };
+      row.append(label, btn);
+      box.append(row);
+    }
+  }
+
+  function openAccount() {
+    if (!state.user) return openAuth('login');
+    $('accountWho').textContent =
+      `${state.user.username}${state.user.email ? ' · ' + state.user.email : ''}` +
+      `${state.user.role === 'admin' ? ' · admin' : ''}`;
+    $('pwCurrent').value = '';
+    $('pwNew').value = '';
+    $('pwNote').textContent = '';
+    openOverlay($('accountModal'), $('pwCurrent'));
+    renderSessions();
+  }
+
+  async function submitPasswordChange() {
+    const currentPassword = $('pwCurrent').value;
+    const newPassword = $('pwNew').value;
+    try {
+      const r = await api('POST', '/api/auth/change-password', { currentPassword, newPassword });
+      $('pwCurrent').value = '';
+      $('pwNew').value = '';
+      $('pwNote').textContent = r.sessions_revoked
+        ? `Password changed — ${r.sessions_revoked} other session(s) signed out.`
+        : 'Password changed.';
+      toast('Password changed');
+      renderSessions();
     } catch (e) {
       toast(e.message, 'err');
     }
@@ -281,7 +396,7 @@
     const hash = (location.hash || '#/markets').replace('#/', '');
     const known = ['markets', 'bets', 'wallet', 'admin'];
     state.page = known.indexOf(hash) >= 0 ? hash : 'markets';
-    if (state.page === 'admin' && !(state.user && state.user.is_admin)) state.page = 'markets';
+    if (state.page === 'admin' && !(state.user && state.user.role === 'admin')) state.page = 'markets';
     qa('#nav button').forEach((b) => b.classList.toggle('active', b.dataset.page === state.page));
     renderPage();
   }
@@ -1693,6 +1808,8 @@
       };
     });
     $('authBtn').onclick = () => (state.user ? logout() : openAuth('login'));
+    $('accountBtn').onclick = () => openAccount();
+    $('pwGo').onclick = () => submitPasswordChange();
     $('authGo').onclick = submitAuth;
     $('authSwitch').onclick = () => openAuth(authMode === 'login' ? 'register' : 'login');
     $('authPass').addEventListener('keydown', (e) => {
