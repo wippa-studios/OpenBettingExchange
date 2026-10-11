@@ -1,5 +1,5 @@
 {
-  "name": "openbookmaker",
+  "name": "openbettingexchange",
   "version": "0.1.0",
   "description": "Open-source Betfair-style betting exchange - back/lay order book, matching engine, tick-ladder pricing, cash-out. Paper money only.",
   "main": "server.js",
@@ -8,7 +8,8 @@
     "seed": "node --no-warnings lib/seed.js",
     "test": "node tests/run_all.js",
     "test:smoke": "./tests/smoke.sh",
-    "test:ui": "node tests/ui_test.mjs"
+    "test:ui": "node tests/ui_test.mjs",
+    "shots": "node scripts/capture-screenshots.mjs"
   },
   "engines": {
     "node": ">=22.13"
@@ -30,11 +31,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wippa-studios/OpenBookmaker.git"
+    "url": "git+https://github.com/wippa-studios/OpenBettingExchange.git"
   },
-  "homepage": "https://github.com/wippa-studios/OpenBookmaker#readme",
+  "homepage": "https://github.com/wippa-studios/OpenBettingExchange#readme",
   "bugs": {
-    "url": "https://github.com/wippa-studios/OpenBookmaker/issues"
+    "url": "https://github.com/wippa-studios/OpenBettingExchange/issues"
   },
   "author": "wippa-studios",
   "private": false

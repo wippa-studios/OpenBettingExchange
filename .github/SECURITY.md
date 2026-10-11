@@ -2,7 +2,7 @@
 
 ## Scope
 
-OpenBookmaker is **paper-money software**: every balance is play money and
+OpenBettingExchange is **paper-money software**: every balance is play money and
 there is no real-money execution path, no payment integration and no
 withdrawal. Reports about the accuracy of the demo economy, the fairness of the
 bot's prices, or the quality of the seeded data are bug reports, not security
@@ -89,7 +89,7 @@ requires — a path this project explicitly does not provide.
 
 Report it privately via GitHub's security advisory form for this repository
 (**Security → Report a vulnerability** at
-<https://github.com/wippa-studios/OpenBookmaker/security/advisories/new>), or by
+<https://github.com/wippa-studios/OpenBettingExchange/security/advisories/new>), or by
 email to the maintainer. Include:
 
 - what an attacker can do, and what they need in order to do it;

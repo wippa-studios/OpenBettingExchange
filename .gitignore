@@ -1,4 +1,4 @@
-# OpenBookmaker
+# OpenBettingExchange
 node_modules/
 data/
 .env
@@ -9,3 +9,10 @@ data/
 
 # browser-test output (the committed board image is docs/screenshot.png)
 ui-test.png
+
+# Companion odds recorder (a separate Python project, ~79MB). It carries its
+# own .gitignore, but it lives INSIDE this working tree with no git repo of its
+# own, so `git add .` from here would stage it — including
+# betfair-market-snapshots/certs/*.key, which are real Betfair bot login keys.
+# Never commit it. Clone it separately; docs/FEED.md describes the contract.
+betfair-market-snapshots/
