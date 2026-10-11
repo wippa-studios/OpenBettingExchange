@@ -34,15 +34,25 @@ preserve it.
 
 **What "operator owns the book" requires that does not exist:**
 
-- No tenant concept — `COMMISSION_RATE` is a global env var
-- Single-entry balances — one `balance_cents` per user, no account types, so
-  player funds cannot be segregated from operator funds
-- No real money movement — `POST /api/wallet/deposit` is a faucet
-- No player lifecycle — no KYC state, no self-exclusion, no deposit limits
-- No results feed — settlement is an admin console action
-- No abuse controls — a player can hold unlimited liability in one market
-- No audit trail of operator actions — only financial movements are recorded
-- No operational surface — metrics, reconciliation, backup/restore
+- ~~No tenant concept~~ ✅ `lib/tenants.js`, per-tenant commission in bps
+- ~~Single-entry balances~~ ✅ `lib/accounts.js` — accounts + balanced postings;
+  `users.balance_cents` is now a proven materialised cache
+- ~~No player lifecycle~~ partially — `status` and self-exclusion ship; **KYC
+  and deposit limits do not**
+- ~~No abuse controls~~ ✅ `lib/limits.js`
+- ~~No audit trail of operator actions~~ ✅ `lib/audit.js`
+- ~~Market-maker loss unbounded~~ ✅ `lib/risk.js` — bounded and skewed before
+  stop. Bounded, not profitable: `drift.js` is still a random walk
+- ~~No tenant concept~~ ✅
+
+**Still absent, and still blocking a licensed operation:**
+- `POST /api/wallet/deposit` is still a faucet; the real-money path exists as
+  an adapter seam with a reference provider, but no PSP is integrated
+- No results feed — settlement is still an admin console action, with no
+  per-sport void rules
+- No reconciliation timer — the report exists, nothing schedules it
+- No KYC, age verification, reality checks or session limits
+- No backup/restore path, and no monitoring surface
 
 ---
 
@@ -85,7 +95,7 @@ project with no licence file is not open source and cannot be contributed to.
 `LICENSE` and `package.json` agree; correct the README's licence section.
 **Done when:** a stranger can clone, read the licence, and contribute.
 
-### Phase 1 — Abuse controls
+### Phase 1 — Abuse controls ✅ SHIPPED
 
 Not solvency — see §2. These limit what a single account can do.
 
@@ -109,9 +119,20 @@ that a player can appeal needs a recorded cause.
 
 **Done when:** a user who would exceed a cap is refused with a distinct error,
 the refusal is in the audit log, and the check is proven not to race under
-concurrent placement.
+concurrent placement. ✅ All satisfied — `tests/limits.test.js` (16 checks).
 
-### Phase 2 — Market-maker risk
+**Three decisions worth keeping:**
+- A missing limits row means NO CAP; a stored `0` is a real zero. Reading "no
+  row" as `0` would silently freeze every account on upgrade.
+- A market scope overrides global **per axis**, so setting a market liability
+  cap does not clear the user's global daily cap.
+- `self_excluded` is a separate flag from `excluded_until`, because
+  "permanently excluded" and "not excluded" must both be expressible. A
+  nullable date alone is ambiguous between them, and resolving it wrongly
+  reads a permanent exclusion as "never excluded" — the worst possible failure
+  of a responsible-gambling control.
+
+### Phase 2 — Market-maker risk ✅ SHIPPED
 
 The venue's actual P&L exposure. This is the piece that makes the exchange
 economically survivable rather than merely technically correct.
@@ -129,16 +150,23 @@ stop_trading_at, quote_skew)`; extend `settings` for desk-level kill switches.
 - Expose the bots' cumulative P&L on the admin desk. A venue that cannot see its
   own market-maker loss is a venue that discovers it by going bankrupt.
 
-**The honest limit:** skew and caps are *damage limitation*, not edge. An
-exchange that wants a positive trading result needs a real quote model — a fair
-price from external books with a spread, not a random walk. `lib/drift.js` is
-explicitly a random walk and the README says so. Phase 2 makes the loss bounded;
-making it positive is Phase 3 work with real odds data.
+**The honest limit is unchanged.** Skew and caps are *damage limitation*, not
+edge. `lib/drift.js` is still explicitly a random walk and the README says so.
+Phase 2 makes the loss bounded; making it positive needs a real quote model from
+external books, which is Phase 5 feed work — not this phase.
 
 **Done when:** a bot cannot exceed its daily loss cap, the desk shows the
-exposure, and the kill switch is tested.
+exposure, and the kill switch is tested. ✅ `tests/risk.test.js` (17 checks).
 
-### Phase 3 — Money: double-entry ledger and real payments
+**Correction worth recording.** The first implementation measured liability as
+the bot's *negative balance*, and a test caught it: that is already bounded by
+the escrow invariant, so it mostly re-measured a guarantee the engine already
+provides while leaving the uncovered number uncapped. A lay at `P` for `s`
+escrows `(P-1)*s` but pays `s*P` if it loses — **that gap is the venue's real
+exposure**, and it is what is now capped, counted over open markets only so it
+cannot ratchet upward with every settlement.
+
+### Phase 3 — Money: double-entry ledger and real payments ✅ PARTIALLY SHIPPED
 
 The change that makes this acceptable to a licensed operator. Fund segregation
 is a legal requirement, and a single `balance_cents` column cannot express it.
@@ -160,9 +188,31 @@ becomes balanced entries summing to zero.** Then:
 - Operator revenue is `operator_commission`, queryable, not inferred.
 
 `users.balance_cents` survives as a materialised cache with a test asserting it
-equals the sum of that user's `player_funds` postings.
+equals the sum of that user's `player_funds` postings. ✅ Implemented in
+`lib/accounts.js`; `tests/ledger2.test.js` (15 checks) asserts conservation,
+segregation, revenue-is-a-query, and cache-equals-postings per user.
 
-**Payments:** replace the faucet with a payment abstraction. Deposit intent →
+**Escrow is a real per-user `player_escrow` account**, not a memo column. It is
+an intra-player split, which is awkward in a naive model; as a genuine
+liability account the rule stays exception-free — if it moves money it posts.
+`direction` carries the sign so `amount_cents` is always a positive magnitude.
+
+**Two arithmetic bugs the cache test caught immediately**, both in `settleUser`:
+commission was posted house→operator_commission when the PLAYER pays it, and
+the P&L leg credited `balanceDelta - frozenRelease` when the collateral had
+already returned via the release leg. Both are the kind of off-by-a-fee error
+that a total-only conservation check cannot see.
+
+**The migration is additive and deliberately so.** `balance_cents` /
+`frozen_cents` are still written exactly as before and are now a materialised
+cache; `assertUserAgrees` proves cache == postings for every user. Flipping
+authority the other way is a later, separate step.
+
+**Payments:** ✅ Interface plus a complete reference provider shipped in
+`lib/payments/`; **no PSP chosen, deliberately** — every jurisdiction differs,
+gambling is restricted almost everywhere, and the operator already holds a PSP
+contract that has been through legal review. The concrete integration is the
+one piece left. Deposit intent →
 provider adapter → credit on confirmation (never on initiation). Withdrawals
 with a hold, a cooling-off period and a reconciliation step. **No provider is
 built in** — the adapter interface plus one reference integration is the
@@ -174,9 +224,18 @@ money movements" and "we can prove to an auditor that players' funds are
 segregated and intact." For the positioning in §0, this is the whole argument.
 
 **Done when:** every cent moves as balanced postings, conservation is asserted
-in tests, and segregation is a query rather than a promise.
+in tests, and segregation is a query rather than a promise. ✅ First two;
+✅ third (`lib/accounts.js segregation()`, `/api/admin/ledger`). Outstanding:
+one real PSP adapter, and a scheduled reconciliation JOB (the report exists;
+nothing invokes it on a timer yet).
 
-### Phase 4 — Tenancy
+**Credit on confirmation, never on initiation** — opening ten deposit intents
+and abandoning them funds you zero times, and confirmation is idempotent by
+intent id so a retried webhook cannot double-credit. An incomplete provider is
+refused **at boot**, and `REAL_PAYMENTS` hard-refuses the reference provider: a
+mock that instantly confirms must never sit behind a live payment button.
+
+### Phase 4 — Tenancy ✅ SHIPPED
 
 Self-hosting is the degenerate case of multi-tenancy. Modelling it as one is
 both simpler to sell and honest about the deployment story.
@@ -200,7 +259,31 @@ every operational table gains `tenant_id` and a leading index entry.
 than incremental. Do it after Phase 3, once the ledger is already multi-row.
 
 **Done when:** two tenants coexist with separate brands, commissions and
-allowlists, and no query can cross them.
+allowlists, and no query can cross them. ✅ `tests/tenants.test.js` (19 checks).
+
+**The default tenant is resolved by SLUG, never a hard-coded id.** An earlier
+draft pinned `DEFAULT_TENANT_ID = 1`, and a test caught it: the moment an
+operator creates a tenant before the default is materialised, that tenant
+takes id 1 and every later "is this the default?" question silently answers
+about the wrong row.
+
+**Jurisdiction is enforced at SESSION CREATION, not at bet placement.** Checked
+at placement, a blocked player registers, deposits and places bets and is
+refused only on trying to win — at which point they hold a live position the
+venue is not permitted to honour, and unwinding it means choosing a side.
+
+**The country is NOT client-claimed.** `createSession` originally accepted a
+`country` that nothing ever supplied, so gating could only fail closed and lock
+out every login — inert-but-configured being the worst failure mode, because
+the tenant believes the control is running. Reading it from a request header
+would be a hole rather than a control. `TRUST_PROXY_JURISDICTION` (default
+**false**) is the operator asserting every request passed an edge that
+overwrites the header; with it off the header is ignored entirely, and with an
+allowlist set but no trusted source, gating fails closed.
+
+**Admin scope is structural.** `listUsers` has no argument value meaning "every
+tenant" — an optional scope is one someone eventually forgets to pass, and a
+forgotten scope on an admin route is a cross-tenant read.
 
 ### Phase 5 — Feed, market lifecycle, scale
 
@@ -338,19 +421,43 @@ conversation.
 
 ## 6. Immediate next actions
 
-1. **Run the suite.** 196 checks are claimed and unverified. Run `npm test`,
-   `npm run test:smoke`, `npm run test:ui` before changing anything, so there is
-   a known-good baseline to compare against.
-2. **Restore Phase 0.** Four files and a public repo. Smallest possible step to
-   making the project real.
-3. **Add order idempotency.** A client-supplied `client_order_id`, unique per
-   user. Small, and at operator scale a double-submit becomes a financial
-   incident rather than an annoyance.
-4. **Prove the escrow invariant adversarially.** Partial fills at tick
-   boundaries, cancel-during-match, cash-out where the only liquidity is the
-   user's own resting orders, settlement after every combination. The suite is
-   self-authored; an outside reading of the money path is worth more than
-   another self-authored test.
+Reassessed after Phases 1–4 landed. The first item is now **done** and was the
+reason this list was worth writing.
 
-Then Phase 1 and Phase 2, which are the real product work, and Phase 3, which is
-the part that makes the positioning true.
+1. ~~Run the suite. 196 checks are claimed and unverified.~~ ✅ Done — and
+   grown to **301 checks across 24 suites**, plus a 33-check live smoke script
+   and a 58-check browser suite, all green.
+2. ~~Restore Phase 0.~~ ✅ Done — files tracked, repo public.
+3. **Add order idempotency.** Still the smallest high-value item outstanding.
+   A client-supplied `client_order_id`, unique per user; a repeat returns the
+   existing order rather than placing a second. At operator scale a
+   double-submit is a financial incident rather than an annoyance.
+4. **Multi-runner cash-out.** `lib/cashout.js` still returns `null` for mixed
+   or multi-selection positions (the `v1 scope` guard). Plan construction is
+   the only thing that changes; the engine primitives are there.
+5. **One real PSP adapter.** The interface and reference provider ship; the
+   concrete integration does not.
+6. **Scheduled reconciliation.** `reconcile()` exists and reports drift; no
+   timer invokes it. A venue that only reconciles when something breaks does
+   not know how far out it is when nothing visibly breaks.
+7. **Results feed and per-sport void rules.** `settleMarket` is already a
+   single idempotent entry point, so this is a consumer rather than a rewrite.
+   Void rules are the part that matters: a results feed that does not model
+   them settles incorrectly and the operator pays for it.
+8. **Responsible gambling surface.** Age verification, reality checks and
+   session limits. Self-exclusion is done and wired to the engine; the rest is
+   not, and the product should not be deployable to an operator who has not
+   configured it.
+
+### The convention is now enforced mechanically
+
+Both this document and WORKSTREAMS.md named the same risk: the escrow
+invariant holds only because `orders.frozen_cents` is treated as maintained
+exclusively by the matching engine, which is a convention rather than a type.
+Both said to enforce it before other contributors arrive.
+
+✅ `tests/guard.test.js` does. An explicit allowlist of the three permitted
+writers, each with a stated reason, checked across `lib/`, `server.js` and the
+frontend. It was verified by deliberately introducing a violating `UPDATE` and
+confirming the suite fails.
+
