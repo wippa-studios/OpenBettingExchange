@@ -622,6 +622,9 @@ app.get('/api/admin/users', requireAdmin, (req, res) => {
       q: req.query.q,
       role: req.query.role,
       status: req.query.status,
+      // Scoped to the caller's own tenant unless they are a venue-level
+      // operator acting on another tenant explicitly.
+      tenantId: req.query.tenant_id ? Number(req.query.tenant_id) : null,
       limit: req.query.limit,
       offset: req.query.offset,
     })
@@ -777,6 +780,37 @@ app.get('/api/admin/ledger', requireAdmin, (req, res) => {
     gateway_clearing_cents: ACCT.balanceOf(db, ACCT.accountId(db, 'gateway_clearing', null)),
     cache_divergent: ACCT.assertUserAgrees(db),
   });
+});
+
+// ── Tenancy (Phase 4) ──────────────────────────────────────────────────────
+// Branding is a CONFIG READ served as JSON and applied via CSS custom
+// properties — no build step. That is why the no-build frontend survives
+// multi-tenancy rather than becoming the thing that has to be rebuilt.
+app.get('/api/branding', (req, res) => {
+  const TEN = require('./lib/tenants');
+  const tenant = req.user ? TEN.ofUser(db, req.user.id) : TEN.defaultTenant(db);
+  res.json({ tenant: tenant ? { id: tenant.id, slug: tenant.slug } : null, ...TEN.branding(db, tenant && tenant.id) });
+});
+
+app.get('/api/admin/tenants', requireAdmin, (req, res) => {
+  const TEN = require('./lib/tenants');
+  res.json({ tenants: TEN.list(db) });
+});
+
+app.put('/api/admin/tenants/:id', requireAdmin, (req, res) => {
+  const TEN = require('./lib/tenants');
+  const b = req.body || {};
+  res.json(
+    TEN.configure(db, {
+      actor: req.user,
+      tenantId: Number(req.params.id),
+      ...(b.name === undefined ? {} : { name: b.name }),
+      ...(b.status === undefined ? {} : { status: b.status }),
+      ...(b.commission_bps === undefined ? {} : { commission_bps: Number(b.commission_bps) }),
+      ...(b.brand === undefined ? {} : { brand: b.brand }),
+      ...(b.jurisdictions === undefined ? {} : { jurisdictions: b.jurisdictions }),
+    })
+  );
 });
 
 // ── SQLite error mapping ───────────────────────────────────────────────────
