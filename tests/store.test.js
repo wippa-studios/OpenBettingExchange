@@ -136,4 +136,49 @@ check('D6 email uniqueness is partial', () => {
   assert.throws(() => ins.run('d', 'h', 'taken@example.com'), /UNIQUE/);
 });
 
+// D7: MIGRATION REGRESSION. A database created before Phase 4's idempotency
+// column must upgrade cleanly. This class of bug is easy to reintroduce and
+// invisible to every other test, because all of them open a FRESH database
+// where SCHEMA and the migrations agree.
+//
+// The trap it pins: `db.exec(SCHEMA)` runs BEFORE the migrations, and a bare
+// CREATE INDEX validates its columns immediately. Putting
+// `CREATE INDEX ... ON orders (user_id, client_order_id)` in SCHEMA therefore
+// throws "no such column" against an old orders table, and the app cannot boot
+// at all — the feature would look fine in CI and break every existing install.
+check('D7 a pre-idempotency database upgrades and keeps its orders', () => {
+  const { DatabaseSync } = require('node:sqlite');
+  // A FILE, not :memory: — openStore needs to reopen a real database to see
+  // it in its pre-migration shape.
+  const file = path.join(os.tmpdir(), `ob_mig_${process.pid}.db`);
+  fs.rmSync(file, { force: true });
+  const seed = new DatabaseSync(file);
+  // An orders table in its OLD shape: no client_order_id at all.
+  seed.exec(`CREATE TABLE orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, market_id INTEGER NOT NULL,
+    selection_id INTEGER NOT NULL, side TEXT NOT NULL, price REAL NOT NULL,
+    stake_cents INTEGER NOT NULL, matched_cents INTEGER NOT NULL DEFAULT 0,
+    frozen_cents INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open',
+    placed_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT)`);
+  seed.prepare("INSERT INTO orders (user_id, market_id, selection_id, side, price, stake_cents) VALUES (1,1,1,'back',2.0,5000)").run();
+  seed.close();
+
+  const db = openStore(file); // must not throw
+  assert.ok(
+    db.prepare("SELECT name FROM pragma_table_info('orders') WHERE name='client_order_id'").get(),
+    'column added'
+  );
+  assert.ok(
+    db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_orders_client_id'").get(),
+    'unique index created'
+  );
+  assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM orders').get().c, 1, 'existing order preserved');
+  db.close();
+  // And a second open is a no-op, not a duplicate-ALTER failure.
+  const again = openStore(file);
+  assert.strictEqual(again.prepare('SELECT COUNT(*) c FROM orders').get().c, 1);
+  again.close();
+  fs.rmSync(file, { force: true });
+});
+
 console.log(`\nstore.test.js: ${passed} checks passed`);

@@ -557,12 +557,20 @@ app.get('/api/format/:price', (req, res) => {
 
 // ── Trading ────────────────────────────────────────────────────────────────
 app.post('/api/orders', requireAuth, (req, res) => {
-  const { selection_id, side, price, stake_cents } = req.body || {};
-  const result = M.placeOrder(db, req.user, { selection_id, side, price, stake_cents });
-  broadcast('book', { market_id: result.order.market_id });
-  broadcast('orders', {}, req.user.id);
-  broadcast('balance', {}, req.user.id);
-  res.status(201).json(result);
+  const { selection_id, side, price, stake_cents, client_order_id } = req.body || {};
+  const result = M.placeOrder(db, req.user, { selection_id, side, price, stake_cents, client_order_id });
+  // A replay created nothing, so it must not broadcast as though it did —
+  // otherwise a retried request makes every other client's board flicker for a
+  // state change that did not happen.
+  if (!result.idempotent_replay) {
+    broadcast('book', { market_id: result.order.market_id });
+    broadcast('orders', {}, req.user.id);
+    broadcast('balance', {}, req.user.id);
+  }
+  // 200 rather than 201 on a replay: the resource already existed. A client
+  // retrying after a timeout can tell "I created this" from "this was already
+  // mine" without inspecting the body.
+  res.status(result.idempotent_replay ? 200 : 201).json(result);
 });
 
 app.get('/api/orders', requireAuth, (req, res) => {
