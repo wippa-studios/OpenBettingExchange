@@ -16,6 +16,7 @@ const ODDS = require('./lib/odds');
 const FEED = require('./lib/feed');
 const ADM = require('./lib/admin');
 const AUDIT = require('./lib/audit');
+const LIMITS = require('./lib/limits');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
 // DELIBERATE demo choice (documented in .github/SECURITY.md): this app is
@@ -667,6 +668,39 @@ app.get('/api/admin/audit', requireAdmin, (req, res) => {
   });
 });
 
+// ── Admin: abuse limits + self-exclusion ───────────────────────────────────
+
+app.get('/api/admin/users/:id/limits', requireAdmin, (req, res) => {
+  res.json({ limits: LIMITS.getLimits(db, Number(req.params.id)) });
+});
+
+app.put('/api/admin/users/:id/limits', requireAdmin, (req, res) => {
+  const { scope, max_open_stake_cents, max_market_liability_cents, max_daily_settled_cents } = req.body || {};
+  res.json(
+    LIMITS.setLimits(db, {
+      actor: req.user,
+      userId: Number(req.params.id),
+      scope: scope === undefined ? LIMITS.GLOBAL_SCOPE : scope,
+      // A key that is ABSENT leaves that axis untouched; a key present with a
+      // null CLEARS the cap. Distinguishing the two matters: omitting
+      // max_daily_settled_cents while tightening a stake limit must not
+      // silently hand the account an unlimited daily cap.
+      ...(max_open_stake_cents === undefined ? {} : { max_open_stake_cents }),
+      ...(max_market_liability_cents === undefined ? {} : { max_market_liability_cents }),
+      ...(max_daily_settled_cents === undefined ? {} : { max_daily_settled_cents }),
+    })
+  );
+});
+
+// Self-exclusion is an operator-recorded ABSOLUTE action. There is no
+// unexclude route on purpose: reinstatement is a separate audited decision,
+// and shipping DELETE next to PUT invites the "just clear the flag" shortcut
+// that makes exclusion meaningless.
+app.post('/api/admin/users/:id/exclude', requireAdmin, (req, res) => {
+  const { until, reason } = req.body || {};
+  res.json(LIMITS.exclude(db, { actor: req.user, userId: Number(req.params.id), until: until ?? null, reason }));
+});
+
 // ── SQLite error mapping ───────────────────────────────────────────────────
 // The admin catalogue INSERTs fail two ways: a client-correctable mistake
 // the schema itself rejects (duplicate slug, unknown foreign key — a
@@ -922,7 +956,14 @@ function errorHandler(err, req, res, next) {
   const raw = Number(err.status) || 500;
   const status = raw >= 500 ? 500 : raw;
   if (status >= 500) console.error('[api]', err);
-  res.status(status).json({ error: status >= 500 ? 'Internal error' : err.message || 'Request failed' });
+  const body = { error: status >= 500 ? 'Internal error' : err.message || 'Request failed' };
+  // Structured context (which limit was breached, what it is) is a 4xx-only
+  // affordance. It is deliberately absent from a 5xx even if present on the
+  // error, so an internal failure cannot leak detail through it.
+  if (status < 500 && err.details && typeof err.details === 'object') {
+    body.details = err.details;
+  }
+  res.status(status).json(body);
 }
 
 app.use(errorHandler);

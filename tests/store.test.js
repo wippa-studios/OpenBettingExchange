@@ -14,7 +14,7 @@ const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
 const TABLES = [
   'users', 'sessions', 'sports', 'competitions', 'events', 'markets', 'selections',
   'orders', 'matches', 'price_history', 'settlements', 'transactions', 'settings',
-  'audit_log',
+  'audit_log', 'limits',
 ];
 
 // D1: every table from the domain spec exists, and opening twice is safe.
