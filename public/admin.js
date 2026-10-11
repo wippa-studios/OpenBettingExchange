@@ -13,7 +13,7 @@
   const { api, toast, fmt, price2, esc, attr, state, refreshAll, openOverlay, closeOverlay } = OB;
 
   async function render(page) {
-    if (!(state.user && state.user.is_admin)) {
+    if (!(state.user && state.user.role === 'admin')) {
       page.innerHTML = '<div class="card"><div class="empty">Admin only</div></div>';
       return;
     }
@@ -22,6 +22,8 @@
         <h3>Trading desk</h3>
         <div class="tabs">
           <button class="btn sm primary" data-view="markets">Markets</button>
+          <button class="btn sm" data-view="users">Users</button>
+          <button class="btn sm" data-view="audit">Audit</button>
           <button class="btn sm" data-view="create">Create</button>
         </div>
         <div id="adminBody"></div>
@@ -31,10 +33,169 @@
         page.querySelectorAll('[data-view]').forEach((x) => x.classList.remove('primary'));
         b.classList.add('primary');
         if (b.dataset.view === 'markets') renderMarketsView();
+        else if (b.dataset.view === 'users') renderUsersView();
+        else if (b.dataset.view === 'audit') renderAuditView();
         else renderCreateView();
       };
     });
     renderMarketsView();
+  }
+
+  // ── accounts ──────────────────────────────────────────────────────────────
+  // Every mutating control below is gated server-side too (reason required,
+  // self-actions refused, last-admin protected). The prompts here exist so the
+  // operator is told WHY at the point of action rather than after a 400.
+  function askReason(what) {
+    const reason = window.prompt(`${what}\n\nReason (recorded in the audit log):`);
+    if (reason === null) return null;
+    const trimmed = reason.trim();
+    return trimmed ? trimmed : null;
+  }
+
+  async function renderUsersView(q) {
+    const body = document.getElementById('adminBody');
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    body.innerHTML = '<div class="empty">Loading…</div>';
+    let data;
+    try {
+      data = await api('GET', '/api/admin/users?' + params.toString());
+    } catch (e) {
+      body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+      return;
+    }
+
+    body.innerHTML = `
+      <div class="row adm-gap">
+        <input id="userSearch" class="grow" placeholder="search username or email" value="${attr(q || '')}" />
+        <button class="btn sm" id="userSearchGo">Search</button>
+        <button class="btn sm" id="userSearchClear">Clear</button>
+        <span class="muted">${data.total} account(s)</span>
+      </div>
+      <table class="adm-tbl">
+        <thead><tr class="fineprint">
+          <th>ID</th><th>User</th><th>Email</th><th>Role</th>
+          <th>Status</th><th class="num">Available</th><th></th>
+        </tr></thead>
+        <tbody>${data.users.map(userRow).join('')}</tbody>
+      </table>`;
+
+    const search = document.getElementById('userSearch');
+    const run = () => renderUsersView(search.value.trim());
+    document.getElementById('userSearchGo').onclick = run;
+    document.getElementById('userSearchClear').onclick = () => renderUsersView('');
+    search.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); run(); } };
+
+    body.querySelectorAll('[data-act]').forEach((btn) => {
+      btn.onclick = async () => {
+        const id = Number(btn.dataset.id);
+        const act = btn.dataset.act;
+        let reason = null;
+        let body_ = {};
+
+        if (act === 'balance') {
+          const raw = window.prompt('Adjustment in dollars (negative to claw back):');
+          if (raw === null) return;
+          const dollars = Number(raw);
+          if (!Number.isFinite(dollars) || dollars === 0) return toast('Enter a non-zero amount', 'err');
+          const cents = Math.round(dollars * 100);
+          reason = askReason('Adjusting a balance');
+          if (!reason) return;
+          body_ = { delta_cents: cents, reason };
+        } else if (act === 'suspend' || act === 'reinstate') {
+          reason = askReason(act === 'suspend' ? 'Suspending an account' : 'Reinstating an account');
+          if (!reason) return;
+          body_ = { status: act === 'suspend' ? 'suspended' : 'active', reason };
+        } else if (act === 'promote' || act === 'demote') {
+          reason = askReason(act === 'promote' ? 'Granting admin' : 'Revoking admin');
+          if (!reason) return;
+          body_ = { role: act === 'promote' ? 'admin' : 'user', reason };
+        }
+
+        btn.disabled = true;
+        try {
+          if (act === 'balance') await api('POST', `/api/admin/users/${id}/balance`, body_);
+          else await api('PATCH', `/api/admin/users/${id}`, body_);
+          toast('Done');
+          renderUsersView(q);
+        } catch (e) {
+          toast(e.message, 'err');
+          btn.disabled = false;
+        }
+      };
+    });
+  }
+
+  function userRow(u) {
+    const suspended = u.status === 'suspended';
+    const isAdmin = u.role === 'admin';
+    return `<tr>
+      <td class="tn">${u.id}</td>
+      <td>${esc(u.username)}</td>
+      <td class="muted">${u.email ? esc(u.email) : '—'}</td>
+      <td>${isAdmin ? '<strong>admin</strong>' : 'user'}</td>
+      <td>${suspended ? '<strong>suspended</strong>' : 'active'}</td>
+      <td class="tn num">${fmt(u.available_cents)}${
+        u.frozen_cents ? ` <small class="muted">· ${fmt(u.frozen_cents)} frozen</small>` : ''
+      }</td>
+      <td class="acts">
+        <button class="btn sm" data-act="balance" data-id="${u.id}">Balance</button>
+        <button class="btn sm" data-act="${suspended ? 'reinstate' : 'suspend'}" data-id="${u.id}">${suspended ? 'Reinstate' : 'Suspend'}</button>
+        <button class="btn sm" data-act="${isAdmin ? 'demote' : 'promote'}" data-id="${u.id}">${isAdmin ? 'Revoke admin' : 'Make admin'}</button>
+      </td>
+    </tr>`;
+  }
+
+  // ── audit trail ───────────────────────────────────────────────────────────
+  async function renderAuditView(target) {
+    const body = document.getElementById('adminBody');
+    body.innerHTML = '<div class="empty">Loading…</div>';
+    let entries;
+    try {
+      const params = new URLSearchParams({ limit: '100' });
+      if (target) params.set('target', target);
+      entries = (await api('GET', '/api/admin/audit?' + params.toString())).entries;
+    } catch (e) {
+      body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+      return;
+    }
+    if (!entries.length) {
+      body.innerHTML = '<div class="empty">No audit entries yet</div>';
+      return;
+    }
+    body.innerHTML = `
+      <div class="row adm-gap">
+        <input id="auditTarget" class="grow" placeholder="filter by target, e.g. user:4" value="${attr(target || '')}" />
+        <button class="btn sm" id="auditGo">Filter</button>
+        <button class="btn sm" id="auditClear">Clear</button>
+      </div>
+      <table class="adm-tbl">
+        <thead><tr class="fineprint">
+          <th>When</th><th>Actor</th><th>Action</th><th>Target</th><th>Change</th><th>Reason</th>
+        </tr></thead>
+        <tbody>${entries.map((e) => `<tr>
+          <td class="tn muted">${esc(e.at)}</td>
+          <td class="tn">${e.actor_id === null ? '<span class="muted">system</span>' : '#' + e.actor_id}</td>
+          <td>${esc(e.action)}</td>
+          <td class="tn">${esc(e.target || '')}</td>
+          <td class="muted fineprint">${auditChange(e)}</td>
+          <td class="muted">${esc(e.reason || '')}</td>
+        </tr>`).join('')}</tbody>
+      </table>`;
+
+    const go = () => renderAuditView(document.getElementById('auditTarget').value.trim());
+    document.getElementById('auditGo').onclick = go;
+    document.getElementById('auditClear').onclick = () => renderAuditView('');
+  }
+
+  // Renders only the keys that actually changed, so a role flip does not print
+  // the whole balance alongside it.
+  function auditChange(e) {
+    if (!e.before && !e.after) return '';
+    const keys = Array.from(new Set([...Object.keys(e.before || {}), ...Object.keys(e.after || {})]));
+    return keys
+      .map((k) => `${k}: ${JSON.stringify(e.before?.[k])} → ${JSON.stringify(e.after?.[k])}`)
+      .join('; ');
   }
 
   // ── markets + settlement ────────────────────────────────────────────────

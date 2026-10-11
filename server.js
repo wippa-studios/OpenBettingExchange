@@ -1,5 +1,5 @@
 'use strict';
-// server.js — OpenBookmaker exchange server (Express ^4, node:sqlite).
+// server.js — OpenBettingExchange exchange server (Express ^4, node:sqlite).
 const express = require('express');
 const path = require('path');
 const config = require('./lib/config');
@@ -14,6 +14,8 @@ const bots = require('./lib/bots');
 const drift = require('./lib/drift');
 const ODDS = require('./lib/odds');
 const FEED = require('./lib/feed');
+const ADM = require('./lib/admin');
+const AUDIT = require('./lib/audit');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
 // DELIBERATE demo choice (documented in .github/SECURITY.md): this app is
@@ -129,7 +131,12 @@ function requireAuth(req, res, next) {
 
 function requireAdmin(req, res, next) {
   if (!req.user) return res.status(401).json({ error: 'Authentication required' });
-  if (!req.user.is_admin) return res.status(403).json({ error: 'Admin only' });
+  // role is authoritative. The `|| req.user.is_admin` is the same legacy
+  // tolerance sanitizeUser applies: a session minted before the accounts
+  // migration may carry a row whose role column has not been read yet.
+  if (req.user.role !== 'admin' && !req.user.is_admin) {
+    return res.status(403).json({ error: 'Admin only' });
+  }
   next();
 }
 
@@ -291,13 +298,13 @@ function rlTooManyAttempts(res, key) {
 }
 
 app.post('/api/auth/register', (req, res) => {
-  const { username, password } = req.body || {};
-  // Registration abuse is account-farming or username enumeration from one
+  const { username, password, email } = req.body || {};
+  // Registration abuse is account-farming or identity enumeration from one
   // machine, so the counter keys on the caller's IP.
   const key = 'register:' + (req.socket.remoteAddress || 'unknown');
   if (rlLocked(key)) return rlTooManyAttempts(res, key);
   try {
-    const user = A.registerUser(db, { username, password });
+    const user = A.registerUser(db, { username, password, email });
     rlRecordSuccess(key);
     const token = A.createSession(db, user.id);
     res.setHeader('Set-Cookie', sessionCookie(token));
@@ -334,6 +341,43 @@ app.post('/api/auth/logout', (req, res) => {
 
 app.get('/api/me', requireAuth, (req, res) => {
   res.json({ user: { ...req.user, available_cents: req.user.balance_cents - req.user.frozen_cents } });
+});
+
+// ── Account self-service ───────────────────────────────────────────────────
+
+// Changing a password revokes every OTHER session, so the response reports how
+// many were invalidated — that count is the user's evidence that the action
+// did what they think it did.
+app.post('/api/auth/change-password', requireAuth, (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+  const r = A.changePassword(db, {
+    userId: req.user.id,
+    currentPassword,
+    newPassword,
+    keepToken: req.token,
+  });
+  // Audited as an account-security event: when an operator later investigates
+  // a compromised account, "the password was changed at 14:02 by its owner"
+  // and "changed at 14:02 by someone else" are both load-bearing facts. The
+  // actor is the account itself — no admin was involved.
+  AUDIT.record(db, req.user, AUDIT.ACTIONS.USER_PASSWORD_CHANGED, `user:${req.user.id}`, null, {
+    sessions_revoked: r.sessionsRevoked,
+  });
+  res.json({ ok: true, sessions_revoked: r.sessionsRevoked });
+});
+
+app.get('/api/auth/sessions', requireAuth, (req, res) => {
+  res.json({ sessions: A.listSessions(db, req.user.id, req.token) });
+});
+
+app.delete('/api/auth/sessions/:id', requireAuth, (req, res) => {
+  // revoking the session you are calling from logs you out here; that is a
+  // legitimate "sign out this device" action, so it is not special-cased.
+  A.revokeSession(db, req.user.id, req.params.id);
+  AUDIT.record(db, req.user, AUDIT.ACTIONS.USER_SESSIONS_REVOKED, `user:${req.user.id}`, null, {
+    session: req.params.id,
+  });
+  res.json({ ok: true });
 });
 
 // ── Board ──────────────────────────────────────────────────────────────────
@@ -564,6 +608,65 @@ function slugify(name) {
   return String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
+// ── Admin: accounts ────────────────────────────────────────────────────────
+// Every route here is audited inside lib/admin.js, in the same transaction as
+// the mutation it describes — so an audit row can never exist for a change
+// that was rolled back.
+
+app.get('/api/admin/users', requireAdmin, (req, res) => {
+  res.json(
+    ADM.listUsers(db, {
+      q: req.query.q,
+      role: req.query.role,
+      status: req.query.status,
+      limit: req.query.limit,
+      offset: req.query.offset,
+    })
+  );
+});
+
+app.get('/api/admin/users/:id', requireAdmin, (req, res) => {
+  res.json({ user: ADM.userDetail(db, Number(req.params.id)) });
+});
+
+app.patch('/api/admin/users/:id', requireAdmin, (req, res) => {
+  const { status, role, reason } = req.body || {};
+  const id = Number(req.params.id);
+  // Status and role are applied in one request but as two audited actions:
+  // they are separate decisions with separate reasons, and collapsing them
+  // would lose which half the operator actually intended.
+  const applied = {};
+  if (status !== undefined) applied.status = ADM.setStatus(db, { actor: req.user, userId: id, status, reason });
+  if (role !== undefined) applied.role = ADM.setRole(db, { actor: req.user, userId: id, role, reason });
+  if (!Object.keys(applied).length) {
+    return res.status(400).json({ error: 'Provide status or role' });
+  }
+  res.json({ ok: true, ...applied });
+});
+
+app.post('/api/admin/users/:id/balance', requireAdmin, (req, res) => {
+  const { delta_cents, reason } = req.body || {};
+  res.json(
+    ADM.adjustBalance(db, {
+      actor: req.user,
+      userId: Number(req.params.id),
+      deltaCents: Number(delta_cents),
+      reason,
+    })
+  );
+});
+
+app.get('/api/admin/audit', requireAdmin, (req, res) => {
+  res.json({
+    entries: AUDIT.list(db, {
+      limit: req.query.limit,
+      target: req.query.target,
+      action: req.query.action,
+      actorId: req.query.actor_id ? Number(req.query.actor_id) : undefined,
+    }),
+  });
+});
+
 // ── SQLite error mapping ───────────────────────────────────────────────────
 // The admin catalogue INSERTs fail two ways: a client-correctable mistake
 // the schema itself rejects (duplicate slug, unknown foreign key — a
@@ -736,6 +839,13 @@ app.patch('/api/admin/markets/:id', requireAdmin, (req, res) => {
   if (!m) return res.status(404).json({ error: 'Market not found' });
   if (m.status === 'settled') return res.status(409).json({ error: 'Market is settled' });
   db.prepare('UPDATE markets SET status = ? WHERE id = ?').run(status, m.id);
+  AUDIT.record(
+    db, req.user,
+    status === 'suspended' ? AUDIT.ACTIONS.MARKET_SUSPENDED : AUDIT.ACTIONS.MARKET_RESTORED,
+    `market:${m.id}`,
+    { status: m.status }, { status },
+    (req.body || {}).reason || null
+  );
   broadcast('book', { market_id: m.id });
   res.json({ market: db.prepare('SELECT * FROM markets WHERE id = ?').get(m.id) });
 });
@@ -750,6 +860,17 @@ app.post('/api/admin/markets/:id/settle', requireAdmin, (req, res) => {
     winner_selection_id: body.winner_selection_id === undefined ? null : body.winner_selection_id,
     void: body.void === undefined ? false : body.void,
   });
+  // Settlement moves the most money of any operator action, so it is audited
+  // with the winning runner and the aggregate rather than the per-user rows —
+  // the per-user detail already lives in `settlements` and `transactions`.
+  AUDIT.record(
+    db, req.user,
+    AUDIT.ACTIONS.MARKET_SETTLED,
+    `market:${mid}`,
+    { status: 'open' },
+    { void: !!body.void, winner_selection_id: body.winner_selection_id ?? null, users_settled: result.per_user.length },
+    body.reason || null
+  );
   broadcast('book', { market_id: mid });
   broadcast('settlement', { market_id: mid });
   for (const u of result.per_user) {
@@ -868,7 +989,7 @@ function main() {
       .catch((e) => console.error('[feed] health check failed:', e.message));
   }
   const server = app.listen(config.PORT, config.HOST, () => {
-    console.log(`OpenBookmaker exchange on http://${config.HOST}:${config.PORT} (paper money only)`);
+    console.log(`OpenBettingExchange on http://${config.HOST}:${config.PORT} (paper money only)`);
   });
   // A hung SSE connection must not keep the process alive on shutdown.
   server.on('close', closeStreams);

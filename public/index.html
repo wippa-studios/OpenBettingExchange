@@ -3,8 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>OpenBookmaker — paper-money betting exchange</title>
+  <title>OpenBettingExchange — paper-money betting exchange</title>
   <link rel="icon" type="image/png" href="/assets/favicon.png" />
+  <link rel="alternate icon" type="image/x-icon" href="/assets/favicon.ico" />
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png" />
   <meta name="theme-color" content="#ffffff" />
   <link rel="preload" href="/fonts/inter-400.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="preload" href="/fonts/inter-700.woff2" as="font" type="font/woff2" crossorigin />
@@ -12,7 +14,7 @@
 </head>
 <body>
   <header>
-    <div class="logo"><img src="/assets/logo.png" alt="OpenBookmaker" /></div>
+    <div class="logo"><img src="/assets/logo.png" alt="OpenBettingExchange" /></div>
     <!-- Narrow screens: opens the race rail. In feed mode the tree is the ONLY
          navigation surface, so it cannot simply be hidden below 1000px. -->
     <button id="navToggle" aria-expanded="false" aria-controls="sidebar" aria-label="Toggle navigation rail">
@@ -32,6 +34,9 @@
     </nav>
     <div class="balance" id="balance" hidden></div>
     <div class="who" id="who"></div>
+    <!-- Account opens the password + sessions panel. Separate from authBtn so
+         signing out is never a single click away from opening a panel. -->
+    <button class="btn sm" id="accountBtn" hidden>Account</button>
     <button class="btn sm" id="authBtn">Sign in</button>
   </header>
 
@@ -60,11 +65,20 @@
   <!-- role=status + aria-live so assistive tech announces toasts passively. -->
   <div id="toast" role="status" aria-live="polite"></div>
 
-  <div id="authModal" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+  <div id="authModal" data-persist role="dialog" aria-modal="true" aria-labelledby="authTitle">
     <div class="box">
       <h3 id="authTitle">Sign in</h3>
       <label class="fieldlabel" for="authUser">Username</label>
       <input id="authUser" placeholder="username" autocomplete="username" />
+      <!-- Registration only: hidden on sign-in, where the identifier above
+           already accepts a username OR an email. -->
+      <div id="authEmailWrap">
+        <label class="fieldlabel" for="authEmail">Email <span class="muted">(optional)</span></label>
+        <input id="authEmail" type="email" placeholder="you@example.com" autocomplete="email" />
+        <p class="muted fineprint">
+          Lets you sign in with your email instead. Paper money only — nothing is ever sent to it.
+        </p>
+      </div>
       <label class="fieldlabel" for="authPass">Password</label>
       <input id="authPass" type="password" placeholder="password" autocomplete="current-password" />
       <div class="row">
@@ -74,6 +88,27 @@
       <p class="muted fineprint">
         Paper money only. Demo: <code>demo/demo123</code> · admin: <code>admin/admin123</code>
       </p>
+    </div>
+  </div>
+
+  <!-- Account: change password, and see/revoke every signed-in device. -->
+  <div id="accountModal" data-persist role="dialog" aria-modal="true" aria-labelledby="accountTitle">
+    <div class="box">
+      <h3 id="accountTitle">Account</h3>
+      <p class="muted fineprint" id="accountWho"></p>
+
+      <label class="fieldlabel" for="pwCurrent">Current password</label>
+      <input id="pwCurrent" type="password" autocomplete="current-password" />
+      <label class="fieldlabel" for="pwNew">New password</label>
+      <input id="pwNew" type="password" autocomplete="new-password" />
+      <p class="muted fineprint">6–128 characters. Changing it signs out every other device.</p>
+      <div class="row">
+        <button class="btn primary grow" id="pwGo">Change password</button>
+      </div>
+
+      <h4 class="fieldlabel adm-sub">Signed-in devices</h4>
+      <div id="sessionList" class="muted fineprint">Loading…</div>
+      <p class="muted fineprint" id="pwNote"></p>
     </div>
   </div>
 
