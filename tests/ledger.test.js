@@ -110,7 +110,7 @@ check('L7 ledger chain', () => {
   L.release(db, u.id, 100);
   L.settleUser(db, u.id, { balanceDelta: 150, frozenRelease: 300, commissionCents: 0 });
   const rows = db
-    .prepare('SELECT type, amount_cents a, balance_after b, frozen_after f FROM transactions ORDER BY id')
+    .prepare("SELECT type, amount_cents a, balance_after b, frozen_after f FROM transactions WHERE type != 'opening' ORDER BY id")
     .all()
     .map((r) => ({ type: r.type, a: r.a, b: r.b, f: r.f }));
   const expected = [
@@ -131,7 +131,7 @@ check('L8 integrity guard', () => {
     (e) => e.status === 500
   );
   assert.deepStrictEqual(balanceOf(db, u.id), { b: 1000, f: 200 }); // untouched
-  const n = db.prepare('SELECT COUNT(*) n FROM transactions').get().n;
+  const n = db.prepare("SELECT COUNT(*) n FROM transactions WHERE type != 'opening'").get().n;
   assert.strictEqual(n, 1); // only the escrow row
 });
 
@@ -140,7 +140,7 @@ check('L9 atomicity on failure', () => {
   const { db, u } = fresh();
   assert.throws(() => L.deposit(db, u.id, 200000, 100000), (e) => e.status === 400);
   assert.deepStrictEqual(balanceOf(db, u.id), { b: 1000, f: 0 });
-  assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM transactions').get().n, 0);
+  assert.strictEqual(db.prepare("SELECT COUNT(*) n FROM transactions WHERE type != 'opening'").get().n, 0);
 });
 
 // L10: walletView shape.

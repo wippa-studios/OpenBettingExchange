@@ -18,6 +18,7 @@ const ADM = require('./lib/admin');
 const AUDIT = require('./lib/audit');
 const LIMITS = require('./lib/limits');
 const RISK = require('./lib/risk');
+const PAY = require('./lib/payments');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
 // DELIBERATE demo choice (documented in .github/SECURITY.md): this app is
@@ -738,6 +739,44 @@ app.put('/api/admin/risk/bots/:id', requireAdmin, (req, res) => {
     }
   };
   wrap(req, res, next);
+});
+
+// ── Payments (Phase 3) ──────────────────────────────────────────────────────
+// The faucet route stays as-is for paper money; these are the real-money
+// seams. An intent credits nothing until confirmed — that is the whole
+// contract, and it is why these are two calls rather than one.
+app.post('/api/wallet/deposit-intent', requireAuth, (req, res, next) => {
+  PAY.openDeposit(db, req.user.id, Number((req.body || {}).amount_cents))
+    .then((r) => res.json(r))
+    .catch(next);
+});
+
+app.post('/api/wallet/deposit-intent/:id/confirm', requireAuth, (req, res) => {
+  res.json(PAY.confirmDeposit(db, Number(req.params.id)));
+});
+
+app.post('/api/wallet/withdraw', requireAuth, (req, res) => {
+  const { amount_cents, reason } = req.body || {};
+  res.json(PAY.openWithdrawal(db, req.user.id, Number(amount_cents), reason));
+});
+
+app.get('/api/admin/reconciliation', requireAdmin, (req, res, next) => {
+  PAY.reconcile(db).then((r) => res.json(r)).catch(next);
+});
+
+// Operator-facing ledger view. players_cents is the segregation figure — the
+// players' money as a number, not a promise.
+app.get('/api/admin/ledger', requireAdmin, (req, res) => {
+  const ACCT = require('./lib/accounts');
+  const seg = ACCT.segregation(db);
+  res.json({
+    segregation: seg,
+    conserved_cents: ACCT.assertConserved(db),
+    commission_cents: ACCT.balanceOf(db, ACCT.accountId(db, 'operator_commission', null)),
+    house_float_cents: ACCT.balanceOf(db, ACCT.accountId(db, 'house_float', null)),
+    gateway_clearing_cents: ACCT.balanceOf(db, ACCT.accountId(db, 'gateway_clearing', null)),
+    cache_divergent: ACCT.assertUserAgrees(db),
+  });
 });
 
 // ── SQLite error mapping ───────────────────────────────────────────────────

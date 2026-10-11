@@ -199,7 +199,9 @@ check('P8 adjustment writes ledger and audit together', () => {
   ADM.adjustBalance(db, { actor: admin, userId: alice.id, deltaCents: 2500, reason: 'goodwill credit' });
   ADM.adjustBalance(db, { actor: admin, userId: alice.id, deltaCents: -500, reason: 'correction' });
 
-  const txs = db.prepare("SELECT type, amount_cents, balance_after FROM transactions WHERE user_id=? ORDER BY id").all(alice.id);
+  // Excludes the 'opening' row written when the account was funded, so this
+  // asserts the two ADJUSTMENTS and nothing else.
+  const txs = db.prepare("SELECT type, amount_cents, balance_after FROM transactions WHERE user_id=? AND type != 'opening' ORDER BY id").all(alice.id);
   assert.strictEqual(txs.length, 2);
   assert.strictEqual(txs[0].type, 'adjust', 'NOT mislabelled as a faucet deposit');
   assert.strictEqual(txs[0].amount_cents, 2500);

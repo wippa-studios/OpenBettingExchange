@@ -112,7 +112,7 @@ check('X6 failed place is all-or-nothing', () => {
   // stake escrow (2000) exceeds the balance (500) -> the whole op must abort
   assert.throws(() => M.placeOrder(db, poor, { selection_id: sel, side: 'back', price: 2.0, stake_cents: 2000 }), /Insufficient/);
   assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM orders').get().n, 0);
-  assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM transactions').get().n, 0);
+  assert.strictEqual(db.prepare("SELECT COUNT(*) n FROM transactions WHERE type != 'opening'").get().n, 0);
   const u = db.prepare('SELECT balance_cents b, frozen_cents f FROM users WHERE id=?').get(poor.id);
   assert.deepStrictEqual({ b: u.b, f: u.f }, { b: 500, f: 0 });
   assert.strictEqual(inTransaction(), false);

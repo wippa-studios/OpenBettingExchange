@@ -62,7 +62,7 @@ const orderOf = (db, id) => {
 };
 const frozenCol = (db, id) => db.prepare('SELECT frozen_cents f FROM orders WHERE id = ?').get(id).f;
 const txsOf = (db, id) =>
-  db.prepare('SELECT type, amount_cents a FROM transactions WHERE user_id = ? ORDER BY id').all(id).map((r) => ({ type: r.type, a: r.a }));
+  db.prepare("SELECT type, amount_cents a FROM transactions WHERE user_id = ? AND type != 'opening' ORDER BY id").all(id).map((r) => ({ type: r.type, a: r.a }));
 const matchesFor = (db, marketId) =>
   db.prepare('SELECT price, stake_cents s FROM matches WHERE market_id = ? ORDER BY id').all(marketId).map((r) => ({ price: r.price, stake: r.s }));
 
@@ -101,7 +101,7 @@ check('E3 lay excess escrow released', () => {
   const b = M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.1, stake_cents: 10000 });
   // escrowed (2.1-1)*10000 = 11000; matched at 2.0 -> liability 10000; excess 1000 released
   assert.deepStrictEqual(balances(db, users.bob.id), { b: 100000, f: 10000 });
-  const txs = db.prepare("SELECT type, amount_cents a FROM transactions WHERE user_id = ? ORDER BY id").all(users.bob.id).map((r) => ({ type: r.type, a: r.a }));
+  const txs = db.prepare("SELECT type, amount_cents a FROM transactions WHERE user_id = ? AND type != 'opening' ORDER BY id").all(users.bob.id).map((r) => ({ type: r.type, a: r.a }));
   assert.deepStrictEqual(txs, [{ type: 'escrow', a: 11000 }, { type: 'release', a: 1000 }]);
   assert.deepStrictEqual(matchesFor(db, market_id), [{ price: 2.0, stake: 10000 }]);
   assert.deepStrictEqual(orderOf(db, a.id), { matched: 10000, status: 'fully_matched' });
@@ -138,7 +138,7 @@ check('E5 lay sweep lowest-first', () => {
   ]);
   // escrowed (2.1-1)*12000 = 13200; released (2.1-1.98)*10000=1200 + (2.1-2.04)*2000=120
   assert.deepStrictEqual(balances(db, users.bob.id), { b: 100000, f: 11880 });
-  const txs = db.prepare("SELECT type, amount_cents a FROM transactions WHERE user_id = ? ORDER BY id").all(users.bob.id).map((r) => ({ type: r.type, a: r.a }));
+  const txs = db.prepare("SELECT type, amount_cents a FROM transactions WHERE user_id = ? AND type != 'opening' ORDER BY id").all(users.bob.id).map((r) => ({ type: r.type, a: r.a }));
   assert.deepStrictEqual(txs, [
     { type: 'escrow', a: 13200 },
     { type: 'release', a: 1200 },
