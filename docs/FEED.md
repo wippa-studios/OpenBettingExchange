@@ -1,13 +1,13 @@
 # Odds feed
 
-OpenBookmaker can take its prices from
+OpenBettingExchange can take its prices from
 [`betfair-market-snapshots`](../betfair-market-snapshots) instead of the demo
 bots. The recorder is a separate Python service that owns the market data;
-OpenBookmaker only **reads** its Postgres database. Neither imports the other,
+OpenBettingExchange only **reads** its Postgres database. Neither imports the other,
 and neither writes to the other's tables.
 
 ```
-betfair-market-snapshots            OpenBookmaker
+betfair-market-snapshots            OpenBettingExchange
   Betfair Stream API                  lib/feed.js
         │                                  │
         ▼                                  ▼
@@ -26,7 +26,7 @@ uv run alembic upgrade head
 uv run betfair-recorder
 uv run betfair-backfill-names    # the stream carries no runner names
 
-# 2. OpenBookmaker
+# 2. OpenBettingExchange
 cp .env.example .env             # then set:
 #    FEED_ENABLED=true
 #    FEED_DATABASE_URL=postgresql://betfair:betfair@127.0.0.1:5432/betfair

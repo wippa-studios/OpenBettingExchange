@@ -1,4 +1,4 @@
-# OpenBookmaker
+# OpenBettingExchange
 
 **An open-source betting exchange** — the kind of venue where the house is a
 *fee*, not a book. Back and lay against other people, order books with real
@@ -10,7 +10,7 @@ Node 22 · Express · SQLite · zero-build frontend · **paper money only**.
 Prices can come from a live odds feed ([`docs/FEED.md`](docs/FEED.md)) or the
 built-in demo bots.
 
-![The OpenBookmaker exchange board showing a Betfair-style ladder](docs/screenshot.png)
+![The OpenBettingExchange board showing a Betfair-style ladder](docs/screenshot.png)
 
 Light house palette (white ground, black text, grey accent), Inter self-hosted
 in place of Canva Sans, brand wordmark and favicon from `assets/`. No build step
@@ -104,7 +104,7 @@ browser (public/ — plain HTML/CSS/classic JS, no build step)
 │  lib/store     schema (SQLite WAL)         lib/seed   fixtures    │
 └───────────────────────────────────────────────────────────────────┘
      ▼
-  data/openbookmaker.db   (created on first run, gitignored)
+  data/openbettingexchange.db   (created on first run, gitignored)
 ```
 
 The dependencies run one way: `match → ledger → tx`, with `settle` and
@@ -174,7 +174,7 @@ a bad value **aborts the launch** rather than failing later.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PORT` / `HOST` | `7777` / `127.0.0.1` | listener; `HOST` is loopback-only by design |
-| `DB_PATH` | `data/openbookmaker.db` | SQLite file (`:memory:` for tests) |
+| `DB_PATH` | `data/openbettingexchange.db` | SQLite file (`:memory:` for tests) |
 | `COMMISSION_RATE` | `0.025` | fee on net winnings |
 | `FAUCET_MAX_CENTS` | `100000` | faucet cap per deposit |
 | `MIN_STAKE_CENTS` / `MAX_STAKE_CENTS` | `100` / `100000` | order size bounds |

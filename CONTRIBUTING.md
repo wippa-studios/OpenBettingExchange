@@ -1,4 +1,4 @@
-# Contributing to OpenBookmaker
+# Contributing to OpenBettingExchange
 
 Thanks for looking at this. It is a small project with one hard rule: **the
 money must balance**. Everything else is negotiable; that is not.
@@ -15,8 +15,8 @@ invariant your change preserves, do not merge it.
 ## Getting set up
 
 ```bash
-git clone https://github.com/wippa-studios/OpenBookmaker.git
-cd OpenBookmaker
+git clone https://github.com/wippa-studios/OpenBettingExchange.git
+cd OpenBettingExchange
 npm install                 # express is the only runtime dependency
 cp .env.example .env        # optional; defaults are fine
 npm run seed && npm start   # http://127.0.0.1:7777

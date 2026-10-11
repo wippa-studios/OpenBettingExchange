@@ -23,7 +23,7 @@ browser (public/)
       │                    ▲                              │
       ▼                    │ broadcast()                  │ lib/tx.js
   node:sqlite (WAL) ── lib/*.js                          │ one transaction
-  data/openbookmaker.db                                  │ discipline
+  data/openbettingexchange.db                                  │ discipline
 ```
 
 There is no ORM, no migration framework and no service layer beyond `lib/`. The
