@@ -2,6 +2,10 @@
 // Run: node tests/store.test.js   (plain assert, no deps)
 'use strict';
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { DatabaseSync } = require('node:sqlite');
 const { openStore } = require('../lib/store');
 
 let passed = 0;
@@ -10,6 +14,7 @@ const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
 const TABLES = [
   'users', 'sessions', 'sports', 'competitions', 'events', 'markets', 'selections',
   'orders', 'matches', 'price_history', 'settlements', 'transactions', 'settings',
+  'audit_log',
 ];
 
 // D1: every table from the domain spec exists, and opening twice is safe.
@@ -76,6 +81,59 @@ check('D4 settlement constraints', () => {
     () => db.prepare('INSERT INTO settlements (market_id, user_id, credit_cents, commission_cents, pnl_cents) VALUES (1,?,0,-1,0)').run(u),
     /CHECK constraint failed/
   );
+});
+
+// D5: a pre-migration database gains the account columns, and `role` is
+// derived from the legacy `is_admin` boolean exactly once. If the derivation
+// re-ran on every open it would silently undo a deliberate demotion.
+check('D5 accounts migration derives role from is_admin, once', () => {
+  const p = path.join(os.tmpdir(), `ob-migrate-${process.pid}.db`);
+  fs.rmSync(p, { force: true });
+  try {
+    // The users table exactly as it was before the accounts migration.
+    const old = new DatabaseSync(p);
+    old.exec(`CREATE TABLE users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL UNIQUE,
+      pass_hash TEXT NOT NULL,
+      is_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0,1)),
+      is_bot INTEGER NOT NULL DEFAULT 0 CHECK (is_bot IN (0,1)),
+      balance_cents INTEGER NOT NULL DEFAULT 0,
+      frozen_cents INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );`);
+    old.prepare("INSERT INTO users (username, pass_hash, is_admin) VALUES ('boss','x',1)").run();
+    old.prepare("INSERT INTO users (username, pass_hash, is_admin) VALUES ('joel','x',0)").run();
+    old.close();
+
+    const db = openStore(p);
+    const rows = db.prepare('SELECT username, role, status, email FROM users ORDER BY id').all();
+    assert.strictEqual(rows[0].role, 'admin', 'is_admin=1 derives role=admin');
+    assert.strictEqual(rows[1].role, 'user');
+    assert.strictEqual(rows[0].status, 'active');
+    assert.strictEqual(rows[0].email, null);
+
+    // Demote the admin, then reopen. The derivation must NOT run again.
+    db.prepare("UPDATE users SET role='user' WHERE username='boss'").run();
+    openStore(p).close();
+    const after = openStore(p)
+      .prepare("SELECT role FROM users WHERE username='boss'").get();
+    assert.strictEqual(after.role, 'user', 'demotion survives a reopen');
+    openStore(p).close();
+  } finally {
+    for (const s of ['', '-wal', '-shm']) fs.rmSync(p + s, { force: true });
+  }
+});
+
+// D6: email identifies at most one account, while accounts without an address
+// are unrestricted — NULL must not count as a shared value.
+check('D6 email uniqueness is partial', () => {
+  const db = openStore(':memory:');
+  const ins = db.prepare('INSERT INTO users (username, pass_hash, email) VALUES (?,?,?)');
+  ins.run('a', 'h', null);
+  ins.run('b', 'h', null); // many accounts may have no address
+  ins.run('c', 'h', 'taken@example.com');
+  assert.throws(() => ins.run('d', 'h', 'taken@example.com'), /UNIQUE/);
 });
 
 console.log(`\nstore.test.js: ${passed} checks passed`);

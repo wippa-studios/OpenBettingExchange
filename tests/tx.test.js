@@ -1,6 +1,11 @@
 // tx.test.js — transaction discipline (lib/tx.js) and money-path atomicity.
 // Run: node tests/tx.test.js   (plain assert, no deps)
 'use strict';
+
+// scrypt cost: this suite creates many accounts and pays the hash once per
+// account, but asserts NOTHING about the stored hash format. auth.test.js
+// runs at the real default (SCRYPT_N=65536) and owns that coverage.
+process.env.SCRYPT_N = '16384';
 const assert = require('assert');
 const { openStore } = require('../lib/store');
 const A = require('../lib/auth');

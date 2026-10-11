@@ -1,6 +1,11 @@
 // ledger.test.js — wallet integrity: deposits, escrow/release, settlement.
 // Run: node tests/ledger.test.js   (plain assert, no deps)
 'use strict';
+
+// scrypt cost: this suite creates many accounts and pays the hash once per
+// account, but asserts NOTHING about the stored hash format. auth.test.js
+// runs at the real default (SCRYPT_N=65536) and owns that coverage.
+process.env.SCRYPT_N = '16384';
 // Hermeticity: pin the money knobs before anything loads lib/config, so an
 // ambient .env can never change what these examples assert.
 process.env.COMMISSION_RATE = '0.025';

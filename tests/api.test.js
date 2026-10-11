@@ -4,6 +4,11 @@
 // Flow: register → deposit → board → place orders → match → positions →
 //       admin settle → wallet reflects credit net of commission.
 'use strict';
+
+// scrypt cost: this suite creates many accounts and pays the hash once per
+// account, but asserts NOTHING about the stored hash format. auth.test.js
+// runs at the real default (SCRYPT_N=65536) and owns that coverage.
+process.env.SCRYPT_N = '16384';
 process.env.DB_PATH = ':memory:';
 process.env.DRIFT_ENABLED = 'false';
 process.env.BOT_ENABLED = 'false';

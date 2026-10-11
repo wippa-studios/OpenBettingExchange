@@ -44,6 +44,19 @@ check('C3 numeric validation', () => {
   assert.throws(() => load({ DRIFT_INTERVAL_MS: 10 }), /DRIFT_INTERVAL_MS/);
 });
 
+// C3b: SCRYPT_N is bounded BELOW for a reason — scrypt's cost is exponential in
+// N, so SCRYPT_N=2 would make every password trivially crackable while still
+// looking correctly formatted. The floor is the cost the pre-2.4 hashes used,
+// so any value at or above it is a strict improvement over what is stored.
+check('C3b SCRYPT_N floor and default', () => {
+  assert.strictEqual(load({}).SCRYPT_N, 65536, 'OWASP floor is the default');
+  assert.strictEqual(load({ SCRYPT_N: 16384 }).SCRYPT_N, 16384);
+  assert.strictEqual(load({ SCRYPT_N: 262144 }).SCRYPT_N, 262144);
+  for (const bad of [2, 1024, 16383, 1048577, 'abc', 1.5, -65536]) {
+    assert.throws(() => load({ SCRYPT_N: bad }), /SCRYPT_N/, String(bad));
+  }
+});
+
 // C4: booleans accept only real booleans / 'true' / 'false'.
 check('C4 boolean validation', () => {
   assert.strictEqual(load({ DRIFT_ENABLED: 'false' }).DRIFT_ENABLED, false);
@@ -57,7 +70,7 @@ check('C4 boolean validation', () => {
 check('C5 DB_PATH resolution', () => {
   assert.ok(load({ DB_PATH: ':memory:' }).DB_PATH === ':memory:');
   const c = load({ DB_PATH: 'data/x.db' });
-  assert.ok(c.DB_PATH.endsWith('/OpenBookmaker/data/x.db'), c.DB_PATH);
+  assert.ok(c.DB_PATH.endsWith('/OpenBettingExchange/data/x.db'), c.DB_PATH);
   const abs = load({ DB_PATH: '/tmp/abs.db' });
   assert.strictEqual(abs.DB_PATH, '/tmp/abs.db');
 });

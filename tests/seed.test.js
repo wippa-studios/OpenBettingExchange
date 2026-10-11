@@ -1,6 +1,11 @@
 // seed.test.js — demo seeding is idempotent, and board hygiene ages fixtures.
 // Run: node tests/seed.test.js   (plain assert, no deps)
 'use strict';
+
+// scrypt cost: this suite creates many accounts and pays the hash once per
+// account, but asserts NOTHING about the stored hash format. auth.test.js
+// runs at the real default (SCRYPT_N=65536) and owns that coverage.
+process.env.SCRYPT_N = '16384';
 // Hermeticity: pin the seeded-credential overrides to EMPTY before any lib
 // require (process env wins over a real .env file, and an empty value reads
 // as "unset" to config's secretVal) — so seeding always uses the documented
