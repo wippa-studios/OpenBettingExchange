@@ -19,7 +19,12 @@ const C = require('../lib/cashout');
 const S = require('../lib/settle');
 const REP = require('../lib/reports');
 const TEN = require('../lib/tenants');
-const config = require('/home/Joel/Desktop/OpenBettingExchange/lib/config');
+// (No absolute-path imports. This suite was generated from a scratch script, and
+// one leftover `require('/home/Joel/Desktop/OpenBettingExchange/lib/config')`
+// shipped committed. It was unused, so it was pure loss: the test passed on the
+// machine that wrote it and failed everywhere else with "Cannot find module".
+// tests/guard.test.js now asserts no source file carries a machine-absolute
+// path, so a generated test cannot pass locally and break CI again.)
 
 let n = 0;
 function book() {

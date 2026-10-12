@@ -164,5 +164,49 @@ check('G10 ledger.js genuinely owns the wallet columns', () => {
   assert.ok(writes >= 4, `expected ledger.js to write the wallet columns in several places, found ${writes}`);
 });
 
+// G11: NO SOURCE FILE MAY CARRY A MACHINE-ABSOLUTE PATH.
+//
+// This exists because one did. tests/reporting-findings.test.js was generated
+// from a scratch script under /tmp, and a leftover
+// `require('/home/Joel/Desktop/OpenBettingExchange/lib/config')` shipped
+// committed. It was unused, so locally it cost nothing and the suite was green;
+// in CI it failed with "Cannot find module '/home/Joel/Desktop/...'" and took
+// the whole Test job and the Repository-guards job red with it.
+//
+// The failure mode is what makes this worth a guard rather than a one-line fix:
+// a test that passes on the machine that wrote it and fails everywhere else. A
+// generated or copied test is exactly how that happens, and nothing in the
+// offline suite would have caught it — only CI, after a push.
+check('G11 no source or test file carries a machine-absolute path', () => {
+  const offenders = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'data') continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (!/\.(js|mjs|cjs|json)$/.test(entry.name)) continue;
+      const src = fs.readFileSync(full, 'utf8')
+        // Strip comments before matching, exactly as G4/G5 do. A comment that
+        // QUOTES the offending pattern (as this check's own note does) is
+        // documentation, not a broken require, and a guard that flags its own
+        // comment is a guard people learn to ignore.
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/^\s*\/\/.*$/gm, '');
+      // Matches an absolute path under a home directory, or any absolute
+      // require/import of a project path that is not relative.
+      const m = src.match(/(?:require\(|from\s+)["'](?:\/home\/|\/Users\/|\/root\/)[^"']*["']/g);
+      if (m) offenders.push(`${path.relative(ROOT, full)}: ${m[0]}`);
+    }
+  };
+  walk(path.join(ROOT, 'lib'));
+  walk(path.join(ROOT, 'tests'));
+  walk(path.join(ROOT, 'scripts'));
+  const srv = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  if (/(?:require\(|from\s+)["'](?:\/home\/|\/Users\/|\/root\/)[^"']*["']/.test(srv)) offenders.push('server.js');
+  assert.deepStrictEqual(offenders, [], `machine-absolute paths: ${offenders.join('; ')}`);
+});
+
 console.log(`\nguard.test.js: ${passed} checks passed`);
-if (passed < 10) { console.error('expected 10 checks'); process.exit(1); }
+if (passed < 11) { console.error('expected 11 checks'); process.exit(1); }
