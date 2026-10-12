@@ -259,6 +259,7 @@ including why a staleness guard was built and then deleted.
 | `RESULTS_FEED_SECRET` | *(unset)* | sent as `Authorization: Bearer`; warns if the URL is set without it |
 | `RESULTS_FEED_TIMEOUT_MS` | `10000` | per-poll timeout; a feed that hangs must not stall the job |
 | `RG_SESSION_MINUTES` | `0` | responsible-gambling session limit; 0 = not configured |
+| `RG_SESSION_IDLE_RESET_MINUTES` | `15` | idle gap that starts a fresh session; signing out never does |
 | `RG_REALITY_CHECK_MINUTES` | `0` | reality-check interval; 0 = not configured |
 | `RG_DEPOSIT_DAILY_CENTS` | `0` | rolling 24h deposit limit; 0 = not configured |
 | `DELAY_RELEASE_INTERVAL_MS` | `5000` | how often expired in-play delays are released into the book; 0 disables |
@@ -266,7 +267,7 @@ including why a staleness guard was built and then deleted.
 ## Development
 
 ```bash
-npm test            # 497 checks, 39 suites — unit + API integration, fully offline
+npm test            # 505 checks, 39 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 58 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code

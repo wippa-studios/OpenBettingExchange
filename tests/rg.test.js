@@ -103,29 +103,80 @@ check('G2 a session limit stops play at the limit', () => {
   }
 });
 
-// G3: THE LIMIT CANNOT BE RESET BY SIGNING IN AGAIN. This is the whole point —
-// a session limit defeated by refreshing the page is not a limit. The session
-// clock is stamped once and only cleared by signing OUT.
-check('G3 signing in again does NOT restart the session clock', () => {
-  const prev = config.RG_SESSION_MINUTES;
+// G3: THE SESSION CLOCK SURVIVES LOGOUT, and only an IDLE GAP resets it.
+//
+// This check used to assert that signing out and back in gave a fresh session —
+// which was the vulnerability, not the control. A session limit defeated by
+// signing out is not a limit, and because the clock was per-USER, one logout
+// cleared it for every OTHER live session too, with no re-login at all.
+//
+// The reset condition is now IDLE, measured from last_active_at (stamped by
+// requireAuth on real use), so signing out cannot start a new session while
+// walking away and coming back does.
+check('G3 the session clock survives logout and resets only after an idle gap', () => {
+  const prev = [config.RG_SESSION_MINUTES, config.RG_SESSION_IDLE_RESET_MINUTES];
   config.RG_SESSION_MINUTES = 60;
+  config.RG_SESSION_IDLE_RESET_MINUTES = 15;
   try {
     const f = fixture();
     RG.startSession(f.db, f.alice.id);
     age(f, { session: 61 });
     const first = RG.stateOf(f.db, f.alice.id).session_started_at;
-    // A second sign-in (what a refresh looks like to the server).
+
+    // A second sign-in (what a refresh looks like) does not touch the clock.
     RG.startSession(f.db, f.alice.id);
-    assert.strictEqual(RG.stateOf(f.db, f.alice.id).session_started_at, first, 'the clock is unchanged');
-    assert.throws(() => bet(f, f.alice), (e) => e.details.code === 'session_limit_reached', 'still limited');
-    // Signing OUT is the reset — a player who has finished should be able to
-    // come back tomorrow.
+    assert.strictEqual(RG.stateOf(f.db, f.alice.id).session_started_at, first, 'the clock is unchanged by signing in');
+
+    // Signing OUT does not clear it either — this is the fix.
     RG.endSession(f.db, f.alice.id);
-    assert.strictEqual(RG.stateOf(f.db, f.alice.id).session_started_at, null);
+    assert.strictEqual(
+      RG.stateOf(f.db, f.alice.id).session_started_at,
+      first,
+      'signing out does NOT reset the clock'
+    );
     RG.startSession(f.db, f.alice.id);
-    assert.ok(bet(f, f.alice).order.id, 'a new session plays again');
+    assert.strictEqual(RG.stateOf(f.db, f.alice.id).session_started_at, first, 'and signing straight back in does not either');
+    assert.throws(() => bet(f, f.alice), (e) => e.details.code === 'session_limit_reached', 'still limited');
+
+    // Real activity does not reset it either — that is the point of touching
+    // last_active_at rather than clearing session_started_at.
+    RG.touch(f.db, f.alice.id);
+    RG.startSession(f.db, f.alice.id);
+    assert.strictEqual(RG.stateOf(f.db, f.alice.id).session_started_at, first, 'activity keeps the clock');
+
+    // A genuine idle gap DOES start a fresh session: a player who finished for
+    // the day must be able to come back, or the limit only ratchets upward.
+    f.db.prepare("UPDATE user_rg_state SET last_active_at = datetime('now','-30 minutes') WHERE user_id = ?").run(f.alice.id);
+    const r = RG.startSession(f.db, f.alice.id);
+    assert.notStrictEqual(r.session_started_at, first, 'a 30-minute idle gap starts a new session');
+    assert.ok(r.reset_after_idle_minutes >= 15, 'and says why');
+    assert.ok(bet(f, f.alice).order.id, 'so the player can play again');
   } finally {
-    config.RG_SESSION_MINUTES = prev;
+    [config.RG_SESSION_MINUTES, config.RG_SESSION_IDLE_RESET_MINUTES] = prev;
+  }
+});
+
+// G3b: ONE logout must not clear another session's clock. Because the clock is
+// per-user, a per-session reset is the only way to be sure — and it is exactly
+// what the old `endSession` did, from any session.
+check('G3b a logout cannot clear a clock another session is still playing', () => {
+  const prev = [config.RG_SESSION_MINUTES, config.RG_SESSION_IDLE_RESET_MINUTES];
+  config.RG_SESSION_MINUTES = 60;
+  config.RG_SESSION_IDLE_RESET_MINUTES = 15;
+  try {
+    const f = fixture();
+    RG.startSession(f.db, f.alice.id);
+    age(f, { session: 61 });
+    const before = RG.stateOf(f.db, f.alice.id).session_started_at;
+    // A "second browser" logs out. Nothing about that should touch the clock.
+    RG.endSession(f.db, f.alice.id);
+    assert.strictEqual(RG.stateOf(f.db, f.alice.id).session_started_at, before, 'the clock survives');
+    assert.throws(() => bet(f, f.alice), (e) => e.details.code === 'session_limit_reached', 'and still bites');
+    // Only an explicit hard reset clears it, and no player route offers one.
+    RG.endSession(f.db, f.alice.id, { hardReset: true });
+    assert.strictEqual(RG.stateOf(f.db, f.alice.id).session_started_at, null, 'a hard reset does clear it');
+  } finally {
+    [config.RG_SESSION_MINUTES, config.RG_SESSION_IDLE_RESET_MINUTES] = prev;
   }
 });
 
@@ -171,6 +222,15 @@ check('G5 a reality check records the player own net position', () => {
     bet(f, f.alice, 2.0, 1000);
     lay(f, f.bob, 2.0, 1000);
     require('../lib/settle').settleMarket(f.db, f.marketId, { winner_selection_id: f.s1 });
+    // The check must be DUE before it can be acknowledged — the endpoint now
+    // refuses a premature one (which used to be a free reset of the clock).
+    assert.throws(
+      () => RG.acknowledgeRealityCheck(f.db, f.alice.id),
+      (e) => e.status === 409 && e.details.code === 'reality_check_not_due',
+      'acknowledging a check that is not due is refused'
+    );
+    age(f, { check: 21 });
+    assert.strictEqual(RG.realityCheckDue(f.db, f.alice.id).due, true, 'now it is due');
     const ack = RG.acknowledgeRealityCheck(f.db, f.alice.id);
     assert.strictEqual(ack.net_settled_today_cents, 1000, 'her net win is recorded');
     assert.strictEqual(ack.balance_cents, bal(f, 'alice').b, 'and her balance');
@@ -287,5 +347,182 @@ check('G10 a user with no RG state is not blocked', () => {
   }
 });
 
+// ── The seven findings from the outside review, as regressions ──────────────
+// Each of these was an EXECUTED exploit, not a theory. They are collected here
+// because every one is the same failure mode: a control enforced on one path,
+// at the wrong moment, or not at all. That is the sixth and seventh time this
+// codebase has produced one.
+
+// G11: CASH-OUT TOOK NO GATE AT ALL. assertTradeable was called from exactly
+// one place in the codebase — order placement — so a permanently self-excluded
+// account was refused on POST /api/orders and then walked out through
+// POST /api/markets/:id/cashout with the venue's money.
+check('G11 cash-out is gated exactly like placing a bet', () => {
+  const C = require('../lib/cashout');
+  const prev = [config.RG_SESSION_MINUTES, config.RG_REALITY_CHECK_MINUTES];
+  config.RG_SESSION_MINUTES = 60;
+  config.RG_REALITY_CHECK_MINUTES = 20;
+  try {
+    // A real position to cash out, or the gate is never reached.
+    const f = fixture();
+    bet(f, f.alice);
+    M.placeOrder(f.db, f.bob, { selection_id: f.s1, side: 'lay', price: 2.0, stake_cents: 1000 });
+    // The position must be worth MORE than its stake, or the plan is refused as
+    // underwater and the gate is never reached — which would make this check
+    // pass for the wrong reason. payoutsFor NETS both outcomes (+10000 if her
+    // selection wins, -10000 if it loses), so the fair price has to move in her
+    // FAVOUR: below her 2.0 bet, not above it. Moving it up makes her position
+    // underwater and the quote is correctly declined.
+    f.db.prepare('UPDATE selections SET fair_price = 1.5 WHERE id = ?').run(f.s1);
+    assert.ok(C.cashoutMarket(f.db, f.alice, f.marketId), 'a healthy player can cash out');
+
+    // Self-excluded: the gate must refuse, in the ENGINE.
+    const g = fixture();
+    bet(g, g.alice);
+    M.placeOrder(g.db, g.bob, { selection_id: g.s1, side: 'lay', price: 2.0, stake_cents: 1000 });
+    g.db.prepare('UPDATE selections SET fair_price = 1.5 WHERE id = ?').run(g.s1);
+    const before = g.db.prepare('SELECT balance_cents b FROM users WHERE username=?').get('alice').b;
+    L.exclude(g.db, { actor: null, userId: g.alice.id, until: null, reason: 'test' });
+    assert.throws(
+      () => C.cashoutMarket(g.db, g.alice, g.marketId),
+      (e) => e.status === 403 && e.details.code === 'self_excluded',
+      'a SELF-EXCLUDED account cannot cash out'
+    );
+    assert.strictEqual(
+      g.db.prepare('SELECT balance_cents b FROM users WHERE username=?').get('alice').b,
+      before,
+      'and no money moved'
+    );
+
+    // Past the session limit, and with a reality check owed: also refused.
+    for (const [label, ages] of [['session limit', { session: 61 }], ['reality check', { check: 21 }]]) {
+      const h = fixture();
+      bet(h, h.alice);
+      M.placeOrder(h.db, h.bob, { selection_id: h.s1, side: 'lay', price: 2.0, stake_cents: 1000 });
+      h.db.prepare('UPDATE selections SET fair_price = 1.5 WHERE id = ?').run(h.s1);
+      RG.startSession(h.db, h.alice.id);
+      age(h, ages);
+      assert.throws(() => C.cashoutMarket(h.db, h.alice, h.marketId), (e) => e.status === 403, `refused on the ${label}`);
+    }
+  } finally {
+    [config.RG_SESSION_MINUTES, config.RG_REALITY_CHECK_MINUTES] = prev;
+  }
+});
+
+// G12: A REALITY CHECK CANNOT BE ACKNOWLEDGED EARLY. The endpoint used to stamp
+// the clock unconditionally, so calling it whenever the player liked kept the
+// countdown permanently fresh: the gate never fired and no summary was ever
+// shown. Twenty parallel calls all returned 200.
+check('G12 acknowledging a check that is not due is refused', () => {
+  const prev = config.RG_REALITY_CHECK_MINUTES;
+  config.RG_REALITY_CHECK_MINUTES = 20;
+  try {
+    const f = fixture();
+    // The clock only starts when the player actually plays: a REFUSED
+    // acknowledgement rolls back the row it would have created, so a refused
+    // call on a virgin account leaves no trace at all — which is correct, and
+    // also why this test has to establish the clock the real way first.
+    bet(f, f.alice);
+    assert.ok(RG.stateOf(f.db, f.alice.id), 'playing establishes the clock');
+    // Not due at all.
+    assert.throws(
+      () => RG.acknowledgeRealityCheck(f.db, f.alice.id),
+      (e) => e.status === 409 && e.details.code === 'reality_check_not_due',
+      'refused when not due'
+    );
+    // One minute short of due: still refused, and the countdown is untouched.
+    age(f, { check: 19 });
+    assert.throws(() => RG.acknowledgeRealityCheck(f.db, f.alice.id), (e) => e.status === 409, 'refused just before due');
+    const stillDueIn = RG.realityCheckDue(f.db, f.alice.id).due_in_minutes;
+    assert.strictEqual(stillDueIn, 1, 'the countdown was NOT reset by the refused calls');
+    // Due: now it works, and only then.
+    age(f, { check: 21 });
+    assert.ok(RG.acknowledgeRealityCheck(f.db, f.alice.id).acknowledged_at, 'accepted when genuinely due');
+    assert.strictEqual(RG.realityCheckDue(f.db, f.alice.id).due, false, 'and the clock resets');
+  } finally {
+    config.RG_REALITY_CHECK_MINUTES = prev;
+  }
+});
+
+// G13: EXCLUSION OUTRANKS THE SESSION LIMIT, so the message an excluded player
+// sees is never "sign out and come back in". A permanently excluded account was
+// being told its session limit had been reached — advice that leads straight
+// back in, on an account that can never come back in.
+check('G13 self-exclusion is reported ahead of any session-limit message', () => {
+  const prev = [config.RG_SESSION_MINUTES, config.RG_REALITY_CHECK_MINUTES];
+  config.RG_SESSION_MINUTES = 60;
+  config.RG_REALITY_CHECK_MINUTES = 20;
+  try {
+    const f = fixture();
+    RG.startSession(f.db, f.alice.id);
+    // BOTH conditions breached, plus a cancelled resting order from exclusion.
+    L.exclude(f.db, { actor: null, userId: f.alice.id, until: null, reason: 'test' });
+    age(f, { session: 61, check: 21 });
+    assert.throws(
+      () => bet(f, f.alice),
+      (e) => e.details.code === 'self_excluded',
+      'the EXCLUSION is the answer, not the session limit'
+    );
+    assert.throws(
+      () => bet(f, f.alice),
+      (e) => !/sign out/i.test(e.message),
+      'and the message never tells an excluded player to sign out'
+    );
+  } finally {
+    [config.RG_SESSION_MINUTES, config.RG_REALITY_CHECK_MINUTES] = prev;
+  }
+});
+
+// G14: THE DEPOSIT LIMIT MUST BE ENFORCED WHERE THE MONEY LANDS. It was checked
+// when the intent was CREATED, which moves no money — so N intents each passed a
+// check that consumed nothing, and every one of them was credited. Measured: a
+// $1,000 limit and $6,000 deposited, stopped only by an unrelated venue cap.
+check('G14 the deposit limit is enforced at credit, not at intent creation', () => {
+  const prev = config.RG_DEPOSIT_DAILY_CENTS;
+  config.RG_DEPOSIT_DAILY_CENTS = 100000; // $1,000
+  try {
+    const f = fixture();
+    const PAY = require('../lib/payments');
+    // Open MANY intents, each individually under the cap. This is what defeated
+    // the control: creating an intent costs nothing, so any number of them can
+    // be opened. Inserted directly because openDeposit is async and this suite's
+    // harness is synchronous — and because the row is all the webhook path ever
+    // looks at.
+    const intents = [];
+    for (let i = 0; i < 6; i++) {
+      const r = f.db
+        .prepare("INSERT INTO payment_intents (user_id, provider, kind, amount_cents) VALUES (?, 'test', 'deposit', 100000)")
+        .run(f.alice.id);
+      intents.push({ id: Number(r.lastInsertRowid) });
+    }
+    assert.strictEqual(intents.length, 6, 'six intents, each the full cap');
+    assert.strictEqual(RG.depositedInWindow(f.db, f.alice.id), 0, 'nothing deposited yet');
+
+    // Confirm them one by one. The FIRST five are within the rolling limit; the
+    // sixth must be refused AT THE POINT OF CREDITING.
+    let credited = 0;
+    let refused = 0;
+    for (const intent of intents) {
+      try {
+        PAY.confirmDeposit(f.db, intent.id, { settled: true });
+        credited++;
+      } catch (e) {
+        if (e.status === 403 && e.details && e.details.code === 'deposit_limit_reached') refused++;
+        else throw e;
+      }
+    }
+    assert.strictEqual(credited, 1, 'only ONE deposit is credited');
+    assert.strictEqual(refused, 5, 'the rest are refused at credit');
+    assert.strictEqual(RG.depositedInWindow(f.db, f.alice.id), 100000, 'the window holds exactly the cap');
+    assert.strictEqual(
+      f.db.prepare('SELECT balance_cents b FROM users WHERE username=?').get('alice').b,
+      100000 + 100000,
+      'the player received exactly one capped deposit'
+    );
+  } finally {
+    config.RG_DEPOSIT_DAILY_CENTS = prev;
+  }
+});
+
 console.log(`\nrg.test.js: ${passed} checks passed`);
-if (passed < 10) { console.error('expected 10 checks'); process.exit(1); }
+if (passed < 15) { console.error('expected 15 checks'); process.exit(1); }

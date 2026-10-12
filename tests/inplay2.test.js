@@ -34,6 +34,8 @@ const M = require('../lib/match');
 const IP = require('../lib/inplay');
 const acc = require('../lib/accounts');
 const S = require('../lib/settle');
+const L = require('../lib/limits');
+const LIMITS = L;
 
 let passed = 0;
 const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
@@ -367,5 +369,111 @@ check('D14b a market that went through a release pass can still settle', () => {
   assert.deepStrictEqual(acc.assertUserAgrees(f.db), []);
 });
 
+// D15: THE RELEASE PASS MUST HONOUR THE SAME ABUSE CONTROL THE TAKER PATH
+// DOES. It was the only sweep that never consulted LIMITS.matchingAllowed, so a
+// player at their daily net-settlement cap was blocked pre-match and released
+// anyway in-play — the cap defeated by choosing an in-play market.
+//
+// The property is PARITY with the taker path, and stating it precisely matters.
+// `matchingAllowed` governs whether a user may be the AGGRESSOR (sweep). It has
+// never governed whether their resting order can be matched by somebody else —
+// that is identical pre-match and in-play, so an assertion of "nothing filled
+// at all" would be testing something the control has never claimed.
+//
+// What the release path must NOT do is RELEASE a capped user's order. And when
+// it declines, it must leave eligible_at alone: clearing it drops the order out
+// of the delayed set, and NULL means "immediately eligible", so the refusal
+// would hand the order straight to the next taker.
+check('D15 the release pass applies the same aggressor cap as the taker path', () => {
+  const f = fixture();
+  const capAt = (cents) =>
+    L.setLimits(f.db, { actor: { id: f.alice.id, role: 'user' }, userId: f.alice.id, scope: 'global', max_daily_settled_cents: cents });
+
+  // A SINGLE order, with no counterparty. The pass releases an order INTO the
+  // book whether or not it fills, so "was it released" is observable without a
+  // second player sweeping it first — which is what made an earlier version of
+  // this check untestable: bob's own release consumed alice's order and
+  // "released" then counted the wrong thing.
+  //
+  // ── Control: uncapped, the order IS released ────────────────────────────
+  // Proven FIRST, so the assertions below cannot pass merely because the pass
+  // is doing nothing — the usual failure mode of a "the control works" test.
+  const control = fixture();
+  goInPlay(control, 60000);
+  order(control, control.alice, { price: 2.0, stake_cents: 2000 });
+  expireAll(control);
+  const okRun = M.releaseEligibleOrders(control.db);
+  assert.ok(okRun.released >= 1, 'CONTROL: an uncapped order is released');
+  assert.strictEqual(
+    control.db.prepare('SELECT eligible_at FROM orders WHERE user_id = ?').get(control.alice.id).eligible_at,
+    null,
+    'and leaves the delayed set'
+  );
+
+  // ── Capped: the order is NOT released, and keeps its delay ─────────────
+  capAt(0);
+  assert.strictEqual(LIMITS.assertTradeable(f.db, f.alice), undefined, 'the account itself may still trade');
+  assert.strictEqual(LIMITS.matchingAllowed(f.db, f.alice.id, f.marketId), false, 'but may not sweep');
+  goInPlay(f, 60000);
+  order(f, f.alice, { price: 2.0, stake_cents: 2000 });
+  expireAll(f);
+  const run = M.releaseEligibleOrders(f.db);
+  assert.strictEqual(run.released, 0, 'the capped order is NOT released');
+  assert.strictEqual(run.skipped, 1, 'it is reported as skipped');
+  // THE KEY PROPERTY. A refusal must not consume the delay: clearing
+  // eligible_at drops the order out of the delayed set, and NULL means
+  // immediately eligible — so the next taker takes it and the cap was a no-op.
+  assert.ok(
+    f.db.prepare('SELECT eligible_at FROM orders WHERE user_id = ?').get(f.alice.id).eligible_at,
+    'and the delay SURVIVES the refusal, so a later pass can still match it'
+  );
+  assert.strictEqual(f.db.prepare('SELECT status FROM orders WHERE user_id = ?').get(f.alice.id).status, 'open');
+
+  // ── Lift the cap and it releases, on the same order, with no re-dating ──
+  capAt(1000000);
+  assert.strictEqual(LIMITS.matchingAllowed(f.db, f.alice.id, f.marketId), true, 'cap lifted');
+  const run2 = M.releaseEligibleOrders(f.db);
+  assert.strictEqual(run2.released, 1, 'and the pass then releases it');
+  assert.strictEqual(
+    f.db.prepare('SELECT eligible_at FROM orders WHERE user_id = ?').get(f.alice.id).eligible_at,
+    null,
+    'clearing the delay only once it is genuinely released'
+  );
+  assert.strictEqual(acc.assertConserved(f.db), 0);
+  assert.deepStrictEqual(acc.assertUserAgrees(f.db), []);
+});
+
+// D15b: A SUSPENSION MUST NOT CONSUME THE BET DELAY. The pass used to clear
+// eligible_at before its gates, so every order that came due while a market was
+// suspended — the routine case being a feed outage — silently lost its delay
+// forever and then matched with no delay of its own. Skipping the sweep is not
+// the same as removing the protection.
+check('D15b a suspension does not strip the bet delay from a due order', () => {
+  const f = fixture();
+  goInPlay(f, 60000);
+  order(f, f.alice, { side: 'lay', price: 2.0, stake_cents: 2000 });
+  const bob = order(f, f.bob, { price: 2.0, stake_cents: 2000 });
+  const before = bob.order.eligible_at;
+  assert.ok(before, 'the order carries a delay');
+
+  // The market goes down (a feed outage) and the delay expires while it is down.
+  IP.setSuspended(f.db, { marketId: f.marketId, suspended: true, reason: 'feed outage' });
+  expireAll(f);
+  const run = M.releaseEligibleOrders(f.db);
+  assert.strictEqual(run.filled, 0, 'nothing is released into a suspended market');
+  assert.ok(
+    f.db.prepare('SELECT eligible_at FROM orders WHERE id = ?').get(bob.order.id).eligible_at,
+    'THE DELAY SURVIVES the suspension — it was not consumed'
+  );
+
+  // Lift the suspension: the order releases, and still honours its own price.
+  IP.setSuspended(f.db, { marketId: f.marketId, suspended: false });
+  const run2 = M.releaseEligibleOrders(f.db);
+  assert.ok(run2.filled > 0, 'and releases once the market trades again');
+  const fills = f.db.prepare('SELECT price FROM matches').all();
+  for (const row of fills) assert.strictEqual(row.price, 2.0, 'at its own price, never a better one');
+  assert.strictEqual(acc.assertConserved(f.db), 0);
+});
+
 console.log(`\ninplay2.test.js: ${passed} checks passed`);
-if (passed < 15) { console.error('expected 15 checks'); process.exit(1); }
+if (passed < 17) { console.error('expected 17 checks'); process.exit(1); }

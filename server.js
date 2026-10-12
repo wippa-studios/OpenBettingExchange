@@ -179,13 +179,56 @@ app.use((req, res, next) => {
   next();
 });
 
+// The first-run credential lock, defined ONCE and called from the auth gate.
+//
+// It used to be an app.use() registered after most of the routes, on the
+// reasoning that "a route added later is covered by default". That is false for
+// any route registered EARLIER — /api/stream, registered some 350 lines above
+// the middleware, answered 200 to a locked account. The design goal was "no
+// per-route list", and a middleware's position in the file is exactly such a
+// list, maintained by accident.
+//
+// Checking it inside requireAuth/requireAdmin makes placement irrelevant: any
+// route that authenticates is covered, and a new one cannot forget.
+function firstRunLockResponse(req, res) {
+  if (!mustChangePassword(req.user)) return false;
+  res.status(403).json({
+    error: 'Change your password before using the exchange',
+    details: {
+      code: 'password_change_required',
+      username: req.user.username,
+      // Named so a fresh demo deployment shows the operator what to change.
+      seeded_password: req.user.username === 'admin' ? 'admin123' : 'demo123',
+    },
+  });
+  return true;
+}
+
 function requireAuth(req, res, next) {
   if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+  // Stamp RG activity on real use. The session clock is reset only after an
+  // IDLE gap measured from this, so signing out cannot start a new session —
+  // see lib/rg.js.
+  try {
+    if (Number(config.RG_SESSION_MINUTES || 0) > 0) RG.touch(db, req.user.id);
+  } catch {
+    // An RG bookkeeping failure must never refuse a request; the gate is
+    // authoritative, this is only the idle timer.
+  }
+  if (firstRunLockResponse(req, res)) return;
   next();
 }
 
 function requireAdmin(req, res, next) {
   if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+  try {
+    if (Number(config.RG_SESSION_MINUTES || 0) > 0) RG.touch(db, req.user.id);
+  } catch {
+    /* idle timer only */
+  }
+  // Same first-run lock as requireAuth, for the same reason: the guarantee must
+  // not depend on where a route happens to be registered.
+  if (firstRunLockResponse(req, res)) return;
   // role is authoritative. The `|| req.user.is_admin` is the same legacy
   // tolerance sanitizeUser applies: a session minted before the accounts
   // migration may carry a row whose role column has not been read yet.
@@ -231,6 +274,14 @@ const clients = new Set();
 const MAX_SSE_CLIENTS = Number(config.MAX_SSE_CLIENTS || 2000);
 
 app.get('/api/stream', (req, res) => {
+  // The first-run lock, explicitly. This route uses OPTIONAL auth — a signed-out
+  // viewer gets an anonymous stream — so it never passes through requireAuth,
+  // and the middleware that used to enforce the lock sat 350 lines BELOW this
+  // registration and therefore did not apply. A locked account got a live
+  // stream. The lock check now lives in requireAuth/requireAdmin so placement
+  // cannot matter, and this one route keeps an explicit call because optional
+  // auth is genuinely a different case, not an oversight.
+  if (req.user && firstRunLockResponse(req, res)) return;
   if (clients.size >= MAX_SSE_CLIENTS) return res.status(503).json({ error: 'Too many concurrent streams' });
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',

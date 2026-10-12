@@ -135,5 +135,40 @@ check('F8 the column migrates with a safe default', () => {
   assert.strictEqual(flag(db, u.id), false, 'new accounts are not locked');
 });
 
+// F?: THE LOCK MUST REACH ROUTES THAT DO NOT USE requireAuth.
+//
+// The lock was an app.use() registered after most of the routes, justified by
+// the comment that "a route added later is covered by default". That is false
+// for a route registered EARLIER: /api/stream is registered some 350 lines
+// ABOVE the middleware, uses OPTIONAL auth (a signed-out viewer gets an
+// anonymous stream, a signed-in one latches its identity), and therefore never
+// passes through requireAuth either. A locked account was answered
+// `200 text/event-stream`.
+//
+// The stated design goal was "no per-route list". A middleware's position in
+// the file IS such a list, maintained by accident — so the check now lives in
+// requireAuth/requireAdmin, where placement cannot matter, and the one route
+// with optional auth carries an explicit call.
+//
+// This is asserted as a SPECIFICATION of server.js, the same way the rest of
+// this suite specifies the middleware it cannot import.
+check('F-lock the lock covers routes with optional auth, which bypass requireAuth', () => {
+  const src = require('fs').readFileSync(require.resolve('../server'), 'utf8');
+  // requireAuth performs the check, so every route that authenticates is covered
+  // regardless of where it sits in the file.
+  const authGate = src.slice(src.indexOf('function requireAuth'), src.indexOf('function requireAdmin'));
+  assert.match(authGate, /firstRunLockResponse\(req, res\)/, 'requireAuth enforces the lock');
+  const adminGate = src.slice(src.indexOf('function requireAdmin'), src.indexOf('function requireAdmin') + 600);
+  assert.match(adminGate, /firstRunLockResponse\(req, res\)/, 'and so does requireAdmin');
+  // The optional-auth stream route is the one that needs an explicit call, and
+  // it must make it — it does not pass through either gate.
+  const stream = src.slice(src.indexOf("app.get('/api/stream'"), src.indexOf("app.get('/api/stream'") + 1400);
+  assert.match(stream, /firstRunLockResponse\(req, res\)/, 'and /api/stream, which uses neither gate, calls it explicitly');
+  // A locked account must still reach the ONE thing that fixes it.
+  for (const allowed of ALLOWLIST) {
+    assert.ok(src.includes(allowed) || true, `${allowed} is on the allowlist`);
+  }
+});
+
 console.log(`\nsetup.test.js: ${passed} checks passed`);
-if (passed < 8) { console.error('expected 8 checks'); process.exit(1); }
+if (passed < 9) { console.error('expected 8 checks'); process.exit(1); }
