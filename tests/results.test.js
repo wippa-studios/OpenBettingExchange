@@ -68,8 +68,10 @@ const status = (db, id) => db.prepare('SELECT status, settlement_hold, hold_reas
 check('V1 abandoned after a red card is void in football but settles elsewhere', () => {
   const sig = { status: 'abandoned', red_card: true };
   assert.strictEqual(VR.resolve('football', sig).decision, VR.VOID);
-  // No rule for a red card in greyhound -> HELD, not guessed.
-  const g = VR.resolve('greyhound', sig);
+  // No rule for a red card in greyhound racing -> HELD, not guessed. The slug
+  // is the SEEDED one (plural); the table used to be keyed on the singular,
+  // which meant every greyhound outcome hit the unknown-sport VOID default.
+  const g = VR.resolve('greyhounds', sig);
   assert.strictEqual(g.decision, VR.HOLD, 'an unspecified case is held, not invented');
   // Abandoned WITHOUT a red card settles at the point of abandonment —
   // and needs a winner, because there is nothing to settle without one.
@@ -204,15 +206,52 @@ check('R6 a winner outside the market is held, not settled', () => {
   assert.strictEqual(status(f.db, f.marketId).status, 'open');
 });
 
-// R7: multiple winners are HELD. This engine settles one selection; a dead
-// heat pays joint favourite, which is not modelled — settling one would
-// strand the other.
-check('R7 multiple winners are held rather than half-settled', () => {
+// R7: multiple winners SETTLE AS A JOINT FAVOURITE. This test used to assert
+// they were HELD, and that was correct at the time: the engine settled exactly
+// one selection, so paying one winner would strand the other. It has the model
+// now — a winner SET with the payout divided — and holding a dead heat forever
+// is its own failure: the operator's only exit was to VOID, which pays nobody,
+// underpaying the winners and overcharging their layers.
+check('R7 multiple winners settle as a joint favourite, not a half-settlement', () => {
   const f = fixture();
   bet(f);
   const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', winners: [f.s1, f.s2] });
+  assert.strictEqual(r.outcome, 'settled', 'a dead heat settles');
+  const m = f.db.prepare('SELECT dead_heat d, joint_winners j, winner_selection_id w FROM markets WHERE id = ?').get(f.marketId);
+  assert.strictEqual(m.d, 1, 'recorded as a dead heat');
+  assert.strictEqual(m.w, null, 'not a single-winner settlement');
+  assert.deepStrictEqual(JSON.parse(m.j).sort((a, b) => a - b), [f.s1, f.s2].sort((a, b) => a - b));
+  assert.strictEqual(acc.assertConserved(f.db), 0, 'and the books balance');
+});
+
+// R7b: a dead heat that names only ONE joint winner is not a dead heat — it is
+// an ordinary finish, and halving a full payout would be a rules error. This
+// uses a HORSE-RACING fixture, because the sport table is per sport and
+// football has no dead_heat rule at all (so it holds for a different, also
+// correct, reason — see R7c).
+check('R7b a dead heat naming one winner is held, not halved', () => {
+  const f = fixture('horse_racing', 4.0); // the SEEDED slug, underscored
+  bet(f);
+  const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', dead_heat: true, winners: [f.s1] });
   assert.strictEqual(r.outcome, 'held');
-  assert.ok(/multiple winners/.test(r.reason));
+  // Both underspecified-dead-heat guards (the rule table's, and the one in
+  // applyOutcome for names filtered out as foreign) use the same wording, so
+  // this one assertion covers both.
+  assert.ok(/at least two joint winners/i.test(r.reason), `reason: ${r.reason}`);
+  assert.strictEqual(status(f.db, f.marketId).status, 'open', 'the market is untouched');
+  assert.strictEqual(acc.assertConserved(f.db), 0, 'and nothing moved');
+});
+
+// R7c: a dead heat in a sport with NO dead-heat rule is held, not settled on
+// the sport's `completed` rule. The rule table is per sport for a reason: a
+// football abandonment after a red card voids, a racing one settles.
+check('R7c a dead heat in a sport without that rule is held', () => {
+  const f = fixture('football');
+  bet(f);
+  const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', dead_heat: true, winners: [f.s1, f.s2] });
+  assert.strictEqual(r.outcome, 'held');
+  assert.ok(/no rule for/i.test(r.reason), `reason: ${r.reason}`);
+  assert.strictEqual(status(f.db, f.marketId).status, 'open');
 });
 
 // R8: a poll cycle settles what the feed reports and ignores what it does not.

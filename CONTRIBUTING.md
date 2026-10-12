@@ -30,7 +30,7 @@ Sign in as `demo` / `demo123`, or `admin` / `admin123` for the trading desk.
 ## Before you open a pull request
 
 ```bash
-npm test            # 419 checks: unit + API integration, fully offline
+npm test            # 435 checks: unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 58 checks: real Chromium via Playwright (frontend changes)
 ```

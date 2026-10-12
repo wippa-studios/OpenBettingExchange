@@ -422,7 +422,7 @@ conversation.
 ## 6. Immediate next actions
 
 Reassessed after Phases 1–4, the follow-on work, and the first outside
-review of the money path. The suite is now **419 checks across 33 suites**,
+review of the money path. The suite is now **435 checks across 35 suites**,
 plus a live smoke script and a 71-check browser suite, all green.
 
 ### Recently completed since the first plan
@@ -475,13 +475,26 @@ plus a live smoke script and a 71-check browser suite, all green.
 4. **Trading-side split of the results feed.** `lib/results.js` consumes an
    injected `fetchResults`; wiring it to the odds recorder in `lib/feed.js` or
    a provider webhook is the remaining transport choice.
-5. **Dead-heat / joint-favourite settlement.** Held today, correctly, because
-   the engine settles exactly one selection. Needs a settlement-shape change.
+5. ~~Dead-heat / joint-favourite settlement.~~ ✅ The engine now settles a
+   winner SET. What divides is the PAYOUT (the liability shared n ways) and
+   each side still returns its own collateral in full, so nobody's escrow is
+   stranded; the share is FLOORED so splitting a win into many small matches
+   cannot harvest the rounding — the same arbitrage the audit found in
+   commission. `voidrules` settles a named dead heat and still HOLDS one that
+   names fewer than two joint winners.
 6. **Responsible gambling surface.** Age verification, reality checks, session
    limits. Self-exclusion ships and is wired to the engine; the rest does not,
    and the product should not be deployable to an operator who has not
    configured it.
-
+7. **The rule table and the seed must agree.** Found while building dead-heat
+   settlement, and it was silently VOIDING MONEY: the seed creates
+   `greyhounds` while the table was keyed `greyhound`, and `basketball` was
+   seeded with no rule set at all. Both fell through the unknown-sport default
+   to VOID, so a finished greyhound race and a finished NBA game paid NOBODY —
+   winners got nothing, layers kept the pot, and the books still balanced
+   perfectly, because conservation cannot tell you a settled market paid the
+   wrong person. `tests/rules-consistency.test.js` now makes the table/seed
+   agreement an invariant rather than a convention.
 ### The verification gap — DISCHARGED
 
 An outside review of the money path ran (a fresh reviewer with no prior

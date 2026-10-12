@@ -1445,9 +1445,14 @@ app.post('/api/admin/markets/:id/settle', requireAdmin, limit('admin'), (req, re
   // Pass the caller's values through UNCHANGED: lib/settle.js validates
   // strictly (a string "false" must not void a market, a boolean must not
   // become selection id 1). No coercion happens here on purpose.
+  // dead_heat is the SET of joint winners; it settles like a win with the
+  // payout divided among them. Validation is in lib/settle.js, as with the
+  // single-winner path — this route passes values through unchanged so a
+  // coerced boolean or a string id cannot pick an outcome.
   const result = SET.settleMarket(db, mid, {
     winner_selection_id: body.winner_selection_id === undefined ? null : body.winner_selection_id,
     void: body.void === undefined ? false : body.void,
+    dead_heat: body.dead_heat === undefined ? null : body.dead_heat,
   });
   // Settlement moves the most money of any operator action, so it is audited
   // with the winning runner and the aggregate rather than the per-user rows —
