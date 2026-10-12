@@ -24,7 +24,7 @@ An inventory, so the plan is grounded rather than generic.
 | Cash-out | `lib/cashout.js` | green-up close, hedge scaled `1/n`, own-liquidity correctly excluded |
 | Tick ladder | `lib/odds.js` | Betfair increments, American/fractional/implied, overround |
 | Odds feed client | `lib/feed.js` | board/nav contract from a Postgres recorder, staleness reporting |
-| Test suite | `tests/` | 17 suites, hand-computed money rules, smoke + Playwright |
+| Test suite | `tests/` | 43 suites, hand-computed money rules, smoke + Playwright |
 
 **The property worth protecting:** settlement solvency is structural, not
 defensive. Every match is collateralised on both sides, so there is no
@@ -472,7 +472,7 @@ conversation.
 ## 6. Immediate next actions
 
 Reassessed after Phases 1–4, the follow-on work, and the first outside
-review of the money path. The suite is now **544 checks across 36 suites**,
+review of the money path. The suite is now **544 checks across 43 suites**,
 plus a live smoke script and a 71-check browser suite, all green.
 
 ### Recently completed since the first plan

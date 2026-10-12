@@ -86,8 +86,9 @@ npm start         # http://127.0.0.1:7777
 | Admin trading desk: catalogue, suspend/restore, settle, stats, overround | working |
 | Live updates | working (SSE with a 15s poll fallback) |
 | Results feed: transport, per-sport void rules, disputes held not guessed, provenance, manual release | working (transport needs `RESULTS_FEED_URL`) |
-| Betfair odds recorder integration | **display only** — feed markets are not tradeable (see below) |
-| In-play: suspension, enforced bet delay, kick-off hold, traded volume | working |
+| Betfair feed integration ([OpenBettingExchangeDataFeed](https://github.com/wippa-studios/OpenBettingExchangeDataFeed)) | **display only** — feed markets are not tradeable (see below) |
+| **Pre-off only** — bets and cash-out close at the event's off time | working (`lib/offtime.js`) |
+| In-play betting | **withdrawn** — see [EXCHANGE_RULES.md](docs/EXCHANGE_RULES.md#pre-off-only) |
 | Dead heat / joint favourite settlement | working |
 | Reporting: financial summary with self-check, player statements, volume, commission, operational | working (`/api/admin/reports/*`, CSV or `?format=json`) |
 | Session limit, reality check, deposit limit | working, operator-configured (0 = off, boot warns) |
@@ -134,7 +135,7 @@ browser (public/ — plain HTML/CSS/classic JS, no build step)
 
 The dependencies run one way: `match → ledger → tx`, with `settle` and
 `cashout` on top of `match`. There is no ORM, no migration tool, and no runtime
-dependency beyond Express and `pg` (the odds feed's recorder client — Playwright
+dependency beyond Express and `pg` (the feed's Postgres client — Playwright
 is dev-only, for the browser suite) — the
 data model is one readable SQL file of 24 tables. Read
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the reasoning.
@@ -213,16 +214,22 @@ a bad value **aborts the launch** rather than failing later.
 | `COMMISSION_RATE` | `0.025` | fee on net winnings |
 | `FAUCET_MAX_CENTS` | `100000` | faucet cap per deposit |
 | `MIN_STAKE_CENTS` / `MAX_STAKE_CENTS` | `100` / `100000` | order size bounds |
-| `FEED_ENABLED` | `false` | show the odds feed alongside the board — **display only, see below** |
-| `FEED_DATABASE_URL` | — | recorder Postgres URL; required when the feed is on |
+| `FEED_ENABLED` | `false` | read fixtures and prices from the feed — **display only, see below** |
+| `FEED_DATABASE_URL` | — | the feed collector's Postgres URL; required when the feed is on |
+
+Betfair credentials are **not** configured here. They are entered in the admin
+dashboard per tenant, encrypted at rest, and passed to the collector as
+environment variables — the exchange never writes a `.env`. See
+[docs/FEED.md](docs/FEED.md).
 
 ### The odds feed is display only
 
-With `FEED_ENABLED=true` the board shows live prices from the Betfair recorder,
+With `FEED_ENABLED=true` the board shows real fixtures and prices from the
+[feed collector](https://github.com/wippa-studios/OpenBettingExchangeDataFeed),
 but **those markets cannot be bet on**, and this is enforced by the engine, not
 just by the client:
 
-- a feed market has no row in this venue's database — the recorder's catalogue
+- a feed market has no row in this venue's database — the collector's catalogue
   lives in its own Postgres — so naming a feed selection id is a `404`, refused
   before any collateral is taken;
 - the client refuses too, and says "Feed markets are display-only".

@@ -195,6 +195,33 @@ commission and nothing else. This is asserted end-to-end in `tests/smoke.sh`
 *Tests:* `tests/settle.test.js` (S1–S20), `tests/smoke.sh` (conservation),
 `tests/api.test.js` (settled market frozen).
 
+### Dead heats and joint favourites
+
+Where a sport's rules permit a joint favourite — horse racing, for example — a
+dead heat **settles**: the payout is divided among the joint winners at
+`floor(liability / n)`, and each side returns its own collateral in full.
+
+The division is on the **payout**, not the stake. Dividing the stake was tried
+and rejected — it strands escrow, because the two joint winners' stakes are not
+equal in general.
+
+Two rules matter more than the arithmetic:
+
+- **The rules table decides, not the signal.** A multi-winner outcome is only
+  *evidence* that something happened. Whether a sport pays a joint favourite is
+  the per-sport rule. A two-winner signal on football — a sport with no dead
+  heats — is **held for review**, because paying a joint favourite there would
+  halve every backer's payout with no human in the loop.
+- **A dead heat naming only one winner is not a dead heat**, and is held.
+
+The human release path can express a dead heat too. A market held because a dead
+heat was *disputed* is exactly the case a hold exists for, and releasing it as a
+single runner — the only option the release route used to offer — paid one
+person a whole stake and charged another's backer his entire stake on a horse
+that tied.
+
+*Tests:* `tests/results.test.js` (R7, R7a, R7b, R7c), `tests/settle.test.js`.
+
 ## Commission
 
 A single rate (`COMMISSION_RATE`, default 2.5%) charged on **net winnings per
@@ -319,6 +346,73 @@ paid a quote for a position they no longer hold.
 *Tests:* `tests/cashout.test.js` (contract), `tests/cashout2.test.js`
 (valuation, multi-runner, no double settlement, counterparty safety).
 
+## Pre-off only
+
+> **Bets may only be placed before an event's off time. Cash-out closes at off
+> with them.**
+
+An in-play price is a *forecast* of a future event, while the venue's book is
+people reacting to what they can see right now — a goal, a red card, a runner
+breaking. If the venue publishes prices instantly and the book reacts in 200ms,
+the venue is **systematically slower than its own liquidity**, and anyone with a
+low-latency feed trades the delay rather than the football. Every real venue
+delays in-play prices for exactly this reason. Removing in-play removes that
+whole class of sharp instead of trying to manage it.
+
+### What the gate does
+
+`lib/offtime.js` closes two things, at `events.starts_at`:
+
+| | |
+|---|---|
+| **Placing an order** | `409` at or after off — refused *before* any collateral is frozen |
+| **Cash-out** | `409` at or after off |
+
+Both are enforced **in the engine**, not in the routes, so a future caller cannot
+forget. A route-only gate is a dead control.
+
+### Why cash-out is part of it
+
+This is the part that is easy to get wrong. Banning in-play *betting* while
+leaving cash-out open through the event would have kept in-play **risk**: the
+venue still owes money on a position whose fair price just moved on a goal. That
+is the exact exposure `lib/inplay.js` exists to contain. Both are now closed at
+off.
+
+### Details that matter
+
+- **Off is inclusive.** The instant of off is closed. "Up to and including the
+  off" would leave a zero-width window and a clock-skew argument about who got in
+  first.
+- **A missing or unparseable off time is treated as CLOSED** (fail-closed). A bad
+  catalogue row must never be read as "no off ⇒ open forever", or one malformed
+  row silently re-opens in-play trading.
+- **Every accepted datetime format resolves to the same UTC instant.**
+  `Date.parse` reads a zoneless `2030-01-01T12:00:00` as **local** time, while
+  SQLite's `datetime('now')` — used by every timestamp in this system — is UTC.
+  An off time written in that form would shift with the server's timezone, and
+  the venue would open or close betting at the wrong wall-clock moment.
+- **The gate reads the off time, not the event status.** `status` is metadata; a
+  market still flagged `upcoming` whose off time has passed is closed.
+- **One source of truth.** `events.starts_at` — already required and already
+  ISO-validated on admin create, and exactly what the feed publishes. There is no
+  second column for the two to disagree about.
+
+### What it does *not* do
+
+- It does **not** settle anything at off. At off, exposure is *frozen*: every
+  matched stake stands until the result arrives. Nothing is auto-voided or
+  auto-laid.
+- It does **not** withdraw a cash-out quote issued pre-off. A quote priced
+  pre-off stays valid until off; execution at or after off is refused.
+
+`lib/inplay.js` and `orders.eligible_at` remain in the tree — they are tested, and
+`eligible_at` is the only mechanism that could carry the gate if in-play is ever
+revisited — but neither has a caller driving an in-play suspension now. See
+[ROADMAP.md](ROADMAP.md).
+
+---
+
 ## Markets, events and lifecycle
 
 ```
@@ -373,11 +467,14 @@ Listed so nobody mistakes a scope decision for a bug:
 
 - **Accumulators / parlays.** One selection per order.
 - **Each-way betting.** Win markets only.
-- **In-play bet delay, partial-fill queueing, cross-market matching.** A taker
-  takes resting liquidity immediately and then rests its remainder.
-- **Dead-heat joint-favourite settlement.** A dead heat is **held** rather than
-  settled on one runner, because this engine settles exactly one selection and
-  paying joint favourite is a settlement-shape change.
+- **In-play betting.** Withdrawn — the venue is pre-off only. See
+  [Pre-off only](#pre-off-only).
+- **Partial-fill queueing, cross-market matching.** A taker takes resting
+  liquidity immediately and then rests its remainder.
+- **Dead heats in sports with no dead-heat rule.** The engine *can* divide a
+  payout among joint winners, but only where the sport's rules permit one. A
+  multi-winner signal under a single-winner rule is **held**, not settled as a
+  joint favourite.
 - **Real money.** No PSP is integrated — the payments machinery ships but
   terminates in a reference provider that moves no money. No KYC/AML, no age
   verification, no licensing path, and the seeded bot's fair prices are a
