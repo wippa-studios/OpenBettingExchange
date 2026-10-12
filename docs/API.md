@@ -173,6 +173,120 @@ the client refetches on every event (a 15s poll is the fallback).
 
 ---
 
+## Feed (read-only; requires `FEED_ENABLED=true`)
+
+The Betfair feed serves a *reference board* from the collector's PostgreSQL.
+Feed markets are **display only** — they have no row in this venue's database,
+so naming a feed selection id on `POST /api/orders` is a `404`, refused before
+any collateral is taken. See [`FEED.md`](FEED.md).
+
+All four answer `409` when the feed is disabled and `503` when the collector's
+database is unreachable.
+
+### `GET /api/feed/board?limit=60`
+
+The board list, newest book first. `limit` is clamped to `[1, 500]` and counts
+**markets**, not rows. `200` →
+
+```jsonc
+{
+  "markets": [
+    {
+      "market_id": "1.262760123",
+      "event_id": "33696285",
+      "event_name": "Famalicao v Alverca",
+      "sport_slug": "soccer",
+      "competition_name": "Portuguese Primeira Liga",
+      "country_code": "PT",
+      "market_name": "Over/Under 3.5 Goals",
+      "market_type_code": "OVER_UNDER_35",
+      "status": "OPEN",
+      "start_time": "2026-10-12T19:15:00.000Z",
+      "in_play": false,
+      "age_seconds": 3693,          // OUR poll age — not the age of the data
+      "stale": false,
+      "back_pct": 100.2,            // overround, both sides complete only
+      "lay_pct": 99.6,
+      "selections": [
+        {
+          "selection_id": "1222344",  // a string: Postgres BIGINT arrives as one
+          "name": "Under 3.5 Goals",
+          "back": [ { "price": 1.55, "size_cents": 16071, "side": "BACK" } ],
+          "lay":   [ { "price": 1.57, "size_cents": 9122,  "side": "LAY" } ],
+          "last_price_traded": 1.55
+        }
+      ]
+    }
+  ]
+}
+```
+
+`back_pct`/`lay_pct` are `null` unless **every** runner is priced on both
+sides — a half-presented book is not a book, and reporting one side of it as a
+percentage would read as an absurd number rather than as "one side is missing".
+
+### `GET /api/feed/market?id=1.262760123`
+
+One market's full ladder, by id — the way the page prices a market that is
+outside the board's cap. `200` → `{ "market": { …same shape as above… } }`,
+or `{ "market": null }` when the id is not in the feed. `id` is required.
+
+### `GET /api/feed/nav`
+
+The browsing tree, one level per click:
+
+```jsonc
+{
+  "enabled": true,
+  "sports": [
+    {
+      "sport": "Soccer",
+      "countries": [
+        { "country": "PT",
+          "competitions": [
+            { "competition": "Portuguese Primeira Liga",
+              "meetings": [
+                { "event_id": "33696285",
+                  "event_name": "Famalicao v Alverca",
+                  "event_time": "2026-10-12T19:15:00.000Z",
+                  "races": [
+                    { "market_id": "1.262760123",
+                      "market_name": "Over/Under 3.5 Goals",
+                      "market_label": null,
+                      "market_time": "2026-10-12T19:15:00.000Z",
+                      "in_play": false,
+                      "status": "OPEN" } ] } ] } ] } ] } ] }
+```
+
+The tree arrives expanded along one branch (the next meeting off), exactly as a
+bookmaker's rail does.
+
+### `GET /api/feed/health`
+
+`200` →
+
+```jsonc
+{
+  "ok": true,
+  "markets": 9976,                // DISTINCT markets, not selection rows
+  "markets_with_odds": 9456,
+  "resolved": 4,
+  "odds_age_seconds": 171,        // how long ago WE polled
+  "oldest_odds_age_seconds": 3693,
+  "data_age_seconds": null,       // null on a Delay key — see below
+  "app_key_delay": true,
+  "delay_note": "Betfair withholds publish_time on a Delay key, so data age
+                 cannot be measured. odds_age_seconds is how long ago WE polled,
+                 not how old the data is. Prices are ~5 minutes behind."
+}
+```
+
+`data_age_seconds` is **null on a Delay key** and published as null rather than
+substituted, because Betfair withholds `publish_time` and a fabricated age would
+read as a measurement. Only a Live key populates it.
+
+---
+
 ## Admin (requires a user with `is_admin`)
 
 All admin routes answer `401` without a session and `403` for a non-admin.
@@ -230,6 +344,54 @@ different market.
 runner, minus 1: **negative** means the runners can all be backed for a guaranteed
 profit (arbitrage), positive means the market is margined, `null` means some
 runner has no available price.
+
+### Feed credentials and the collector supervisor
+
+The Betfair credentials the collector needs — **exactly three fields**: an app
+key, a username and a password. There is no certificate option, because a Delay
+key cannot use one. They are stored per tenant, sealed with AES-256-GCM, and
+**no route returns a secret** — every response reports which fields *exist*,
+never their values. Storing and deleting are audited.
+
+If `FEED_CREDENTIALS_KEY` is unset, storing is refused with `503` and **nothing
+is written**. There is no plaintext fallback.
+
+| Route | What |
+| --- | --- |
+| `GET /api/admin/feed/credentials` | every tenant's status, as a list |
+| `GET /api/admin/feed/credentials/:id` | one tenant's status |
+| `PUT /api/admin/feed/credentials/:id?` | store all three fields; restarts a supervised collector |
+| `DELETE /api/admin/feed/credentials/:id?` | remove them; stops a supervised collector |
+| `GET /api/admin/feed/runner/:id?` | supervisor state, restarts, exit codes, scrubbed log tail |
+| `POST /api/admin/feed/runner/start` · `/stop` | start or stop the collector |
+
+`:id` defaults to the requester's own tenant.
+
+`GET /api/admin/feed/credentials/1` → `200`
+
+```jsonc
+{
+  "tenant_id": 1,
+  "configured": true,
+  "storage_available": true,      // false when FEED_CREDENTIALS_KEY is unset
+  "login_mode": "password",
+  "app_key_set": true,           // booleans, never values
+  "username_set": true,
+  "password_set": true,
+  "created_at": "2026-10-12 20:10:04",
+  "updated_at": "2026-10-12 20:10:04"
+}
+```
+
+`PUT` with a malformed app key answers `400` naming the field; an unknown
+tenant answers `404`. `POST /runner/start` answers **`409` with the specific
+missing condition** when the supervisor cannot start — a `200` that says
+"started" while nothing runs would be worse than an error.
+
+The supervisor restarts the collector with exponential backoff (5 s to 5 min), so
+a wrong password cannot hammer Betfair's login endpoint, and every line of
+captured collector output is scrubbed of the stored credential values before it
+is stored or shown. See [`FEED.md`](FEED.md).
 
 ---
 

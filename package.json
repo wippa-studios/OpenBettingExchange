@@ -9,7 +9,7 @@
     "test": "node tests/run_all.js",
     "test:smoke": "./tests/smoke.sh",
     "test:ui": "node tests/ui_test.mjs",
-    "shots": "node scripts/capture-screenshots.mjs",
+    "shots": "node scripts/shoot.mjs",
     "docs:check": "node scripts/check-docs.mjs",
     "load": "node scripts/load-test.mjs"
   },

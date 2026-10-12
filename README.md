@@ -1,5 +1,10 @@
 # OpenBettingExchange
 
+[![CI](https://github.com/wippa-studios/OpenBettingExchange/actions/workflows/ci.yml/badge.svg)](https://github.com/wippa-studios/OpenBettingExchange/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![node](https://img.shields.io/badge/node-%E2%89%A522-339933.svg)](package.json)
+[![paper money](https://img.shields.io/badge/funds-paper_money_only-orange)](DISCLAIMER.md)
+
 **An open-source betting exchange** — the kind of venue where the house is a
 *fee*, not a book. Back and lay against other people, order books with real
 depth, a matching engine with price-time priority, and settlement that pays the
@@ -7,14 +12,32 @@ pot.
 
 Node 22 · Express · SQLite · zero-build frontend · **paper money only**.
 
-Prices can come from a live odds feed ([`docs/FEED.md`](docs/FEED.md)) or the
-built-in demo bots.
+Prices can come from a live Betfair feed
+([`docs/FEED.md`](docs/FEED.md), collected by
+[OpenBettingExchangeDataFeed](https://github.com/wippa-studios/OpenBettingExchangeDataFeed))
+or the built-in demo bots.
 
-![The OpenBettingExchange board showing a Betfair-style ladder](docs/screenshot.png)
+![The OpenBettingExchange board: a sport rail, competition-grouped cards and a Betfair-style ladder](docs/shots/board.png)
 
 Light house palette (white ground, black text, grey accent), Inter self-hosted
 in place of Canva Sans, brand wordmark and favicon from `assets/`. No build step
 and no CDN: fonts, logo and icon are all served from `public/`.
+
+## Screenshots
+
+| | |
+|---|---|
+| **The board, reading a live Betfair collector.** Real fixtures and real ladders — a Delay key, so the prices are a reference book, and display-only by engine rule. | **The bet slip.** Click a price and the slip opens on that side; stake and price step along the ladder. |
+| [![Board in feed mode](docs/shots/feed-board.png)](docs/shots/feed-board.png) | [![Bet slip](docs/shots/betslip.png)](docs/shots/betslip.png) |
+| **Positions.** Per-runner backed and laid stakes, the escrow holding them, and the if-this-wins P&L for every runner. | **Wallet.** Available versus frozen, and every deposit, escrow, release, payout and commission as a ledger. |
+| [![Positions](docs/shots/positions.png)](docs/shots/positions.png) | [![Wallet](docs/shots/wallet.png)](docs/shots/wallet.png) |
+| **The admin trading desk.** The live catalogue with matched volume and overround, suspend/restore, and settle-with-winner. | **User administration.** Status, limits, balance adjustment and self-exclusion, every action audited with a reason. |
+| [![Admin desk](docs/shots/admin-markets.png)](docs/shots/admin-markets.png) | [![Admin users](docs/shots/admin-users.png)](docs/shots/admin-users.png) |
+
+Screenshots are regenerated against the current UI with
+`node scripts/shoot.mjs`, which refuses to save a capture it has not verified —
+each one is preceded by DOM assertions that the thing worth showing is actually
+on screen.
 
 > **Paper money only.** Every balance is play money and there is **no real-money
 > execution path**: no PSP is integrated and there is no licensed operation
@@ -55,13 +78,14 @@ npm run seed      # demo catalogue, users and bot liquidity
 npm start         # http://127.0.0.1:7777
 ```
 
-1. Open the board: sports across the top, competition-grouped event cards, and a
-   ladder per market — three back prices, the runner and its last traded price,
-   three lay prices. Blue flashes are price rises, red are falls.
-2. Sign in as `demo` / `demo123`, then **click a price**. The bet slip opens on
-   the right with that side and price; adjust the stake or step the price along
-   the ladder. Press **Place** — it matches against real liquidity or rests on
-   the book.
+1. Open the board: a sport rail on the left, competition-grouped event cards,
+   and a ladder per market — three back prices, the runner and its last traded
+   price, three lay prices. Blue flashes are price rises, red are falls.
+2. Register an account (or sign in as `demo` / `demo123` — the seeded logins
+   demand a password change before they will trade, which is deliberate), then
+   **click a price**. The bet slip opens with that side and price; adjust the
+   stake or step the price along the ladder. Press **Place** — it matches
+   against real liquidity or rests on the book.
 3. **My Bets → Positions** shows what you are exposed to: per-runner backed and
    laid stakes, your escrow, and the if-this-wins P&L for every runner. A losing
    position on a winning runner can be **cashed out** at top of book.
@@ -92,7 +116,7 @@ npm start         # http://127.0.0.1:7777
 | Dead heat / joint favourite settlement | working |
 | Reporting: financial summary with self-check, player statements, volume, commission, operational | working (`/api/admin/reports/*`, CSV or `?format=json`) |
 | Session limit, reality check, deposit limit | working, operator-configured (0 = off, boot warns) |
-| Accumulators / each-way / dead-heat joint favourite | not implemented |
+| Accumulators / each-way | not implemented |
 | Real-money execution (no PSP integrated) | not implemented |
 
 ## Architecture
@@ -235,30 +259,6 @@ environment variables — the exchange never writes a `.env`. See
 | `GET /api/admin/feed/runner/:id?` | admin | supervisor state, restarts, exit codes, scrubbed log tail |
 | `POST /api/admin/feed/runner/start` \| `/stop` | admin | start or stop the collector |
 
-### The odds feed is display only
-
-With `FEED_ENABLED=true` the board shows real fixtures and prices from the
-[feed collector](https://github.com/wippa-studios/OpenBettingExchangeDataFeed),
-but **those markets cannot be bet on**, and this is enforced by the engine, not
-just by the client:
-
-- a feed market has no row in this venue's database — the collector's catalogue
-  lives in its own Postgres — so naming a feed selection id is a `404`, refused
-  before any collateral is taken;
-- the client refuses too, and says "Feed markets are display-only".
-
-Also: enabling the feed force-disables the bots and the drift engine
-(`BOTS_ON`/`DRIFT_ON` in `server.js`), because a bot requoting a ladder straight
-over the observed Betfair book would be the venue fighting its own price source.
-So in feed mode the venue's **own** markets are unquoted, and the venue trades
-nothing.
-
-That is a coherent design — a price-observation tool attached to an engine, not a
-merged product — but it is easy to read "odds feed integration" as something
-else, so it is stated here and pinned by `tests/feed-display-only.test.js`.
-Making feed markets tradeable needs a market mapping and a liquidity source; that
-is a feature with a cost, not a switch. `docs/ROADMAP.md` has the reasoning,
-including why a staleness guard was built and then deleted.
 | `FEED_STALE_SECONDS` | `300` | frame age beyond which the board reports stale |
 | `FEED_MARKET_LIMIT` | `60` | markets returned to the board |
 | `BOT_ENABLED` / `DRIFT_ENABLED` | `true` | demo liquidity and price drift (ignored when the feed is on) |
@@ -284,6 +284,31 @@ including why a staleness guard was built and then deleted.
 | `RG_DEPOSIT_DAILY_CENTS` | `0` | rolling 24h deposit limit; 0 = not configured |
 | `DELAY_RELEASE_INTERVAL_MS` | `5000` | how often expired in-play delays are released into the book; 0 disables |
 
+### The odds feed is display only
+
+With `FEED_ENABLED=true` the board shows real fixtures and prices from the
+[feed collector](https://github.com/wippa-studios/OpenBettingExchangeDataFeed),
+but **those markets cannot be bet on**, and this is enforced by the engine, not
+just by the client:
+
+- a feed market has no row in this venue's database — the collector's catalogue
+  lives in its own Postgres — so naming a feed selection id is a `404`, refused
+  before any collateral is taken;
+- the client refuses too, and says "Feed markets are display-only".
+
+Also: enabling the feed force-disables the bots and the drift engine
+(`BOTS_ON`/`DRIFT_ON` in `server.js`), because a bot requoting a ladder straight
+over the observed Betfair book would be the venue fighting its own price source.
+So in feed mode the venue's **own** markets are unquoted, and the venue trades
+nothing.
+
+That is a coherent design — a price-observation tool attached to an engine, not a
+merged product — but it is easy to read "odds feed integration" as something
+else, so it is stated here and pinned by `tests/feed-display-only.test.js`.
+Making feed markets tradeable needs a market mapping and a liquidity source; that
+is a feature with a cost, not a switch. `docs/ROADMAP.md` has the reasoning,
+including why a staleness guard was built and then deleted.
+
 ## Development
 
 ```bash
@@ -307,7 +332,7 @@ Contributing, house conventions and where to add things:
 
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
-public/    frontend (no build)     tests/      39 unit/API suites + smoke + browser + guards
+public/    frontend (no build)     tests/      45 unit/API suites + smoke + browser + guards
             public/js/*.js          7 UI modules, 187-419 lines each
 docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```
@@ -318,12 +343,18 @@ docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 integrated, and its reference provider moves no money. No KYC/AML, no age
 verification, no licensing path — and no software can supply the licence.
 
-**In-play is absent**: no bet delay modelling, no traded-volume ladder. This
-is the difference between a toy and a venue; in-play without honest delay
-modelling is where sharps win.
+**In-play is a deliberate refusal, not a gap.** The venue closes bets and
+cash-out at the event's off time (`lib/offtime.js`): an in-play price is a
+*forecast* of a future event while the book reacts to what everyone can see,
+and a venue publishing instantly is systematically slower than its own
+liquidity. Every real venue delays in-play prices for exactly this reason;
+removing it removes that whole class of sharp. See
+[`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#pre-off-only).
 
-**Not implemented:** accumulators, each-way betting, dead-heat joint-favourite
-settlement (held rather than guessed), and cash-out risk capping.
+**Not implemented:** accumulators, each-way betting, and cash-out risk capping.
+(Dead-heat joint-favourite settlement **is** implemented — the payout divides
+among joint winners where the sport's rules permit one, and a multi-winner
+signal under a single-winner rule is held for review.)
 
 **Cash-out is an uncapped venue risk.** Phase 2 bounds market-maker liability;
 nothing yet bounds a player converting positions into guaranteed house payouts.
@@ -346,13 +377,13 @@ Full list and rationale in
 
 ## Roadmap
 
-- In-play: bet delay modelling and a traded-volume ladder
 - Cap cash-out venue risk in `lib/risk.js`, alongside the bot liability cap
 - Integrate a real PSP against the `lib/payments` interface
 - ~~Wire the results feed to a live transport~~ — done: `lib/resultsfeed.js`, an HTTP
   transport posting the pending set. Point `RESULTS_FEED_URL` at your results
   service, or settle by hand/webhook as before.
-- Dead-heat joint-favourite settlement
+- ~~Dead-heat joint-favourite settlement~~ — done: the payout divides among joint
+  winners where the sport's rules permit one; otherwise held.
 - Accumulators and each-way markets
 - Odds-history charts and a market-mover view on the board
 

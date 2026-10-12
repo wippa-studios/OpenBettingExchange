@@ -6,6 +6,45 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Documentation
+
+A full pass against the code, prompted by the screenshots having aged out of
+the truth: they were captured before the sport filter moved into the left rail,
+so the README's own picture contradicted its own text.
+
+- **The README configuration table was broken.** A prose section had been
+  inserted into the middle of it, leaving seven rows stranded after it with no
+  header — GitHub rendered them as loose text, and `FEED_STALE_SECONDS` through
+  `DELAY_RELEASE_INTERVAL_MS` were effectively undocumented. The section now
+  sits after the table.
+- **Regenerated every screenshot** against the current UI, and added the one
+  that was missing: the board in feed mode reading a **live Betfair collector**.
+  `scripts/shoot.mjs` replaces `scripts/capture-screenshots.mjs`; it walks
+  seeded mode and feed mode, and refuses to save a capture it has not verified —
+  each shot is preceded by DOM assertions that the thing worth showing is on
+  screen (the old script produced no assertions at all, which is how seven stale
+  images got committed in the first place). `docs/screenshot.png` is gone,
+  superseded by `docs/shots/board.png`, and all eight images are wired into a
+  README gallery instead of one being referenced and six being orphaned.
+- **Three claims contradicted each other.** Dead-heat settlement was listed as
+  "not implemented" twice and "working" once; it is implemented and tested, so
+  the two stale rows are gone and the roadmap item is struck through.
+- **In-play was framed as a gap.** It is a deliberate product decision — the
+  venue is pre-off only, and `lib/offtime.js` enforces it — so "Known
+  limitations" now says so and links the rules, rather than describing the
+  absence of something no venue should want unguarded.
+- Badges (CI, MIT, Node, paper-money) on the README; counts resynced across
+  README/CONTRIBUTING/WORKSTREAMS (45 suites, 74 browser checks).
+- **`docs/API.md` documented none of the feed routes.** Added the four public
+  read-only routes — with the response shapes as actually served, including
+  `selection_id` as a string (Postgres BIGINT), `back_pct`/`lay_pct` null unless
+  both sides are complete, and `data_age_seconds: null` on a Delay key — and
+  the six admin credential/supervisor routes, including the 503-with-no-write
+  refusal when `FEED_CREDENTIALS_KEY` is unset.
+- The 60-second tour no longer says "sports across the top" (they are in the
+  left rail) and no longer hands a new user the `demo` login without mentioning
+  the mandatory password change that locks it out of trading.
+
 ### Fixed
 
 The feed read path was still written against the retired `betfair-market-snapshots`
