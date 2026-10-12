@@ -44,7 +44,14 @@ const check = async (name, fn) => {
     try {
       json = await res.json();
     } catch {}
-    return { status: res.status, json, setCookie };
+    // Headers are returned as a plain object so a test can assert on them
+    // (content-type, content-disposition). The reporting routes are the first
+    // thing in this codebase whose CORRECTNESS is partly in their headers — a
+    // CSV export an operator cannot attribute or that a browser renders inline
+    // instead of downloading is wrong in a way a status code cannot show.
+    const respHeaders = {};
+    for (const [k, v] of res.headers) respHeaders[k] = v;
+    return { status: res.status, json, setCookie, headers: respHeaders };
   };
   const cookieOf = (r) => (r.setCookie.find((c) => c.startsWith('ob_session=')) || '').split(';')[0];
 
@@ -592,6 +599,69 @@ const check = async (name, fn) => {
       assert.strictEqual(typeof r.json.considered, 'number');
       // With no feed configured it must be a clean no-op, not an outage.
       assert.strictEqual(r.json.error, null, 'and report no error');
+    });
+
+    // R6: every reporting route answers, as CSV and as JSON, and every one of
+    // them is CALLED. Six routes that nobody exercises is six routes nobody
+    // knows are broken — the same gap that hid the dead delay-release job and
+    // the intVal route.
+    await check('R6 every reporting route answers, CSV and JSON', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      const routes = [
+        ['/api/admin/reports/summary', ['period', 'definitions', 'financial', 'activity', 'rates', 'self_check_ok']],
+        ['/api/admin/reports/settlements', ['period', 'statements']],
+        ['/api/admin/reports/volume', ['period', 'by_market', 'by_selection']],
+        ['/api/admin/reports/volume-by-selection', ['period', 'rows']],
+        ['/api/admin/reports/commission', ['period', 'rows']],
+        ['/api/admin/reports/operational', ['period', 'definitions', 'activity', 'rates']],
+      ];
+      for (const [route, keys] of routes) {
+        const csv = await j('GET', route, { cookie: admin });
+        assert.strictEqual(csv.status, 200, `${route} answers`);
+        assert.match(String(csv.headers['content-type'] || ''), /text\/csv/, `${route} defaults to CSV`);
+        // A report an operator cannot attribute is a report in a downloads
+        // folder by Friday, so the period rides in the filename.
+        assert.match(String(csv.headers['content-disposition'] || ''), /attachment; filename=".*\d{4}-\d{2}-\d{2}/, `${route} names the period`);
+
+        const json = await j('GET', `${route}?format=json`, { cookie: admin });
+        assert.strictEqual(json.status, 200, `${route} answers as JSON`);
+        for (const k of keys) assert.ok(k in json.json, `${route} reports ${k}`);
+      }
+    });
+
+    await check('R7 the financial summary carries its definitions and self-check', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      const r = await j('GET', '/api/admin/reports/summary?format=json', { cookie: admin });
+      assert.strictEqual(r.status, 200);
+      // A figure without a definition gets filed wrong, so the definitions ship
+      // with the numbers rather than in a separate document.
+      for (const k of ['commission', 'ggr', 'turnover', 'margin_bps']) {
+        assert.ok(r.json.definitions[k], `defines ${k}`);
+      }
+      assert.ok('self_check_ok' in r.json, 'and reports whether its own invariant holds');
+    });
+
+    await check('R8 a reporting period is validated rather than defaulted silently', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      // An operator who asked for a month and was handed the lifetime total
+      // would file it, so a bad period is an error, not a fallback.
+      for (const q of ['?from=nope', '?to=nope', '?from=2026-02-01&to=2026-01-01', '?from=2000-01-01']) {
+        const r = await j('GET', `/api/admin/reports/summary${q}`, { cookie: admin });
+        assert.strictEqual(r.status, 400, `refused: ${q}`);
+      }
+      // A valid explicit window is honoured.
+      const ok = await j('GET', '/api/admin/reports/summary?from=2026-01-01&to=2026-01-31&format=json', { cookie: admin });
+      assert.strictEqual(ok.status, 200);
+      assert.strictEqual(ok.json.period.from, '2026-01-01');
+      assert.strictEqual(ok.json.period.to, '2026-01-31');
+    });
+
+    await check('R9 reporting is behind the admin role', async () => {
+      const player = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'alice', password: 'secret1' } }));
+      for (const route of ['/api/admin/reports/summary', '/api/admin/reports/settlements', '/api/admin/reports/operational']) {
+        const r = await j('GET', route, { cookie: player });
+        assert.strictEqual(r.status, 403, `${route} is not readable by a player`);
+      }
     });
 
     await check('W4 a deposit intent above the per-intent cap is refused', async () => {

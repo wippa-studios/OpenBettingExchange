@@ -254,5 +254,29 @@ check('D12 the engine delay and the client advisory never disagree', () => {
   );
 });
 
+// D13: A DELAYED ORDER STAYS IDENTIFIABLE AFTER IT IS RELEASED. The release
+// pass clears eligible_at — that IS the released state, so the scheduling state
+// is gone once the order is in the book. That left no way to tell afterwards
+// whether an order had been delayed, which makes the venue's offered bet delay
+// unreportable (lib/reports.js could not compute it, and initially read
+// `eligible_at IS NOT NULL` and found nothing). `orders.delayed` is the durable
+// historical fact, kept separately from the scheduling state.
+check('D13 a released order is still identifiable as delayed', () => {
+  const f = fixture();
+  goInPlay(f, 60000);
+  order(f, f.alice, { side: 'lay' });
+  const bob = order(f, f.bob);
+  assert.strictEqual(f.db.prepare('SELECT delayed d FROM orders WHERE id=?').get(bob.order.id).d, 1, 'flagged at placement');
+  expireAll(f);
+  M.releaseEligibleOrders(f.db);
+  const after = f.db.prepare('SELECT delayed d, eligible_at e FROM orders WHERE id=?').get(bob.order.id);
+  assert.strictEqual(after.d, 1, 'still flagged after release');
+  assert.strictEqual(after.e, null, 'and out of the delayed set');
+  // A pre-match order is never flagged, so the flag means what it says.
+  const g = fixture();
+  const pre = order(g, g.alice);
+  assert.strictEqual(g.db.prepare('SELECT delayed d FROM orders WHERE id=?').get(pre.order.id).d, 0);
+});
+
 console.log(`\ninplay2.test.js: ${passed} checks passed`);
-if (passed < 12) { console.error('expected 12 checks'); process.exit(1); }
+if (passed < 13) { console.error('expected 13 checks'); process.exit(1); }

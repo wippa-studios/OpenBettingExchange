@@ -22,6 +22,7 @@ const RG = require('./lib/rg');
 // with the other is a silent, load-time SyntaxError that costs more to find
 // than one longer name saves.
 const RFEED = require('./lib/resultsfeed');
+const REPORTS = require('./lib/reports');
 const SET = require('./lib/settle');
 const CASH = require('./lib/cashout');
 const bots = require('./lib/bots');
@@ -1134,6 +1135,94 @@ app.post('/api/admin/results/poll', requireAdmin, limit('admin'), async (req, re
   } catch (e) {
     next(e);
   }
+});
+
+// ── Reporting ──────────────────────────────────────────────────────────────
+// Regulatory, financial and operational reporting. Every route defaults to CSV,
+// because CSV is what an operator actually files and what a regulator asks for;
+// ?format=json returns the same figures as JSON with their definitions intact.
+//
+// The period is validated (strict dates, a bounded span) rather than defaulted
+// silently: an operator who asked for a month and was handed the lifetime total
+// would file it.
+//
+// A CONTENT-DISPOSITION filename carries the period, because a report called
+// `report.csv` in a downloads folder is unattributable within a week.
+const reportPeriod = (req) => REPORTS.period(req.query.from, req.query.to);
+
+// `?format=json` returns the same figures with their definitions; anything else
+// is the CSV an operator files. The handlers set the headers themselves rather
+// than sharing a helper, because each one's filename differs and a shared
+// wrapper here would be one more thing to keep correct.
+function req_format_is_json(req) {
+  return String(req.query.format || '').toLowerCase() === 'json';
+}
+
+// The financial position: commission, the venue's own trading result, and GGR
+// with the components beside it and the formula in the payload.
+app.get('/api/admin/reports/summary', requireAdmin, limit('admin'), (req, res) => {
+  const p = reportPeriod(req);
+  const rep = REPORTS.summary(db, p);
+  if (req_format_is_json(req)) return res.json(rep);
+  res.setHeader('content-type', 'text/csv; charset=utf-8');
+  res.setHeader('content-disposition', `attachment; filename="summary_${p.from}_to_${p.to}.csv"`);
+  res.send(REPORTS.summaryCsv(rep));
+});
+
+// Per-player settlement statements. The document a regulator asks about an
+// individual and the one a player disputes with.
+app.get('/api/admin/reports/settlements', requireAdmin, limit('admin'), (req, res) => {
+  const p = reportPeriod(req);
+  const rep = REPORTS.playerStatements(db, p);
+  if (req_format_is_json(req)) return res.json(rep);
+  res.setHeader('content-type', 'text/csv; charset=utf-8');
+  res.setHeader('content-disposition', `attachment; filename="settlements_${p.from}_to_${p.to}.csv"`);
+  res.send(REPORTS.statementsCsv(rep));
+});
+
+// Volume by market and by selection: the export reconciled against matched-side
+// records, and the one that makes venue-only turnover visible.
+app.get('/api/admin/reports/volume', requireAdmin, limit('admin'), (req, res) => {
+  const p = reportPeriod(req);
+  const byMarket = REPORTS.volumeByMarket(db, p);
+  const bySelection = REPORTS.volumeBySelection(db, p);
+  if (req_format_is_json(req)) {
+    return res.json({ period: p, by_market: byMarket.rows, by_selection: bySelection });
+  }
+  res.setHeader('content-type', 'text/csv; charset=utf-8');
+  res.setHeader('content-disposition', `attachment; filename="volume_${p.from}_to_${p.to}.csv"`);
+  res.send(REPORTS.volumeCsv(byMarket));
+});
+
+app.get('/api/admin/reports/volume-by-selection', requireAdmin, limit('admin'), (req, res) => {
+  const p = reportPeriod(req);
+  const rows = REPORTS.volumeBySelection(db, p);
+  if (req_format_is_json(req)) return res.json({ period: p, rows });
+  res.setHeader('content-type', 'text/csv; charset=utf-8');
+  res.setHeader('content-disposition', `attachment; filename="volume_by_selection_${p.from}_to_${p.to}.csv"`);
+  res.send(REPORTS.selectionVolumeCsv(rows));
+});
+
+// Commission by tenant, with the effective rate beside the amount so the
+// arithmetic can be checked by hand.
+app.get('/api/admin/reports/commission', requireAdmin, limit('admin'), (req, res) => {
+  const p = reportPeriod(req);
+  const rows = REPORTS.commissionByTenant(db, p);
+  if (req_format_is_json(req)) return res.json({ period: p, rows });
+  res.setHeader('content-type', 'text/csv; charset=utf-8');
+  res.setHeader('content-disposition', `attachment; filename="commission_${p.from}_to_${p.to}.csv"`);
+  res.send(REPORTS.commissionCsv(rows));
+});
+
+// Operational health, including the realised bet delay — which is only a
+// meaningful figure because that delay is now enforced by the engine.
+app.get('/api/admin/reports/operational', requireAdmin, limit('admin'), (req, res) => {
+  const p = reportPeriod(req);
+  const rep = REPORTS.operational(db, p);
+  if (req_format_is_json(req)) return res.json(rep);
+  res.setHeader('content-type', 'text/csv; charset=utf-8');
+  res.setHeader('content-disposition', `attachment; filename="operational_${p.from}_to_${p.to}.csv"`);
+  res.send(REPORTS.operationalCsv(rep));
 });
 
 app.get('/api/admin/results/void-rules', requireAdmin, limit('admin'), (req, res) => {

@@ -343,10 +343,12 @@ distinguished from the system.
 ledgers: PSP settlement reports against `gateway_clearing`, player balances
 against `player_funds`. Discrepancies are findings, not exceptions to log.
 
-**Reporting.** Regulatory exports (per-market volume, per-player net
-settlement, commission), financial (GGR, hold, margin), and operational
-(match rate, unmatched ratio, average bet delay, bot P&L). Operators buy
-reporting because it is the alternative to writing it themselves.
+**Reporting.** ✅ `lib/reports.js`, `/api/admin/reports/*`. Regulatory (per-market
+and per-selection volume, per-player statements, commission by tenant), financial
+(summary with GGR, hold and margin), operational (match rate, unmatched ratio,
+realised bet delay, resting orders). CSV by default, `?format=json` for the same
+figures with their definitions. Operators buy reporting because it is the
+alternative to writing it themselves.
 
 **Responsible gambling.** Age verification, reality checks, session limits,
 self-exclusion wired to the Phase 1 table. Not optional anywhere it is legal,
@@ -545,7 +547,32 @@ plus a live smoke script and a 71-check browser suite, all green.
    session limit left the check permanently not-due — a control that appears in
    the config and does nothing, which is the precise failure this module exists
    to prevent.
-7. **The rule table and the seed must agree.** Found while building dead-heat
+7. **Reporting and exports.** ✅ `lib/reports.js` — see Phase 6. Two things it
+   does that a naive report does not, both learned by getting them wrong first:
+
+   - **It states its definitions and checks itself against the ledger.** Every
+     figure ships with the formula that produced it, because GGR is not one
+     thing: on an exchange the venue earns commission and carries its own
+     trading risk, and those are different lines for different regulators. The
+     self-check is `SUM(pnl_cents) = 0` — settlements are zero-sum BETWEEN
+     PLAYERS, with commission charged on top of that pool. The first version
+     asserted `SUM(pnl) + SUM(commission) = 0`, which is wrong by exactly the
+     venue's fee, and it reported a 750-cent FAILURE on a perfectly correct
+     book. An invariant written from reasoning rather than from the ledger
+     produces confident nonsense, and an operator would have filed it as a real
+     discrepancy against themselves.
+
+   - **CSV export is a security control, not formatting.** A cell beginning
+     `=`, `+`, `-` or `@` is a FORMULA in a spreadsheet, and a free-text event or
+     market name carrying `=cmd|'/c calc'!A0` executes on the operator's machine
+     when they open the export. Usernames cannot carry it (auth.js restricts the
+     charset), which is why the guard lives at the export boundary rather than
+     in each field: a boundary guard survives the next field that forgets.
+     Testing position 0 alone left a hole — `' =1+1'` has a leading space, and a
+     spreadsheet trims it and then evaluates the `=`. Found by the test that was
+     written to check the guard.
+
+8. **The rule table and the seed must agree.** Found while building dead-heat
    settlement, and it was silently VOIDING MONEY: the seed creates
    `greyhounds` while the table was keyed `greyhound`, and `basketball` was
    seeded with no rule set at all. Both fell through the unknown-sport default

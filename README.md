@@ -88,6 +88,7 @@ npm start         # http://127.0.0.1:7777
 | Results feed: transport, per-sport void rules, disputes held not guessed, provenance, manual release | working (transport needs `RESULTS_FEED_URL`) |
 | In-play: suspension, enforced bet delay, kick-off hold, traded volume | working |
 | Dead heat / joint favourite settlement | working |
+| Reporting: financial summary with self-check, player statements, volume, commission, operational | working (`/api/admin/reports/*`, CSV or `?format=json`) |
 | Session limit, reality check, deposit limit | working, operator-configured (0 = off, boot warns) |
 | Accumulators / each-way / dead-heat joint favourite | not implemented |
 | Real-money execution (no PSP integrated) | not implemented |
@@ -111,6 +112,7 @@ browser (public/ — plain HTML/CSS/classic JS, no build step)
 │  lib/tenants   multi-tenancy, per-tenant commission, jurisdictions   │
 │  lib/payments  provider interface + reference provider               │
 │  lib/results   results feed, per-sport void rules, dispute holds     │
+│  lib/reports   regulatory, financial and operational exports           │
 │  lib/voidrules the rule table: settle / void / hold per sport        │
 │  lib/jobs      scheduled reconciliation and maintenance              │
 │  lib/ops       health, readiness, metrics, backup, restore           │
@@ -239,7 +241,7 @@ a bad value **aborts the launch** rather than failing later.
 ## Development
 
 ```bash
-npm test            # 467 checks, 37 suites — unit + API integration, fully offline
+npm test            # 490 checks, 38 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 58 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code
@@ -259,7 +261,7 @@ Contributing, house conventions and where to add things:
 
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
-public/    frontend (no build)     tests/      37 unit/API suites + smoke + browser + guards
+public/    frontend (no build)     tests/      38 unit/API suites + smoke + browser + guards
             public/js/*.js          7 UI modules, 187-419 lines each
 docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```
