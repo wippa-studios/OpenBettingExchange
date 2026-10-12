@@ -264,8 +264,13 @@ settlement (held rather than guessed), and cash-out risk capping.
 nothing yet bounds a player converting positions into guaranteed house payouts.
 
 **Operational:** SQLite is single-writer and synchronous — which is *why* the
-sweep is atomic, and a genuine strength — but the ceiling is unmeasured. No
-load test ships.
+sweep is atomic, and a genuine strength — but it is one process and one
+machine. Measured on a developer laptop (`npm run load`): **~500 orders/sec
+placed** (p99 ~206ms at 50 concurrent) and **~1,000–2,000 reads/sec**, with
+the ledger still balanced to zero afterwards. Placement is ~4x slower than
+reads because it does escrow, the match sweep and double-entry postings; that
+is the money path doing real work, not overhead. Treat these as a
+single-node floor, not a capacity claim.
 
 The demo bot's fair prices are a random walk, not a model. Seeded credentials
 are committed on purpose for the demo; boot warns loudly and a first-run

@@ -339,11 +339,12 @@ const VOLUME_BUCKETS = {
   // Trading is the money path. Generous per user — a scalper legitimately
   // fires many orders — but bounded, because unbounded order placement is a
   // self-DoS on the single-threaded engine.
-  trade: { limit: 120, windowMs: 60_000 },
-  cashout: { limit: 30, windowMs: 60_000 },
-  admin: { limit: 240, windowMs: 60_000 },
-  wallet: { limit: 60, windowMs: 60_000 },
-  read: { limit: 600, windowMs: 60_000 },
+  // Limits come from config so an operator can tune them; 0 disables a bucket.
+  trade: { limit: config.RATE_LIMIT_TRADE, windowMs: 60_000 },
+  cashout: { limit: config.RATE_LIMIT_CASHOUT, windowMs: 60_000 },
+  admin: { limit: config.RATE_LIMIT_ADMIN, windowMs: 60_000 },
+  wallet: { limit: config.RATE_LIMIT_WALLET, windowMs: 60_000 },
+  read: { limit: config.RATE_LIMIT_READ, windowMs: 60_000 },
 };
 const volumeHits = new Map(); // key -> number[] of timestamps
 
@@ -356,7 +357,7 @@ function volumeKey(req, bucket) {
 
 function volumeExceeded(req, bucket) {
   const cfg = VOLUME_BUCKETS[bucket];
-  if (!cfg) return 0;
+  if (!cfg || cfg.limit <= 0) return 0; // 0 disables the bucket
   const key = volumeKey(req, bucket);
   const now = Date.now();
   const hits = (volumeHits.get(key) || []).filter((t) => now - t < cfg.windowMs);

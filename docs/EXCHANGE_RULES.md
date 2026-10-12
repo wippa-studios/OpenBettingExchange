@@ -385,8 +385,11 @@ Listed so nobody mistakes a scope decision for a bug:
 - **Cash-out risk capping.** Phase 2 bounds market-maker liability; nothing yet
   bounds a player repeatedly converting positions into guaranteed house
   payouts. This is the most significant open risk in the system.
-- **A load test.** SQLite is single-writer and synchronous — which is *why* the
-  sweep is atomic, and a genuine strength — but the ceiling is unmeasured.
+- **Horizontal scale.** SQLite is single-writer and synchronous — which is *why*
+  the sweep is atomic, and a genuine strength — but it is one process on one
+  machine. `npm run load` measures that single node (~500 orders/sec placed);
+  running more than one requires the Postgres migration, which makes the engine
+  async and re-opens the escrow invariant under row-level locking.
 
 **Shipped since this list was first written:** the results feed with per-sport
 void rules and dispute holds, multi-runner cash-out, abuse limits and

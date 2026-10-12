@@ -107,6 +107,22 @@ jobs:
         # are the specific failure this prevents.
         run: node scripts/check-docs.mjs
 
+  # A capacity smoke, not a benchmark: it asserts the system survives concurrent
+  # writes with the books still balanced, which is a correctness property and
+  # belongs in CI. Absolute rps is machine-dependent and is NOT asserted —
+  # pinning a number here would fail on a slower runner for no real reason.
+  load:
+    name: Load smoke (concurrent writes, books balanced)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: node scripts/load-test.mjs --orders 600 --concurrency 25
+
   security:
     name: Dependency audit
     runs-on: ubuntu-latest
