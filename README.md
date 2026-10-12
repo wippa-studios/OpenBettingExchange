@@ -137,7 +137,7 @@ The dependencies run one way: `match → ledger → tx`, with `settle` and
 `cashout` on top of `match`. There is no ORM, no migration tool, and no runtime
 dependency beyond Express and `pg` (the feed's Postgres client — Playwright
 is dev-only, for the browser suite) — the
-data model is one readable SQL file of 24 tables. Read
+data model is one readable SQL file of 25 tables. Read
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the reasoning.
 
 ## The rules that protect the money
@@ -216,11 +216,23 @@ a bad value **aborts the launch** rather than failing later.
 | `MIN_STAKE_CENTS` / `MAX_STAKE_CENTS` | `100` / `100000` | order size bounds |
 | `FEED_ENABLED` | `false` | read fixtures and prices from the feed — **display only, see below** |
 | `FEED_DATABASE_URL` | — | the feed collector's Postgres URL; required when the feed is on |
+| `FEED_CREDENTIALS_KEY` | — | 64 hex chars (AES-256-GCM key). **Unset ⇒ credentials are refused, never stored in plaintext.** `openssl rand -hex 32` |
+| `FEED_RUNNER_ENABLED` | `false` | supervise the collector here (spawn + restart it) instead of running it yourself |
+| `FEED_COLLECTOR_CMD` | `betfeed collect` | the collector command; split on whitespace, so an absolute path or a wrapper works |
+| `FEED_RUNNER_MIN_UPTIME_SECONDS` | `120` | how long a child must survive before a restart is counted as a fresh start |
 
 Betfair credentials are **not** configured here. They are entered in the admin
 dashboard per tenant, encrypted at rest, and passed to the collector as
 environment variables — the exchange never writes a `.env`. See
 [docs/FEED.md](docs/FEED.md).
+
+| Endpoint | Who | What |
+|---|---|---|
+| `GET /api/admin/feed/credentials/:id?` | admin | which fields are stored — **never their values** |
+| `PUT /api/admin/feed/credentials/:id?` | admin | store app key + username + password; restarts a supervised collector |
+| `DELETE /api/admin/feed/credentials/:id?` | admin | remove them; stops a supervised collector |
+| `GET /api/admin/feed/runner/:id?` | admin | supervisor state, restarts, exit codes, scrubbed log tail |
+| `POST /api/admin/feed/runner/start` \| `/stop` | admin | start or stop the collector |
 
 ### The odds feed is display only
 
@@ -274,7 +286,7 @@ including why a staleness guard was built and then deleted.
 ## Development
 
 ```bash
-npm test            # 540 checks, 42 suites — unit + API integration, fully offline
+npm test            # 576 checks, 45 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 74 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code

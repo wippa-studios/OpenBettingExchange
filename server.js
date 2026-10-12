@@ -29,6 +29,8 @@ const bots = require('./lib/bots');
 const drift = require('./lib/drift');
 const ODDS = require('./lib/odds');
 const FEED = require('./lib/feed');
+const FCREDS = require('./lib/feedcreds');
+const FRUN = require('./lib/feedrunner');
 const ADM = require('./lib/admin');
 const AUDIT = require('./lib/audit');
 const LIMITS = require('./lib/limits');
@@ -123,6 +125,9 @@ app.use(
 
 // DB + idempotent seed on first run.
 const db = openStore(config.DB_PATH);
+// The feed supervisor reads its credentials from this same handle. Injected after
+// openStore so lib/feedrunner.js never has to import lib/store.js.
+FRUN.setDb(db);
 seedIfNeeded(db);
 // Housekeeping: drop expired sessions at boot, and hourly while running —
 // a long-lived demo otherwise accumulates dead rows forever. The interval is
@@ -772,6 +777,94 @@ app.get('/api/feed/health', aw(async (req, res) => {
   console.error('[feed] health check reported failure:', (h && (h.error || h.detail)) || '(no detail)');
   res.status(503).json({ ok: false, error: 'Odds feed unavailable' });
 }));
+
+// ── Feed collector: operator surface ──────────────────────────────────────
+// Credentials and process supervision. Deliberately SEPARATE from the read-only
+// board routes above: those are public, these are admin-only and they touch the
+// single most sensitive thing this system stores.
+//
+// There is no route here that returns a stored credential, and that is a
+// property of the design rather than an omission — lib/feedcreds exposes no
+// function that serves plaintext to an HTTP caller.
+
+/** Which tenant the request is acting on. Defaults to the requester's own. */
+function feedTenantId(req) {
+  const asked = req.params.id || req.body?.tenant_id || req.query.tenant_id;
+  return asked === undefined || asked === '' ? TEN.ofUser(db, req.user.id)?.id ?? TEN.defaultTenant(db).id : Number(asked);
+}
+
+// Status: WHICH credentials exist, never their values.
+//
+// Two GET shapes, because an operator setting up a venue wants the LIST and one
+// troubleshooting wants the DETAIL. A separate `/credentials-all` path was the
+// first attempt and it is a trap: it reads as a sibling of `/credentials` but
+// sits at the same level as `/credentials/:id`, so any future refactor that
+// reorders these silently starts routing it as a tenant id called "-all".
+app.get('/api/admin/feed/credentials', requireAdmin, limit('admin'), (req, res) => {
+  res.json({ tenants: FCREDS.statusAll(db) });
+});
+
+app.get('/api/admin/feed/credentials/:id', requireAdmin, limit('admin'), (req, res) => {
+  res.json(FCREDS.status(db, feedTenantId(req)));
+});
+
+// Store. Exactly three fields, because the collector needs exactly three:
+// Betfair's Delay key authenticates with a username and password, and there is
+// no certificate on it. Offering a cert upload would imply support that a Delay
+// key cannot use.
+app.put('/api/admin/feed/credentials/:id?', requireAdmin, limit('admin'), (req, res) => {
+  const b = req.body || {};
+  const result = FCREDS.setCredentials(db, {
+    actor: req.user,
+    tenantId: feedTenantId(req),
+    appKey: b.app_key,
+    username: b.username,
+    password: b.password,
+  });
+  // A credential change only takes effect on the next launch, so restart a
+  // supervised collector rather than leaving it running on the old one — the
+  // single most confusing possible outcome otherwise ("I saved it and nothing
+  // changed"). Never restarted without supervision.
+  let restarted = false;
+  if (FRUN.health(result.tenant_id).running) {
+    FRUN.stop(result.tenant_id);
+    FRUN.start(result.tenant_id);
+    restarted = true;
+  }
+  res.json({ ...result, collector_restarted: restarted });
+});
+
+app.delete('/api/admin/feed/credentials/:id?', requireAdmin, limit('admin'), (req, res) => {
+  const tenantId = feedTenantId(req);
+  const result = FCREDS.clearCredentials(db, { actor: req.user, tenantId });
+  // A collector holding credentials that no longer exist should stop, not keep
+  // polling with them. Stopping is the safe direction: it cannot spend weight.
+  let stopped = false;
+  if (FRUN.health(tenantId).running) {
+    FRUN.stop(tenantId);
+    stopped = true;
+  }
+  res.json({ ...result, collector_stopped: stopped });
+});
+
+// Supervision. The readiness reason comes back verbatim rather than as a bool,
+// because "the runner will not start" is useless to an operator who is not told
+// which of five conditions is missing.
+app.get('/api/admin/feed/runner/:id?', requireAdmin, limit('admin'), (req, res) => {
+  res.json(FRUN.health(feedTenantId(req)));
+});
+
+app.post('/api/admin/feed/runner/start', requireAdmin, limit('admin'), (req, res) => {
+  const result = FRUN.start(feedTenantId(req), { actor: req.user });
+  // A refusal is a 409 with the reason, not a 200 with started:false that a UI
+  // renders as success.
+  if (!result.started) return res.status(409).json({ error: result.reason, ...result });
+  res.json(result);
+});
+
+app.post('/api/admin/feed/runner/stop', requireAdmin, limit('admin'), (req, res) => {
+  res.json(FRUN.stop(feedTenantId(req)));
+});
 
 app.get('/api/events', (req, res) => {
   const sportSlug = req.query.sport;

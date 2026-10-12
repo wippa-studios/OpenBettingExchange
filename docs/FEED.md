@@ -69,11 +69,52 @@ for the key-creation steps in full.
 
 ### Credential handling
 
-Credentials are stored **per tenant**, encrypted at rest with AES-256-GCM, and
-are never returned by any API — status endpoints report *whether* a credential
-is present, never its value. Every write is audited. If the encryption key is not
-configured the venue refuses to store credentials rather than falling back to
-plaintext.
+Credentials are stored **per tenant**, encrypted at rest with AES-256-GCM
+(`FEED_CREDENTIALS_KEY`), and are never returned by any API — the status
+endpoint reports *whether* a field is present, never its value. Every write and
+every deletion is audited. If the encryption key is not configured the venue
+**refuses to store** a credential rather than falling back to plaintext.
+
+The design point is that no HTTP route can return a secret: `lib/feedcreds.js`
+exports no function that serves plaintext to a caller, and a test asserts that
+adding one would be a deliberate act rather than a convenience. One function —
+`forCollector()` — returns plaintext, and its only caller is the code that
+builds the child process's environment.
+
+| | |
+|---|---|
+| **Cipher** | AES-256-GCM, 12-byte random IV per value, auth tag stored alongside |
+| **Envelope** | `v1:<iv>:<tag>:<ciphertext>`, so a future key rotation can tell v1 from v2 |
+| **Per field** | each of the three is sealed independently, so one can be rotated alone |
+| **Tampering** | a modified row fails the auth tag and is reported as an integrity failure, never decrypted to garbage |
+| **No key** | `503`, and **nothing is written** |
+
+### Running the collector
+
+By default the venue **only reads** the collector's database and you run the
+collector yourself — systemd, Docker, whatever you already use. Set
+`FEED_RUNNER_ENABLED=true` to have the venue supervise it instead: it spawns
+`FEED_COLLECTOR_CMD` as a child process, passes the decrypted credentials as
+environment variables, and restarts it with exponential backoff.
+
+Three things about that arrangement are worth stating plainly:
+
+- **Credentials go in `env`, never in `argv`.** `ps` is world-readable.
+- **A child's environment is readable** via `/proc/<pid>/environ` by the same
+  user that started it. Encryption at rest protects the database and its
+  backups; it does not make a credential invisible to anyone who can already run
+  code as this user. Anyone who can read this process's memory can read it too.
+- **Child output is redacted before it is stored or shown.** The collector logs
+  its own configuration, and a Betfair error can echo a key. Captured output
+  has the known credential values replaced before it reaches a log file, the
+  admin API, or a support ticket.
+
+A collector that exits immediately — the normal failure for a wrong password —
+is restarted on a backoff from 5 s to 5 min. That is deliberate: retrying every
+second against Betfair's login endpoint with a credential already known to be
+wrong is a good way to get the account rate-limited or locked. Raising the
+backoff resets when a child has stayed up longer than
+`FEED_RUNNER_MIN_UPTIME_SECONDS`.
 
 ---
 

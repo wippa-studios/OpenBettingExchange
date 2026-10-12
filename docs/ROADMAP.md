@@ -24,7 +24,7 @@ An inventory, so the plan is grounded rather than generic.
 | Cash-out | `lib/cashout.js` | green-up close, hedge scaled `1/n`, own-liquidity correctly excluded |
 | Tick ladder | `lib/odds.js` | Betfair increments, American/fractional/implied, overround |
 | Odds feed client | `lib/feed.js` | board/nav contract from a Postgres recorder, staleness reporting |
-| Test suite | `tests/` | 42 suites, hand-computed money rules, smoke + Playwright |
+| Test suite | `tests/` | 45 suites, hand-computed money rules, smoke + Playwright |
 
 **The property worth protecting:** settlement solvency is structural, not
 defensive. Every match is collateralised on both sides, so there is no
@@ -472,7 +472,7 @@ conversation.
 ## 6. Immediate next actions
 
 Reassessed after Phases 1–4, the follow-on work, and the first outside
-review of the money path. The suite is now **540 checks across 42 suites**,
+review of the money path. The suite is now **576 checks across 45 suites**,
 plus a live smoke script and a 71-check browser suite, all green.
 
 ### Recently completed since the first plan
@@ -674,7 +674,7 @@ BACK position, which masked the broken branch. Now regression-tested both
 sides (cashout2 C8/C13).
 
 The lesson the project takes from this: **an author cannot review their own
-money path.** The self-authored suite grew from 340 to 540 checks and every
+money path.** The self-authored suite grew from 340 to 576 checks and every
 one of the ten findings was reproducible as a test — but none of them was
 FOUND by the suite, because the suite tested what the author intended, and
 the code did something else. A second outside reading before real money

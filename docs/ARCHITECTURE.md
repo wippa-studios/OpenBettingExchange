@@ -27,7 +27,7 @@ browser (public/)
 ```
 
 There is no ORM, no migration framework and no service layer beyond `lib/`. The
-schema is a single `CREATE TABLE IF NOT EXISTS` block in `lib/store.js` (24
+schema is a single `CREATE TABLE IF NOT EXISTS` block in `lib/store.js` (25
 tables), which is why a fresh clone runs with one command. Express is the only
 runtime dependency; Playwright is dev-only and used by the browser suite.
 
@@ -52,6 +52,9 @@ runtime dependency; Playwright is dev-only and used by the browser suite.
 | `lib/bots.js` | MarketMakers ladders, requote | match itself (the engine's self-match guard covers it) |
 | `lib/drift.js` | fair-price random walk | move LTP (only real trades do) |
 | `lib/seed.js` | first-run fixtures, board roll-forward | run on every boot unconditionally |
+| `lib/feed.js` | read the feed collector's database (`v_feed1`/`v_feed2`) and serve the board | decide what a feed price means (see [FEED.md](FEED.md)) |
+| `lib/feedcreds.js` | per-tenant Betfair credentials: seal, open, status | **return a plaintext credential to an HTTP caller** — no function here does, and a test asserts adding one would be deliberate |
+| `lib/feedrunner.js` | supervise the collector as a child process: spawn, restart, backoff, redact its output | poll Betfair itself (the collector does that) |
 
 The dependency direction is strictly one way: `match → ledger → tx`, and
 `settle/cashout → match`. Nothing imports `server.js`.

@@ -7,8 +7,38 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- Optional odds feed: `lib/feed.js` reads the `betfair-market-snapshots`
-  recorder's Postgres and serves `GET /api/feed/board` + `/api/feed/health`.
+
+- **Betfair credentials in the admin dashboard.** An operator supplies an app
+  key, username and password per tenant; the exchange stores them encrypted
+  (AES-256-GCM) and passes them to the collector as environment variables. It
+  never writes a `.env`, which is what lets the collector boot from the
+  environment alone.
+  - `lib/feedcreds.js`, the `feed_credentials` table, and admin routes for
+    status / store / delete. **No route returns a secret** — status reports
+    booleans, and no exported function serves plaintext to an HTTP caller.
+  - **If `FEED_CREDENTIALS_KEY` is unset, storing is refused with a 503 and
+    nothing is written.** There is no plaintext fallback. "Not configured" is
+    never quietly treated as "allowed".
+  - Every write and every deletion is audited, with sealed values recorded as
+    `[sealed]`.
+
+- **Collector supervision** (`FEED_RUNNER_ENABLED`, default off so a venue that
+  already runs the collector does not acquire a second copy):
+  - `lib/feedrunner.js` spawns `FEED_COLLECTOR_CMD` and restarts it with
+    exponential backoff from 5s to 5min. A wrong password produces an immediate
+    repeating failure, and retrying that every second is a good way to get a
+    Betfair account rate-limited.
+  - Credentials go in `env`, never in `argv` — `ps` is world-readable.
+  - **Child output is redacted before it is stored or shown.** The collector
+    logs its own configuration and a Betfair error can echo a key; captured
+    output has known credential values replaced before reaching a log file, the
+    admin API, or a support ticket.
+  - Storing or deleting a credential restarts or stops a supervised collector,
+    so a change can never be silently ignored by a process still running on the
+    old one.
+
+- Optional odds feed: `lib/feed.js` reads the feed collector's Postgres
+  (`v_feed1`/`v_feed2`) and serves `GET /api/feed/board` + `/api/feed/health`.
   Set `FEED_ENABLED=true` and `FEED_DATABASE_URL`; the board then shows
   recorded Betfair prices instead of the demo bots. Bots and drift are
   suppressed automatically, since two price sources would fight. See
@@ -21,6 +51,10 @@ All notable changes to this project are documented here. The format follows
   adds `ix_snapshots_market_pubtime_desc`. Without it, "latest snapshot per
   market" seq-scans and sorts all of history — measured at 99,498 rows where
   the real content was 138.
+  *(Historical: `betfair-market-snapshots` has since been replaced by
+  [OpenBettingExchangeDataFeed](https://github.com/wippa-studios/OpenBettingExchangeDataFeed),
+  which supersedes the recorder, its Alembic schema and this migration. Left in
+  place because a changelog records what happened, not what is currently true.)*
 - House-account exemption in the money invariant: `CHECK (is_bot = 1 OR
   balance_cents >= 0)`. The house counterparty may go negative (it owes
   `(price-1)*stake` when a bet wins and there is no matched pot to pay from);
