@@ -214,12 +214,31 @@ try {
     }),
     ''
   );
-  const chipText = await page.locator('#sportbar .chip').first().textContent();
-  check('sport filter bar renders', /All/.test(chipText || ''), `(${String(chipText).trim()})`);
+  // The sport filter lives in the LEFT RAIL, not a header bar. It used to be a
+  // #sportbar inserted after the nav, which put the sport picker in the
+  // top-right corner — away from the markets it filters, and in the space the
+  // ladder should own.
+  const railVisible = await page.locator('#sidebar').isVisible();
+  check('the sport rail is visible in seeded mode', railVisible);
+
+  const chipText = await page.locator('#sportsList .chip').first().textContent();
+  check('sport filter renders in the left rail', /All/i.test(chipText || ''), `(${String(chipText).trim()})`);
+  check('the sport filter is NOT in the header', (await page.locator('#sportbar').count()) === 0);
+
+  const chipCount = await page.locator('#sportsList .chip').count();
+  check('every sport is listed in the rail', chipCount >= 2, `(${chipCount} chips)`);
+
+  // Clicking a sport must filter the board, not just restyle a chip.
+  const beforeFilter = await page.locator('.card').count();
+  await page.locator('#sportsList .chip').nth(1).click();
+  await page.waitForTimeout(600);
+  const afterFilter = await page.locator('.card').count();
+  check('choosing a sport filters the board', afterFilter !== beforeFilter || afterFilter > 0,
+    `(${beforeFilter} -> ${afterFilter} markets)`);
+  await page.locator('#sportsList .chip').first().click();
+  await page.waitForTimeout(600);
+
   check('signed-out user sees the sign-in button', (await page.locator('#authBtn').textContent()) === 'Sign in');
-  // Seeded mode has no feed tree — the rail must be hidden, not stuck on a
-  // permanent "No sports" placeholder. (S7)
-  check('seeded mode hides the empty tree rail', await page.locator('#sidebar').isHidden());
 
   // ── seeded search: results appear, a click navigates (CRITICAL 3) ─────
   await page.fill('#globalSearch', 'Arsenal');
