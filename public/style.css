@@ -466,6 +466,14 @@ button { font: inherit; cursor: pointer; }
   white-space: nowrap;
 }
 .lmid .ltp { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--muted); font-size: 12px; flex: none; }
+/* The LTP badge. Rendered ONLY when the last traded price is not already on
+   the ladder (board.js), and always labelled, so a stale trade can never be
+   mistaken for one of the live prices sitting beside it. */
+.lmid .ltp .ltplab {
+  font-size: 9px; font-weight: 700; letter-spacing: .06em;
+  color: var(--muted); opacity: .75; margin-right: 4px;
+  border: 1px solid var(--line); border-radius: 3px; padding: 0 3px;
+}
 
 /* Header row mirrors the price grid exactly so labels sit over their columns. */
 .lrow.lhdr { background: var(--bg2); border-bottom: 1px solid var(--line2); }
@@ -535,6 +543,21 @@ button.chip { font-family: inherit; cursor: pointer; }
 button.chip:hover { border-color: var(--accent); color: var(--text); }
 .chip.open { color: var(--green); border-color: var(--green); background: var(--green-bg); }
 .chip.suspended { color: var(--muted); border-color: var(--accent); background: var(--accent-bg); }
+
+/* The sport chips, as a full-width stacked list in the left rail rather than a
+   wrapped pill bar in the header. The header placement put the sport picker in
+   the top-right corner, away from the markets it filters and in the space the
+   ladder should own. */
+.sportslist { display: flex; flex-direction: column; gap: 3px; }
+.sportslist .chipblock {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; padding: 6px 10px; border-radius: 6px; font-size: 12px;
+  text-align: left; border: 1px solid transparent; background: none;
+}
+.sportslist .chipblock:hover { background: var(--bg2); border-color: var(--line2); color: var(--text); }
+.sportslist .chipblock.on {
+  color: var(--text); border-color: var(--accent); background: var(--accent-bg); font-weight: 600;
+}
 .chip.settled { color: var(--muted); }
 .chip.live { color: var(--pink); border-color: var(--pink); background: var(--pink-bg); }
 

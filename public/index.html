@@ -40,11 +40,14 @@
     <button class="btn sm" id="authBtn">Sign in</button>
   </header>
 
-  <!-- Left rail: the sport → country → track → meeting → race tree. This is the
-       only navigation in feed mode; there are no dropdowns. -->
+  <!-- Left rail: the sport picker in seeded mode, and the full
+       sport → country → track → meeting → race tree in feed mode (where it is
+       the ONLY navigation surface; there are no dropdowns). Exactly one of the
+       two renders here — public/js/nav.js decides, and never both at once. -->
   <aside id="sidebar">
     <div class="sidegroup">
-      <div class="sidehead">SPORTS</div>
+      <!-- Contents are rendered by nav.js: the SPORTS heading is emitted there
+           so each mode controls its own markup. -->
       <div id="sportsList" class="sportslist"></div>
     </div>
   </aside>

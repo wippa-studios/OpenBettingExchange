@@ -19,23 +19,37 @@
   // is the reference for what must NOT be touched.
 
   // ── sports filter ────────────────────────────────────────────────────────
+  //
+  // The sport chips live in the LEFT RAIL, not in the header. They used to be
+  // created as a #sportbar and inserted after the nav, which put the sport
+  // picker in the top-right corner — separated from the markets it filters,
+  // in the one piece of screen real estate that should be the ladder.
+  //
+  // In seeded mode this rail is now the ONLY navigation, so hiding it (which
+  // renderSidebar used to do when there is no feed tree) would leave the venue
+  // with no sport picker at all. Feed mode still uses the same rail for the
+  // sport → country → track → meeting → race tree, so exactly one of the two
+  // owns it at a time and neither has to know about the other's markup.
   function renderSportNav() {
-    let bar = OB.$('sportbar');
-    if (!bar) {
-      bar = document.createElement('div');
-      bar.id = 'sportbar';
-      bar.className = 'sportbar';
-      OB.$('nav').parentNode.insertBefore(bar, OB.$('nav').nextSibling);
+    const rail = OB.$('sidebar');
+    const list = OB.$('sportsList');
+    // Feed mode owns the rail with the deep tree; the chips would be a second,
+    // competing navigation over the same space.
+    if (!rail || !list || OB.state.feedMode) {
+      const old = OB.$('sportbar');
+      if (old) old.remove();
+      return;
     }
-    const all = `<button class="chip ${OB.state.sport === null ? 'on' : ''}" data-sport="">All</button>`;
+    rail.hidden = false;
+    const all = `<button class="chip chipblock ${OB.state.sport === null ? 'on' : ''}" data-sport="">All sports</button>`;
     const chips = OB.state.sports
       .map(
         (s) =>
-          `<button class="chip ${OB.state.sport === s.slug ? 'on' : ''}" data-sport="${OB.attr(s.slug)}">${OB.esc(s.name)} <span class="muted">${s.event_count}</span></button>`
+          `<button class="chip chipblock ${OB.state.sport === s.slug ? 'on' : ''}" data-sport="${OB.attr(s.slug)}">${OB.esc(s.name)} <span class="muted">${s.event_count}</span></button>`
       )
       .join('');
-    bar.innerHTML = all + chips;
-    OB.qa('button[data-sport]', bar).forEach((b) => {
+    list.innerHTML = `<div class="sidehead">SPORTS</div>` + all + chips;
+    OB.qa('button[data-sport]', list).forEach((b) => {
       b.onclick = () => {
         OB.state.sport = b.dataset.sport || null;
         renderSportNav();
@@ -53,16 +67,24 @@
     const aside = OB.$('sidebar');
     const list = OB.$('sportsList');
     if (!aside || !list) return;
-    // Seeded mode has no tree data — hide the rail instead of leaving a
-    // permanent "No sports" placeholder. The sport chips are that mode's nav.
+    // Seeded mode has no tree data, so the deep tree does not render — but the
+    // rail itself STAYS VISIBLE, because in seeded mode it is the sport picker.
+    // It used to be hidden outright here ("the sport chips are that mode's
+    // nav"), which was true when the chips were a header bar and stopped being
+    // true the moment they moved into this rail: hiding it would have left the
+    // venue with no way to filter by sport at all.
+    //
+    // renderSportNav() owns the rail's contents in seeded mode; this function
+    // must not blank it, or the two would erase each other depending on which
+    // ran last.
     if (!OB.state.feedMode) {
-      aside.hidden = true;
+      aside.hidden = false;
       return;
     }
     aside.hidden = false;
     const sports = OB.state.nav || [];
     if (!sports.length) {
-      list.innerHTML = '<div class="sempty">No sports</div>';
+      list.innerHTML = '<div class="sidehead">SPORTS</div><div class="sempty">No sports</div>';
       return;
     }
     const sel = OB.state.navSel || {};

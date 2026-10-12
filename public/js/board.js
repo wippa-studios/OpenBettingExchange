@@ -247,10 +247,35 @@
       // index 0 in each; reverse the back list to place it nearest the runner.
       const b = cellsFor(sel, back.slice().reverse(), 'back', 'atright');
       const l = cellsFor(sel, lay, 'lay', 'atleft');
+      // LAST TRADED PRICE — only worth showing when it says something the
+      // ladder does not.
+      //
+      // It used to render whenever it was non-null, bare and unlabelled, in the
+      // name column. When the last trade happened to be at a price that is
+      // still on the ladder, that number appeared a second time OUTSIDE the
+      // coloured boxes and read as a stray odds bug:
+      //
+      //   Park Meadings   Trap 1    LTP 5.10   back ladder 4.90 5.00 5.10
+      //   Premier League  Arsenal   LTP 2.58   back ladder 2.54 2.56 2.58
+      //
+      // It showed on the FIRST runner of each card only because that is the one
+      // that had traded; it was never a first-runner problem.
+      //
+      // So: suppress it when the ladder already shows that exact price (it adds
+      // nothing and duplicates a number the reader can already see), and when it
+      // IS shown, label it and give it a title, so a price that is genuinely
+      // NOT on the ladder can never be mistaken for a live quote. An unlabelled
+      // number sitting next to live prices will always be read as one of them.
+      const ltpShown =
+        sel.ltp != null &&
+        ![...back, ...lay].some((lv) => lv && Number(lv.price) === Number(sel.ltp))
+          ? `<div class="ltp tn" title="Last traded price — not currently on the ladder">` +
+            `<span class="ltplab">LTP</span>${OB.price2(sel.ltp)}</div>`
+          : '';
       rows +=
         `<div class="lrow">` +
         `<div class="lmid"><div class="nm" title="${OB.esc(sel.name)}">${OB.esc(sel.name)}</div>` +
-        (sel.ltp != null ? `<div class="ltp tn">${OB.price2(sel.ltp)}</div>` : '') +
+        ltpShown +
         `</div>` +
         `<div class="${b.cls}">${b.html}</div>` +
         `<div class="${l.cls}">${l.html}</div></div>`;
