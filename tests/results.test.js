@@ -209,22 +209,48 @@ check('R6 a winner outside the market is held, not settled', () => {
   assert.strictEqual(status(f.db, f.marketId).status, 'open');
 });
 
-// R7: multiple winners SETTLE AS A JOINT FAVOURITE. This test used to assert
-// they were HELD, and that was correct at the time: the engine settled exactly
-// one selection, so paying one winner would strand the other. It has the model
-// now — a winner SET with the payout divided — and holding a dead heat forever
-// is its own failure: the operator's only exit was to VOID, which pays nobody,
-// underpaying the winners and overcharging their layers.
-check('R7 multiple winners settle as a joint favourite, not a half-settlement', () => {
-  const f = fixture();
+// R7: MULTIPLE WINNERS SETTLE AS A JOINT FAVOURITE — BUT ONLY WHERE THE RULES
+// PERMIT ONE.
+//
+// This test previously asserted that multiple winners settle, on a FOOTBALL
+// fixture, because the code derived "is this a dead heat?" from
+// `winners.length > 1` and let that OVERRIDE the rules table. Football has no
+// dead-heat rule at all, so that path paid a joint favourite in a sport with no
+// joint favourites: alice got 4875 where a single winner would have paid her
+// 9750, with no human in the loop and no hold.
+//
+// The rules table is the authority on whether a sport pays a joint favourite. A
+// signal naming two winners is only evidence about what happened. So the two
+// cases are genuinely different now, and both are asserted.
+check('R7 multiple winners under a dead-heat rule settle as a joint favourite', () => {
+  const f = fixture('horse_racing', 2.0);
   bet(f);
-  const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', winners: [f.s1, f.s2] });
-  assert.strictEqual(r.outcome, 'settled', 'a dead heat settles');
+  const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', dead_heat: true, winners: [f.s1, f.s2] });
+  assert.strictEqual(r.outcome, 'settled', 'a racing dead heat settles');
   const m = f.db.prepare('SELECT dead_heat d, joint_winners j, winner_selection_id w FROM markets WHERE id = ?').get(f.marketId);
   assert.strictEqual(m.d, 1, 'recorded as a dead heat');
   assert.strictEqual(m.w, null, 'not a single-winner settlement');
   assert.deepStrictEqual(JSON.parse(m.j).sort((a, b) => a - b), [f.s1, f.s2].sort((a, b) => a - b));
   assert.strictEqual(acc.assertConserved(f.db), 0, 'and the books balance');
+});
+
+// R7a: and under a SINGLE-WINNER rule it is HELD. A feed naming two winners of
+// a football match is either broken or describing something nobody has
+// modelled, and both deserve a human rather than a halved payout.
+check('R7a multiple winners under a single-winner rule are held', () => {
+  const f = fixture('football');
+  bet(f);
+  const before = f.db.prepare('SELECT balance_cents b FROM users WHERE id = ?').get(f.alice.id).b;
+  const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', winners: [f.s1, f.s2] });
+  assert.strictEqual(r.outcome, 'held', 'held for review, not settled');
+  assert.match(r.reason, /multiple winners/i, `reason: ${r.reason}`);
+  assert.strictEqual(status(f.db, f.marketId).status, 'open', 'the market is untouched');
+  assert.strictEqual(
+    f.db.prepare('SELECT balance_cents b FROM users WHERE id = ?').get(f.alice.id).b,
+    before,
+    'and no money moved'
+  );
+  assert.strictEqual(acc.assertConserved(f.db), 0);
 });
 
 // R7b: a dead heat that names only ONE joint winner is not a dead heat — it is

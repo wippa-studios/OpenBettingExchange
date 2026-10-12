@@ -267,7 +267,7 @@ including why a staleness guard was built and then deleted.
 ## Development
 
 ```bash
-npm test            # 505 checks, 39 suites — unit + API integration, fully offline
+npm test            # 530 checks, 41 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 58 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code

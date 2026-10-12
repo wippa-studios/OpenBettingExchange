@@ -121,7 +121,7 @@ const p = () => REP.period();
 // exactly 0 and commission is charged on top of that pool. The first version
 // asserted `SUM(pnl) + SUM(commission) = 0` and reported a 750-cent failure on
 // a perfectly correct book — wrong by exactly the fee.
-check('R1 SUM(pnl) is exactly zero and commission is charged on top of it', () => {
+check('R1 SUM(pnl) equals the buyout identity, and commission is reported apart', () => {
   const b = book();
   const m1 = b.market();
   b.trade(m1);
@@ -134,8 +134,10 @@ check('R1 SUM(pnl) is exactly zero and commission is charged on top of it', () =
   const raw = b.db.prepare('SELECT COALESCE(SUM(pnl_cents),0) p, COALESCE(SUM(commission_cents),0) c FROM settlements').get();
   assert.notStrictEqual(raw.c, 0, 'the book really did charge commission');
   assert.strictEqual(raw.p, 0, 'and the players really did net to zero');
-  assert.strictEqual(rep.settlements_net_to_zero, 0, 'so the self-check passes');
+  assert.strictEqual(rep.settlements_net_pnl, 0, 'so the players net to zero with no buyout');
+  assert.strictEqual(rep.expected_net_pnl, 0, 'and the identity agrees: 0 == paid(0) - took over(0)');
   assert.strictEqual(rep.self_check_ok, true);
+  assert.ok(rep.self_check_basis, 'and the invariant is STATED, not just asserted');
   assert.strictEqual(rep.financial.commission_cents, raw.c, 'commission is reported separately');
 });
 
@@ -152,7 +154,8 @@ check('R2 the self-check reports a failure rather than always passing', () => {
   // or a tampered database looks like.
   b.db.prepare('UPDATE settlements SET pnl_cents = pnl_cents + 5000 WHERE id = 1').run();
   const rep = REP.summary(b.db, p());
-  assert.strictEqual(rep.settlements_net_to_zero, 5000, 'the drift is visible');
+  assert.strictEqual(rep.settlements_net_pnl, 5000, 'the drift is visible');
+  assert.strictEqual(rep.expected_net_pnl, 0, 'and it does not match the identity');
   assert.strictEqual(rep.self_check_ok, false, 'and the report says it is not ok');
 });
 
@@ -253,8 +256,10 @@ check('R6 a statement reports staked, net and commission per player', () => {
     0,
     'players net to zero between themselves'
   );
-  // 2x the matched stake, once per side of each match.
-  assert.strictEqual(rep.turnover.reduce((a, t) => a + t.staked, 0), 30000);
+  // 2x the matched stake, once per side of each match. Summed from the
+  // STATEMENTS rather than from the raw per-user SQL rows, which used to be
+  // returned alongside the same figures (the reviewer's F9) and are gone.
+  assert.strictEqual(rep.statements.reduce((a, x) => a + x.staked_cents, 0), 30000);
 });
 
 // R7: statements exist for every settled player, including bots, and bots are
@@ -365,9 +370,19 @@ check('R11 a tenant own rate is reported as its own', () => {
   assert.ok(gold, 'the tenant appears as its own line');
   assert.strictEqual(gold.commission_bps, 400, 'its own rate');
   assert.ok(rows.length >= 1);
-  // The two rates are NOT blended into one number.
+
+  // THE POINT OF THE FIX. A user with NO tenant row is billed by tenants.ofUser
+  // at the DEFAULT TENANT's rate, not at config.COMMISSION_RATE — and an
+  // operator can change that rate. This check used to assert the opposite ("the
+  // default line keeps the global rate"), which is the finding itself: the
+  // report told the operator 250 while 400 was actually charged.
   const allDefault = rows.find((r) => r.tenant_id === 0);
-  if (allDefault) assert.strictEqual(allDefault.commission_bps, 250, 'the default line keeps the global rate');
+  assert.ok(allDefault, 'the null-tenant bucket is present');
+  assert.strictEqual(allDefault.commission_bps, 400, 'reports the rate actually CHARGED');
+  assert.strictEqual(allDefault.global_rate_bps, 250, 'and shows the global rate beside it for comparison');
+  assert.match(allDefault.tenant, /default tenant/i, 'and names what those users are really billed through');
+  // The two columns agree, which is the whole point of reporting implied_bps.
+  assert.strictEqual(allDefault.implied_bps, allDefault.commission_bps, 'stated rate == implied rate');
 });
 
 // ── Operational ─────────────────────────────────────────────────────────────
@@ -417,7 +432,7 @@ check('R13 rates are null on an empty book, never NaN', () => {
   const sum = REP.summary(b.db, p());
   assert.strictEqual(sum.rates.margin_bps, null, 'margin is null on no turnover');
   assert.strictEqual(sum.rates.hold_bps, null);
-  assert.strictEqual(sum.self_check_ok, true, 'and an empty book still self-checks (0 === 0)');
+  assert.strictEqual(sum.self_check_ok, true, 'and an empty book still self-checks (0 == 0)');
   // And the CSV for it is still well-formed.
   assert.match(REP.operationalCsv(op), /^period_from,period_to,/);
 });
@@ -507,12 +522,22 @@ check('R15 CSV quoting survives commas, quotes and newlines', () => {
   // reported a spurious extra row. So the quoting is verified the only way it
   // can honestly be: parse it back and check the value round-trips.
   const records = parseCsv(out);
-  assert.strictEqual(records.length, 2, 'header plus one market row');
+  // The CSV is now HEADER + DATA + a DEFINITIONS BLOCK, because CSV is the
+  // default format and the operator's primary artefact must explain its own
+  // columns. So the data row is the one that matches the header's width, and
+  // the definitions follow below it.
   const header = records[0];
-  const row = records[1];
-  assert.strictEqual(row.length, header.length, 'every row has the header s column count');
-  assert.strictEqual(row[header.indexOf('market')], 'Match, Odds "2"\nSecond line',
+  const width = header.length;
+  const dataRows = records.slice(1).filter((r) => r.length === width && !r[0].startsWith('#'));
+  assert.strictEqual(dataRows.length, 1, 'exactly one market data row');
+  assert.strictEqual(dataRows[0][header.indexOf('market')], 'Match, Odds "2"\nSecond line',
     'the awkward name round-trips EXACTLY — comma, quotes and newline all intact');
+  // And the definitions survived the round trip too.
+  const defIndex = records.findIndex((r) => r[0] === '# definition');
+  assert.ok(defIndex > 0, 'the export carries its own definitions');
+  const turnoverDef = records.slice(defIndex).find((r) => r[1] === 'turnover_cents');
+  assert.ok(turnoverDef, 'and turnover_cents is defined');
+  assert.match(turnoverDef[2], /once per trade/i, 'saying it is counted once per trade');
 });
 
 // R16: every CSV has a header an operator can read and a stable column order.

@@ -1236,19 +1236,36 @@ app.get('/api/admin/reports/settlements', requireAdmin, limit('admin'), (req, re
 app.get('/api/admin/reports/volume', requireAdmin, limit('admin'), (req, res) => {
   const p = reportPeriod(req);
   const byMarket = REPORTS.volumeByMarket(db, p);
-  const bySelection = REPORTS.volumeBySelection(db, p);
-  if (req_format_is_json(req)) {
-    return res.json({ period: p, by_market: byMarket.rows, by_selection: bySelection });
+  // The selection breakdown is a SECOND ~1s query that the CSV path then threw
+  // away, so a CSV request did double the work for nothing. node:sqlite is
+  // synchronous, so that is double the blocked event loop on a server with one
+  // thread. Only computed when it will actually be used.
+  if (!req_format_is_json(req)) {
+    res.setHeader('content-type', 'text/csv; charset=utf-8');
+    res.setHeader('content-disposition', `attachment; filename="volume_${p.from}_to_${p.to}.csv"`);
+    return res.send(REPORTS.volumeCsv(byMarket));
   }
-  res.setHeader('content-type', 'text/csv; charset=utf-8');
-  res.setHeader('content-disposition', `attachment; filename="volume_${p.from}_to_${p.to}.csv"`);
-  res.send(REPORTS.volumeCsv(byMarket));
+  // volumeBySelection returns the rows directly, NOT { rows } — the first
+  // version of this route read `.rows` off an array and shipped `undefined` for
+  // by_selection, which the API suite caught immediately.
+  const bySelection = REPORTS.volumeBySelection(db, p);
+  return res.json({
+    period: p,
+    by_market: byMarket.rows,
+    by_selection: bySelection,
+    definitions: {
+      by_market: byMarket.definitions,
+      by_selection: REPORTS.SELECTION_VOLUME_DEFS,
+    },
+  });
 });
 
 app.get('/api/admin/reports/volume-by-selection', requireAdmin, limit('admin'), (req, res) => {
   const p = reportPeriod(req);
   const rows = REPORTS.volumeBySelection(db, p);
-  if (req_format_is_json(req)) return res.json({ period: p, rows });
+  if (req_format_is_json(req)) {
+    return res.json({ period: p, rows, definitions: REPORTS.SELECTION_VOLUME_DEFS });
+  }
   res.setHeader('content-type', 'text/csv; charset=utf-8');
   res.setHeader('content-disposition', `attachment; filename="volume_by_selection_${p.from}_to_${p.to}.csv"`);
   res.send(REPORTS.selectionVolumeCsv(rows));
@@ -1259,7 +1276,9 @@ app.get('/api/admin/reports/volume-by-selection', requireAdmin, limit('admin'), 
 app.get('/api/admin/reports/commission', requireAdmin, limit('admin'), (req, res) => {
   const p = reportPeriod(req);
   const rows = REPORTS.commissionByTenant(db, p);
-  if (req_format_is_json(req)) return res.json({ period: p, rows });
+  if (req_format_is_json(req)) {
+    return res.json({ period: p, rows, definitions: REPORTS.COMMISSION_DEFS });
+  }
   res.setHeader('content-type', 'text/csv; charset=utf-8');
   res.setHeader('content-disposition', `attachment; filename="commission_${p.from}_to_${p.to}.csv"`);
   res.send(REPORTS.commissionCsv(rows));
@@ -1295,13 +1314,19 @@ app.get('/api/admin/results/held', requireAdmin, limit('admin'), (req, res) => {
 // Releasing a hold is explicit, reasoned and audited: the whole point of
 // holding a disputed market is that a machine could not decide it.
 app.post('/api/admin/results/held/:id/release', requireAdmin, limit('admin'), (req, res) => {
-  const { decision, winner_selection_id, reason } = req.body || {};
+  const { decision, winner_selection_id, dead_heat, reason } = req.body || {};
   res.json(
     RESULTS.releaseHold(db, {
       actor: req.user,
       marketId: intId(req.params.id),
       decision,
       winnerSelectionId: winner_selection_id === undefined ? null : Number(winner_selection_id),
+      // A held DEAD HEAT is exactly the case a hold exists for, and this route
+      // could only express a single winner — so releasing one paid a whole stake
+      // to one runner and charged a joint winner's backer his whole stake. The
+      // joint-favourite list is passed through UNCHANGED so lib/results.js
+      // validates it; a coerced id must never pick an outcome here.
+      deadHeatSelectionIds: dead_heat === undefined ? null : dead_heat,
       reason,
     })
   );

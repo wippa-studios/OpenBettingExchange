@@ -609,10 +609,10 @@ const check = async (name, fn) => {
       const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
       const routes = [
         ['/api/admin/reports/summary', ['period', 'definitions', 'financial', 'activity', 'rates', 'self_check_ok']],
-        ['/api/admin/reports/settlements', ['period', 'statements']],
-        ['/api/admin/reports/volume', ['period', 'by_market', 'by_selection']],
-        ['/api/admin/reports/volume-by-selection', ['period', 'rows']],
-        ['/api/admin/reports/commission', ['period', 'rows']],
+        ['/api/admin/reports/settlements', ['period', 'statements', 'definitions']],
+        ['/api/admin/reports/volume', ['period', 'by_market', 'by_selection', 'definitions']],
+        ['/api/admin/reports/volume-by-selection', ['period', 'rows', 'definitions']],
+        ['/api/admin/reports/commission', ['period', 'rows', 'definitions']],
         ['/api/admin/reports/operational', ['period', 'definitions', 'activity', 'rates']],
       ];
       for (const [route, keys] of routes) {
@@ -639,6 +639,7 @@ const check = async (name, fn) => {
         assert.ok(r.json.definitions[k], `defines ${k}`);
       }
       assert.ok('self_check_ok' in r.json, 'and reports whether its own invariant holds');
+      assert.ok(r.json.self_check_basis, 'and STATES the invariant rather than asserting a bare number');
     });
 
     await check('R8 a reporting period is validated rather than defaulted silently', async () => {
