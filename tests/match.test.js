@@ -331,10 +331,13 @@ check('E17 taker 1-cent top-up, cancel releases tracked remainder, settle -> 0',
   assert.deepStrictEqual(balances(db, users.bob.id), { b: 100000, f: 26 }); // matched liability kept
   assert.strictEqual(frozenCol(db, b.order.id), 0);
   S.settleMarket(db, market_id, { winner_selection_id: s2 }); // lay wins
-  assert.deepStrictEqual(balances(db, users.bob.id), { b: 100049, f: 0 }); // +50 - 1 commission
+  // +50 - 2 commission: ceil(50*0.025) = ceil(1.25) = 2. Round gave 1, which
+  // is the splitter shave the outside audit's F7 quantified; ceil leaves no
+  // exploitable rounding direction for the player.
+  assert.deepStrictEqual(balances(db, users.bob.id), { b: 100048, f: 0 }); // +50 - 2 commission (ceil)
   assert.deepStrictEqual(balances(db, users.alice.id), { b: 99850, f: 0 }); // lost 100 (to carol) + 50 (to bob)
   assert.deepStrictEqual(balances(db, users.carol.id), { b: 100097, f: 0 }); // +100 - 3 commission
-  assert.deepStrictEqual(txsOf(db, users.bob.id).slice(-2), [{ type: 'settle', a: 50 }, { type: 'commission', a: 1 }]);
+  assert.deepStrictEqual(txsOf(db, users.bob.id).slice(-2), [{ type: 'settle', a: 50 }, { type: 'commission', a: 2 }]); // ceil(1.25)=2
 });
 
 // E18: the same top-up on a RESTING lay — a back taker's fill pushes the

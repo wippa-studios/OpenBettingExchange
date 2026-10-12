@@ -305,12 +305,16 @@ examples, no mocks, executable specification per file. The browser suite
 asserting ladder *geometry* rather than presence is a good instinct — extend
 the same rigor to slip arithmetic and refusal rendering.
 
-**The verification gap is unchanged.** 196 checks are claimed and unverified.
-Baseline the suite before any of this work. Then have someone outside read the
-money path: partial fills at tick boundaries, cancel-during-match, cash-out
-where the only liquidity is the player's own resting orders, settlement after
-every combination. A self-authored suite is weaker evidence than an outside
-reading of the invariant.
+**The verification gap — DISCHARGED (see docs/ROADMAP.md).** An outside
+reviewer read every money-path module and ran exploit scripts against the
+real modules. Ten findings, three of them real-money blockers, all fixed and
+regression-tested (tests/audit.test.js). The outside pass also found a
+lay-side cash-out bug that every self-authored test had masked, because they
+all cashed out a back position. The `orders.frozen_cents` allowlist this
+document demanded is now enforced by tests/guard.test.js — along with the
+equivalent for `users.balance_cents` / `users.frozen_cents`, which the audit
+found was the actual hole (the withdrawal path wrote it directly, outside
+the posting layer).
 
 **One risk that cuts across all three:** the `orders.frozen_cents` convention.
 It's the linchpin of the escrow invariant, it's currently protected by a comment

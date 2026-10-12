@@ -70,14 +70,19 @@
     let cashout = '<tr><td colspan="6" class="muted">Cash-out risk unavailable on this build.</td></tr>';
     try {
       const co = await api('GET', '/api/admin/risk/cashout');
+      // The desk reads EXECUTED BUYOUTS now, not quotes: exposure is the
+      // fair value of buyouts in unresolved markets, outlay is what has been
+      // paid today. Both are written inside the paying transaction — the
+      // previous "quotes" reading was zero forever (the audit's F2).
       cashout = `
-        <tr><td><strong>Cash-out exposure</strong></td>
+        <tr><td><strong>Cash-out exposure</strong><div class="muted small">unsettled buyouts, fair value</div></td>
             <td>${money(co.outstanding_cents)}</td>
             <td class="muted">${fmt(co.max_outstanding_cents)}</td>
-            <td>${money(-co.realised_loss_today_cents)}</td>
+            <td>${money(-co.realised_loss_today_cents)}<div class="muted small">realised loss today</div></td>
             <td colspan="2">${co.quoting_allowed
-              ? `<span class="chip live">${co.open_quotes} open quote(s)</span>`
-              : '<span class="chip suspended">capped</span>'}</td></tr>`;
+              ? `<span class="chip live">${co.open_buyouts} open buyout(s) · ${co.taken_today} taken today</span>`
+              : '<span class="chip suspended">capped</span>'}
+                <div class="muted small">outlay today ${fmt(co.outlay_today_cents)} of ${fmt(co.max_daily_outlay_cents)}</div></td></tr>`;
     } catch { /* older build — keep the row, say so in it */ }
 
     body.innerHTML = `
@@ -89,7 +94,6 @@
       <div class="row gap">
         <button class="btn ${data.kill_switch ? 'danger' : ''}" id="riskKill">${data.kill_switch ? 'Release kill switch' : 'PULL KILL SWITCH'}</button>
         <button class="btn" id="riskWithdraw">Withdraw all bot quotes</button>
-        <button class="btn sm" id="riskExpireQuotes">Expire stale cash-out quotes</button>
       </div>
       <p class="muted small">Killing stops NEW quotes; it does not cancel resting ones, because a quote
       already on the book is a promise the venue made. Withdrawing is the separate, explicit action.</p>
@@ -114,13 +118,6 @@
       try {
         const r = await api('POST', '/api/admin/risk/withdraw', { reason });
         toast(`Cancelled ${r.cancelled_orders} quote(s), released ${fmt(r.released_cents)}`);
-        renderRiskView(body);
-      } catch (e) { toast(e.message); }
-    };
-    body.querySelector('#riskExpireQuotes').onclick = async () => {
-      try {
-        const r = await api('POST', '/api/admin/risk/cashout/expire', {});
-        toast(`Expired ${r.expired} stale quote(s)`);
         renderRiskView(body);
       } catch (e) { toast(e.message); }
     };

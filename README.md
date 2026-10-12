@@ -222,13 +222,15 @@ a bad value **aborts the launch** rather than failing later.
 | `RISK_MAX_LIABILITY_CENTS` | `5000000` | how far the market-maker bot may go into debt |
 | `RISK_MAX_DAILY_LOSS_CENTS` | `1000000` | bot realised daily loss cap |
 | `OPS_TOKEN` | — | required for `/metrics` and the backup control; unset ⇒ they 404 |
+| `PAYMENTS_WEBHOOK_SECRET` | — | HMAC secret for `POST /api/payments/webhook`; unset ⇒ the webhook 404s and no deposit can confirm |
+| `DEPOSIT_MAX_CENTS` / `DEPOSIT_DAILY_MAX_CENTS` | `100000` / `500000` | per-intent and per-user-per-day caps on confirmed deposits |
 | `BACKUP_DIR` / `BACKUP_RETENTION` | — / `24` | scheduled snapshots; unset ⇒ **backups are off** and boot says so |
 | `RECONCILE_INTERVAL_MS` | `900000` | scheduled reconciliation cadence |
 
 ## Development
 
 ```bash
-npm test            # 382 checks, 31 suites — unit + API integration, fully offline
+npm test            # 407 checks, 32 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 58 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code
@@ -248,7 +250,7 @@ Contributing, house conventions and where to add things:
 
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
-public/    frontend (no build)     tests/      31 unit/API suites + smoke + browser + guards
+public/    frontend (no build)     tests/      32 unit/API suites + smoke + browser + guards
             public/js/*.js          7 UI modules, 187-419 lines each
 docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```

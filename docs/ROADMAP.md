@@ -469,10 +469,53 @@ browser suite, all green.
    and the product should not be deployable to an operator who has not
    configured it.
 
-### The verification gap, restated
+### The verification gap — DISCHARGED
 
-The money path is now covered by 340 checks including a price × stake property
-sweep, an escrow sweep, and an adversarial double-entry suite. It is still a
-**self-authored** suite. `docs/WORKSTREAMS.md` recommends an outside reading
-before real money, and that recommendation has not been discharged: the
-reviews behind Phases 1–4 were internal.
+An outside review of the money path ran (a fresh reviewer with no prior
+exposure, reading every money-path module and running exploit scripts against
+the real modules). It found **ten findings**, of which three were serious
+enough to have been blockers for real money — and every one was found by
+someone who had not written the code:
+
+1. **CRITICAL — a player could mint unlimited money.** The deposit-intent
+   confirm route was player-callable: it checked only that the intent was
+   pending, never that money had arrived or who was calling, and credited
+   with the faucet cap bypassed. Fixed: the route is gone; confirmation is
+   provider-webhook-only (HMAC over the raw body, constant-time) or admin;
+   per-intent and per-user-daily caps bound even a compromised webhook.
+2. **HIGH — the cash-out risk caps were dead controls.** The module tracked
+   quotes, but quotes are atomic with their execution here, so nothing ever
+   wrote the rows it read: exposure was zero forever while the roadmap
+   claimed a defence. Fixed: executed BUYOUTS are recorded inside the paying
+   transaction, resolved at settlement; the realised-loss metric is
+   paid-minus-what-the-position-returned, not the margin.
+3. **HIGH — cashoutPosition defended nothing.** No market-state check, so a
+   direct call paid out against a settled market and stranded another
+   market's escrow, bricking its settlement. Fixed: the primitive checks
+   market status and hold itself, so no second caller can inherit an
+   unguarded money path.
+
+Plus: settlement_hold now enforced in the settlement primitive (the plain
+admin settle route could bypass the reasoned release); the withdrawal
+lifecycle completed (complete + fail-with-refund routes, previously a dead
+end that stranded money in gateway_clearing); per-tenant commission actually
+charged at settlement (stored, audited, displayed — and previously ignored);
+commission rounding made house-favourable (ceil; round let a splitter shave
+the fee); `BEGIN IMMEDIATE` for multi-process accidents; the house may settle
+negative per its own schema (previously a bricked market, no repair path);
+and `guard.test.js` now mechanically enforces that only `ledger.js` writes
+the wallet columns.
+
+**The second outside pass found a fourth blocker the first missed**: a
+one-token bug in the lay-side cash-out replacement paired the house with the
+player's own dead order and DROPPED THE COUNTERPARTY — stranding their escrow
+and bricking settlement of the whole market. Every existing test cashed out a
+BACK position, which masked the broken branch. Now regression-tested both
+sides (cashout2 C8/C13).
+
+The lesson the project takes from this: **an author cannot review their own
+money path.** The self-authored suite grew from 340 to 407 checks and every
+one of the ten findings was reproducible as a test — but none of them was
+FOUND by the suite, because the suite tested what the author intended, and
+the code did something else. A second outside reading before real money
+remains worthwhile; the first one paid for itself twice.

@@ -99,5 +99,70 @@ check('G6 the matching engine genuinely owns the column', () => {
   assert.ok(writes >= 3, `expected the engine to write frozen_cents in several places, found ${writes}`);
 });
 
+// ── The WALLET columns ───────────────────────────────────────────────────────
+// The outside audit's third fix: the guard covered orders.frozen_cents but
+// NOT users.balance_cents / users.frozen_cents — and at the time, the
+// withdrawal path in lib/payments wrote balance_cents directly, outside
+// ledger.js and outside any enforcement. The module that owns the wallet
+// columns is what makes "balance_cents is a cache of the double-entry
+// postings" a theorem rather than a hope: a writer that bypasses the posting
+// layer breaks assertUserAgrees silently and the player sees a wrong balance.
+// That writer moved into ledger.withdrawHold; these checks pin it there.
+const WALLET_ALLOWED = {
+  'ledger.js': 'the posting layer: the only module that writes the wallet columns AND their double-entry counterparts together',
+};
+
+// G7: no module outside the allowlist UPDATEs the wallet columns.
+check('G7 only ledger.js writes users.balance_cents / users.frozen_cents', () => {
+  const files = fs.readdirSync(LIB).filter((f) => f.endsWith('.js'));
+  const offenders = [];
+  for (const f of files) {
+    if (WALLET_ALLOWED[f]) continue;
+    const code = fs.readFileSync(path.join(LIB, f), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    if (/UPDATE\s+users\s+SET[^;]*(balance_cents|frozen_cents)/i.test(code)) {
+      offenders.push(f);
+    }
+  }
+  assert.deepStrictEqual(offenders, [], `unapproved writers of the wallet columns: ${offenders.join(', ')}`);
+});
+
+// G8: server.js — the largest file and the likeliest landing spot for an
+// "emergency" balance fix — must not write them either.
+check('G8 the HTTP layer never writes the wallet columns', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(!/UPDATE\s+users\s+SET[^;]*(balance_cents|frozen_cents)/i.test(src), 'server.js writes the wallet columns');
+});
+
+// G9: the OPENING balance is the one legitimate write outside an UPDATE — an
+// INSERT at account creation, validated to a non-negative integer by
+// createAccount. Pin it to auth.js so nobody else mints starting balances.
+check('G9 only auth.js inserts an opening balance', () => {
+  const files = fs.readdirSync(LIB).filter((f) => f.endsWith('.js'));
+  const offenders = [];
+  for (const f of files) {
+    if (f === 'auth.js') continue;
+    const code = fs.readFileSync(path.join(LIB, f), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    if (/INSERT\s+INTO\s+users[^;]*balance_cents/i.test(code)) offenders.push(f);
+  }
+  const srv = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  if (/INSERT\s+INTO\s+users[^;]*balance_cents/i.test(srv)) offenders.push('server.js');
+  assert.deepStrictEqual(offenders, [], `unapproved opening-balance inserts: ${offenders.join(', ')}`);
+});
+
+// G10: the guard is not vacuous — ledger.js really is where the writes are.
+check('G10 ledger.js genuinely owns the wallet columns', () => {
+  const src = fs.readFileSync(path.join(LIB, 'ledger.js'), 'utf8');
+  const writes = (src.match(/UPDATE\s+users\s+SET[^;]*(balance_cents|frozen_cents)/gi) || []).length;
+  assert.ok(writes >= 4, `expected ledger.js to write the wallet columns in several places, found ${writes}`);
+});
+
 console.log(`\nguard.test.js: ${passed} checks passed`);
-if (passed < 6) { console.error('expected 6 checks'); process.exit(1); }
+if (passed < 10) { console.error('expected 10 checks'); process.exit(1); }

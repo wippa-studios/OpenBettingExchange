@@ -254,10 +254,14 @@ check('S12 repro A settles cleanly: frozen -> 0 for everyone', () => {
   assert.deepStrictEqual(balances(db, users.bob.id), { b: 100000, f: 5 });
   const res = S.settleMarket(db, market_id, { winner_selection_id: s1 }); // back wins
   assert.strictEqual(res.market.status, 'settled');
-  assert.deepStrictEqual(balances(db, users.alice.id), { b: 100005, f: 0 }); // +round(0.03*150)=5, commission round(0.125)=0
+  // Commission is CEIL (house-favourable, by design — see lib/settle.js):
+  // a win of 5 pays ceil(5*0.025) = ceil(0.125) = 1, not round's 0. The old
+  // round-to-zero here was exactly the splitter exploit the outside audit's
+  // F7 quantified: tiny wins paid no fee at all.
+  assert.deepStrictEqual(balances(db, users.alice.id), { b: 100004, f: 0 }); // +round(0.03*150)=5, commission ceil(0.125)=1
   assert.deepStrictEqual(balances(db, users.bob.id), { b: 99995, f: 0 });
   const total = db.prepare('SELECT SUM(balance_cents) t FROM users').get().t;
-  assert.strictEqual(total, 400000); // conserved (commission rounded to 0)
+  assert.strictEqual(total, 399999); // conserved; the 1 cent of commission is house revenue
 });
 
 // S13 (Critical-1 repro B end-to-end): lay 155 @ 1.10 matched @ 1.02 keeps
@@ -269,7 +273,9 @@ check('S13 repro B settles cleanly: frozen -> 0 for everyone', () => {
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 1.10, stake_cents: 155 });
   assert.deepStrictEqual(balances(db, users.bob.id), { b: 100000, f: 3 });
   S.settleMarket(db, market_id, { winner_selection_id: s1 }); // back wins
-  assert.deepStrictEqual(balances(db, users.alice.id), { b: 100003, f: 0 }); // +3, commission 0
+  // +3, commission ceil(3*0.025)=ceil(0.075)=1 — the minimum fee the ceil rule
+  // charges; round gave 0.
+  assert.deepStrictEqual(balances(db, users.alice.id), { b: 100002, f: 0 }); // +3 - 1
   assert.deepStrictEqual(balances(db, users.bob.id), { b: 99997, f: 0 });
 });
 
@@ -438,7 +444,9 @@ check('S20 escrow invariant property sweep (ticks x stakes)', () => {
     assert.strictEqual(wallet(bob.id).f, 0, `lay frozen -> 0 after ${mode} (Q=${Q} P=${P} stake=${stake})`);
     assert.strictEqual(wallet(carol.id).f, 0, `back frozen -> 0 after ${mode}`);
     const delta = wallet(bob.id).b - before;
-    assert.strictEqual(delta, mode === 'void' ? 0 : stake - Math.round(stake * 0.025), `lay ${mode} delta (Q=${Q} P=${P} stake=${stake})`);
+    // Commission is CEIL — the house-favourable rounding rule (see
+    // lib/settle.js); round was the splitter-shave the audit's F7 quantified.
+    assert.strictEqual(delta, mode === 'void' ? 0 : stake - Math.ceil(stake * 0.025), `lay ${mode} delta (Q=${Q} P=${P} stake=${stake})`);
     scenarios++;
   };
 
@@ -461,7 +469,7 @@ check('S20 escrow invariant property sweep (ticks x stakes)', () => {
     assert.strictEqual(wallet(carol.id).f, 0);
     assert.strictEqual(wallet(alice.id).f, 0);
     const delta = wallet(bob.id).b - before;
-    assert.strictEqual(delta, mode === 'void' ? 0 : stake - Math.round(stake * 0.025), `multi-fill ${mode} delta (Q=${Q} stake=${stake})`);
+    assert.strictEqual(delta, mode === 'void' ? 0 : stake - Math.ceil(stake * 0.025), `multi-fill ${mode} delta (Q=${Q} stake=${stake})`);
     scenarios++;
   };
 
@@ -481,7 +489,7 @@ check('S20 escrow invariant property sweep (ticks x stakes)', () => {
     S.settleMarket(db, market_id, { winner_selection_id: s2 }); // lay keeps the 100
     assert.strictEqual(wallet(bob.id).f, 0, `partial frozen -> 0 after settle (Q=${Q} stake=${stake})`);
     assert.strictEqual(wallet(carol.id).f, 0);
-    assert.strictEqual(wallet(bob.id).b - before, 100 - Math.round(100 * 0.025));
+    assert.strictEqual(wallet(bob.id).b - before, 100 - Math.ceil(100 * 0.025));
     scenarios++;
   };
 

@@ -86,7 +86,17 @@ app.use((req, res, next) => {
   return res.status(403).json({ error: 'Forbidden origin' });
 });
 
-app.use(express.json({ limit: '256kb' }));
+app.use(
+  express.json({
+    limit: '256kb',
+    // The payments webhook authenticates by HMAC over the RAW request body.
+    // express.json would otherwise hand the route a re-serialised object whose
+    // bytes differ from what the provider signed (key order, whitespace), and
+    // the signature would never verify. Capturing the buffer here is the
+    // standard fix.
+    verify: (req, res, buf) => { req.rawBody = buf; },
+  })
+);
 
 // DB + idempotent seed on first run.
 const db = openStore(config.DB_PATH);
@@ -931,8 +941,76 @@ app.post('/api/wallet/deposit-intent', requireAuth, limit('wallet'), (req, res, 
     .catch(next);
 });
 
-app.post('/api/wallet/deposit-intent/:id/confirm', requireAuth, limit('wallet'), (req, res) => {
-  res.json(PAY.confirmDeposit(db, Number(req.params.id)));
+// NOTE: there is deliberately NO player-callable confirm route here.
+//
+// The outside audit's critical finding (F1) was that this used to exist: any
+// signed-in player could POST /api/wallet/deposit-intent/:id/confirm and mint
+// unbounded money. The route checked only that the intent was pending — never
+// that money had arrived from the provider, never that the caller owned the
+// intent — and the confirmation path credited with the faucet cap disabled
+// (Number.MAX_SAFE_INTEGER as the ceiling). "Credit on confirmation, never on
+// initiation" is worthless if the PLAYER is the one who confirms.
+//
+// Confirmation now happens in exactly two places: the provider-authenticated
+// webhook below, and the admin desk. Both enforce caps as well.
+
+// ── Payments webhook ───────────────────────────────────────────────────────
+// The ONLY automated deposit-confirmation path, and it authenticates the
+// CALLER, not the session: an HMAC over the raw body with a shared secret,
+// compared in constant time. Without the secret the route 404s rather than
+// accepting unsigned events — the safe default, since this is the path that
+// creates money.
+const crypto = require('crypto');
+app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
+  if (!config.PAYMENTS_WEBHOOK_SECRET) return res.status(404).json({ error: 'Not found' });
+  const sig = String(req.headers['x-obx-signature'] || '');
+  const expected = crypto
+    .createHmac('sha256', config.PAYMENTS_WEBHOOK_SECRET)
+    .update(req.rawBody || Buffer.alloc(0))
+    .digest('hex');
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  // timingSafeEqual throws on length mismatch, so check first. A plain ===
+  // compare would leak the correct signature's length and early-exit timing.
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'Bad signature' });
+  }
+  const body = req.body || {};
+  try {
+    const r = PAY.confirmByExternalId(db, {
+      provider: body.provider,
+      externalId: body.external_id,
+      amountCents: Number(body.amount_cents),
+    });
+    res.json(r);
+  } catch (e) {
+    // A webhook the provider RETRIES must not credit twice, and one that
+    // references an unknown or already-confirmed intent is the normal result
+    // of at-least-once delivery — answer it, do not crash the process.
+    if (e && e.status) return res.status(e.status).json({ error: e.message, details: e.details || null });
+    throw e;
+  }
+});
+
+// ── Withdrawal lifecycle (admin) ────────────────────────────────────────────
+// The outside audit's F5: a withdrawal could be opened and debited, and
+// NOTHING in the system could complete or refund it — the money sat in
+// gateway_clearing forever. These two routes close the lifecycle, and both
+// are audited with a written reason.
+app.post('/api/admin/payments/intents/:id/complete', requireAdmin, limit('admin'), (req, res) => {
+  const reason = (req.body || {}).reason;
+  if (!reason || String(reason).trim().length < 5) return res.status(400).json({ error: 'A written reason is required' });
+  const r = PAY.completeWithdrawal(db, intId(req.params.id), String(reason).trim());
+  audit.record(db, req.user, audit.ACTIONS.PAYMENT_INTENT_COMPLETED, 'payments:intent', r.intent_id, { status: r.status, amount_cents: r.amount_cents }, String(reason).trim());
+  res.json(r);
+});
+
+app.post('/api/admin/payments/intents/:id/fail', requireAdmin, limit('admin'), (req, res) => {
+  const reason = (req.body || {}).reason;
+  if (!reason || String(reason).trim().length < 5) return res.status(400).json({ error: 'A written reason is required' });
+  const r = PAY.failWithdrawal(db, intId(req.params.id), String(reason).trim());
+  audit.record(db, req.user, audit.ACTIONS.PAYMENT_INTENT_FAILED, 'payments:intent', r.intent_id, { status: r.status, refunded_cents: r.refunded_cents }, String(reason).trim());
+  res.json(r);
 });
 
 app.post('/api/wallet/withdraw', requireAuth, limit('wallet'), (req, res) => {
@@ -1075,11 +1153,11 @@ app.get('/api/admin/risk/cashout', requireAdmin, limit('admin'), (req, res) => {
   }));
 });
 
-app.post('/api/admin/risk/cashout/expire', requireAdmin, limit('admin'), (req, res) => {
-  const n = CASHOUTRISK.expireStaleQuotes(db);
-  audit.record(db, req.user, audit.ACTIONS.CASHOUT_QUOTES_EXPIRED, 'risk:cashout', null, { expired: n }, (req.body || {}).reason);
-  res.json({ expired: n });
-});
+// NOTE: the old "expire stale cash-out quotes" route is deliberately GONE.
+// It expired a kind of row that no production path ever wrote (the outside
+// audit's F2): quotes and their executions are atomic in the same request,
+// so there is no live quote to go stale. What the venue carries now is
+// executed BUYOUTS, which resolve at settlement — nothing to sweep.
 
 // ── Operational surface ────────────────────────────────────────────────────
 // /healthz is LIVENESS and must not touch the database: a liveness probe that

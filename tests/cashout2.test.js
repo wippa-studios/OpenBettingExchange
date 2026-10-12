@@ -256,5 +256,52 @@ check('C12 no position, or the house, gets no quote', () => {
   void config;
 });
 
+// C13: THE LAY SIDE OF THE SAME FLOW. C8 cashes out the BACK player, and for
+// months that was the only branch tested — which masked a one-token bug found
+// by the second outside review: the replacement match paired the house with
+// the PLAYER'S OWN dead order and dropped the counterparty entirely, so a
+// lay-side cash-out stranded the backer's escrow against a dead match and the
+// market's settlement then failed outright ("releasing more than frozen") —
+// a bricked market, no repair path, on the second-most-natural trade on the
+// board. This test mirrors C8 with the sides swapped, and asserts settlement
+// completes with the counterparty paid EXACTLY.
+check('C13 the LAY side cashes out and the BACK counterparty is preserved exactly', () => {
+  const { db, alice, bob, marketId, ids } = fixture();
+  // Bob LAYS a profitable price (1.5), so his position is quotable: laying at
+  // 2.5 in a 2.0/2.0 book is value-destroying and correctly gets no quote.
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
+
+  const r = cashout.cashoutMarket(db, bob, marketId);
+  assert.ok(r.payout_cents > 0, 'bob is bought out of his profitable lay');
+  assert.strictEqual(wallet(db, alice.id).f, 10000, 'alice collateral is still held');
+  // The counterparty must STILL BE IN A LIVE MATCH: the replacement pairs the
+  // house with HER back order, not with bob's dead lay. This was the bug —
+  // the back slot held the player's own order id.
+  const live = db
+    .prepare(
+      `SELECT bo.user_id AS back_user, lo.user_id AS lay_user
+         FROM matches mt JOIN orders bo ON bo.id = mt.back_order_id
+         JOIN orders lo ON lo.id = mt.lay_order_id
+        WHERE mt.market_id = ? AND mt.cashout = 0`
+    )
+    .all(marketId);
+  assert.strictEqual(live.length, 1, 'exactly one live replacement match');
+  assert.strictEqual(live[0].back_user, alice.id, 'alice is in it, as the back');
+  assert.notStrictEqual(live[0].lay_user, bob.id, 'bob\'s dead order is NOT in it');
+
+  // And the market must settle, paying alice her exact due. Before the fix
+  // this threw "releasing more than frozen" and left the market un-settleable.
+  settle.settleMarket(db, marketId, { winner_selection_id: ids.Alpha });
+  const aliceFinal = wallet(db, alice.id);
+  assert.strictEqual(aliceFinal.f, 0, 'her collateral is released');
+  // Back 10000 @ 1.5 wins 5000; commission 2.5% of 5000 = 125. The fixture
+  // funds 1000000, so her final balance is 1000000 + 5000 - 125.
+  assert.strictEqual(aliceFinal.b, 1000000 + 5000 - 125, 'she is paid exactly');
+  // Bob keeps his buyout and is NOT settled again.
+  assert.strictEqual(wallet(db, bob.id).b, 1000000 + r.payout_cents, 'bob is not re-settled');
+  assert.strictEqual(acc.assertConserved(db), 0, 'and the books still balance');
+});
+
 console.log(`\ncashout2.test.js: ${passed} checks passed`);
-if (passed < 12) { console.error('expected 12 checks'); process.exit(1); }
+if (passed < 13) { console.error("expected 13 checks"); process.exit(1); }

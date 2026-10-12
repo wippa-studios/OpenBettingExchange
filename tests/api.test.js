@@ -502,6 +502,55 @@ const check = async (name, fn) => {
       assert.strictEqual(fresh.status, 201); // reset unblocks the shared-IP register path
     });
 
+    // ── The deposit trust boundary (outside audit's F1, at the HTTP layer) ──
+    // The critical finding was that any signed-in player could confirm a
+    // deposit intent themselves and mint unlimited money. These checks pin
+    // the boundary at the ROUTE level: a player reaches open + read, never
+    // confirm; only the provider-authenticated webhook can.
+    await check('W1 a player can open a deposit intent but it credits nothing', async () => {
+      const login = await j('POST', '/api/auth/login', { body: { username: 'alice', password: 'secret1' } });
+      const cookie = cookieOf(login);
+      const before = (await j('GET', '/api/wallet', { cookie })).json.balance_cents;
+      const r = await j('POST', '/api/wallet/deposit-intent', { body: { amount_cents: 25000 }, cookie });
+      assert.strictEqual(r.status, 200);
+      assert.ok(r.json.intent_id, 'an intent id exists');
+      assert.strictEqual(r.json.status, 'pending');
+      const after = (await j('GET', '/api/wallet', { cookie })).json.balance_cents;
+      assert.strictEqual(after, before, 'opening an intent moves no money');
+    });
+
+    await check('W2 THE PLAYER-CONFIRMABLE ROUTE IS GONE (404)', async () => {
+      const login = await j('POST', '/api/auth/login', { body: { username: 'alice', password: 'secret1' } });
+      const cookie = cookieOf(login);
+      const before = (await j('GET', '/api/wallet', { cookie })).json.balance_cents;
+      // The auditor's exact exploit: any intent id, the player's own session.
+      // (The balance is relative, not absolute: alice has been trading
+      // throughout this suite, and the point is that THIS route cannot move
+      // it — not what it happened to be.)
+      const r = await j('POST', '/api/wallet/deposit-intent/1/confirm', { body: {}, cookie });
+      assert.strictEqual(r.status, 404, 'the route no longer exists');
+      const after = (await j('GET', '/api/wallet', { cookie })).json.balance_cents;
+      assert.strictEqual(after, before, 'and no self-service credit path remains');
+    });
+
+    await check('W3 the webhook is default-deny without the secret', async () => {
+      // This suite runs without PAYMENTS_WEBHOOK_SECRET, so the route 404s —
+      // the safe default: an unauthenticated confirm path is exactly the
+      // critical bug the audit found, so it must not exist unless configured.
+      const r = await j('POST', '/api/payments/webhook', { body: { external_id: 'x', amount_cents: 100 } });
+      assert.ok(r.status === 404 || r.status === 401, `unsigned/unconfigured webhook is refused, got ${r.status}`);
+    });
+
+    await check('W4 a deposit intent above the per-intent cap is refused', async () => {
+      const login = await j('POST', '/api/auth/login', { body: { username: 'alice', password: 'secret1' } });
+      const r = await j('POST', '/api/wallet/deposit-intent', {
+        body: { amount_cents: 50000000 },
+        cookie: cookieOf(login),
+      });
+      assert.strictEqual(r.status, 400, 'the 50,000,000-cent exploit is refused at creation');
+      assert.ok(/per-intent cap/.test(r.json.error));
+    });
+
     console.log(`\napi.test.js: ${passed} checks passed`);
   } finally {
     server.close();
