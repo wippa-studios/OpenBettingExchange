@@ -27,7 +27,7 @@ browser (public/)
 ```
 
 There is no ORM, no migration framework and no service layer beyond `lib/`. The
-schema is a single `CREATE TABLE IF NOT EXISTS` block in `lib/store.js` (22
+schema is a single `CREATE TABLE IF NOT EXISTS` block in `lib/store.js` (23
 tables), which is why a fresh clone runs with one command. Express is the only
 runtime dependency; Playwright is dev-only and used by the browser suite.
 

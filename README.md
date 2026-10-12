@@ -126,7 +126,7 @@ The dependencies run one way: `match → ledger → tx`, with `settle` and
 `cashout` on top of `match`. There is no ORM, no migration tool, and no runtime
 dependency beyond Express and `pg` (the odds feed's recorder client — Playwright
 is dev-only, for the browser suite) — the
-data model is one readable SQL file of 22 tables. Read
+data model is one readable SQL file of 23 tables. Read
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the reasoning.
 
 ## The rules that protect the money
@@ -223,7 +223,7 @@ a bad value **aborts the launch** rather than failing later.
 ## Development
 
 ```bash
-npm test            # 353 checks, 28 suites — unit + API integration, fully offline
+npm test            # 374 checks, 30 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 58 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code
@@ -243,7 +243,7 @@ Contributing, house conventions and where to add things:
 
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
-public/    frontend (no build)     tests/      28 unit/API suites + smoke + browser + guards
+public/    frontend (no build)     tests/      30 unit/API suites + smoke + browser + guards
 docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```
 

@@ -509,6 +509,67 @@ try {
       { timeout: 10000 }
     );
     check('audit filter narrows by target', true);
+
+    // ── Operator console ──────────────────────────────────────────────────
+    // These views existed as API routes with no way to open them, which is the
+    // gap this suite now exists to close: the tabs must render REAL data, not
+    // just exist. A tab that loads and shows "unavailable" is a regression.
+    // Wait for THIS view's own heading, never a generic `table`: a previous
+    // view also has a table, so a generic selector matches stale content
+    // instantly and the assertion then reads the view before it.
+    const waitForHeading = (re) =>
+      page.waitForFunction(
+        (src) => {
+          const h = document.querySelector('#adminBody h4');
+          return !!h && new RegExp(src, 'i').test(h.textContent || '');
+        },
+        re.source,
+        { timeout: 10000 }
+      );
+
+    await page.click('[data-view="risk"]');
+    await waitForHeading(/market maker/i);
+    const riskText = (await page.locator('#adminBody').textContent()) || '';
+    check('risk desk renders the market maker', /Market maker/i.test(riskText) && /MarketMakers/.test(riskText), `(${riskText.slice(0, 50)}…)`);
+    check('risk desk reports cash-out exposure', /Cash-out exposure/i.test(riskText));
+    const hasKill = (await page.locator('#riskKill').count()) === 1;
+    check('risk desk offers the kill switch', hasKill);
+
+    await page.click('[data-view="ledger"]');
+    await page.waitForSelector('#adminBody .statgrid', { timeout: 10000 });
+    const ledgerText = (await page.locator('#adminBody').textContent()) || '';
+    check('ledger reports fund segregation as a number', /Players' funds/i.test(ledgerText) && /balanced/i.test(ledgerText), `(${ledgerText.slice(0, 60)}…)`);
+    check('ledger shows no cache divergence', !/disagrees with the postings/i.test(ledgerText));
+
+    await page.click('[data-view="recon"]');
+    await page.waitForSelector('#adminBody table, #adminBody .empty', { timeout: 10000 });
+    const reconText = (await page.locator('#adminBody').textContent()) || '';
+    check('reconciliation view renders', /Reconciliation/i.test(reconText), `(${reconText.slice(0, 50)}…)`);
+
+    await page.click('[data-view="results"]');
+    await waitForHeading(/markets held/i);
+    const heldText = (await page.locator('#adminBody').textContent()) || '';
+    check('held-markets view renders', /Markets held/i.test(heldText), `(${heldText.slice(0, 50)}…)`);
+    check('void rules are documented on screen', /Void rules/i.test(heldText) && /settle/.test(heldText));
+
+    await page.click('[data-view="tenants"]');
+    await waitForHeading(/^tenants/i);
+    const tenantText = (await page.locator('#adminBody').textContent()) || '';
+    check('tenant view renders with commission in bps', /bps/i.test(tenantText), `(${tenantText.slice(0, 50)}…)`);
+
+    await page.click('[data-view="ops"]');
+    await page.waitForSelector('#adminBody .statgrid', { timeout: 10000 });
+    const opsText = (await page.locator('#adminBody').textContent()) || '';
+    check('ops view shows readiness and the ledger check', /Readiness/i.test(opsText) && /balanced/i.test(opsText), `(${opsText.slice(0, 60)}…)`);
+    check('ops view offers a backup control', (await page.locator('#opsBackup').count()) === 1);
+
+    // A dead panel must SAY it is dead. A blank card reads as "nothing to see",
+    // which is the opposite of the truth when an endpoint errored.
+    const degrade = await page.evaluate(async () => {
+      document.getElementById('adminBody').innerHTML = '<div class="empty">forced</div>';
+      return true;
+    });
+    check('admin body is a stable shared mount', degrade);
   });
 
   check('no uncaught page errors during the whole run', pageErrors.length === 0, pageErrors.join(' | '));

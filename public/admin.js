@@ -25,6 +25,12 @@
           <button class="btn sm" data-view="users">Users</button>
           <button class="btn sm" data-view="audit">Audit</button>
           <button class="btn sm" data-view="create">Create</button>
+          <button class="btn sm" data-view="risk">Risk</button>
+          <button class="btn sm" data-view="ledger">Ledger</button>
+          <button class="btn sm" data-view="recon">Reconcile</button>
+          <button class="btn sm" data-view="results">Held</button>
+          <button class="btn sm" data-view="tenants">Tenants</button>
+          <button class="btn sm" data-view="ops">Ops</button>
         </div>
         <div id="adminBody"></div>
       </div>`;
@@ -32,9 +38,15 @@
       b.onclick = () => {
         page.querySelectorAll('[data-view]').forEach((x) => x.classList.remove('primary'));
         b.classList.add('primary');
-        if (b.dataset.view === 'markets') renderMarketsView();
-        else if (b.dataset.view === 'users') renderUsersView();
-        else if (b.dataset.view === 'audit') renderAuditView();
+        const v = b.dataset.view;
+        // The operator views live in admin-risk.js and share this tab strip and
+        // this #adminBody, so there is ONE code path for rendering and the two
+        // halves cannot drift apart.
+        if (window.OBAdminRisk && window.OBAdminRisk.views.includes(v)) {
+          window.OBAdminRisk.renderInto(v);
+        } else if (v === 'markets') renderMarketsView();
+        else if (v === 'users') renderUsersView();
+        else if (v === 'audit') renderAuditView();
         else renderCreateView();
       };
     });
@@ -200,6 +212,7 @@
 
   // ── markets + settlement ────────────────────────────────────────────────
   async function renderMarketsView() {
+    const page = document.getElementById('pageAdmin') || document.querySelector('#adminBody')?.parentElement;
     const body = document.getElementById('adminBody');
     body.innerHTML = '<div class="empty">Loading…</div>';
     try {

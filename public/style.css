@@ -738,3 +738,20 @@ form.inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
 .adm-tbl .acts { text-align: right; white-space: nowrap; }
 .adm-sub { margin-top: 18px; }
 .sess-row { margin-bottom: 6px; }
+
+/* Width steps as CLASSES, not inline styles: the app's own CSP is
+   style-src 'self' with no 'unsafe-inline', so style="width:N%" is blocked by
+   the browser -- correctly. The browser suite caught it as a page error. A
+   meter that silently fails to render is worse than no meter, so the width is
+   bucketed to 10% and expressed as a class. */
+.meterfill.w-0 { width: 0; }
+.meterfill.w-10 { width: 10%; }
+.meterfill.w-20 { width: 20%; }
+.meterfill.w-30 { width: 30%; }
+.meterfill.w-40 { width: 40%; }
+.meterfill.w-50 { width: 50%; }
+.meterfill.w-60 { width: 60%; }
+.meterfill.w-70 { width: 70%; }
+.meterfill.w-80 { width: 80%; }
+.meterfill.w-90 { width: 90%; }
+.meterfill.w-100 { width: 100%; }
