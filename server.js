@@ -36,6 +36,8 @@ const JOBS = require('./lib/jobs');
 const RESULTS = require('./lib/results');
 const VOIDRULES = require('./lib/voidrules');
 const OPS = require('./lib/ops');
+const INPLAY = require('./lib/inplay');
+const CASHOUTRISK = require('./lib/cashoutrisk');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
 // DELIBERATE demo choice (documented in .github/SECURITY.md): this app is
@@ -967,6 +969,49 @@ app.get('/api/admin/reconciliation/findings', requireAdmin, limit('admin'), (req
 
 app.post('/api/admin/reconciliation/findings/:id/resolve', requireAdmin, limit('admin'), (req, res) => {
   res.json(JOBS.resolveFinding(db, { actor: req.user, id: intId(req.params.id), reason: (req.body || {}).reason }));
+});
+
+// ── In-play desk ──────────────────────────────────────────────────────────
+// Suspending a market is the control that stops a sharp trading the venue's
+// reaction latency during a goal. Going in-play SUSPENDS by design.
+app.post('/api/admin/markets/:id/suspend', requireAdmin, limit('admin'), (req, res) => {
+  const b = req.body || {};
+  res.json(INPLAY.setSuspended(db, {
+    marketId: intId(req.params.id),
+    suspended: b.suspended !== false,
+    until: b.until ?? null,
+    reason: b.reason ?? null,
+  }));
+});
+
+app.post('/api/admin/markets/:id/inplay', requireAdmin, limit('admin'), (req, res) => {
+  const b = req.body || {};
+  res.json(INPLAY.setInplay(db, { marketId: intId(req.params.id), inplay: b.inplay !== false, delayMs: b.delay_ms }));
+});
+
+// Clearing the kick-off suspension is the ONLY way an in-play market starts
+// accepting bets, and it is deliberately a separate action from suspending.
+app.post('/api/admin/markets/:id/release', requireAdmin, limit('admin'), (req, res) => {
+  res.json(INPLAY.releaseKickoffSuspension(db, intId(req.params.id)));
+});
+
+app.get('/api/admin/markets/:id/volume', requireAdmin, limit('admin'), (req, res) => {
+  const id = intId(req.params.id);
+  res.json({ ...INPLAY.tradedVolume(db, id, req.query.window), by_selection: INPLAY.volumeBySelection(db, id, req.query.window) });
+});
+
+// ── Cash-out venue risk ───────────────────────────────────────────────────
+app.get('/api/admin/risk/cashout', requireAdmin, limit('admin'), (req, res) => {
+  res.json(CASHOUTRISK.desk(db, {
+    venueMaxOutstandingCents: config.CASHOUT_MAX_OUTSTANDING_CENTS,
+    venueMaxDailyLossCents: config.CASHOUT_MAX_DAILY_LOSS_CENTS,
+  }));
+});
+
+app.post('/api/admin/risk/cashout/expire', requireAdmin, limit('admin'), (req, res) => {
+  const n = CASHOUTRISK.expireStaleQuotes(db);
+  audit.record(db, req.user, audit.ACTIONS.CASHOUT_QUOTES_EXPIRED, 'risk:cashout', null, { expired: n }, (req.body || {}).reason);
+  res.json({ expired: n });
 });
 
 // ── Operational surface ────────────────────────────────────────────────────

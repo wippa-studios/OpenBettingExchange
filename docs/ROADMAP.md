@@ -445,12 +445,18 @@ browser suite, all green.
 
 ### Still outstanding
 
-1. **Cash-out is an uncapped venue risk.** Phase 2 bounds the market maker, but
-   a player can now convert a position into a guaranteed house payout. This
-   should be capped in `lib/risk.js` the same way bot liability is — it is the
-   same class of unbounded loss, on a path that did not exist a week ago.
-2. **In-play / bet delay modelling.** Not started. In-play without honest delay
-   modelling is where a venue loses money to sharps.
+1. ~~Cash-out is an uncapped venue risk.~~ ✅ Fixed — `lib/cashoutrisk.js`.
+   Exposure begins at the QUOTE, not at execution, since an unexercised quote
+   is still a liability; caps are venue-wide, per-user and daily, with a
+   mandatory 15-minute quote expiry so an abandoned quote cannot pin the
+   venue's whole budget. Realised shortfall is fixed at execution rather than
+   recomputed, so moving a fair price cannot rewrite history.
+2. ~~In-play / bet delay modelling.~~ ✅ `lib/inplay.js` — market suspension,
+   a configurable in-play bet delay reported to the client as a concrete
+   matchable time, kick-off suspension that releases into the delay, and
+   windowed traded volume per market and per selection. Suspension is enforced
+   in `placeOrderTx`, so a suspended market accepts nothing. The delay's
+   scheduling to the matching pass is the remaining piece.
 3. **One real PSP adapter.** The interface and reference provider ship; the
    concrete integration does not.
 4. **Trading-side split of the results feed.** `lib/results.js` consumes an
