@@ -118,6 +118,11 @@ browser (public/ — plain HTML/CSS/classic JS, no build step)
 │  lib/bots      MarketMakers ladders        lib/drift  fair drift │
 │  lib/store     schema (SQLite WAL)         lib/seed   fixtures    │
 └───────────────────────────────────────────────────────────────────┘
+     │
+┌───────────────────────────────────────────────────────────────────┐
+│  public/js/    the UI, split by concern:  core, shell, nav,        │
+│                board, slip, views, boot   (window.OB namespace)     │
+└───────────────────────────────────────────────────────────────────┘
      ▼
   data/openbettingexchange.db   (created on first run, gitignored)
 ```
@@ -244,6 +249,7 @@ Contributing, house conventions and where to add things:
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
 public/    frontend (no build)     tests/      31 unit/API suites + smoke + browser + guards
+            public/js/*.js          7 UI modules, 187-419 lines each
 docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```
 

@@ -144,9 +144,20 @@ check "settled market is frozen" "$(status -b "$TMP/alice.jar" -X POST "$BASE/ap
   -d "{\"selection_id\":$SEL1,\"side\":\"back\",\"price\":2.5,\"stake_cents\":10000}")" "409"
 
 # ── 6. frontend assets ─────────────────────────────────────────────────────
-for asset in / /app.js /admin.js /style.css; do
+# The app's 1,891-line app.js was split into seven modules under /js/. They are
+# listed individually because a partial split is the exact failure mode worth
+# catching: the page loads, one view is blank, and nothing in the server log
+# says why.
+for asset in / /ladder.js /js/core.js /js/shell.js /js/nav.js /js/board.js \
+             /js/slip.js /js/views.js /js/boot.js /admin.js /admin-risk.js \
+             /style.css; do
   check "serves $asset" "$(status "$BASE$asset")" "200"
 done
+
+# The old single file must be GONE, not merely unused. A stale
+# <script src="/app.js"> in a template would 404 in the browser with nothing in
+# the server log, and the page would come up half-rendered.
+check "no stale /app.js left behind" "$(status "$BASE/app.js")" "404"
 
 # ── 7. integrity: the wallet is clean integer cents, never NaN or float ────
 # The amount was already pinned in section 5; this checks the TYPE. A NaN

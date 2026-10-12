@@ -112,10 +112,26 @@
     </div>
   </div>
 
-  <!-- ladder.js MUST load before app.js: app.js consumes window.OBLadder for
-       the slip's tick stepper and exposure maths. -->
+  <!-- Load order is load-BEARING and the reason for it is written down here,
+       because it is the first thing a future contributor will "tidy up".
+
+       ladder.js first: the slip's tick stepper and exposure maths consume
+       window.OBLadder.
+
+       Then the app modules, in dependency order. They share ONE global
+       (window.OB), created by core.js and extended by each file after it, so
+       a module that loads before its dependency simply sees undefined and
+       fails later. boot.js is LAST because boot() reaches the router, the
+       loaders and every view: load it early and one missing export becomes a
+       blank page instead of one broken view. -->
   <script src="/ladder.js"></script>
-  <script src="/app.js"></script>
+  <script src="/js/core.js"></script>
+  <script src="/js/shell.js"></script>
+  <script src="/js/nav.js"></script>
+  <script src="/js/board.js"></script>
+  <script src="/js/slip.js"></script>
+  <script src="/js/views.js"></script>
+  <script src="/js/boot.js"></script>
   <script src="/admin.js"></script>
   <script src="/admin-risk.js"></script>
 </body>
