@@ -86,7 +86,7 @@ npm start         # http://127.0.0.1:7777
 | Admin trading desk: catalogue, suspend/restore, settle, stats, overround | working |
 | Live updates | working (SSE with a 15s poll fallback) |
 | Results feed: per-sport void rules, disputes held not guessed, provenance, manual release | working |
-| In-play: bet delay modelling, traded-volume ladder | not implemented |
+| In-play: suspension, enforced bet delay, kick-off hold, traded volume | working |
 | Accumulators / each-way / dead-heat joint favourite | not implemented |
 | Real-money execution (no PSP integrated) | not implemented |
 
@@ -226,11 +226,12 @@ a bad value **aborts the launch** rather than failing later.
 | `DEPOSIT_MAX_CENTS` / `DEPOSIT_DAILY_MAX_CENTS` | `100000` / `500000` | per-intent and per-user-per-day caps on confirmed deposits |
 | `BACKUP_DIR` / `BACKUP_RETENTION` | — / `24` | scheduled snapshots; unset ⇒ **backups are off** and boot says so |
 | `RECONCILE_INTERVAL_MS` | `900000` | scheduled reconciliation cadence |
+| `DELAY_RELEASE_INTERVAL_MS` | `5000` | how often expired in-play delays are released into the book; 0 disables |
 
 ## Development
 
 ```bash
-npm test            # 407 checks, 32 suites — unit + API integration, fully offline
+npm test            # 419 checks, 33 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 58 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code
@@ -250,7 +251,7 @@ Contributing, house conventions and where to add things:
 
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
-public/    frontend (no build)     tests/      32 unit/API suites + smoke + browser + guards
+public/    frontend (no build)     tests/      33 unit/API suites + smoke + browser + guards
             public/js/*.js          7 UI modules, 187-419 lines each
 docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```

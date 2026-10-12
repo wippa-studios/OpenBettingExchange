@@ -29,6 +29,14 @@ const JOBS_INTERVALS = {
   backupMs: Number(process.env.BACKUP_INTERVAL_MS || 21600000),
   // WAL checkpoint + incremental vacuum, hourly.
   maintenanceMs: Number(process.env.MAINTENANCE_INTERVAL_MS || 3600000),
+  // In-play delay release. This is what makes the bet delay ENFORCED rather
+  // than merely reported: a delayed order rests until this pass releases it.
+  // It has to be a timer, not a side effect of the next placement — otherwise
+  // an in-play order would sit unmatched until a taker happened to arrive,
+  // which is a venue that quietly stops trading. Five seconds is a sensible
+  // cadence: tight enough that a 6-second delay is honoured, loose enough
+  // that the scan is trivial. 0 disables it.
+  delayReleaseMs: Number(process.env.DELAY_RELEASE_INTERVAL_MS || 5000),
 };
 const PAY = require('./lib/payments');
 const TEN = require('./lib/tenants');
@@ -1140,6 +1148,14 @@ app.post('/api/admin/markets/:id/release', requireAdmin, limit('admin'), (req, r
   res.json(INPLAY.releaseKickoffSuspension(db, intId(req.params.id)));
 });
 
+// Manual trigger for the delay-release pass. The timer is the normal path;
+// this exists so an operator can drain a backlog immediately (after restoring
+// a database, or after turning a delay off mid-event) without waiting a cycle.
+app.post('/api/admin/inplay/release-delays', requireAdmin, limit('admin'), (req, res) => {
+  const r = MATCH.releaseEligibleOrders(db, { limit: intVal(req.body && req.body.limit) || 1000 });
+  res.json(r);
+});
+
 app.get('/api/admin/markets/:id/volume', requireAdmin, limit('admin'), (req, res) => {
   const id = intId(req.params.id);
   res.json({ ...INPLAY.tradedVolume(db, id, req.query.window), by_selection: INPLAY.volumeBySelection(db, id, req.query.window) });
@@ -1216,6 +1232,17 @@ if (JOBS_INTERVALS.backupMs > 0 && config.BACKUP_DIR) {
     JOBS.every(JOBS_INTERVALS.backupMs, async () => {
       const r = OPS.backup(db, { dir: config.BACKUP_DIR, retention: config.BACKUP_RETENTION });
       console.log(`[backup] ${r.path} (${r.bytes} bytes, ${r.users} users)`);
+    })
+  );
+}
+
+if (JOBS_INTERVALS.delayReleaseMs > 0) {
+  jobTimers.push(
+    JOBS.every(JOBS_INTERVALS.delayReleaseMs, async () => {
+      const r = MATCH.releaseEligibleOrders(db);
+      if (r.filled > 0) {
+        console.log(`[inplay] released ${r.released} delayed order(s), ${r.filled} cents filled`);
+      }
     })
   );
 }

@@ -421,9 +421,9 @@ conversation.
 
 ## 6. Immediate next actions
 
-Reassessed after Phases 1–4 and the follow-on work landed. The suite is now
-**340 checks across 27 suites**, plus a live smoke script and a 58-check
-browser suite, all green.
+Reassessed after Phases 1–4, the follow-on work, and the first outside
+review of the money path. The suite is now **419 checks across 33 suites**,
+plus a live smoke script and a 71-check browser suite, all green.
 
 ### Recently completed since the first plan
 
@@ -445,18 +445,31 @@ browser suite, all green.
 
 ### Still outstanding
 
-1. ~~Cash-out is an uncapped venue risk.~~ ✅ Fixed — `lib/cashoutrisk.js`.
-   Exposure begins at the QUOTE, not at execution, since an unexercised quote
-   is still a liability; caps are venue-wide, per-user and daily, with a
-   mandatory 15-minute quote expiry so an abandoned quote cannot pin the
-   venue's whole budget. Realised shortfall is fixed at execution rather than
-   recomputed, so moving a fair price cannot rewrite history.
-2. ~~In-play / bet delay modelling.~~ ✅ `lib/inplay.js` — market suspension,
-   a configurable in-play bet delay reported to the client as a concrete
-   matchable time, kick-off suspension that releases into the delay, and
-   windowed traded volume per market and per selection. Suspension is enforced
-   in `placeOrderTx`, so a suspended market accepts nothing. The delay's
-   scheduling to the matching pass is the remaining piece.
+1. ~~Cash-out is an uncapped venue risk.~~ ✅ Fixed — `lib/cashoutrisk.js`,
+   then **rewritten** after the outside review found the first version was a
+   dead control: it tracked quotes, but quotes are atomic with their
+   execution here, so nothing ever wrote the rows it read and exposure was
+   zero forever. It now records EXECUTED BUYOUTS inside the paying
+   transaction, bounds outstanding fair-value exposure and daily payout
+   outlay (venue-wide and per-user), and resolves each buyout at settlement so
+   the realised loss is paid-minus-what-the-position-actually-returned.
+2. ~~In-play / bet delay modelling.~~ ✅ `lib/inplay.js` + `orders.eligible_at`
+   — market suspension (enforced in `placeOrderTx`), kick-off suspension that
+   releases into the delay, windowed traded volume per market and per
+   selection, and the bet delay **enforced by the engine**: an order's
+   `eligible_at` gates both sides of the match, and a scheduled release pass
+   (`releaseEligibleOrders`) puts a delayed order into the book when the delay
+   expires, as a maker at its OWN price.
+
+   This was the **fourth control that existed only in its reporting**. For
+   months the API told the client "your order becomes matchable at
+   02:05:59" and the engine matched it on arrival, every time — proven, not
+   theorised:
+   `delay reported to the client: 60000ms | bob matched on arrival: true`.
+   A reported-but-unenforced delay is worse than no delay: the player believes
+   they are protected, and the venue is systematically slower than its own
+   liquidity — the exact condition in-play delay exists to prevent.
+   Regression-tested both directions in `tests/inplay2.test.js` (12 checks).
 3. **One real PSP adapter.** The interface and reference provider ship; the
    concrete integration does not.
 4. **Trading-side split of the results feed.** `lib/results.js` consumes an
