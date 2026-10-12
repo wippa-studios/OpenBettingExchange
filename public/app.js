@@ -288,6 +288,10 @@
         connectSSE(); // private balance/orders events follow the new session
         route();
         toast(`Welcome back, ${r.user.username}`);
+        // A seeded demo password locks the account out of everything except
+        // the panel that fixes it, so say that up front rather than letting
+        // the operator discover it with a 403 on their first bet.
+        maybeForceSetup(r.user);
       } else {
         const email = $('authEmail').value.trim();
         const r = await api('POST', '/api/auth/register', {

@@ -58,7 +58,20 @@ const scenario = async (name, fn) => {
 
 const server = spawn(process.execPath, ['--no-warnings', 'server.js'], {
   cwd: ROOT,
-  env: { ...process.env, DB_PATH: path.join(TMP, 'ui.db'), PORT: String(PORT), DRIFT_ENABLED: 'false' },
+  // ADMIN_PASSWORD / DEMO_PASSWORD are set so this suite runs as a
+  // PROPERLY CONFIGURED deployment rather than on the seeded demo
+  // credentials. The first-run lock (tests/setup.test.js) deliberately makes a
+  // demo-password account unable to reach anything except the panel that
+  // changes it — correct behaviour, and it would otherwise block every flow
+  // here on the first login.
+  env: {
+    ...process.env,
+    DB_PATH: path.join(TMP, 'ui.db'),
+    PORT: String(PORT),
+    DRIFT_ENABLED: 'false',
+    ADMIN_PASSWORD: 'ui-admin-password',
+    DEMO_PASSWORD: 'ui-demo-password',
+  },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 const serverLog = [];
@@ -244,7 +257,7 @@ try {
 
   // ── sign in as the seeded demo user ──────────────────────────────────
   await page.fill('#authUser', 'demo');
-  await page.fill('#authPass', 'demo123');
+  await page.fill('#authPass', 'ui-demo-password');
   await page.click('#authGo');
   // Wait for the real success signal (balance chip), then assert the modal closed.
   await page.waitForSelector('#balance:not([hidden])', { timeout: 10000 });
@@ -337,7 +350,7 @@ try {
     await page.click('#authBtn');
     await page.waitForSelector('#authModal.show', { timeout: 5000 });
     await page.fill('#authUser', 'admin');
-    await page.fill('#authPass', 'admin123');
+    await page.fill('#authPass', 'ui-admin-password');
     await page.click('#authGo');
     await page.waitForSelector('#navAdmin:not([hidden])', { timeout: 10000 });
     await page.click('#nav button[data-page="admin"]');
@@ -466,7 +479,7 @@ try {
     await page.click('#authBtn');
     await page.waitForSelector('#authModal.show', { timeout: 5000 });
     await page.fill('#authUser', 'admin');
-    await page.fill('#authPass', 'admin123');
+    await page.fill('#authPass', 'ui-admin-password');
     await page.click('#authGo');
     await page.waitForSelector('#navAdmin:not([hidden])', { timeout: 10000 });
     await page.click('#nav button[data-page="admin"]');
@@ -571,6 +584,23 @@ try {
     });
     check('admin body is a stable shared mount', degrade);
   });
+
+  // ── First-run lock ──────────────────────────────────────────────────────
+  // A locked account must be told what to do immediately, not left to
+  // discover the lock by getting a 403 on their first bet.
+  // #authBtn is Sign out while signed in and Sign in once out, so the first
+  // click signs out and the second opens the modal.
+  await page.click('#authBtn');
+  await page.waitForTimeout(500);
+  await page.click('#authBtn');
+  await page.waitForSelector('#authModal.show', { timeout: 10000 });
+  await page.fill('#authUser', 'demo');
+  await page.fill('#authPass', 'ui-demo-password');
+  await page.click('#authGo');
+  // Configured password => not locked => no forced setup panel.
+  await page.waitForTimeout(600);
+  const setupShown = await page.locator('#accountModal.show').count();
+  check('a configured password does not trigger the setup lock', setupShown === 0, `(${setupShown} modal(s))`);
 
   check('no uncaught page errors during the whole run', pageErrors.length === 0, pageErrors.join(' | '));
 } catch (e) {

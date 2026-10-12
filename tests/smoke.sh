@@ -48,7 +48,7 @@ pick() {
 status() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
 echo "→ booting server on :$PORT (temp db, bots on, drift off)"
-DB_PATH="$TMP/ob.db" PORT="$PORT" DRIFT_ENABLED=false node --no-warnings server.js >"$TMP/server.log" 2>&1 &
+DB_PATH="$TMP/ob.db" PORT="$PORT" DRIFT_ENABLED=false ADMIN_PASSWORD=smoke-admin-password DEMO_PASSWORD=smoke-demo-password node --no-warnings server.js >"$TMP/server.log" 2>&1 &
 PID=$!
 for _ in $(seq 1 60); do
   curl -sf --max-time 1 "$BASE/api/sports" -o /dev/null 2>/dev/null && break
@@ -72,7 +72,7 @@ node -e 'const {snapToTick}=require("./lib/odds");const p=Number(process.argv[1]
 # ── 2. customers + admin ───────────────────────────────────────────────────
 check "alice registers" "$(status -c "$TMP/alice.jar" -X POST "$BASE/api/auth/register" -H 'content-type: application/json' -d '{"username":"smoke_alice","password":"secret1"}')" "201"
 check "bob registers"   "$(status -c "$TMP/bob.jar"   -X POST "$BASE/api/auth/register" -H 'content-type: application/json' -d '{"username":"smoke_bob","password":"secret2"}')" "201"
-check "admin logs in"   "$(status -c "$TMP/admin.jar" -X POST "$BASE/api/auth/login"   -H 'content-type: application/json' -d '{"username":"admin","password":"admin123"}')" "200"
+check "admin logs in"   "$(status -c "$TMP/admin.jar" -X POST "$BASE/api/auth/login"   -H 'content-type: application/json' -d '{"username":"admin","password":"smoke-admin-password"}')" "200"
 check "alice 401 pre-auth" "$(status "$BASE/api/me")" "401"
 check "foreign origin rejected" "$(status -b "$TMP/alice.jar" -X POST "$BASE/api/wallet/deposit" -H 'content-type: application/json' -H 'Origin: https://evil.example' -d '{"amount_cents":100}')" "403"
 

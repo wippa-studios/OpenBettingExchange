@@ -223,7 +223,7 @@ a bad value **aborts the launch** rather than failing later.
 ## Development
 
 ```bash
-npm test            # 374 checks, 30 suites — unit + API integration, fully offline
+npm test            # 382 checks, 31 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 58 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code
@@ -243,7 +243,7 @@ Contributing, house conventions and where to add things:
 
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
-public/    frontend (no build)     tests/      30 unit/API suites + smoke + browser + guards
+public/    frontend (no build)     tests/      31 unit/API suites + smoke + browser + guards
 docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```
 

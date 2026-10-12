@@ -486,6 +486,72 @@ app.delete('/api/auth/sessions/:id', requireAuth, (req, res) => {
 });
 
 // ── Board ──────────────────────────────────────────────────────────────────
+/**
+ * THE FIRST-RUN LOCK.
+ *
+ * A boot warning is a suggestion, and suggestions are what get ignored. This
+ * makes the seeded credentials a hard block: an account still on a demo
+ * password can sign in — it must, or there is no route to the panel that fixes
+ * it — but every state-changing route is refused until it is replaced.
+ *
+ * The allowlist is the minimum needed to GET TO THE FIX and nothing more:
+ * whoami, change-password, logout, session management. Notably absent is
+ * everything a demo password should not reach — trading, the wallet, and the
+ * entire admin desk, which is the account that matters most. An admin left on
+ * admin123 who can read the ledger and move other people's money is the worst
+ * state this project can be deployed in.
+ *
+ * Enforcement is in middleware rather than per-route so a route added later is
+ * covered by default. A list of PROTECTED routes would be the design that
+ * fails open.
+ */
+const SETUP_ALLOWLIST = new Set([
+  'GET /api/me',
+  'POST /api/auth/change-password',
+  'POST /api/auth/logout',
+  'GET /api/auth/sessions',
+  'DELETE /api/auth/sessions/:id',
+]);
+
+function mustChangePassword(user) {
+  // Reads the STORED FLAG, never re-verifies a scrypt hash: doing that per
+  // request would put ~160ms on the hot path for every caller.
+  return !!(user && user.must_change_password);
+}
+
+/**
+ * Boot sweep: flag any account still on a seeded demo password.
+ *
+ * Runs once at boot rather than at seed time so an EXISTING deployment that was
+ * already running demo credentials gets locked too. Idempotent, and it only
+ * ever SETS the flag — an account whose password has been changed is never
+ * re-flagged, so a boot cannot lock out a venue that has already sorted itself.
+ */
+function enforceFirstRunLock() {
+  let flagged = 0;
+  for (const name of ['admin', 'demo']) {
+    if (!isDefaultCredential(name)) continue;
+    const r = db.prepare('UPDATE users SET must_change_password = 1 WHERE username = ? AND must_change_password = 0').run(name);
+    flagged += r.changes;
+  }
+  return flagged;
+}
+
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') return next();
+  if (SETUP_ALLOWLIST.has(`${req.method} ${req.path}`)) return next();
+  if (!mustChangePassword(req.user)) return next();
+  res.status(403).json({
+    error: 'Change your password before using the exchange',
+    details: {
+      code: 'password_change_required',
+      username: req.user.username,
+      // Named so a fresh demo deployment shows the operator what to change.
+      seeded_password: req.user.username === 'admin' ? 'admin123' : 'demo123',
+    },
+  });
+});
+
 app.get('/api/sports', (req, res) => {
   const sports = db
     .prepare(
@@ -1356,18 +1422,26 @@ app.use(errorHandler);
 // truthful for pre-existing databases — and stops warning exactly when the
 // operator changes the password or seeds a custom one.
 function warnDefaultCredentials() {
-  const seeded = [
-    ['admin', 'admin123', 'ADMIN_PASSWORD'],
-    ['demo', 'demo123', 'DEMO_PASSWORD'],
-  ];
-  for (const [name, pw, envVar] of seeded) {
-    const row = db.prepare('SELECT pass_hash FROM users WHERE username = ?').get(name);
-    if (!row || !A.verifyPassword(pw, row.pass_hash)) continue;
+  for (const name of ['admin', 'demo']) {
+    if (!isDefaultCredential(name)) continue;
     console.warn(
-      `[security] DEFAULT CREDENTIALS ACTIVE: user "${name}" accepts the seeded demo password.` +
-        ` Set ${envVar} (see .env.example) and re-seed, or change the password, before showing this app to anyone.`
+      `[security] "${name}" still accepts its seeded demo password and must change it before trading.`
     );
   }
+}
+
+/**
+ * Is this account still on a seeded demo password?
+ *
+ * VERIFIES AGAINST THE STORED HASH rather than comparing config. That matters:
+ * an operator who sets ADMIN_PASSWORD in .env gets a real account and this
+ * returns false immediately, whereas comparing config would keep flagging an
+ * account that is already safe and train the operator to ignore the warning.
+ */
+function isDefaultCredential(username) {
+  const DEFAULTS = { admin: 'admin123', demo: 'demo123' };
+  const row = db.prepare('SELECT pass_hash FROM users WHERE username = ?').get(username);
+  return !!row && A.verifyPassword(DEFAULTS[username], row.pass_hash);
 }
 
 function main() {
@@ -1410,6 +1484,7 @@ function main() {
     console.warn('[ops] OPS_TOKEN unset — /metrics and the backup control return 404.');
   }
 
+  enforceFirstRunLock();
   warnDefaultCredentials();
   if (config.FEED_ENABLED) {
     FEED.health()
