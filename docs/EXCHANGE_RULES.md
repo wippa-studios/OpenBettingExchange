@@ -225,43 +225,99 @@ the better fill happened.
 
 ## Cash-out
 
-Cash-out closes a matched position by trading against the book, so it only works
-while the position can be offset — and it is all-or-nothing.
+Cash-out closes a matched position early. It is a **venue buyout**, not a trade
+against the book, and the distinction is not cosmetic — it is the difference
+between a feature that works and one that quietly destroys value.
 
-**When it is offered** (v1): the position is a single runner, single side, the
-market is open, and the opposite side of the book has enough non-self liquidity.
+### Why the market hedge was removed
 
-**The hedge**: to close a position at current price `n`, place an order of size
+The obvious implementation is to hedge the position against the book: place the
+opposite side at top of book and the position goes flat. That works for a single
+runner, where there is exactly one outcome to neutralise.
 
-```
-hedge = round( Σ (stake_i × entryPrice_i) / n )
-```
-
-The division by the **current** price is the whole trick — the hedge stake scales
-as `1/n`, which is why their green-up maths is not symmetric.
-
-**The locked value** (identical regardless of the outcome, within a cent of
-rounding):
-
-- closing a **back** `L` = hedge stake, value `L − Σ stake_i`
-- closing a **lay** `B` = hedge stake, value `Σ stake_i − B`
-
-Worked example — back 10000 @ 2.00, price drifts in to 1.90:
+It **cannot** work for multiple runners, and the derivation is worth stating
+because "generalise the hedge" is the obvious next step and it is a dead end.
+Forcing every outcome to the same value `V`, with hedge stakes `S_i` at each
+runner's own top-of-back price `q_i`:
 
 ```
-numer = 10000 × 2.00 = 20000
-hedge  = round(20000 / 1.90) = 10526
-value  = 10526 − 10000 = 526      (i.e. $5.26, the house formula 100 × (2.0−1.9)/1.9)
+S_i    = (k − Payout_i) / q_i          with  k = V + Σ S_i
+V      = k(1 − Σ1/q_i) + Σ Payout_i/q_i
+net    = V − Σ S_i = k(1 − 2Σ1/q_i) + 2Σ Payout_i/q_i
 ```
 
-The hedge is a lay of 10526 @ 1.90, which escrows `round(0.9 × 10526) = 9473`.
-After it, the position pays 527 if the runner wins and 526 if it loses — green
-to within the single cent of rounding, and the trader's 526 is guaranteed.
+The coefficient of `k` is `1 − 2Σ1/q_i`.
 
-If the hedge cannot fill **completely**, the whole cash-out is rolled back and
-the request is rejected: you are never left half-closed.
+- For a two-runner market quoted at 2.0 both sides, `Σ1/q = 1` and the
+  coefficient is **zero** — every `k` yields the same net.
+- For any real price dispersion the coefficient is **negative**, so the best
+  legal `k` is the smallest one and `net` comes out **negative**.
 
-*Tests:* `tests/cashout.test.js` (C1–C8).
+Hedging a multi-runner position against a fair book therefore always costs the
+player money. The apparent arbitrage is the book being fair. The old `v1 scope`
+guard — which refused mixed and multi-runner positions — was a **correct
+refusal**, not unfinished work.
+
+### What the venue quotes instead
+
+The operator prices the position from its own fair probabilities and buys it:
+
+```
+fair_value = Σ_i  p_i · Payout_i
+quoted     = floor(fair_value · (1 − CASHOUT_MARGIN_BPS / 10000))
+```
+
+`Payout_i` is the player's net if runner `i` wins: a back profits
+`(P−1)·s` on its own runner and loses its stake otherwise; a lay is the mirror.
+This mirrors `lib/settle.js` exactly — a one-cent disagreement would mean the
+quote differs from the settlement the player was avoiding.
+
+`p_i` is **normalised by the sum of implied probabilities**, so a book summing
+to 105% does not hand the player the overround. A valuation generalises to any
+number of runners immediately, because it is a valuation and not a hedge
+construction. The venue's edge is the margin and superior pricing — not an
+impossible arbitrage.
+
+### When no quote is offered
+
+Cash-out returns **no quote** rather than a bad number when:
+
+- the market is settled, or the player holds no position;
+- a matched runner has **no fair price** — the valuation would ignore a real
+  outcome, and a payout that ignores an outcome can be wrong;
+- the position is **underwater** relative to the book (`fair_value ≤ 0`).
+  Paying a player to take on risk they did not want hands out free money;
+- the quoted value is below `MIN_STAKE_CENTS`;
+- the player is a bot (the house does not cash itself out);
+- `CASHOUT_ENABLED` is false.
+
+A signal the rule table does not recognise is **held for review**, not defaulted
+to void and not guessed.
+
+### Execution
+
+Execution is atomic and recomputes the plan **inside** the transaction: the
+position can change between a quote and an execute, and a player must never be
+paid a quote for a position they no longer hold.
+
+1. The player's matched collateral is released — their own money back. A
+   cash-out sells the **position**; it does not confiscate the stake.
+2. The quoted value is paid house → player through the normal ledger, so it
+   posts to `player_funds` and is visible to an auditor.
+3. **The venue takes the player's side**: a replacement match is written with
+   the house in the player's slot and the counterparty's order retained in the
+   other, and the escrow moves to the house. At settlement the counterparty
+   meets the venue exactly as they would have met the player. Skipping this
+   would strand the counterparty's collateral forever — a match is between two
+   users, so excluding it excludes them too.
+4. The original match is flagged `cashout = 1`, which settlement skips. This is
+   what makes double settlement impossible.
+5. The player's **resting** orders in that market are cancelled and their
+   escrow released, so they cannot be matched into a position they no longer
+   hold.
+
+*Tests:* `tests/cashout.test.js` (contract), `tests/cashout2.test.js`
+(valuation, multi-runner, no double settlement, counterparty safety).
 
 ## Markets, events and lifecycle
 
@@ -270,7 +326,7 @@ sport ──< competition ──< event ──< market ──< runner
                                       │
                         open ──suspended──open
                           │
-                       settled   (terminal: winner | void)
+                      settled   (terminal: winner | void | held)
 ```
 
 - **open** — orders accepted, ladders quoted.
@@ -278,6 +334,11 @@ sport ──< competition ──< event ──< market ──< runner
   market, or the desk does).
 - **settled** — frozen. The winner (or void) is recorded, escrow is distributed,
   and nothing can be placed or settled again.
+- **held** (`settlement_hold = 1`) — still **open**: the player genuinely holds
+  a position and their collateral is untouched. Excluded from automatic
+  settlement until a human releases it with a written reason. A disputed or
+  unrecognised outcome parks here rather than being settled or voided, because
+  settling picks a side and voiding may give away money the venue owes.
 - An event is **completed** when all of its markets are settled.
 - Events whose start time has passed roll from `upcoming` to `live` at boot, so a
   demo left running does not slowly empty its own board.
@@ -292,6 +353,16 @@ sport ──< competition ──< event ──< market ──< runner
 | `DRIFT_INTERVAL_MS` | 5000 | how often a fair price moves |
 | `BOT_ENABLED` / `DRIFT_ENABLED` | true | demo liquidity and price movement |
 | `SESSION_TTL_DAYS` | 30 | session lifetime |
+| `SCRYPT_N` | 65536 | scrypt cost; floored at 16384 |
+| `MAX_SSE_CLIENTS` | 2000 | concurrent live streams |
+| `CASHOUT_ENABLED` / `CASHOUT_MARGIN_BPS` | true / 200 | venue cash-out and its margin |
+| `RISK_MAX_LIABILITY_CENTS` | 5000000 | market-maker bot debt cap |
+| `RISK_MAX_DAILY_LOSS_CENTS` | 1000000 | bot realised daily loss cap |
+| `RISK_QUOTE_SKEW` | 0.5 | ticks of widening at full pressure |
+| `TRUST_PROXY_JURISDICTION` | false | read the country header at all |
+| `OPS_TOKEN` | — | required for `/metrics` and backup; unset ⇒ they 404 |
+| `BACKUP_DIR` / `BACKUP_RETENTION` | — / 24 | scheduled snapshots; unset ⇒ backups OFF |
+| `MIN_STAKE_CENTS`/`MAX_STAKE_CENTS` limits | per user | abuse caps, enforced in-transaction |
 
 A runner created **without** a fair price is never quoted by the bots — that is
 how you build a market with no demo liquidity in it.
@@ -304,8 +375,20 @@ Listed so nobody mistakes a scope decision for a bug:
 - **Each-way betting.** Win markets only.
 - **In-play bet delay, partial-fill queueing, cross-market matching.** A taker
   takes resting liquidity immediately and then rests its remainder.
-- **A results feed.** Settlement is a manual admin action; the feed would call
-  the same `settleMarket`.
-- **Multi-runner or mixed cash-out.** Those positions are traded manually.
-- **Real money.** No payment, withdrawal, KYC/AML or licensing path exists, and
-  the seeded bot's fair prices are a random walk rather than a model.
+- **Dead-heat joint-favourite settlement.** A dead heat is **held** rather than
+  settled on one runner, because this engine settles exactly one selection and
+  paying joint favourite is a settlement-shape change.
+- **Real money.** No PSP is integrated — the payments machinery ships but
+  terminates in a reference provider that moves no money. No KYC/AML, no age
+  verification, no licensing path, and the seeded bot's fair prices are a
+  random walk rather than a model.
+- **Cash-out risk capping.** Phase 2 bounds market-maker liability; nothing yet
+  bounds a player repeatedly converting positions into guaranteed house
+  payouts. This is the most significant open risk in the system.
+- **A load test.** SQLite is single-writer and synchronous — which is *why* the
+  sweep is atomic, and a genuine strength — but the ceiling is unmeasured.
+
+**Shipped since this list was first written:** the results feed with per-sport
+void rules and dispute holds, multi-runner cash-out, abuse limits and
+self-exclusion, market-maker risk caps, double-entry accounting, payments
+abstraction, tenancy, and the operational surface (health, metrics, backup).

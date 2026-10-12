@@ -1,0 +1,118 @@
+name: CI
+
+# This project exists so that an OUTSIDE reader can check the money path. Tests
+# that only run on one laptop are the opposite of that, so CI is not
+# convenience here — it is the claim.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A superseded run is wasted compute on a queue nobody is watching.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor from package.json engines, and current LTS. node:sqlite is
+        # still moving, so the matrix is the early warning that a release broke
+        # it BEFORE an operator finds out.
+        node: ['22.13', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Unit + API integration (offline)
+        run: npm test
+
+      - name: Live end-to-end smoke
+        run: npm run test:smoke
+
+      - name: Operational surface (backup/restore, rate limits)
+        run: node tests/ops.test.js
+
+  browser:
+    name: Browser (Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Browser suite
+        run: npm run test:ui
+
+  # Guardrails that do not need a full test run. Cheap, and they catch the
+  # class of change that quietly breaks the project's central promise.
+  guards:
+    name: Repository guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Escrow invariant is enforced, not just commented
+        # The escrow invariant rests on orders.frozen_cents being owned by the
+        # matching engine. tests/guard.test.js proves it, but it runs inside
+        # npm test where a reader may not notice it. Surfaced on its own so a
+        # PR that quietly widens the allowlist gets a named failure.
+        run: node tests/guard.test.js
+
+      - name: No committed credentials
+        run: |
+          # Betfair bot login keys are the specific risk in this project's
+          # history: a companion recorder with private keys sits in the working
+          # tree. Assert the directory is not tracked rather than trusting a
+          # .gitignore that can be edited in the same PR.
+          if git ls-files --error-unmatch betfair-market-snapshots >/dev/null 2>&1; then
+            echo "::error::betfair-market-snapshots is tracked; it contains bot login keys"
+            exit 1
+          fi
+          if git ls-files | grep -E '\.(key|pem|p12)$'; then
+            echo "::error::private key material is committed"
+            exit 1
+          fi
+
+      - name: No stray large files
+        run: |
+          # node_modules, a database, or a screenshot dump would bloat history
+          # irreversibly. 5MB is generous for source and assets in this repo.
+          big=$(git ls-files -z | xargs -0 -I{} sh -c 'test -f "{}" && stat -c%s "{}"' 2>/dev/null | awk '$1 > 5242880 {print}')
+          if [ -n "$big" ]; then echo "::error::files over 5MB tracked"; exit 1; fi
+
+      - name: Docs do not contradict the code
+        # The review found the README claiming cash-out was a market hedge (it
+        # is a venue buyout), that a shipped results feed did not exist, and a
+        # stale table count and test count. Numbers that drift from the code
+        # are the specific failure this prevents.
+        run: node scripts/check-docs.mjs
+
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm audit --audit-level=high

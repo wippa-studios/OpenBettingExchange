@@ -27,7 +27,7 @@ browser (public/)
 ```
 
 There is no ORM, no migration framework and no service layer beyond `lib/`. The
-schema is a single `CREATE TABLE IF NOT EXISTS` block in `lib/store.js` (13
+schema is a single `CREATE TABLE IF NOT EXISTS` block in `lib/store.js` (22
 tables), which is why a fresh clone runs with one command. Express is the only
 runtime dependency; Playwright is dev-only and used by the browser suite.
 
@@ -78,7 +78,7 @@ A single back order that matches, from click to settlement:
 
 ## Why these choices
 
-- **No ORM, no migrations.** The schema is thirteen tables (plus SQLite's own
+- **No ORM, no migrations.** The schema is twenty-two tables (plus SQLite's own
   `sqlite_sequence`) of plain SQL with
   `CHECK` constraints on the money columns. A contributor can read the whole
   data model in one file, and the database itself refuses an invalid cent.

@@ -9,7 +9,8 @@
     "test": "node tests/run_all.js",
     "test:smoke": "./tests/smoke.sh",
     "test:ui": "node tests/ui_test.mjs",
-    "shots": "node scripts/capture-screenshots.mjs"
+    "shots": "node scripts/capture-screenshots.mjs",
+    "docs:check": "node scripts/check-docs.mjs"
   },
   "engines": {
     "node": ">=22.13"

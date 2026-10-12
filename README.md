@@ -16,12 +16,16 @@ Light house palette (white ground, black text, grey accent), Inter self-hosted
 in place of Canva Sans, brand wordmark and favicon from `assets/`. No build step
 and no CDN: fonts, logo and icon are all served from `public/`.
 
-> **Paper money only.** Every balance is play money and there is no real-money
-> execution path, no payments and no withdrawals anywhere in this codebase.
-> Running a real-money exchange requires licensing and regulatory compliance
-> (18+, responsible gambling, AML/KYC). This is a self-hosted demo and a teaching
-> project — see [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md) for what it
-> does and does not do.
+> **Paper money only.** Every balance is play money and there is **no real-money
+> execution path**: no PSP is integrated and there is no licensed operation
+> behind this. The payments *machinery* ships (deposit intents, confirmation-
+> gated crediting, a withdrawal hold, webhook verification and reconciliation)
+> but it terminates in a reference provider that moves no money. See
+> [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md) for the full boundary.
+>
+> Running a real-money exchange additionally requires licensing and regulatory
+> compliance (18+, responsible gambling, AML/KYC, fund segregation). Software
+> cannot supply any of that — see [`docs/ROADMAP.md`](docs/ROADMAP.md) §5.
 
 ## What makes it an exchange
 
@@ -77,13 +81,14 @@ npm start         # http://127.0.0.1:7777
 | Matching engine: best-for-taker sweeps, match at resting price, partial fills, FIFO, self-match guard | working |
 | Escrow wallet: available vs frozen, full transaction ledger, faucet | working |
 | Settlement: pot distribution, void refunds, commission on net winnings, auto-cancel, double-settle protection | working |
-| Cash-out: green-up close at top of book, all-or-nothing | working (single runner, single side) |
+| Cash-out: **venue buyout** from fair probabilities, any number of runners, all-or-nothing | working |
 | Liquidity bots + fair-price drift | working (disable with `BOT_ENABLED=false`) |
 | Admin trading desk: catalogue, suspend/restore, settle, stats, overround | working |
 | Live updates | working (SSE with a 15s poll fallback) |
-| Accumulators / parlays | not implemented — see the rules doc |
-| Each-way betting | not implemented |
-| In-play bet delay, partial-fill queueing, results feed, real money | not implemented (out of scope) |
+| Results feed: per-sport void rules, disputes held not guessed, provenance, manual release | working |
+| In-play: bet delay modelling, traded-volume ladder | not implemented |
+| Accumulators / each-way / dead-heat joint favourite | not implemented |
+| Real-money execution (no PSP integrated) | not implemented |
 
 ## Architecture
 
@@ -96,8 +101,18 @@ browser (public/ — plain HTML/CSS/classic JS, no build step)
 │  lib/tx        transaction depth; nested calls use savepoints     │
 │  lib/match     the engine: sweeps, fills, escrow, book, positions  │
 │  lib/ledger    the only writer of balances and the transactions log │
-│  lib/settle    pot distribution, commission, void, auto-cancel     │
-│  lib/cashout   green-up close                                      │
+│  lib/settle    pot distribution, commission, void, cash-out close    │
+│  lib/cashout   venue buyout quote (any number of runners)            │
+│  lib/accounts  double-entry postings; conservation + segregation     │
+│  lib/limits    abuse controls (per-user caps, self-exclusion)        │
+│  lib/risk      market-maker risk: caps, skew, kill switch            │
+│  lib/tenants   multi-tenancy, per-tenant commission, jurisdictions   │
+│  lib/payments  provider interface + reference provider               │
+│  lib/results   results feed, per-sport void rules, dispute holds     │
+│  lib/voidrules the rule table: settle / void / hold per sport        │
+│  lib/jobs      scheduled reconciliation and maintenance              │
+│  lib/ops       health, readiness, metrics, backup, restore           │
+│  lib/audit     append-only operator action log                       │
 │  lib/odds      tick ladder, American/fractional, implied, overround │
 │  lib/auth      scrypt + opaque session tokens                      │
 │  lib/bots      MarketMakers ladders        lib/drift  fair drift │
@@ -111,7 +126,7 @@ The dependencies run one way: `match → ledger → tx`, with `settle` and
 `cashout` on top of `match`. There is no ORM, no migration tool, and no runtime
 dependency beyond Express and `pg` (the odds feed's recorder client — Playwright
 is dev-only, for the browser suite) — the
-data model is one readable SQL file of 13 tables. Read
+data model is one readable SQL file of 22 tables. Read
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the reasoning.
 
 ## The rules that protect the money
@@ -132,10 +147,20 @@ asserted by a test.
 | Void refunds each side its **own** contribution | nobody wins or loses on a void | `settle` (S4, S10) |
 | Commission on **net winnings per user per market**, only if positive | mirrors the real-world model; never a fee on a loser | `settle` (S7) |
 | A settled market is frozen and cannot settle twice | no double-pay | `settle` (S6), `api` |
-| Cash-out hedge `= round(Σ sᵢ·eᵢ / n)` — divides by the **current** price | the hedge stake scales as `1/n`; entry-price maths is wrong | `cashout` (C1–C2) |
-| Cash-out is all-or-nothing | never half-closed | `cashout` (C3) |
+| Cash-out is a **venue buyout** priced at `Σ pᵢ·Payoutᵢ` less a margin, not a market hedge | hedging N runners against a fair book is provably value-destroying; see the derivation in `lib/cashout.js` | `cashout2` (C1–C5) |
+| Cash-out **holds** a position the venue cannot price fairly (underwater, unpriced runner) | paying a player to take risk they did not want hands out free money | `cashout2` (C3, C4) |
+| A cashed-out match is flagged so settlement can never pay it again | double settlement is the worst bug this system could have | `cashout2` (C7) |
+| Cash-out hands the player's side to the venue, not to nobody | excluding the match outright would strand the counterparty's collateral forever | `cashout2` (C8) |
+| Cash-out is all-or-nothing, in one transaction | never half-closed | `cashout` (C4) |
 | Every money operation is one transaction (`lib/tx.js`) | a failure leaves no partial state | `tx` (X1–X6) |
 | The database itself refuses invalid cents (`CHECK`) | the invariant does not rely on JavaScript | `store` (D3) |
+| Every posting set sums to **zero**; global conservation is a query | double-entry makes "where did this money come from" answerable | `ledger2` (D2, D7) |
+| `users.balance_cents` is a **cache** of `player_funds` + `player_escrow`, proven per user | the two representations cannot drift silently | `ledger2` (D3) |
+| Credit on **confirmation**, never on initiation | ten abandoned deposit intents must fund you zero times | `payments` (P1, P4) |
+| A `client_order_id` repeat returns the original order and takes **no second escrow** | a double-submit is a financial incident, not an annoyance | `idempotency` (I1, I6) |
+| Abuse limits are enforced **inside** the placement transaction | a check-then-act outside would let two concurrent placements both pass | `limits` (L13) |
+| A disputed outcome is **held**, never settled or voided | settling picks a side; voiding gives away money the venue may owe | `results` (V3, R3) |
+| `orders.frozen_cents` is written only by three named modules | the escrow invariant rests on this, and a convention is not a type | `guard` (G2) |
 
 Full specification, with worked examples: [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md).
 
@@ -185,13 +210,23 @@ a bad value **aborts the launch** rather than failing later.
 | `BOT_ENABLED` / `DRIFT_ENABLED` | `true` | demo liquidity and price drift (ignored when the feed is on) |
 | `DRIFT_INTERVAL_MS` | `5000` | drift cadence |
 | `SESSION_TTL_DAYS` | `30` | session lifetime |
+| `SCRYPT_N` | `65536` | password hashing cost; floored at 16384 |
+| `MAX_SSE_CLIENTS` | `2000` | concurrent live streams; each is a held socket |
+| `TRUST_PROXY_JURISDICTION` | `false` | read the country header at all — only when an edge overwrites it |
+| `CASHOUT_ENABLED` / `CASHOUT_MARGIN_BPS` | `true` / `200` | venue cash-out and its margin |
+| `RISK_MAX_LIABILITY_CENTS` | `5000000` | how far the market-maker bot may go into debt |
+| `RISK_MAX_DAILY_LOSS_CENTS` | `1000000` | bot realised daily loss cap |
+| `OPS_TOKEN` | — | required for `/metrics` and the backup control; unset ⇒ they 404 |
+| `BACKUP_DIR` / `BACKUP_RETENTION` | — / `24` | scheduled snapshots; unset ⇒ **backups are off** and boot says so |
+| `RECONCILE_INTERVAL_MS` | `900000` | scheduled reconciliation cadence |
 
 ## Development
 
 ```bash
-npm test            # 196 checks, 17 suites — unit + API integration, fully offline
-npm run test:smoke  # 32 checks — live end-to-end against a real server
-npm run test:ui     # 44 checks — real Chromium via Playwright (board + admin desk)
+npm test            # 353 checks, 28 suites — unit + API integration, fully offline
+npm run test:smoke  # live end-to-end against a real server
+npm run test:ui     # 58 checks — real Chromium via Playwright (board + admin desk)
+npm run docs:check  # fail if the documentation contradicts the code
 ```
 
 The suite is dependency-free: plain `assert`, numbered examples, no framework,
@@ -208,25 +243,45 @@ Contributing, house conventions and where to add things:
 
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
-public/    frontend (no build)     tests/      17 unit/API suites + smoke + browser
+public/    frontend (no build)     tests/      28 unit/API suites + smoke + browser + guards
 docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```
 
 ## Known limitations
 
-Paper money only; no payments, KYC/AML or licensing path. Accumulators,
-each-way betting, in-play bet delay, partial-fill queueing and a results feed
-are out of scope. Settlement is a manual admin action, and the demo bot's fair
-prices are a random walk, not a model. The seeded credentials are committed on
-purpose for the demo — never deploy this as-is. Full list and rationale in
+**No real-money execution.** The payments machinery ships but no PSP is
+integrated, and its reference provider moves no money. No KYC/AML, no age
+verification, no licensing path — and no software can supply the licence.
+
+**In-play is absent**: no bet delay modelling, no traded-volume ladder. This
+is the difference between a toy and a venue; in-play without honest delay
+modelling is where sharps win.
+
+**Not implemented:** accumulators, each-way betting, dead-heat joint-favourite
+settlement (held rather than guessed), and cash-out risk capping.
+
+**Cash-out is an uncapped venue risk.** Phase 2 bounds market-maker liability;
+nothing yet bounds a player converting positions into guaranteed house payouts.
+
+**Operational:** SQLite is single-writer and synchronous — which is *why* the
+sweep is atomic, and a genuine strength — but the ceiling is unmeasured. No
+load test ships.
+
+The demo bot's fair prices are a random walk, not a model. Seeded credentials
+are committed on purpose for the demo; boot warns loudly and a first-run
+password change is required. Never deploy this as-is.
+
+Full list and rationale in
 [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#what-is-deliberately-not-implemented).
 
 ## Roadmap
 
-- Accumulators (parlays) and each-way markets
 - In-play: bet delay modelling and a traded-volume ladder
-- A cash-out that greens multi-runner positions
-- A pluggable results feed that calls the same settlement entry point
+- Cap cash-out venue risk in `lib/risk.js`, alongside the bot liability cap
+- Integrate a real PSP against the `lib/payments` interface
+- Wire the results feed to a live transport (the `fetchResults` seam is ready)
+- Dead-heat joint-favourite settlement
+- Accumulators and each-way markets
 - Odds-history charts and a market-mover view on the board
 
 ## Licence
