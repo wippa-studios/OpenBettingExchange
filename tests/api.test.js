@@ -541,6 +541,41 @@ const check = async (name, fn) => {
       assert.ok(r.status === 404 || r.status === 401, `unsigned/unconfigured webhook is refused, got ${r.status}`);
     });
 
+    // ── Every operator/control route is CALLED at least once ──────────────
+    // `const MATCH = M;` went missing to a shell-quoting failure and NOTHING
+    // failed: the delay-release job and its admin route were dead, because no
+    // test called them and the undefined identifier only errors when the route
+    // is taken. A route nobody exercises is a route nobody knows is broken, so
+    // these are called for real — the point is reachability, not behaviour,
+    // which the module suites cover.
+    await check('R1 the in-play delay-release route is reachable and answers', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      const r = await j('POST', '/api/admin/inplay/release-delays', { body: { limit: 50 }, cookie: admin });
+      assert.strictEqual(r.status, 200, 'the manual release trigger answers');
+      assert.strictEqual(typeof r.json.considered, 'number', 'and reports what it considered');
+      assert.ok(r.json.released !== undefined && r.json.filled !== undefined, 'with the counts a desk needs');
+    });
+
+    await check('R2 the responsible-gambling status route answers, configured or not', async () => {
+      const r = await j('GET', '/api/auth/rg', { cookie: cookieOf(await j('POST', '/api/auth/login', { body: { username: 'alice', password: 'secret1' } })) });
+      assert.strictEqual(r.status, 200);
+      // The three controls and the "is this deployment guarded at all" answer.
+      for (const k of ['session_limit_minutes', 'reality_check_minutes', 'deposit_limit_cents', 'configured']) {
+        assert.ok(k in r.json, `reports ${k}`);
+      }
+    });
+
+    await check('R3 the reality-check acknowledgement is reachable and idempotent', async () => {
+      const cookie = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'alice', password: 'secret1' } }));
+      const first = await j('POST', '/api/auth/reality-check', { body: {}, cookie });
+      assert.strictEqual(first.status, 200);
+      assert.ok(first.json.acknowledged_at, 'stamps an acknowledgement');
+      // Re-acknowledging is not an error: a player double-clicking the dialog
+      // must not be shown a failure.
+      const second = await j('POST', '/api/auth/reality-check', { body: {}, cookie });
+      assert.strictEqual(second.status, 200, 'and again');
+    });
+
     await check('W4 a deposit intent above the per-intent cap is refused', async () => {
       const login = await j('POST', '/api/auth/login', { body: { username: 'alice', password: 'secret1' } });
       const r = await j('POST', '/api/wallet/deposit-intent', {

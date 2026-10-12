@@ -87,6 +87,8 @@ npm start         # http://127.0.0.1:7777
 | Live updates | working (SSE with a 15s poll fallback) |
 | Results feed: per-sport void rules, disputes held not guessed, provenance, manual release | working |
 | In-play: suspension, enforced bet delay, kick-off hold, traded volume | working |
+| Dead heat / joint favourite settlement | working |
+| Session limit, reality check, deposit limit | working, operator-configured (0 = off, boot warns) |
 | Accumulators / each-way / dead-heat joint favourite | not implemented |
 | Real-money execution (no PSP integrated) | not implemented |
 
@@ -131,7 +133,7 @@ The dependencies run one way: `match → ledger → tx`, with `settle` and
 `cashout` on top of `match`. There is no ORM, no migration tool, and no runtime
 dependency beyond Express and `pg` (the odds feed's recorder client — Playwright
 is dev-only, for the browser suite) — the
-data model is one readable SQL file of 23 tables. Read
+data model is one readable SQL file of 24 tables. Read
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and the reasoning.
 
 ## The rules that protect the money
@@ -226,12 +228,15 @@ a bad value **aborts the launch** rather than failing later.
 | `DEPOSIT_MAX_CENTS` / `DEPOSIT_DAILY_MAX_CENTS` | `100000` / `500000` | per-intent and per-user-per-day caps on confirmed deposits |
 | `BACKUP_DIR` / `BACKUP_RETENTION` | — / `24` | scheduled snapshots; unset ⇒ **backups are off** and boot says so |
 | `RECONCILE_INTERVAL_MS` | `900000` | scheduled reconciliation cadence |
+| `RG_SESSION_MINUTES` | `0` | responsible-gambling session limit; 0 = not configured |
+| `RG_REALITY_CHECK_MINUTES` | `0` | reality-check interval; 0 = not configured |
+| `RG_DEPOSIT_DAILY_CENTS` | `0` | rolling 24h deposit limit; 0 = not configured |
 | `DELAY_RELEASE_INTERVAL_MS` | `5000` | how often expired in-play delays are released into the book; 0 disables |
 
 ## Development
 
 ```bash
-npm test            # 435 checks, 35 suites — unit + API integration, fully offline
+npm test            # 448 checks, 36 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 58 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code
@@ -251,7 +256,7 @@ Contributing, house conventions and where to add things:
 
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
-public/    frontend (no build)     tests/      35 unit/API suites + smoke + browser + guards
+public/    frontend (no build)     tests/      36 unit/API suites + smoke + browser + guards
             public/js/*.js          7 UI modules, 187-419 lines each
 docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```

@@ -27,7 +27,7 @@ browser (public/)
 ```
 
 There is no ORM, no migration framework and no service layer beyond `lib/`. The
-schema is a single `CREATE TABLE IF NOT EXISTS` block in `lib/store.js` (23
+schema is a single `CREATE TABLE IF NOT EXISTS` block in `lib/store.js` (24
 tables), which is why a fresh clone runs with one command. Express is the only
 runtime dependency; Playwright is dev-only and used by the browser suite.
 
@@ -42,7 +42,10 @@ runtime dependency; Playwright is dev-only and used by the browser suite.
 | `lib/auth.js` | scrypt hashing, sessions, sanitised user shape | touch balances |
 | `lib/ledger.js` | the only writer of balances/escrow and `transactions` rows | decide who wins |
 | `lib/match.js` | order validation, book sweeps, fills, `bookFor`, positions, overround | settle anything |
-| `lib/settle.js` | market settlement: pot distribution, commission, void, auto-cancel | place orders |
+| `lib/settle.js` | market settlement: pot distribution (single winner or a dead heat's joint set), commission, void, auto-cancel | place orders |
+| `lib/limits.js` | abuse controls: stake, market liability, daily settled, self-exclusion | decide who wins |
+| `lib/rg.js` | responsible gambling: session limit, reality check, rolling deposit limit | be enforced anywhere but the one gate in `limits.js` |
+| `lib/results.js` / `lib/voidrules.js` | per-sport void rules, outcome application, settlement holds, provenance | invent an outcome |
 | `lib/cashout.js` | quote + execute a green-up close | touch the raw pot maths |
 | `lib/bots.js` | MarketMakers ladders, requote | match itself (the engine's self-match guard covers it) |
 | `lib/drift.js` | fair-price random walk | move LTP (only real trades do) |

@@ -422,7 +422,7 @@ conversation.
 ## 6. Immediate next actions
 
 Reassessed after Phases 1–4, the follow-on work, and the first outside
-review of the money path. The suite is now **435 checks across 35 suites**,
+review of the money path. The suite is now **448 checks across 36 suites**,
 plus a live smoke script and a 71-check browser suite, all green.
 
 ### Recently completed since the first plan
@@ -482,10 +482,34 @@ plus a live smoke script and a 71-check browser suite, all green.
    cannot harvest the rounding — the same arbitrage the audit found in
    commission. `voidrules` settles a named dead heat and still HOLDS one that
    names fewer than two joint winners.
-6. **Responsible gambling surface.** Age verification, reality checks, session
-   limits. Self-exclusion ships and is wired to the engine; the rest does not,
-   and the product should not be deployable to an operator who has not
-   configured it.
+6. ~~Responsible gambling surface.~~ ✅ `lib/rg.js` — self-exclusion (Phase 1),
+   session limit, reality check and rolling 24-hour deposit limit. All three
+   new controls are asserted by the ENGINE, inside the one function every
+   betting path already calls, because a session limit enforced in the UI is a
+   suggestion. Age verification is deliberately absent: it is an identity/KYC
+   control with an external verification provider, not a limit, and it was
+   deferred deliberately.
+
+   Three details that decide whether such a control is real:
+   - **Signing in again does not restart the session clock.** A session limit
+     defeated by refreshing the page is not a limit; only signing OUT ends a
+     session.
+   - **The reality check is decided by the engine**, and only the
+     acknowledgement clears it — a check the player can skip by not clicking
+     the dialog is not a check.
+   - **The deposit limit is a ROLLING window and covers BOTH deposit paths.**
+     A calendar-day limit is trivially gamed at 23:59 and 00:01, and a limit
+     guarding only the faucet is defeated by paying through the card instead.
+
+   All three default to 0 — *not configured*, not "unlimited but enforced",
+   because no session limit is correct for every operator. The server says so
+   at boot rather than letting an unguarded demo reach production quietly.
+
+   Found while building it: the reality clock was originally stamped by the
+   SESSION LIMIT's row creation, so configuring a reality check without a
+   session limit left the check permanently not-due — a control that appears in
+   the config and does nothing, which is the precise failure this module exists
+   to prevent.
 7. **The rule table and the seed must agree.** Found while building dead-heat
    settlement, and it was silently VOIDING MONEY: the seed creates
    `greyhounds` while the table was keyed `greyhound`, and `basketball` was

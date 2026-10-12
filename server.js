@@ -8,6 +8,15 @@ const { seedIfNeeded, rollForwardEvents } = require('./lib/seed');
 const A = require('./lib/auth');
 const L = require('./lib/ledger');
 const M = require('./lib/match');
+// Two aliases with a reason each. MATCH is the engine under the name the
+// in-play release pass uses, so a reader of that job sees M.* and
+// MATCH.releaseEligibleOrders in the same file and knows they are one module.
+// RG is the responsible-gambling gate. (Both lines were briefly missing after a
+// shell-quoting failure in a sed, and nothing noticed until the API suite
+// called a route that used them — a reminder that an undefined identifier in a
+// rarely-taken route is a runtime error, not a load error.)
+const MATCH = M;
+const RG = require('./lib/rg');
 const SET = require('./lib/settle');
 const CASH = require('./lib/cashout');
 const bots = require('./lib/bots');
@@ -449,15 +458,26 @@ app.post('/api/auth/login', (req, res) => {
   try {
     const { user, token } = A.loginUser(db, { ...(req.body || {}), country: TEN.trustedCountry(req) });
     rlRecordSuccess(key); // a success proves the real user — clear the slate
+    // Sign-in starts the RG session clock, and does NOT restart a session
+    // already running: a player who refreshes the page must not get a fresh
+    // session limit, which is the easiest way to defeat one.
+    const rg = RG.startSession(db, user.id);
     res.setHeader('Set-Cookie', sessionCookie(token));
-    res.json({ user });
+    res.json({ user, rg });
   } catch (e) {
     if (e && e.status === 401) rlRecordFailure(key); // only auth misses count
     throw e; // sync throw → Express forwards to the error handler
   }
 });
 
+// Signing out ENDS the session: a player who has finished for the day should
+// be able to come back tomorrow, and a session limit that only ever ratchets
+// upward is not a session limit.
 app.post('/api/auth/logout', (req, res) => {
+  // End the RG session too, but only for a session this request actually owns:
+  // the first-run lock allows logout for a locked account, and ending a
+  // stranger's session clock on their behalf would be a control with a bypass.
+  if (req.user) RG.endSession(db, req.user.id);
   A.destroySession(db, req.token);
   res.setHeader('Set-Cookie', 'ob_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0');
   res.json({ ok: true });
@@ -796,9 +816,24 @@ app.get('/api/settlements', requireAuth, (req, res) => {
 
 app.post('/api/wallet/deposit', requireAuth, limit('wallet'), (req, res) => {
   const amount = req.body ? req.body.amount_cents : undefined;
+  // The RG deposit limit is checked on BOTH deposit paths, so it cannot be
+  // side-stepped by using the payment intent instead of the faucet.
+  RG.assertDeposit(db, req.user.id, Number(amount));
   const result = L.deposit(db, req.user.id, amount, config.FAUCET_MAX_CENTS);
   broadcast('balance', {}, req.user.id);
   res.json(result);
+});
+
+// ── Responsible gambling ───────────────────────────────────────────────────
+// The ENGINE decides whether a check is due (lib/rg.js); this is the
+// acknowledgement, which is the only thing that resets its clock. A check the
+// player can skip by not clicking is not a check.
+app.post('/api/auth/reality-check', requireAuth, limit('wallet'), (req, res) => {
+  res.json(RG.acknowledgeRealityCheck(db, req.user.id));
+});
+
+app.get('/api/auth/rg', requireAuth, limit('read'), (req, res) => {
+  res.json(RG.status(db, req.user.id));
 });
 
 // ── Admin (trading desk) ───────────────────────────────────────────────────
@@ -944,7 +979,9 @@ app.put('/api/admin/risk/bots/:id', requireAdmin, limit('admin'), (req, res) => 
 // seams. An intent credits nothing until confirmed — that is the whole
 // contract, and it is why these are two calls rather than one.
 app.post('/api/wallet/deposit-intent', requireAuth, limit('wallet'), (req, res, next) => {
-  PAY.openDeposit(db, req.user.id, Number((req.body || {}).amount_cents))
+  const amount = Number((req.body || {}).amount_cents);
+  RG.assertDeposit(db, req.user.id, amount);
+  PAY.openDeposit(db, req.user.id, amount)
     .then((r) => res.json(r))
     .catch(next);
 });
@@ -1152,7 +1189,18 @@ app.post('/api/admin/markets/:id/release', requireAdmin, limit('admin'), (req, r
 // this exists so an operator can drain a backlog immediately (after restoring
 // a database, or after turning a delay off mid-event) without waiting a cycle.
 app.post('/api/admin/inplay/release-delays', requireAdmin, limit('admin'), (req, res) => {
-  const r = MATCH.releaseEligibleOrders(db, { limit: intVal(req.body && req.body.limit) || 1000 });
+  // The helper here is `intId`, not `intVal` — there is no `intVal` in this
+  // file, so the first version of this route threw a ReferenceError and
+  // answered 500 to every caller, including the admin who needed it to drain a
+  // backlog after restoring a database. It stayed invisible because no test
+  // called the route; tests/api.test.js R1 now does, for exactly that reason.
+  // The limit is a hint, so an absent or nonsensical one falls back rather than
+  // throwing: an operator's emergency button should not 400 because they typed
+  // a limit badly.
+  const raw = req.body && req.body.limit;
+  const n = Number(raw);
+  const limit = Number.isInteger(n) && n > 0 ? Math.min(n, 5000) : 1000;
+  const r = MATCH.releaseEligibleOrders(db, { limit });
   res.json(r);
 });
 
@@ -1593,6 +1641,20 @@ function main() {
   }
   if (!config.OPS_TOKEN) {
     console.warn('[ops] OPS_TOKEN unset — /metrics and the backup control return 404.');
+  }
+  // Responsible gambling. Self-exclusion ships and is always on; the session
+  // limit, reality check and deposit limit are operator-configured and default
+  // to 0. That is deliberate (no session limit is correct for every operator),
+  // but it means a demo deployment is UNGUARDED, and that must be said at boot
+  // rather than discovered in an audit.
+  if (!RG.configured()) {
+    console.warn(
+      '[rg] NO RESPONSIBLE-GAMBLING LIMITS CONFIGURED.\n' +
+      '[rg] Session limit, reality check and deposit limit are all off, so this\n' +
+      '[rg] venue offers unbounded play. Set RG_SESSION_MINUTES,\n' +
+      '[rg] RG_REALITY_CHECK_MINUTES and RG_DEPOSIT_DAILY_CENTS before it can\n' +
+      '[rg] serve anyone. Self-exclusion (always on) is not a substitute.'
+    );
   }
 
   enforceFirstRunLock();
