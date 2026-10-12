@@ -86,6 +86,7 @@ npm start         # http://127.0.0.1:7777
 | Admin trading desk: catalogue, suspend/restore, settle, stats, overround | working |
 | Live updates | working (SSE with a 15s poll fallback) |
 | Results feed: transport, per-sport void rules, disputes held not guessed, provenance, manual release | working (transport needs `RESULTS_FEED_URL`) |
+| Betfair odds recorder integration | **display only** — feed markets are not tradeable (see below) |
 | In-play: suspension, enforced bet delay, kick-off hold, traded volume | working |
 | Dead heat / joint favourite settlement | working |
 | Reporting: financial summary with self-check, player statements, volume, commission, operational | working (`/api/admin/reports/*`, CSV or `?format=json`) |
@@ -212,8 +213,32 @@ a bad value **aborts the launch** rather than failing later.
 | `COMMISSION_RATE` | `0.025` | fee on net winnings |
 | `FAUCET_MAX_CENTS` | `100000` | faucet cap per deposit |
 | `MIN_STAKE_CENTS` / `MAX_STAKE_CENTS` | `100` / `100000` | order size bounds |
-| `FEED_ENABLED` | `false` | take prices from the odds feed instead of the bots |
+| `FEED_ENABLED` | `false` | show the odds feed alongside the board — **display only, see below** |
 | `FEED_DATABASE_URL` | — | recorder Postgres URL; required when the feed is on |
+
+### The odds feed is display only
+
+With `FEED_ENABLED=true` the board shows live prices from the Betfair recorder,
+but **those markets cannot be bet on**, and this is enforced by the engine, not
+just by the client:
+
+- a feed market has no row in this venue's database — the recorder's catalogue
+  lives in its own Postgres — so naming a feed selection id is a `404`, refused
+  before any collateral is taken;
+- the client refuses too, and says "Feed markets are display-only".
+
+Also: enabling the feed force-disables the bots and the drift engine
+(`BOTS_ON`/`DRIFT_ON` in `server.js`), because a bot requoting a ladder straight
+over the observed Betfair book would be the venue fighting its own price source.
+So in feed mode the venue's **own** markets are unquoted, and the venue trades
+nothing.
+
+That is a coherent design — a price-observation tool attached to an engine, not a
+merged product — but it is easy to read "odds feed integration" as something
+else, so it is stated here and pinned by `tests/feed-display-only.test.js`.
+Making feed markets tradeable needs a market mapping and a liquidity source; that
+is a feature with a cost, not a switch. `docs/ROADMAP.md` has the reasoning,
+including why a staleness guard was built and then deleted.
 | `FEED_STALE_SECONDS` | `300` | frame age beyond which the board reports stale |
 | `FEED_MARKET_LIMIT` | `60` | markets returned to the board |
 | `BOT_ENABLED` / `DRIFT_ENABLED` | `true` | demo liquidity and price drift (ignored when the feed is on) |
@@ -241,7 +266,7 @@ a bad value **aborts the launch** rather than failing later.
 ## Development
 
 ```bash
-npm test            # 490 checks, 38 suites — unit + API integration, fully offline
+npm test            # 495 checks, 39 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 58 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code
@@ -261,7 +286,7 @@ Contributing, house conventions and where to add things:
 
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
-public/    frontend (no build)     tests/      38 unit/API suites + smoke + browser + guards
+public/    frontend (no build)     tests/      39 unit/API suites + smoke + browser + guards
             public/js/*.js          7 UI modules, 187-419 lines each
 docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```

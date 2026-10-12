@@ -299,10 +299,37 @@ this is a consumer, not a rewrite. Requirements beyond calling it:
 of the latency you actually offer. In-play without honest delay modelling is
 where a venue loses money to sharps.
 
-**Feed resilience.** `FEED_STALE_SECONDS` reports staleness but does not
-reconcile. A dropped SSE connection mid-event leaves an unmarked hole. Add gap
-detection and a resync path — `crates/adapters/betfair/src/book/recovery.rs` in
-Nautilus Trader is a good reference for the lifecycle.
+**Feed resilience.** ✅ Investigated, and the answer is that the risk is not
+real *as the system stands*. `FEED_STALE_SECONDS` reports staleness and does not
+reconcile, which reads like a money-path gap: a venue must not trade against a
+book that has stopped moving. I built the control — a pass that suspends markets
+whose prices have gone stale — and then checked the premise before shipping it,
+which said no.
+
+**Feed markets are DISPLAY ONLY, end to end:**
+
+1. A feed market has no local row. The recorder's catalogue lives in its own
+   Postgres database; the venue's tradeable markets are rows in this one.
+2. The engine refuses an order naming a feed selection id — 404, because that
+   selection does not exist here — and refuses *before* taking any collateral.
+3. The client refuses too, and says "Feed markets are display-only".
+
+So no money can be at stake in a stale feed price, and a guard built on that fear
+would protect nothing while introducing a real hazard: it would take FEED market
+ids and try to suspend LOCAL venue markets, closing the venue's real book
+because an unrelated market's prices were old. I deleted it.
+`tests/feed-display-only.test.js` pins the three facts so the reasoning survives
+whoever comes next, and F4 also asserts the hoist in `server.js` still suppresses
+the bots and drift when the feed is on — the one part here that IS load-bearing.
+
+**What this actually leaves open** is a product decision rather than a control:
+with `FEED_ENABLED=true` the venue has no price source of its own, because the
+bots and drift are force-disabled so they cannot requote over the observed book.
+Feed mode is an observation tool attached to an engine, not a merged product,
+and in that mode the venue's own markets are unquoted. That is coherent — but it
+was written down nowhere, and "odds feed integration" does not describe it.
+Making feed markets tradeable needs a market mapping and a liquidity source, and
+that is a feature with a cost, not a control.
 
 **Persistence — a decision, not a task.** The engine is synchronous and
 `DatabaseSync` is single-threaded, which is *why* the sweep is inherently
