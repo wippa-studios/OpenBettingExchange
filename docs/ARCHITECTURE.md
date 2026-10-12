@@ -46,6 +46,7 @@ runtime dependency; Playwright is dev-only and used by the browser suite.
 | `lib/limits.js` | abuse controls: stake, market liability, daily settled, self-exclusion | decide who wins |
 | `lib/rg.js` | responsible gambling: session limit, reality check, rolling deposit limit | be enforced anywhere but the one gate in `limits.js` |
 | `lib/results.js` / `lib/voidrules.js` | per-sport void rules, outcome application, settlement holds, provenance | invent an outcome |
+| `lib/resultsfeed.js` | the results transport: fetch, normalise, report health | decide or settle anything |
 | `lib/cashout.js` | quote + execute a green-up close | touch the raw pot maths |
 | `lib/bots.js` | MarketMakers ladders, requote | match itself (the engine's self-match guard covers it) |
 | `lib/drift.js` | fair-price random walk | move LTP (only real trades do) |

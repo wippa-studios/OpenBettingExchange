@@ -576,6 +576,24 @@ const check = async (name, fn) => {
       assert.strictEqual(second.status, 200, 'and again');
     });
 
+    await check('R4 the results-feed state route answers, configured or not', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      const r = await j('GET', '/api/admin/results/feed', { cookie: admin });
+      assert.strictEqual(r.status, 200, 'the operator can ask whether the feed is up');
+      // The three states an operator must be able to tell apart, and no more.
+      assert.ok(['not_configured', 'failing', 'stale', 'ok'].includes(r.json.status), `a known status (got ${r.json.status})`);
+      assert.ok('consecutive_failures' in r.json && 'last_ok_at' in r.json, 'with the counters a desk needs');
+    });
+
+    await check('R5 a manual results poll is reachable and settles nothing by itself', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      const r = await j('POST', '/api/admin/results/poll', { body: {}, cookie: admin });
+      assert.strictEqual(r.status, 200, 'the manual trigger answers');
+      assert.strictEqual(typeof r.json.considered, 'number');
+      // With no feed configured it must be a clean no-op, not an outage.
+      assert.strictEqual(r.json.error, null, 'and report no error');
+    });
+
     await check('W4 a deposit intent above the per-intent cap is refused', async () => {
       const login = await j('POST', '/api/auth/login', { body: { username: 'alice', password: 'secret1' } });
       const r = await j('POST', '/api/wallet/deposit-intent', {

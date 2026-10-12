@@ -85,7 +85,7 @@ npm start         # http://127.0.0.1:7777
 | Liquidity bots + fair-price drift | working (disable with `BOT_ENABLED=false`) |
 | Admin trading desk: catalogue, suspend/restore, settle, stats, overround | working |
 | Live updates | working (SSE with a 15s poll fallback) |
-| Results feed: per-sport void rules, disputes held not guessed, provenance, manual release | working |
+| Results feed: transport, per-sport void rules, disputes held not guessed, provenance, manual release | working (transport needs `RESULTS_FEED_URL`) |
 | In-play: suspension, enforced bet delay, kick-off hold, traded volume | working |
 | Dead heat / joint favourite settlement | working |
 | Session limit, reality check, deposit limit | working, operator-configured (0 = off, boot warns) |
@@ -228,6 +228,9 @@ a bad value **aborts the launch** rather than failing later.
 | `DEPOSIT_MAX_CENTS` / `DEPOSIT_DAILY_MAX_CENTS` | `100000` / `500000` | per-intent and per-user-per-day caps on confirmed deposits |
 | `BACKUP_DIR` / `BACKUP_RETENTION` | — / `24` | scheduled snapshots; unset ⇒ **backups are off** and boot says so |
 | `RECONCILE_INTERVAL_MS` | `900000` | scheduled reconciliation cadence |
+| `RESULTS_FEED_URL` | *(unset)* | POST this for outcomes; unset = settle by hand or webhook |
+| `RESULTS_FEED_SECRET` | *(unset)* | sent as `Authorization: Bearer`; warns if the URL is set without it |
+| `RESULTS_FEED_TIMEOUT_MS` | `10000` | per-poll timeout; a feed that hangs must not stall the job |
 | `RG_SESSION_MINUTES` | `0` | responsible-gambling session limit; 0 = not configured |
 | `RG_REALITY_CHECK_MINUTES` | `0` | reality-check interval; 0 = not configured |
 | `RG_DEPOSIT_DAILY_CENTS` | `0` | rolling 24h deposit limit; 0 = not configured |
@@ -236,7 +239,7 @@ a bad value **aborts the launch** rather than failing later.
 ## Development
 
 ```bash
-npm test            # 448 checks, 36 suites — unit + API integration, fully offline
+npm test            # 467 checks, 37 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 58 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code
@@ -256,7 +259,7 @@ Contributing, house conventions and where to add things:
 
 ```
 lib/       engine and domain      server.js   HTTP + SSE wiring
-public/    frontend (no build)     tests/      36 unit/API suites + smoke + browser + guards
+public/    frontend (no build)     tests/      37 unit/API suites + smoke + browser + guards
             public/js/*.js          7 UI modules, 187-419 lines each
 docs/      architecture, rules, feed   data/   SQLite database (gitignored)
 ```
@@ -298,7 +301,9 @@ Full list and rationale in
 - In-play: bet delay modelling and a traded-volume ladder
 - Cap cash-out venue risk in `lib/risk.js`, alongside the bot liability cap
 - Integrate a real PSP against the `lib/payments` interface
-- Wire the results feed to a live transport (the `fetchResults` seam is ready)
+- ~~Wire the results feed to a live transport~~ — done: `lib/resultsfeed.js`, an HTTP
+  transport posting the pending set. Point `RESULTS_FEED_URL` at your results
+  service, or settle by hand/webhook as before.
 - Dead-heat joint-favourite settlement
 - Accumulators and each-way markets
 - Odds-history charts and a market-mover view on the board

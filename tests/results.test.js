@@ -161,12 +161,15 @@ check('R3 a disputed market is held open, not settled or voided', () => {
 
 // R4: a held market is excluded from the polling cycle, so the feed cannot
 // settle it behind the operator's back on the next tick.
-check('R4 held markets are excluded from the poll cycle', () => {
+check('R4 held markets are excluded from the poll cycle', async () => {
   const f = fixture();
   bet(f);
   R.applyOutcome(f.db, f.marketId, { status: 'completed', winners: [f.s1], disputed: true });
   completeEvent(f);
-  const run = R.pollOnce(f.db, () => ({ [f.marketId]: { status: 'completed', winners: [f.s1] } }));
+  // async: pollOnce awaits the transport. Forgetting that here is exactly how
+  // the async-shape bug hid — `run` would be a Promise and `run.applied`
+  // undefined, which `assert.strictEqual(undefined, 0)` does not catch.
+  const run = await R.pollOnce(f.db, () => ({ [f.marketId]: { status: 'completed', winners: [f.s1] } }));
   assert.strictEqual(run.applied, 0, 'nothing applied');
   assert.strictEqual(status(f.db, f.marketId).status, 'open', 'and it is still held open');
 });
@@ -255,17 +258,21 @@ check('R7c a dead heat in a sport without that rule is held', () => {
 });
 
 // R8: a poll cycle settles what the feed reports and ignores what it does not.
-check('R8 a poll cycle settles only markets the feed has outcomes for', () => {
+// async: pollOnce is async, because it awaits the injected transport. It was
+// synchronous and read `fetchResults(db)` without awaiting, which silently
+// applied nothing for any transport that was not a local synchronous read — see
+// the note on pollOnce and tests/resultsfeed.test.js T16.
+check('R8 a poll cycle settles only markets the feed has outcomes for', async () => {
   const f = fixture();
   bet(f);
   completeEvent(f);
-  const run = R.pollOnce(f.db, () => ({ [f.marketId]: { status: 'completed', winners: [f.s2] } }));
+  const run = await R.pollOnce(f.db, () => ({ [f.marketId]: { status: 'completed', winners: [f.s2] } }));
   assert.strictEqual(run.applied, 1);
   assert.strictEqual(run.results[0].outcome, 'settled');
   // A market with no signal is untouched.
   const g = fixture();
   bet(g);
-  const run2 = R.pollOnce(g.db, () => ({}));
+  const run2 = await R.pollOnce(g.db, () => ({}));
   assert.strictEqual(run2.applied, 0);
   assert.strictEqual(status(g.db, g.marketId).status, 'open');
 });

@@ -17,6 +17,11 @@ const M = require('./lib/match');
 // rarely-taken route is a runtime error, not a load error.)
 const MATCH = M;
 const RG = require('./lib/rg');
+// NOT `FEED`: that identifier is already the odds recorder (lib/feed.js). The
+// two are unrelated transports that happen to both be feeds, and shadowing one
+// with the other is a silent, load-time SyntaxError that costs more to find
+// than one longer name saves.
+const RFEED = require('./lib/resultsfeed');
 const SET = require('./lib/settle');
 const CASH = require('./lib/cashout');
 const bots = require('./lib/bots');
@@ -1113,6 +1118,24 @@ app.put('/api/admin/tenants/:id', requireAdmin, limit('admin'), (req, res) => {
 // ── Results feed + reconciliation (operator surface) ───────────────────────
 // The automatic polling loop is wired at boot; these are the human paths for
 // inspecting held markets and closing reconciliation findings.
+// The feed's own state, and a manual poll.
+//
+// An operator's first question when markets are not settling is "is the feed
+// up?", and the answer has to be one GET. A feed that silently stopped is
+// otherwise indistinguishable from a feed with nothing to say — and the
+// difference is players' money sitting unsettled.
+app.get('/api/admin/results/feed', requireAdmin, limit('admin'), (req, res) => {
+  res.json(RFEED.health({ staleAfterMs: JOBS_INTERVALS.resultsPollMs * 2 }));
+});
+
+app.post('/api/admin/results/poll', requireAdmin, limit('admin'), async (req, res, next) => {
+  try {
+    res.json(await RFEED.pollNow(db, { staleAfterMs: JOBS_INTERVALS.resultsPollMs * 2 }));
+  } catch (e) {
+    next(e);
+  }
+});
+
 app.get('/api/admin/results/void-rules', requireAdmin, limit('admin'), (req, res) => {
   res.json({ sports: VOIDRULES.knownSports(), rules: VOIDRULES.RULES, default: VOIDRULES.DEFAULT_RULE });
 });
@@ -1290,6 +1313,32 @@ if (JOBS_INTERVALS.delayReleaseMs > 0) {
       const r = MATCH.releaseEligibleOrders(db);
       if (r.filled > 0) {
         console.log(`[inplay] released ${r.released} delayed order(s), ${r.filled} cents filled`);
+      }
+    })
+  );
+}
+
+// The results poll. This job did not exist even though
+// RESULTS_POLL_INTERVAL_MS was documented in the README and pollOnce() had a
+// complete consumer — so outcomes only ever arrived when an operator pushed
+// them by hand, and the documentation described a feature the server did not
+// have. A knob that reads nothing is worse than no knob: an operator who set
+// it believed their settlement was automated.
+if (JOBS_INTERVALS.resultsPollMs > 0) {
+  const fetcher = RFEED.createFetcher({
+    url: config.RESULTS_FEED_URL,
+    secret: config.RESULTS_FEED_SECRET,
+    timeoutMs: config.RESULTS_FEED_TIMEOUT_MS,
+  });
+  jobTimers.push(
+    JOBS.every(JOBS_INTERVALS.resultsPollMs, async () => {
+      const r = await RFEED.pollNow(db, { fetcher, staleAfterMs: JOBS_INTERVALS.resultsPollMs * 2 });
+      if (r.error) {
+        console.warn(`[results] poll failed: ${r.error.reason} ${r.error.detail || ''}`);
+      } else if (r.applied > 0) {
+        console.log(`[results] applied ${r.applied}/${r.considered} outcome(s) from the feed`);
+      } else if (r.feed.status === 'failing') {
+        console.warn(`[results] feed ${r.feed.status} (${r.feed.consecutive_failures} in a row): ${r.feed.last_error && r.feed.last_error.reason}`);
       }
     })
   );
@@ -1654,6 +1703,17 @@ function main() {
       '[rg] venue offers unbounded play. Set RG_SESSION_MINUTES,\n' +
       '[rg] RG_REALITY_CHECK_MINUTES and RG_DEPOSIT_DAILY_CENTS before it can\n' +
       '[rg] serve anyone. Self-exclusion (always on) is not a substitute.'
+    );
+  }
+
+  // The results feed is off unless configured. That is a legitimate way to run
+  // (settle by hand or by webhook), so it is not an error — but it is worth
+  // one line, because the alternative reading is "results are automatic", and
+  // on a venue that reading means nobody notices markets not settling.
+  if (!config.RESULTS_FEED_URL) {
+    console.warn(
+      '[results] RESULTS_FEED_URL unset — no automatic results feed. Markets settle\n' +
+      '[results] by webhook or by an operator settling them by hand.'
     );
   }
 

@@ -472,9 +472,44 @@ plus a live smoke script and a 71-check browser suite, all green.
    Regression-tested both directions in `tests/inplay2.test.js` (12 checks).
 3. **One real PSP adapter.** The interface and reference provider ship; the
    concrete integration does not.
-4. **Trading-side split of the results feed.** `lib/results.js` consumes an
-   injected `fetchResults`; wiring it to the odds recorder in `lib/feed.js` or
-   a provider webhook is the remaining transport choice.
+4. ~~Trading-side split of the results feed.~~ ✅ `lib/resultsfeed.js` — the
+   consumer in `lib/results.js` existed the whole time and had NO transport, and
+   the scheduled poll had never been wired at all, so
+   `RESULTS_POLL_INTERVAL_MS` was a documented knob that no job read: outcomes
+   arrived only when an operator pushed them by hand. The transport POSTs the
+   pending set (the SAME query the consumer uses, so the two cannot drift) to
+   `RESULTS_FEED_URL`, with a bearer secret, a hard timeout, and a byte cap so a
+   provider cannot OOM the venue to deliver bad news. Every failure mode records
+   a reason and returns nothing rather than throwing into the job runner.
+
+   The design decisions that make it a control rather than a hope:
+   - **The feed is a signal, not an authority.** It never decides an outcome. A
+     feed naming a winner outside the market, or a disputed result, is HELD —
+     the strictness already in `lib/results.js` and the reason a machine cannot
+     shortcut a human decision.
+   - **Every failure is soft and recorded, and three states are
+     distinguishable**: `not_configured`, `failing`, `stale`. A feed that
+     silently stopped is otherwise indistinguishable from a feed with nothing
+     to say, and the difference is players' money sitting unsettled.
+   - **Staleness never blocks trading and never gates readiness.** A dead feed
+     means late outcomes and a human, not a wrong book; pulling a healthy venue
+     out of rotation over a provider outage would manufacture the outage it was
+     meant to prevent.
+   - **A poll with nothing pending is a SUCCESS.** Otherwise a quiet venue
+     reports a broken feed all night and the real outage is the one nobody reads.
+
+   ── THE BUG THIS FOUND, AND IT IS THE FIFTH DEAD CONTROL ─────────────────
+   `pollOnce` called `fetchResults(db)` WITHOUT AWAITING IT. It was synchronous
+   and written for the one transport that existed — a synchronous local read —
+   so for every async transport `outcomes` was a Promise, `outcomes[id]` was
+   undefined for every market, and the cycle reported `applied: 0` having
+   applied nothing. Wiring the HTTP feed would have produced a scheduled job, a
+   green health endpoint and a venue that settled nothing at all.
+
+   It survived a green suite for the same reason the other four did: the
+   injected double returned a plain object, which is the single shape that hides
+   it. `pollOnce` is async now, and T16 asserts the SHAPE — a promise-returning
+   fetcher must be applied, not read as an object.
 5. ~~Dead-heat / joint-favourite settlement.~~ ✅ The engine now settles a
    winner SET. What divides is the PAYOUT (the liability shared n ways) and
    each side still returns its own collateral in full, so nobody's escrow is
