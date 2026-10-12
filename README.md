@@ -220,6 +220,7 @@ a bad value **aborts the launch** rather than failing later.
 | `FEED_RUNNER_ENABLED` | `false` | supervise the collector here (spawn + restart it) instead of running it yourself |
 | `FEED_COLLECTOR_CMD` | `betfeed collect` | the collector command; split on whitespace, so an absolute path or a wrapper works |
 | `FEED_RUNNER_MIN_UPTIME_SECONDS` | `120` | how long a child must survive before a restart is counted as a fresh start |
+| `FEED_NUMBER` | `2` | which feed to read: `1` fixtures only, `2` fixtures + prices + results |
 
 Betfair credentials are **not** configured here. They are entered in the admin
 dashboard per tenant, encrypted at rest, and passed to the collector as
@@ -286,7 +287,7 @@ including why a staleness guard was built and then deleted.
 ## Development
 
 ```bash
-npm test            # 576 checks, 45 suites — unit + API integration, fully offline
+npm test            # 581 checks, 45 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 74 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code

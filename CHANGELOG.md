@@ -6,7 +6,65 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+The feed read path was still written against the retired `betfair-market-snapshots`
+schema (`markets`, `snapshots`, `market_runners`). Rewritten against the
+collector's `v_feed1`/`v_feed2`, and every bug below was invisible until it ran
+against a real database with 9,456 books in it:
+
+- **The board rendered empty ladders for every market.** `PRICE_COLUMNS` listed
+  `odds_captured_at`, `price_age_seconds`, `publish_time`, `inplay` and
+  `bet_delay` — and not `odds`, the per-selection ladder the board is built from.
+  Nothing threw. `health()` counts `odds IS NOT NULL` in its *own* query, so it
+  reported 9,456 markets with odds while all sixty markets on the board were
+  price-free. Two queries, one of them right.
+- **`FEED_MARKET_LIMIT` has never actually capped markets.** The limit was on the
+  outer select, and the view is one row per *selection* — a Correct Score market
+  is 31 rows, so "limit 5" returned one market. The market list is now chosen in
+  a CTE and joined back. `limit 60` returns 60 markets.
+- **The single-market read carried `LIMIT 1`**, returning one *runner* of a
+  twenty-runner market. A single market is now unlimited and filtered by id.
+- **The board led with dead markets.** Ordering by start time ascending puts
+  already-finished markets first — and those are exactly the ones the odds job
+  does not poll, so the top of the board had no prices by construction. Feed 2
+  now orders by book freshness; feed 1 still orders by start time, because a
+  fixture list is chronological and feed 1 has no prices to be fresh about.
+- **`bookPercentages` published `percent_book` while the UI reads `back_pct` and
+  `lay_pct`** — fields it never produced, so the ladder headers would have shown
+  nothing. It now computes the overround, the sum of 1/price over every runner,
+  and reports a percentage only for a **complete two-sided book**. Ten runners at
+  1.02 with no lays read ~980% under the old rule; that is one side of a book,
+  not a book.
+- **`runnerOrder` read `runner_name` but sorts selection objects**, which carry
+  `name`, so the numeric-prefix rule never fired and "10" sorted before "2".
+- **`nestNav` emitted `events`/`name` where the renderer walks `meetings`/`competition`**,
+  which would have emptied the entire nav tree. Caught by reading
+  `public/js/nav.js` rather than by a failing test.
+- **`health()` leaked the driver error** — host, user and connection string —
+  instead of failing closed with the generic message. Caught by the outage suite.
+- **`health()` counted selection rows and called them markets** — 81,785 against
+  9,976 actual.
+
+### Removed
+
+- **Delta carry-forward and the `carried` flag.** The Stream API sent only the
+  runners that changed, so a "latest frame" book was partial and prices were
+  carried forward from earlier cycles. The collector polls whole books, so every
+  level in a ladder comes from one poll and there is nothing to carry — and the
+  flag was never read by the UI in any case. The three tests that covered it went
+  with it, replaced by the cases that can now actually occur (a market the odds
+  job has not reached; a feed-1 market with no price column).
+- `market_count` on nav competitions. One commit introduced it and nothing has
+  ever read it.
+
 ### Added
+
+- `FEED_NUMBER` (1 or 2) — which feed to read. Anything else is refused at boot
+  rather than silently falling back, because falling back would serve prices to a
+  venue that asked for fixtures only.
+- Six checks pinning the SQL shape, since the omissions above are exactly the
+  ones an offline suite cannot catch by joining Postgres.
 
 - **Betfair credentials in the admin dashboard.** An operator supplies an app
   key, username and password per tenant; the exchange stores them encrypted

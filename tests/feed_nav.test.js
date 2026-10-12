@@ -112,8 +112,14 @@ const FEED_ON = process.env.FEED_ENABLED === 'true';
         assert.ok(Array.isArray(sports) && sports.length === 1, 'the tree arrived');
         const comp = sports[0].countries[0].competitions[0];
         assert.strictEqual(comp.competition, 'Mount Gambier');
-        assert.strictEqual(comp.market_count, 1, 'shaped counts survive the route');
+        assert.strictEqual(comp.meetings.length, 1, 'one meeting');
         assert.strictEqual(comp.meetings[0].races[0].market_id, '1.1');
+        // The previous assertion here was `comp.market_count === 1`. Nothing has
+        // ever read that field: `git log -S market_count` shows one commit, the
+        // one that introduced the feed, and no reference in public/ since. It was
+        // a shape nobody consumed, so it is gone rather than re-added — keeping a
+        // field alive solely because a test asserts it is the same mistake as the
+        // delta carry-forward this rewrite removed.
       } finally {
         feed.fetchNav = realFetchNav; // never leak the stub into other checks
       }

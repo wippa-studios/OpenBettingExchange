@@ -32,7 +32,10 @@ is its decision, and it is a real one:
 | Cadence | 12 h by default | 5 m by default |
 | Price data | structurally impossible — no price column exists in `v_feed1` | `market_odds_current` |
 | Auto-settlement | yes, on the fixtures cadence | yes, and fresher |
+| Board order | by start time — a fixture list is chronological | by book freshness — a price board is not chronological |
 | Use when | the venue sets **its own odds** and only wants a real fixture list | the venue wants a **reference book** and faster settlement |
+
+`FEED_NUMBER` selects which one the venue reads (default `2`).
 
 Both are the same contract document, differing only in whether `price` is
 populated. One implementation, so they cannot drift apart.
@@ -194,6 +197,20 @@ happened. A two-winner signal on football — a sport with no dead heats — is
 
 Outcomes that cannot be settled safely are **held**, never guessed, and a held
 market can be released by an operator with a written reason.
+
+### A resolved market stays readable
+
+The collector marks a settled market inactive so its odds job stops polling it.
+The views still publish it, for seven days. That matters more than it sounds:
+filtering on "active" alone removed every settled market from both feeds, so the
+result was collected, stored, and then made invisible — auto-settlement could
+never have fired. Measured: six rows in `market_result`, zero visible in
+`v_feed2`.
+
+A **non-runner never voids a market.** `REMOVED` is an input to settlement, not
+an outcome: a football fixture with one late withdrawal must not be reported as
+a cancellation. Only Betfair's own `VOIDED` status voids, and the runner's
+status still reaches you so you can apply your own non-runner rule.
 
 ### Freshness, and the lag that matters
 

@@ -5,7 +5,7 @@
 // the behaviour that actually breaks a ladder UI — side ordering, the delta
 // carry-forward case, and stale detection.
 const assert = require('assert');
-const { groupRows, ageSeconds } = require('../lib/feed');
+const { groupRows, ageSeconds, boardSql } = require('../lib/feed');
 
 // Pull the registered /api/feed/nav handler off the Express stack so it can be
 // called without binding a port. Express 4 stores routes in app._router.stack.
@@ -54,32 +54,40 @@ const NOW = Date.now();
 const iso = (msAgo) => new Date(NOW - msAgo).toISOString();
 const FRAME = iso(60_000); // the market's newest frame, 1 minute old
 
-// One row per (runner, side), as BOARD_SQL returns it.
+// ONE ROW PER SELECTION, as v_feed2 returns it, with that selection's ladders
+// already extracted into an `odds` JSONB object by the view.
+//
+// This used to be one row per (runner, side) carrying scalar price/size, which
+// the previous implementation needed because Betfair's Stream API sends only
+// the runners that CHANGED in a cycle. The collector polls a whole market book
+// at a time and writes the complete ladder, so there are no partial books left
+// to reconcile — hence one row, both ladders, nothing to carry forward.
 const row = (over = {}) => ({
   market_id: '1.100',
   market_name: 'Match Odds',
-  event_id: '10',
+  fixture_id: '10',
   event_name: 'Arsenal v Chelsea',
   market_status: 'OPEN',
-  in_play: false,
-  frame_at: FRAME,
+  inplay: false,
+  odds_captured_at: FRAME,
   selection_id: 1,
   runner_name: 'Arsenal',
   sort_priority: 1,
-  side: 'BACK',
-  price: 2.4,
-  size: 100,
-  price_at: FRAME,
+  odds: { back: [{ price: 2.4, size: 100 }], lay: [{ price: 2.5, size: 100 }] },
   ...over,
 });
+
+/** A ladder of levels: `lv(2.4)` -> {price: 2.4, size: 100}. */
+const lv = (price, size = 100) => ({ price, size });
+/** An `odds` object from explicit ladders, so a test can order them wrongly. */
+const odds = (back = [], lay = []) => ({ back, lay });
 
 // Only self-run when executed directly. tests/feed_nav.test.js imports this
 // file to reuse findNavHandler/navCall, and must not re-run these checks.
 if (require.main === module) (async () => {
   await check('a single priced runner yields one market with both ladders', () => {
     const out = groupRows([
-      row({ side: 'BACK', price: 2.4 }),
-      row({ side: 'LAY', price: 2.5 }),
+      row({ odds: odds([lv(2.4)], [lv(2.5)]) }),
     ]);
     assert.strictEqual(out.length, 1, 'one market');
     assert.strictEqual(out[0].selections.length, 1, 'one runner');
@@ -89,25 +97,19 @@ if (require.main === module) (async () => {
   });
 
   await check('back ladder is highest-first (best price to back)', () => {
-    const out = groupRows([
-      row({ side: 'BACK', price: 2.4 }),
-      row({ side: 'BACK', price: 2.6 }),
-      row({ side: 'BACK', price: 2.5 }),
-    ]);
+    // Deliberately unsorted: Betfair does not return a ladder in order, and the
+    // top of the back ladder is the best price to back.
+    const out = groupRows([row({ odds: odds([lv(2.4), lv(2.6), lv(2.5)]) })]);
     assert.deepStrictEqual(out[0].selections[0].back.map((l) => l.price), [2.6, 2.5, 2.4]);
   });
 
   await check('lay ladder is lowest-first (best price to lay)', () => {
-    const out = groupRows([
-      row({ side: 'LAY', price: 2.9 }),
-      row({ side: 'LAY', price: 2.7 }),
-      row({ side: 'LAY', price: 2.8 }),
-    ]);
+    const out = groupRows([row({ odds: odds([], [lv(2.9), lv(2.7), lv(2.8)]) })]);
     assert.deepStrictEqual(out[0].selections[0].lay.map((l) => l.price), [2.7, 2.8, 2.9]);
   });
 
   await check('size converts from pounds to integer cents', () => {
-    const out = groupRows([row({ side: 'BACK', price: 2.4, size: 123.45 })]);
+    const out = groupRows([row({ odds: odds([lv(2.4, 123.45)]) })]);
     assert.strictEqual(out[0].selections[0].back[0].size_cents, 12345);
   });
 
@@ -121,103 +123,168 @@ if (require.main === module) (async () => {
 
   await check('multiple runners in one market are kept', () => {
     const out = groupRows([
-      row({ selection_id: 1, side: 'BACK', price: 2.4 }),
-      row({ selection_id: 2, side: 'BACK', price: 3.1 }),
+      row({ selection_id: 1, odds: odds([lv(2.4)]) }),
+      row({ selection_id: 2, runner_name: 'Chelsea', sort_priority: 2, odds: odds([lv(3.1)]) }),
     ]);
     assert.strictEqual(out[0].selections.length, 2);
-    assert.deepStrictEqual(out[0].selections.map((s) => s.selection_id), [1, 2]);
+    // A string, not a number: Postgres BIGINT arrives from `pg` as a string, and
+    // a runner id beyond Number.MAX_SAFE_INTEGER must not be rounded.
+    assert.deepStrictEqual(out[0].selections.map((s) => s.selection_id), ['1', '2']);
   });
 
-  // THE DELTA CASE. An unchanged runner has no row in the newest frame, so the
-  // query returns its price from an earlier cycle. It must still appear, and be
-  // marked so the UI can show it as not-live.
-  await check('a price from an earlier frame is kept and marked carried', () => {
-    const out = groupRows([
-      row({ side: 'BACK', price: 2.4, price_at: iso(240_000) }), // 4 min old
-    ]);
-    const back = out[0].selections[0].back;
-    assert.strictEqual(back.length, 1, 'runner does not blink out');
-    assert.strictEqual(back[0].price, 2.4);
-    assert.strictEqual(back[0].carried, true, 'marked as not-live');
-  });
-
-  await check('a price from the current frame is NOT marked carried', () => {
-    const out = groupRows([row({ side: 'BACK', price: 2.4, price_at: FRAME })]);
+  // ── WHAT REPLACED THE DELTA CARRY-FORWARD ──────────────────────────────────
+  // Three tests used to cover the Stream API's partial frames: a price carried
+  // from an earlier cycle and flagged `carried`. That case cannot occur any
+  // more — the collector writes a COMPLETE ladder per market, so every level in
+  // a ladder came from the same poll — and `carried` was never read by the UI
+  // in any case.
+  //
+  // These three cover the real cases now: a market the odds job has not reached,
+  // a selection with genuinely no price, and a whole market from feed 1, which
+  // has no price column at all.
+  await check('no level is ever flagged carried, because a poll is never partial', () => {
+    const out = groupRows([row({ odds: odds([lv(2.4)]) })]);
     assert.strictEqual(out[0].selections[0].back[0].carried, undefined);
   });
 
-  await check('carryForward off: an older-frame price is hidden', () => {
-    const out = groupRows([row({ side: 'BACK', price: 2.4, price_at: iso(240_000) })], {
-      carryForward: false,
-    });
-    assert.strictEqual(out[0].selections[0].back.length, 0);
-  });
-
-  await check('a runner with no price at all still renders, with empty ladders', () => {
-    const out = groupRows([row({ side: null, price: null, price_at: null })]);
+  await check('a runner with no odds at all still renders, with empty ladders', () => {
+    // A market inside the fixtures scope that the odds job has not reached yet.
+    const out = groupRows([row({ odds: null, odds_captured_at: null })]);
     assert.strictEqual(out[0].selections.length, 1, 'runner survives');
     assert.strictEqual(out[0].selections[0].back.length, 0);
     assert.strictEqual(out[0].selections[0].lay.length, 0);
+    assert.strictEqual(out[0].poll_age_seconds, null, 'and its age is honestly null, not zero');
+  });
+
+  await check('a whole market priced as unpriced (feed 1) renders with empty ladders', () => {
+    // feed 1 has no odds column, so `priced: false` is passed and nothing is
+    // invented. The market must still appear — a fixture list is the point of
+    // feed 1 — but with no prices, and marked stale so it cannot be mistaken
+    // for a live board.
+    const out = groupRows([row({ odds: undefined, odds_captured_at: undefined })], { priced: false });
+    assert.strictEqual(out.length, 1, 'the fixture is still listed');
+    assert.strictEqual(out[0].selections.length, 1);
+    assert.strictEqual(out[0].selections[0].back.length, 0);
+    assert.strictEqual(out[0].selections[0].lay.length, 0);
+    assert.strictEqual(out[0].poll_age_seconds, null);
   });
 
   await check('a null price never becomes a zero-price level', () => {
-    const out = groupRows([row({ side: 'BACK', price: null, price_at: null })]);
+    const out = groupRows([row({ odds: odds([{ price: null, size: 10 }]) })]);
     assert.strictEqual(out[0].selections[0].back.length, 0);
   });
 
-  // ── Postgres boundary: unusable price rows are skipped, never rendered ──
-  // The recorder's REAL columns can carry NaN or negatives from a wedged
-  // capture cycle; a bad price flowing on corrupts ladder sorts and the
-  // book-percentage sums. The row is dropped at the boundary instead.
-  await check('a NaN or infinite price row is skipped, not rendered as a level', () => {
+  // ── Postgres boundary: unusable levels are skipped, never rendered ──
+  // The ladder arrives as JSONB from Betfair, and it CAN carry a non-finite
+  // number: an infinite-size 1.01 lay — Betfair's "infinite" marker — is a real
+  // response, and the collector stores it as null precisely so it never reaches
+  // here as `Infinity`. It has anyway, in tests and in a future SDK. A bad price
+  // flowing on corrupts ladder sorts and the book-percentage sums, so the level
+  // is dropped at the boundary instead.
+  await check('a NaN or infinite price level is skipped, not rendered', () => {
     const out = groupRows([
-      row({ side: 'BACK', price: NaN }),
-      row({ side: 'LAY', price: Infinity }),
-      row({ side: 'BACK', price: 2.4 }),
+      row({ odds: odds([lv(NaN), lv(2.4)], [lv(Infinity)]) }),
     ]);
     const s = out[0].selections[0];
     assert.strictEqual(s.back.length, 1, 'only the finite BACK level survives');
     assert.strictEqual(s.back[0].price, 2.4);
-    assert.strictEqual(s.lay.length, 0, 'the infinite LAY row is gone');
+    assert.strictEqual(s.lay.length, 0, "Betfair's infinite LAY level is gone");
   });
 
-  await check('a negative or sub-1 price row is skipped (boundary: price >= 1)', () => {
-    const out = groupRows([
-      row({ side: 'BACK', price: -2 }),
-      row({ side: 'LAY', price: 0.5 }),
-    ]);
+  await check('a negative or sub-1 price level is skipped (boundary: price >= 1)', () => {
+    const out = groupRows([row({ odds: odds([lv(-2)], [lv(0.5)]) })]);
     assert.strictEqual(out[0].selections[0].back.length, 0, 'negative price skipped');
     assert.strictEqual(out[0].selections[0].lay.length, 0, 'sub-1 price skipped');
   });
 
   await check('a negative or absent size is skipped; a null size is a real zero', () => {
-    const bad = groupRows([
-      row({ side: 'BACK', size: -5 }),
-      row({ side: 'LAY', size: NaN }),
-    ]);
+    const bad = groupRows([row({ odds: odds([lv(2.4, -5)], [lv(2.5, NaN)]) })]);
     assert.strictEqual(bad[0].selections[0].back.length, 0, 'negative size skipped');
     assert.strictEqual(bad[0].selections[0].lay.length, 0, 'NaN size skipped');
-    // Betfair really does send size = NULL for a price with no size behind
-    // it; that stays a (zero-cents) level rather than vanishing.
-    const zero = groupRows([row({ side: 'BACK', size: null })]);
+    // Betfair really does send size = NULL for a price with no size behind it;
+    // that stays a (zero-cents) level rather than vanishing.
+    const zero = groupRows([row({ odds: odds([lv(2.4, null)]) })]);
     assert.strictEqual(zero[0].selections[0].back.length, 1, 'null size is a level');
     assert.strictEqual(zero[0].selections[0].back[0].size_cents, 0, 'at zero cents');
   });
 
-  await check('a runner whose only rows are unusable still renders, with empty ladders', () => {
+  await check('a duplicated level is shown once, not as a repeated price cell', () => {
+    // Betfair can emit the same (price, size) twice across a resumption. The UI
+    // has no way to render a duplicate cell, and a doubled level also doubles
+    // its contribution to the book percentage.
+    const out = groupRows([row({ odds: odds([lv(2.4, 100), lv(2.4, 100), lv(2.6, 50)]) })]);
+    assert.deepStrictEqual(
+      out[0].selections[0].back.map((l) => [l.price, l.size_cents]),
+      [[2.6, 5000], [2.4, 10000]],
+      'the duplicate is gone and the order is right'
+    );
+  });
+
+  await check('a runner whose only level is unusable still renders, with empty ladders', () => {
     const out = groupRows([
-      row({ selection_id: 1, side: 'BACK', price: NaN }),
-      row({ selection_id: 2, side: 'BACK', price: 2.4 }),
+      row({ selection_id: 1, runner_name: 'Arsenal', odds: odds([lv(NaN)]) }),
+      row({ selection_id: 2, runner_name: 'Chelsea', sort_priority: 2, odds: odds([lv(2.4)]) }),
     ]);
     assert.strictEqual(out[0].selections.length, 2, 'both runners survive');
-    assert.strictEqual(out[0].selections.find((s) => s.selection_id === 1).back.length, 0);
-    assert.strictEqual(out[0].selections.find((s) => s.selection_id === 2).back.length, 1);
+    assert.strictEqual(out[0].selections.find((s) => String(s.selection_id) === '1').back.length, 0);
+    assert.strictEqual(out[0].selections.find((s) => String(s.selection_id) === '2').back.length, 1);
   });
 
   await check('runners with no name still render (null mid-backfill)', () => {
     const out = groupRows([row({ runner_name: null })]);
     assert.strictEqual(out[0].selections.length, 1);
     assert.strictEqual(out[0].selections[0].name, null);
+  });
+
+  // The omission that made the whole board render empty: PRICE_COLUMNS listed
+  // odds_captured_at, price_age_seconds, publish_time, inplay and bet_delay —
+  // and not `odds`, the per-selection ladder the board is built from. Nothing
+  // threw. `health()` counts `odds IS NOT NULL` in its OWN query, so it
+  // cheerfully reported 9,456 markets with odds while every one of the sixty
+  // markets on the board rendered with empty ladders.
+  //
+  // An offline suite cannot join Postgres to catch it, so this pins the column
+  // list itself — which is the part that actually broke.
+  await check('the priced board query selects the ladder column, not just its metadata', () => {
+    const sql = boardSql(2, false);
+    assert.match(sql, /\bv\.odds\s*,/, 'v.odds is selected on feed 2');
+    assert.match(sql, /\bv\.odds_captured_at\b/, 'and the book timestamp beside it');
+    assert.match(sql, /v_feed2/, 'from the priced view');
+  });
+
+  await check('the unpriced board query selects no price column at all', () => {
+    const sql = boardSql(1, false);
+    assert.ok(!/\bv\.odds\b/.test(sql), 'feed 1 must not ask for a column that does not exist there');
+    assert.ok(!/odds_captured_at/.test(sql));
+    assert.match(sql, /v_feed1/, 'and it reads the unpriced view');
+  });
+
+  await check('a board query with no limit clause cannot return one selection', () => {
+    // The single-market read once carried LIMIT 1. The view is one row per
+    // SELECTION, so that returned one runner of a twenty-runner market and the
+    // ladder rendered with a single line.
+    const single = boardSql(2, true);
+    assert.ok(!/LIMIT/i.test(single), 'the single-market read is not limited');
+    assert.match(single, /WHERE v\.market_id = \$1/);
+    const board = boardSql(2, false);
+    assert.match(board, /LIMIT \$1/, 'the board read is');
+  });
+
+  await check('the board cap counts markets, not selection rows', () => {
+    // Same class of error as the LIMIT above: a plain LIMIT on the outer select
+    // caps rows, and a Correct Score market is 31 rows, so "limit 5" returned
+    // one market. The market list is chosen in a CTE first.
+    const sql = boardSql(2, false);
+    assert.match(sql, /WITH chosen AS/, 'markets are chosen before the join');
+    assert.match(sql, /GROUP BY v\.market_id/, 'deduplicated by market');
+    assert.match(sql, /JOIN chosen c ON c\.market_id = v\.market_id/);
+  });
+
+  await check('a board query starts with WITH, not FROM', () => {
+    // Postgres reports a misplaced WITH as "syntax error at or near WITH",
+    // which says nothing about the cause.
+    const sql = boardSql(2, false).trim();
+    assert.match(sql, /^WITH chosen AS \(/, 'the CTE leads the statement');
   });
 
   await check('ageSeconds measures seconds since publish', () => {
