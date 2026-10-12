@@ -65,25 +65,54 @@ check('S3 seeded fair prices are ladder-valid', () => {
   }
 });
 
-// S4: past-due fixtures become 'live' so a long-running demo keeps a board;
-// future events and completed events are left alone.
-check('S4 roll forward past-due events', () => {
+// S4: the seeded showcase book self-heals; a real operator's fixture never
+// moves. This check CHANGED MEANING with the off-time gate.
+//
+// It used to assert that any past-due event became 'live'. That was the whole
+// of "rolling forward" before events.starts_at closed markets, and with the gate
+// it does nothing at all: the market stays shut on its off time whatever the
+// status says. A demo machine left running for a few days therefore showed ten
+// markets and refused every bet, and looked broken rather than stale.
+//
+// So the demo's off TIME is what moves now, and ONLY for events the seed
+// created (is_demo = 1). The second half is the load-bearing half: silently
+// re-dating an operator's real fixture to keep a demo happy is a far worse
+// failure than a stale demo board, so an is_demo = 0 event must be untouched
+// even when it is long past due.
+check('S4 roll the DEMO book forward in time; leave operator fixtures alone', () => {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('F','f')").run();
-  const add = (name, starts, status) =>
+  const add = (name, starts, status, isDemo) =>
     db
-      .prepare('INSERT INTO events (sport_id, name, starts_at, status) VALUES (1, ?, ?, ?)')
-      .run(name, starts, status);
-  add('past-upcoming', '2020-01-01 12:00:00', 'upcoming');
-  add('soon-upcoming', '2099-01-01 12:00:00', 'upcoming');
-  add('past-completed', '2020-01-01 12:00:00', 'completed');
-  assert.strictEqual(rollForwardEvents(db), 1);
-  const status = (n) => db.prepare('SELECT status s FROM events WHERE name=?').get(n).s;
-  assert.strictEqual(status('past-upcoming'), 'live');
-  assert.strictEqual(status('soon-upcoming'), 'upcoming');
-  assert.strictEqual(status('past-completed'), 'completed');
+      .prepare('INSERT INTO events (sport_id, name, starts_at, status, is_demo) VALUES (1, ?, ?, ?, ?)')
+      .run(name, starts, status, isDemo);
+  add('demo-past', '2020-01-01 12:00:00', 'upcoming', 1);
+  add('demo-soon', '2099-01-01 12:00:00', 'upcoming', 1);
+  add('demo-completed', '2020-01-01 12:00:00', 'completed', 1);
+  add('operator-past', '2020-01-01 12:00:00', 'upcoming', 0);
+
+  const startsAt = (n) => db.prepare('SELECT starts_at t FROM events WHERE name=?').get(n).t;
+  const operatorBefore = startsAt('operator-past');
+
+  assert.strictEqual(rollForwardEvents(db), 1, 'only the past-due DEMO event rolls');
+
+  // The demo event moved into the future, which is what actually reopens it.
+  const rolled = startsAt('demo-past');
+  assert.notStrictEqual(rolled, '2020-01-01 12:00:00', 'the past-due demo event was re-dated');
+  assert.ok(
+    db.prepare("SELECT 1 FROM events WHERE name='demo-past' AND datetime(starts_at) > datetime('now')").get(),
+    'and it is now genuinely in the FUTURE, so the off-time gate lets it trade'
+  );
+  assert.strictEqual(startsAt('demo-soon'), '2099-01-01 12:00:00', 'a future demo event is left alone');
+  assert.strictEqual(startsAt('demo-completed'), '2020-01-01 12:00:00', 'a completed demo event is history and is not re-dated');
+  assert.strictEqual(startsAt('operator-past'), operatorBefore, 'AN OPERATOR FIXTURE IS NEVER MOVED');
+  assert.ok(
+    db.prepare("SELECT 1 FROM events WHERE name='operator-past' AND datetime(starts_at) <= datetime('now')").get(),
+    'and it stays off, which is correct: the venue does not relocate real events'
+  );
+
   // idempotent: nothing left to roll
-  assert.strictEqual(rollForwardEvents(db), 0);
+  assert.strictEqual(rollForwardEvents(db), 0, 'rolling again is a no-op');
 });
 
 // S5: ADMIN_PASSWORD / DEMO_PASSWORD (lib/config.js) override the seeded

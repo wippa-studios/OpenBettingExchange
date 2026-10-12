@@ -190,8 +190,54 @@ app.use((req, res, next) => {
 //
 // Checking it inside requireAuth/requireAdmin makes placement irrelevant: any
 // route that authenticates is covered, and a new one cannot forget.
+// The routes an account locked by the first-run lock must still be able to
+// reach, or the lock is a dead end rather than a lock. Declared here, above
+// firstRunLockResponse, because BOTH the requireAuth/requireAdmin check and the
+// app.use() middleware below consult it and it must be one list, not two.
+//
+// The minimum needed to GET TO THE FIX and nothing more: whoami,
+// change-password, logout, session management. Notably absent is everything a
+// demo password should not reach — trading, the wallet, and the entire admin
+// desk, which is the account that matters most. An admin left on admin123 who
+// can read the ledger and move other people's money is the worst state this
+// project can be deployed in.
+const SETUP_ALLOWLIST = new Set([
+  'GET /api/me',
+  'POST /api/auth/change-password',
+  'POST /api/auth/logout',
+  'GET /api/auth/sessions',
+  'DELETE /api/auth/sessions/:id',
+]);
+
+// isSetupRoute: the exact key the allowlist is written in, from the request.
+// `req.path` is used rather than `req.originalUrl` so a query string does not
+// turn an allowlisted route into a locked one — `GET /api/me?x=1` must behave
+// identically to `GET /api/me`, and originalUrl would compare 'GET /api/me?x=1'
+// against 'GET /api/me' and miss.
+function isSetupRoute(req) {
+  return SETUP_ALLOWLIST.has(`${req.method} ${req.path}`);
+}
+
 function firstRunLockResponse(req, res) {
   if (!mustChangePassword(req.user)) return false;
+  // A LOCKED ACCOUNT MUST STILL BE ABLE TO UNLOCK ITSELF.
+  //
+  // This check was moved into requireAuth/requireAdmin on the reasoning that
+  // placement in the file should not matter (correct), but the move DROPPED the
+  // allowlist exception: the app.use() middleware that consulted it was left
+  // behind, registered some 400 lines later, where it can never run for a route
+  // that requireAuth has already answered. So `POST /api/auth/change-password`
+  // — the one route that clears the flag — was itself behind the lock.
+  //
+  // Measured: of the five allowlisted routes, only `POST /api/auth/logout`
+  // worked, because it is the only one that does not use requireAuth. Every
+  // other route on the list returned 403 'Change your password before using the
+  // exchange', and no password could ever be changed. A fresh deployment was
+  // unusable and the only way out was a direct database edit.
+  //
+  // The lock is a control, not a trap: it must block trading while leaving the
+  // exit open.
+  if (isSetupRoute(req)) return false;
   res.status(403).json({
     error: 'Change your password before using the exchange',
     details: {
@@ -590,24 +636,16 @@ app.delete('/api/auth/sessions/:id', requireAuth, (req, res) => {
  * password can sign in — it must, or there is no route to the panel that fixes
  * it — but every state-changing route is refused until it is replaced.
  *
- * The allowlist is the minimum needed to GET TO THE FIX and nothing more:
- * whoami, change-password, logout, session management. Notably absent is
- * everything a demo password should not reach — trading, the wallet, and the
- * entire admin desk, which is the account that matters most. An admin left on
- * admin123 who can read the ledger and move other people's money is the worst
- * state this project can be deployed in.
+ * Enforcement is in TWO places, both consulting the one SETUP_ALLOWLIST above,
+ * so they cannot disagree about which routes a locked account may reach:
  *
- * Enforcement is in middleware rather than per-route so a route added later is
- * covered by default. A list of PROTECTED routes would be the design that
- * fails open.
+ *   - inside requireAuth / requireAdmin (firstRunLockResponse). This is what
+ *     actually covers authenticated routes, and it is placement-independent:
+ *     a route added later cannot forget to be covered. Moving the check here
+ *     is what closed /api/stream, which sits far above any app.use().
+ *   - an app.use() below, which is what catches a route that reads req.user
+ *     WITHOUT requireAuth. There is exactly one of those and it matters.
  */
-const SETUP_ALLOWLIST = new Set([
-  'GET /api/me',
-  'POST /api/auth/change-password',
-  'POST /api/auth/logout',
-  'GET /api/auth/sessions',
-  'DELETE /api/auth/sessions/:id',
-]);
 
 function mustChangePassword(user) {
   // Reads the STORED FLAG, never re-verifies a scrypt hash: doing that per
@@ -635,17 +673,9 @@ function enforceFirstRunLock() {
 
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return next();
-  if (SETUP_ALLOWLIST.has(`${req.method} ${req.path}`)) return next();
+  if (isSetupRoute(req)) return next();
   if (!mustChangePassword(req.user)) return next();
-  res.status(403).json({
-    error: 'Change your password before using the exchange',
-    details: {
-      code: 'password_change_required',
-      username: req.user.username,
-      // Named so a fresh demo deployment shows the operator what to change.
-      seeded_password: req.user.username === 'admin' ? 'admin123' : 'demo123',
-    },
-  });
+  firstRunLockResponse(req, res);
 });
 
 app.get('/api/sports', (req, res) => {
