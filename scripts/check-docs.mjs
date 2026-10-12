@@ -59,25 +59,53 @@ function readdirCount(suffix) {
   const files = execFileSync('bash', ['-lc', `ls ${path.join(ROOT, 'tests')} | grep -- '${suffix}$' | wc -l`], { encoding: 'utf8' });
   return Number(files.trim());
 }
+// Returns { count } on a fully green run, or { count: null, why } otherwise.
+//
+// ── WHY THIS REFUSES TO COMPARE A FAILED RUN ──────────────────────────────
+// The original version grepped `run_all: .*checks` and took whatever number it
+// found. But tests/run_all.js prints a summary line on FAILURE too:
+//
+//   run_all: ALL GREEN — 39 suites, 495 checks passed
+//   run_all: FAILURES — 34/39 suites green (440 checks); failed: api.test.js
+//
+// Both match. So when the suite did not pass, this read the PARTIAL count and
+// compared it against the docs — inventing a discrepancy that did not exist.
+// In CI that is exactly what happened: the `guards` job never ran `npm ci`, so
+// suites needing express/pg died on require, the count came back 440 (CI said
+// 442), and CI went red accusing README.md of lying while the README was right.
+//
+// A checker that cannot tell "the docs are wrong" from "the suite did not run"
+// is worse than no checker, because it reports a confident falsehood. So a
+// failed run yields NO count, and the caller says so plainly instead.
 function checkCount() {
   try {
-    // grep the summary line specifically. `tail -3` was wrong: the runner's
-    // final lines are the LAST suite's output, not the aggregate, and it
-    // reported one small suite's checks as the whole project's.
     const out = execFileSync(
       'bash',
-      ['-lc', `cd ${ROOT} && npm test 2>&1 | grep -E 'run_all: .*checks' | tail -1`],
+      ['-lc', `cd ${ROOT} && npm test 2>&1 | grep -E '^run_all:' | tail -1`],
       { encoding: 'utf8', timeout: 600000 }
     );
-    const m = out.match(/(\d+) checks/);
-    return m ? Number(m[1]) : null;
-  } catch {
-    return null; // suite failed; `npm test` in the test job reports that
+    const green = out.match(/run_all: ALL GREEN — \d+ suites, (\d+) checks passed/);
+    if (green) return { count: Number(green[1]) };
+    const bad = out.match(/run_all: FAILURES[^\n]*/);
+    return { count: null, why: bad ? bad[0] : 'the suite printed no summary' };
+  } catch (e) {
+    return { count: null, why: `the suite could not be run (${e && e.message ? e.message.slice(0, 120) : 'unknown'})` };
   }
 }
 
 const suites = suiteCount();
-const checks = checkCount();
+const { count: checks, why: countFailure } = checkCount();
+
+// Refuse to make any claim about the docs' check count unless the suite is
+// green. Failing here is deliberate: a doc-consistency checker that silently
+// skips its own central assertion is a control that reports and does not act —
+// the exact failure this project's audit keeps finding.
+if (checks === null) {
+  console.error('\n  CANNOT VERIFY the documented check count.');
+  console.error(`  The test suite did not pass, so there is no count to compare against:\n    ${countFailure}`);
+  console.error('  This is NOT a claim that the docs are correct. Fix the suite, then re-run.');
+  process.exit(1);
+}
 if (checks) {
   // ONLY the `npm test` line. The UI and smoke suites have their own counts
   // and are legitimately different numbers; comparing all of them against the

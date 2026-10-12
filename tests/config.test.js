@@ -2,6 +2,7 @@
 // Run: node tests/config.test.js   (plain assert, no deps)
 'use strict';
 const assert = require('assert');
+const path = require('path');
 const { loadConfig } = require('../lib/config');
 
 let passed = 0;
@@ -70,7 +71,13 @@ check('C4 boolean validation', () => {
 check('C5 DB_PATH resolution', () => {
   assert.ok(load({ DB_PATH: ':memory:' }).DB_PATH === ':memory:');
   const c = load({ DB_PATH: 'data/x.db' });
-  assert.ok(c.DB_PATH.endsWith('/OpenBettingExchange/data/x.db'), c.DB_PATH);
+  // Derived from THIS repository's own location rather than a hardcoded folder
+  // name. The assertion used to be `endsWith('/OpenBettingExchange/data/x.db')`,
+  // which passes only because CI happens to check out into a directory of that
+  // name — so it failed for anyone who cloned the project under a different one,
+  // and passed for the wrong reason in the place it mattered most.
+  const repoRoot = path.resolve(__dirname, '..');
+  assert.strictEqual(c.DB_PATH, path.join(repoRoot, 'data', 'x.db'), c.DB_PATH);
   const abs = load({ DB_PATH: '/tmp/abs.db' });
   assert.strictEqual(abs.DB_PATH, '/tmp/abs.db');
 });

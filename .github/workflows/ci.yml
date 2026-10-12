@@ -71,6 +71,13 @@ jobs:
           node-version: '24'
           cache: npm
 
+      # Required, not optional: the docs check below EXECUTES `npm test` to
+      # count the checks it compares against the README. Without dependencies
+      # installed, suites needing express/pg die on require, the runner reports
+      # a partial count, and the checker concluded the docs were wrong. That is
+      # how CI went red for three commits with README.md telling the truth.
+      - run: npm ci
+
       - name: Escrow invariant is enforced, not just commented
         # The escrow invariant rests on orders.frozen_cents being owned by the
         # matching engine. tests/guard.test.js proves it, but it runs inside

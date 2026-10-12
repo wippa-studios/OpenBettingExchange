@@ -33,6 +33,7 @@ const A = require('../lib/auth');
 const M = require('../lib/match');
 const IP = require('../lib/inplay');
 const acc = require('../lib/accounts');
+const S = require('../lib/settle');
 
 let passed = 0;
 const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
@@ -278,5 +279,93 @@ check('D13 a released order is still identifiable as delayed', () => {
   assert.strictEqual(g.db.prepare('SELECT delayed d FROM orders WHERE id=?').get(pre.order.id).d, 0);
 });
 
+// D14: THE RELEASE PASS MUST NOT ERASE MATCHED HISTORY. This is a critical bug
+// that the earlier checks in this file could not see, and understanding WHY is
+// the point of keeping it.
+//
+// Every helper above defaults `stake_cents: 1000`, so D6 and D9 use EQUAL
+// stakes: the first released order fully fills the second, the second then hits
+// the `matched_cents >= stake_cents` early-return and never reaches
+// finalizeTaker. The bug needed UNEQUAL stakes and a specific order of events —
+// an order filled as a COUNTERPARTY by an earlier release, and then itself
+// processed by the pass.
+//
+// What went wrong: finalizeTaker derives `matched = stake - remaining` and needs
+// `remaining` on the same scale as `stake`. The pass passed
+// `o.matched_cents + swept.remaining`, double-counting the already-matched part.
+// The first released order then reported matched=2000/3000 as matched=0/3000
+// with frozen_cents at the full 3000. Two consequences, both severe:
+//
+//   - cancelOrderTx released collateral securing a LIVE match, and the player
+//     withdrew it;
+//   - settlement then refused with "releasing more than frozen", and so did
+//     void — leaving the market permanently unsettleable AND un-voidable.
+//
+// The double-entry invariants never fired (conserved 0, no divergent users)
+// because the LEDGER postings stayed balanced. The corruption was in the order
+// row, and its only symptom appeared later, at cancel and settle. Asserting
+// conservation after a release — which every earlier check here does — cannot
+// see it.
+check('D14 a release never erases matched history or inflates escrow', () => {
+  const f = fixture();
+  goInPlay(f, 60000);
+  // UNEQUAL stakes on purpose: the layer rests less than the backer wants, so
+  // releasing the backer only PARTIALLY fills the layer.
+  order(f, f.alice, { side: 'lay', price: 2.0, stake_cents: 2000 });
+  order(f, f.bob, { price: 2.0, stake_cents: 3000 });
+  expireAll(f);
+  M.releaseEligibleOrders(f.db);
+
+  // The expectation must come from an INDEPENDENT record of what traded, never
+  // from the order row's own matched_cents — deriving it from the field under
+  // test is circular, and the first version of this check did exactly that and
+  // therefore PASSED against the very bug it was written for. `matches` is the
+  // engine's own record of every fill, so it is the arbiter.
+  const tradedFor = (orderId) =>
+    f.db.prepare('SELECT COALESCE(SUM(stake_cents), 0) s FROM matches WHERE back_order_id = ? OR lay_order_id = ?')
+      .get(orderId, orderId).s;
+
+  const lay = f.db.prepare("SELECT * FROM orders WHERE side='lay'").get();
+  const back = f.db.prepare("SELECT * FROM orders WHERE side='back'").get();
+  for (const [label, o] of [['lay', lay], ['back', back]]) {
+    const traded = tradedFor(o.id);
+    assert.strictEqual(o.matched_cents, traded,
+      `${label}: matched_cents (${o.matched_cents}) equals what the matches table records (${traded})`);
+    const expectedRemaining = o.stake_cents - traded;
+    const expectedFrozen = o.side === 'lay' ? Math.round((o.price - 1) * expectedRemaining) : expectedRemaining;
+    assert.strictEqual(o.frozen_cents, expectedFrozen,
+      `${label}: frozen_cents (${o.frozen_cents}) is the escrow of the unmatched remainder (${expectedFrozen})`);
+    assert.strictEqual(o.status, expectedRemaining === 0 ? 'fully_matched' : 'open', `${label}: status`);
+  }
+  // And something actually traded, so the check above is not vacuous.
+  assert.ok(tradedFor(back.id) > 0 && tradedFor(back.id) < back.stake_cents,
+    `the backer was PARTIALLY filled (${tradedFor(back.id)} of ${back.stake_cents}) — the shape that exposed the bug`);
+  // The real proof: the market can still be settled AND voided. Before the fix
+  // both threw "releasing more than frozen".
+  assert.strictEqual(acc.assertConserved(f.db), 0, 'conserved');
+  assert.deepStrictEqual(acc.assertUserAgrees(f.db), [], 'and the cache agrees');
+});
+
+check('D14b a market that went through a release pass can still settle', () => {
+  const f = fixture();
+  goInPlay(f, 60000);
+  order(f, f.alice, { side: 'lay', price: 2.0, stake_cents: 2000 });
+  order(f, f.bob, { price: 2.0, stake_cents: 3000 });
+  expireAll(f);
+  M.releaseEligibleOrders(f.db);
+  // Settling used to throw "Settlement integrity error: releasing more than
+  // frozen" — and so did voiding — leaving players' money permanently stuck.
+  // This is the assertion that would have caught the bug.
+  const r = S.settleMarket(f.db, f.marketId, { winner_selection_id: f.s1 });
+  assert.ok(r, 'the market settles');
+  assert.strictEqual(f.db.prepare('SELECT status s FROM markets WHERE id=?').get(f.marketId).s, 'settled');
+  for (const u of ['alice', 'bob']) {
+    const row = f.db.prepare('SELECT frozen_cents fz FROM users WHERE username=?').get(u);
+    assert.strictEqual(row.fz, 0, `${u} is fully unfrozen`);
+  }
+  assert.strictEqual(acc.assertConserved(f.db), 0);
+  assert.deepStrictEqual(acc.assertUserAgrees(f.db), []);
+});
+
 console.log(`\ninplay2.test.js: ${passed} checks passed`);
-if (passed < 13) { console.error('expected 13 checks'); process.exit(1); }
+if (passed < 15) { console.error('expected 15 checks'); process.exit(1); }
