@@ -23,12 +23,19 @@ const RISK = require('./lib/risk');
 const JOBS_INTERVALS = {
   reconcileMs: Number(process.env.RECONCILE_INTERVAL_MS || 900000),
   resultsPollMs: Number(process.env.RESULTS_POLL_INTERVAL_MS || 60000),
+  // Backups on a timer, not on request: an operator who forgets to press the
+  // button has no backup, and the button is the first thing skipped under
+  // pressure. Six hours keeps a day of snapshots with the default retention.
+  backupMs: Number(process.env.BACKUP_INTERVAL_MS || 21600000),
+  // WAL checkpoint + incremental vacuum, hourly.
+  maintenanceMs: Number(process.env.MAINTENANCE_INTERVAL_MS || 3600000),
 };
 const PAY = require('./lib/payments');
 const TEN = require('./lib/tenants');
 const JOBS = require('./lib/jobs');
 const RESULTS = require('./lib/results');
 const VOIDRULES = require('./lib/voidrules');
+const OPS = require('./lib/ops');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
 // DELIBERATE demo choice (documented in .github/SECURITY.md): this app is
@@ -181,7 +188,12 @@ const clients = new Set();
 // write buffer, so a leak or a script-opening client must not multiply
 // without bound. Over the cap the endpoint answers 503 once (no SSE body)
 // — EventSource retries on its own schedule as older streams free up.
-const MAX_SSE_CLIENTS = 100;
+// A venue's live book IS the product; a player who cannot subscribe has a
+// dead board. 100 was appropriate for a loopback demo and is far too low for
+// anything public — it answers 503, so the 101st concurrent visitor simply has
+// no live prices. Configurable, with the trade-off stated: every stream is a
+// held socket and a periodic write, so this is a real memory ceiling, not free.
+const MAX_SSE_CLIENTS = Number(config.MAX_SSE_CLIENTS || 2000);
 
 app.get('/api/stream', (req, res) => {
   if (clients.size >= MAX_SSE_CLIENTS) return res.status(503).json({ error: 'Too many concurrent streams' });
@@ -308,6 +320,81 @@ function rlTooManyAttempts(res, key) {
     .status(429)
     .setHeader('Retry-After', String(rlRetryAfterSeconds(key)))
     .json({ error: 'Too many failed attempts; try again later' });
+}
+
+// ── Request VOLUME limiting ────────────────────────────────────────────────
+// The counter above limits CONSECUTIVE FAILURES, which is the right shape for
+// guessing a password and the wrong shape for everything else. An attacker
+// making only VALID requests — placing thousands of orders, hammering
+// cash-out, walking the admin catalogue — never trips a failure counter.
+//
+// So a second, independent limiter counts requests in a sliding window.
+// Deliberately SEPARATE from rlAttempts rather than merged: a login failing
+// ten times and a burst of successful reads are different problems with
+// different remedies, and one counter serving both would let traffic of
+// either kind clear the other's budget.
+const VOLUME_BUCKETS = {
+  // Trading is the money path. Generous per user — a scalper legitimately
+  // fires many orders — but bounded, because unbounded order placement is a
+  // self-DoS on the single-threaded engine.
+  trade: { limit: 120, windowMs: 60_000 },
+  cashout: { limit: 30, windowMs: 60_000 },
+  admin: { limit: 240, windowMs: 60_000 },
+  wallet: { limit: 60, windowMs: 60_000 },
+  read: { limit: 600, windowMs: 60_000 },
+};
+const volumeHits = new Map(); // key -> number[] of timestamps
+
+function volumeKey(req, bucket) {
+  // Authenticated routes key on the USER, so one noisy client cannot exhaust
+  // the budget of everyone behind the same NAT or proxy address.
+  const who = req.user ? `u:${req.user.id}` : `ip:${req.socket.remoteAddress || 'unknown'}`;
+  return `${bucket}:${who}`;
+}
+
+function volumeExceeded(req, bucket) {
+  const cfg = VOLUME_BUCKETS[bucket];
+  if (!cfg) return 0;
+  const key = volumeKey(req, bucket);
+  const now = Date.now();
+  const hits = (volumeHits.get(key) || []).filter((t) => now - t < cfg.windowMs);
+  if (hits.length >= cfg.limit) {
+    // Keep the pruned list so a blocked caller cannot grow memory unbounded.
+    volumeHits.set(key, hits);
+    return Math.ceil((cfg.windowMs - (now - hits[0])) / 1000);
+  }
+  hits.push(now);
+  volumeHits.set(key, hits);
+  return 0;
+}
+
+// Periodic sweep. Without it the map grows one entry per distinct
+// user/IP/bucket forever — a slow leak driven by exactly the traffic this
+// exists to defend against.
+const volumeSweeper = setInterval(() => {
+  const cutoff = Date.now() - Math.max(...Object.values(VOLUME_BUCKETS).map((b) => b.windowMs));
+  for (const [k, hits] of volumeHits) {
+    const kept = hits.filter((t) => t > cutoff);
+    if (kept.length === 0) volumeHits.delete(k);
+    else volumeHits.set(k, kept);
+  }
+}, 60_000);
+if (volumeSweeper.unref) volumeSweeper.unref();
+
+/** Rate-limit middleware factory: 429 with Retry-After once the budget is spent. */
+function limit(bucket) {
+  return (req, res, next) => {
+    const retryAfter = volumeExceeded(req, bucket);
+    if (retryAfter > 0) {
+      res.setHeader('Retry-After', String(retryAfter));
+      return res.status(429).json({ error: 'Too many requests', retry_after_seconds: retryAfter });
+    }
+    next();
+  };
+}
+
+function resetVolumeLimits() {
+  volumeHits.clear();
 }
 
 app.post('/api/auth/register', (req, res) => {
@@ -565,7 +652,7 @@ app.get('/api/format/:price', (req, res) => {
 });
 
 // ── Trading ────────────────────────────────────────────────────────────────
-app.post('/api/orders', requireAuth, (req, res) => {
+app.post('/api/orders', requireAuth, limit('trade'), (req, res) => {
   const { selection_id, side, price, stake_cents, client_order_id } = req.body || {};
   const result = M.placeOrder(db, req.user, { selection_id, side, price, stake_cents, client_order_id });
   // A replay created nothing, so it must not broadcast as though it did —
@@ -586,7 +673,7 @@ app.get('/api/orders', requireAuth, (req, res) => {
   res.json({ orders: M.openOrdersFor(db, req.user.id) });
 });
 
-app.post('/api/orders/:id/cancel', requireAuth, (req, res) => {
+app.post('/api/orders/:id/cancel', requireAuth, limit('trade'), (req, res) => {
   const order = M.cancelOrder(db, req.user, intId(req.params.id));
   broadcast('book', { market_id: order.market_id });
   broadcast('orders', {}, req.user.id);
@@ -602,7 +689,7 @@ app.get('/api/positions', requireAuth, (req, res) => {
   res.json({ positions });
 });
 
-app.post('/api/markets/:id/cashout', requireAuth, (req, res) => {
+app.post('/api/markets/:id/cashout', requireAuth, limit('cashout'), (req, res) => {
   const mid = intId(req.params.id);
   const result = CASH.cashoutMarket(db, req.user, mid);
   broadcast('book', { market_id: mid });
@@ -620,7 +707,7 @@ app.get('/api/settlements', requireAuth, (req, res) => {
   res.json({ settlements: SET.settledFor(db, req.user.id) });
 });
 
-app.post('/api/wallet/deposit', requireAuth, (req, res) => {
+app.post('/api/wallet/deposit', requireAuth, limit('wallet'), (req, res) => {
   const amount = req.body ? req.body.amount_cents : undefined;
   const result = L.deposit(db, req.user.id, amount, config.FAUCET_MAX_CENTS);
   broadcast('balance', {}, req.user.id);
@@ -637,7 +724,7 @@ function slugify(name) {
 // the mutation it describes — so an audit row can never exist for a change
 // that was rolled back.
 
-app.get('/api/admin/users', requireAdmin, (req, res) => {
+app.get('/api/admin/users', requireAdmin, limit('admin'), (req, res) => {
   res.json(
     ADM.listUsers(db, {
       q: req.query.q,
@@ -652,11 +739,11 @@ app.get('/api/admin/users', requireAdmin, (req, res) => {
   );
 });
 
-app.get('/api/admin/users/:id', requireAdmin, (req, res) => {
+app.get('/api/admin/users/:id', requireAdmin, limit('admin'), (req, res) => {
   res.json({ user: ADM.userDetail(db, Number(req.params.id)) });
 });
 
-app.patch('/api/admin/users/:id', requireAdmin, (req, res) => {
+app.patch('/api/admin/users/:id', requireAdmin, limit('admin'), (req, res) => {
   const { status, role, reason } = req.body || {};
   const id = Number(req.params.id);
   // Status and role are applied in one request but as two audited actions:
@@ -671,7 +758,7 @@ app.patch('/api/admin/users/:id', requireAdmin, (req, res) => {
   res.json({ ok: true, ...applied });
 });
 
-app.post('/api/admin/users/:id/balance', requireAdmin, (req, res) => {
+app.post('/api/admin/users/:id/balance', requireAdmin, limit('admin'), (req, res) => {
   const { delta_cents, reason } = req.body || {};
   res.json(
     ADM.adjustBalance(db, {
@@ -683,7 +770,7 @@ app.post('/api/admin/users/:id/balance', requireAdmin, (req, res) => {
   );
 });
 
-app.get('/api/admin/audit', requireAdmin, (req, res) => {
+app.get('/api/admin/audit', requireAdmin, limit('admin'), (req, res) => {
   res.json({
     entries: AUDIT.list(db, {
       limit: req.query.limit,
@@ -696,11 +783,11 @@ app.get('/api/admin/audit', requireAdmin, (req, res) => {
 
 // ── Admin: abuse limits + self-exclusion ───────────────────────────────────
 
-app.get('/api/admin/users/:id/limits', requireAdmin, (req, res) => {
+app.get('/api/admin/users/:id/limits', requireAdmin, limit('admin'), (req, res) => {
   res.json({ limits: LIMITS.getLimits(db, Number(req.params.id)) });
 });
 
-app.put('/api/admin/users/:id/limits', requireAdmin, (req, res) => {
+app.put('/api/admin/users/:id/limits', requireAdmin, limit('admin'), (req, res) => {
   const { scope, max_open_stake_cents, max_market_liability_cents, max_daily_settled_cents } = req.body || {};
   res.json(
     LIMITS.setLimits(db, {
@@ -722,7 +809,7 @@ app.put('/api/admin/users/:id/limits', requireAdmin, (req, res) => {
 // unexclude route on purpose: reinstatement is a separate audited decision,
 // and shipping DELETE next to PUT invites the "just clear the flag" shortcut
 // that makes exclusion meaningless.
-app.post('/api/admin/users/:id/exclude', requireAdmin, (req, res) => {
+app.post('/api/admin/users/:id/exclude', requireAdmin, limit('admin'), (req, res) => {
   const { until, reason } = req.body || {};
   res.json(LIMITS.exclude(db, { actor: req.user, userId: Number(req.params.id), until: until ?? null, reason }));
 });
@@ -731,19 +818,19 @@ app.post('/api/admin/users/:id/exclude', requireAdmin, (req, res) => {
 // A venue that cannot see its own market-maker loss is a venue that
 // discovers it by going bankrupt. The kill switch stops NEW quotes; it does
 // not cancel resting ones, so withdraw is a separate explicit action.
-app.get('/api/admin/risk', requireAdmin, (req, res) => {
+app.get('/api/admin/risk', requireAdmin, limit('admin'), (req, res) => {
   res.json({ kill_switch: RISK.killSwitch(db), bots: RISK.desk(db, bots.riskDefaults()) });
 });
 
-app.put('/api/admin/risk/kill-switch', requireAdmin, (req, res) => {
+app.put('/api/admin/risk/kill-switch', requireAdmin, limit('admin'), (req, res) => {
   res.json(RISK.setKillSwitch(db, { actor: req.user, on: !!(req.body || {}).on }));
 });
 
-app.post('/api/admin/risk/withdraw', requireAdmin, (req, res) => {
+app.post('/api/admin/risk/withdraw', requireAdmin, limit('admin'), (req, res) => {
   res.json(bots.withdrawAll(db));
 });
 
-app.put('/api/admin/risk/bots/:id', requireAdmin, (req, res) => {
+app.put('/api/admin/risk/bots/:id', requireAdmin, limit('admin'), (req, res) => {
   const b = req.body || {};
   const wrap = (req, res, next) => {
     try {
@@ -769,28 +856,28 @@ app.put('/api/admin/risk/bots/:id', requireAdmin, (req, res) => {
 // The faucet route stays as-is for paper money; these are the real-money
 // seams. An intent credits nothing until confirmed — that is the whole
 // contract, and it is why these are two calls rather than one.
-app.post('/api/wallet/deposit-intent', requireAuth, (req, res, next) => {
+app.post('/api/wallet/deposit-intent', requireAuth, limit('wallet'), (req, res, next) => {
   PAY.openDeposit(db, req.user.id, Number((req.body || {}).amount_cents))
     .then((r) => res.json(r))
     .catch(next);
 });
 
-app.post('/api/wallet/deposit-intent/:id/confirm', requireAuth, (req, res) => {
+app.post('/api/wallet/deposit-intent/:id/confirm', requireAuth, limit('wallet'), (req, res) => {
   res.json(PAY.confirmDeposit(db, Number(req.params.id)));
 });
 
-app.post('/api/wallet/withdraw', requireAuth, (req, res) => {
+app.post('/api/wallet/withdraw', requireAuth, limit('wallet'), (req, res) => {
   const { amount_cents, reason } = req.body || {};
   res.json(PAY.openWithdrawal(db, req.user.id, Number(amount_cents), reason));
 });
 
-app.get('/api/admin/reconciliation', requireAdmin, (req, res, next) => {
+app.get('/api/admin/reconciliation', requireAdmin, limit('admin'), (req, res, next) => {
   PAY.reconcile(db).then((r) => res.json(r)).catch(next);
 });
 
 // Operator-facing ledger view. players_cents is the segregation figure — the
 // players' money as a number, not a promise.
-app.get('/api/admin/ledger', requireAdmin, (req, res) => {
+app.get('/api/admin/ledger', requireAdmin, limit('admin'), (req, res) => {
   const ACCT = require('./lib/accounts');
   const seg = ACCT.segregation(db);
   res.json({
@@ -812,11 +899,11 @@ app.get('/api/branding', (req, res) => {
   res.json({ tenant: tenant ? { id: tenant.id, slug: tenant.slug } : null, ...TEN.branding(db, tenant && tenant.id) });
 });
 
-app.get('/api/admin/tenants', requireAdmin, (req, res) => {
+app.get('/api/admin/tenants', requireAdmin, limit('admin'), (req, res) => {
   res.json({ tenants: TEN.list(db) });
 });
 
-app.put('/api/admin/tenants/:id', requireAdmin, (req, res) => {
+app.put('/api/admin/tenants/:id', requireAdmin, limit('admin'), (req, res) => {
   const b = req.body || {};
   res.json(
     TEN.configure(db, {
@@ -834,11 +921,11 @@ app.put('/api/admin/tenants/:id', requireAdmin, (req, res) => {
 // ── Results feed + reconciliation (operator surface) ───────────────────────
 // The automatic polling loop is wired at boot; these are the human paths for
 // inspecting held markets and closing reconciliation findings.
-app.get('/api/admin/results/void-rules', requireAdmin, (req, res) => {
+app.get('/api/admin/results/void-rules', requireAdmin, limit('admin'), (req, res) => {
   res.json({ sports: VOIDRULES.knownSports(), rules: VOIDRULES.RULES, default: VOIDRULES.DEFAULT_RULE });
 });
 
-app.get('/api/admin/results/held', requireAdmin, (req, res) => {
+app.get('/api/admin/results/held', requireAdmin, limit('admin'), (req, res) => {
   res.json({
     markets: db
       .prepare(
@@ -852,7 +939,7 @@ app.get('/api/admin/results/held', requireAdmin, (req, res) => {
 
 // Releasing a hold is explicit, reasoned and audited: the whole point of
 // holding a disputed market is that a machine could not decide it.
-app.post('/api/admin/results/held/:id/release', requireAdmin, (req, res) => {
+app.post('/api/admin/results/held/:id/release', requireAdmin, limit('admin'), (req, res) => {
   const { decision, winner_selection_id, reason } = req.body || {};
   res.json(
     RESULTS.releaseHold(db, {
@@ -865,7 +952,7 @@ app.post('/api/admin/results/held/:id/release', requireAdmin, (req, res) => {
   );
 });
 
-app.get('/api/admin/reconciliation/findings', requireAdmin, (req, res) => {
+app.get('/api/admin/reconciliation/findings', requireAdmin, limit('admin'), (req, res) => {
   res.json({
     findings: db
       .prepare(
@@ -878,8 +965,45 @@ app.get('/api/admin/reconciliation/findings', requireAdmin, (req, res) => {
   });
 });
 
-app.post('/api/admin/reconciliation/findings/:id/resolve', requireAdmin, (req, res) => {
+app.post('/api/admin/reconciliation/findings/:id/resolve', requireAdmin, limit('admin'), (req, res) => {
   res.json(JOBS.resolveFinding(db, { actor: req.user, id: intId(req.params.id), reason: (req.body || {}).reason }));
+});
+
+// ── Operational surface ────────────────────────────────────────────────────
+// /healthz is LIVENESS and must not touch the database: a liveness probe that
+// queries a dependency restarts the process when that dependency blips, turning
+// a database outage into a crash loop. /readyz is READINESS and does check —
+// including the ledger, because a venue whose books have drifted must not be
+// sent players.
+const OPS_TOKEN = config.OPS_TOKEN || null;
+function opsGuard(req, res, next) {
+  // Unauthenticated by default: liveness/readiness are how a SUPERVISOR
+  // reaches the process, and requiring a token breaks that. Metrics and the
+  // backup controls expose real numbers, so they need OPS_TOKEN — and
+  // without one they answer 404 rather than leaking the books.
+  const publicRoute = req.path === '/healthz' || req.path === '/readyz';
+  if (publicRoute || OPS_TOKEN) return next();
+  res.status(404).json({ error: 'Not found' });
+}
+
+app.get('/healthz', opsGuard, (req, res) => res.json(OPS.health()));
+app.get('/readyz', opsGuard, (req, res) => {
+  const r = OPS.readiness(db);
+  res.status(r.status === 'ready' ? 200 : 503).json(r);
+});
+app.get('/metrics', opsGuard, (req, res) => {
+  res.type('text/plain; version=0.0.4').send(OPS.metrics(db));
+});
+
+// Backup/restore are deliberately POST and token-gated. `fs` handles the
+// snapshot; this only decides WHEN.
+app.post('/api/admin/backup', requireAdmin, opsGuard, (req, res) => {
+  const r = OPS.backup(db, {
+    dir: (req.body || {}).dir || config.BACKUP_DIR,
+    retention: (req.body || {}).retention ?? config.BACKUP_RETENTION,
+  });
+  audit.record(db, req.user, audit.ACTIONS.BACKUP_TAKEN, 'ops:backup', null, { path: r.path, bytes: r.bytes }, (req.body || {}).reason);
+  res.json(r);
 });
 
 // ── Scheduled jobs ─────────────────────────────────────────────────────────
@@ -893,6 +1017,24 @@ if (JOBS_INTERVALS.reconcileMs > 0) {
     JOBS.every(JOBS_INTERVALS.reconcileMs, async () => {
       const r = await JOBS.reconcileOnce(db);
       if (!r.ok) console.warn(`[reconcile] ${r.findings.length} finding(s); ${r.open.length} open`);
+    })
+  );
+}
+
+if (JOBS_INTERVALS.backupMs > 0 && config.BACKUP_DIR) {
+  jobTimers.push(
+    JOBS.every(JOBS_INTERVALS.backupMs, async () => {
+      const r = OPS.backup(db, { dir: config.BACKUP_DIR, retention: config.BACKUP_RETENTION });
+      console.log(`[backup] ${r.path} (${r.bytes} bytes, ${r.users} users)`);
+    })
+  );
+}
+
+if (JOBS_INTERVALS.maintenanceMs > 0) {
+  jobTimers.push(
+    JOBS.every(JOBS_INTERVALS.maintenanceMs, async () => {
+      const m = OPS.maintenance(db);
+      if (!m.ok) console.warn(`[maintenance] ${m.error}`);
     })
   );
 }
@@ -942,7 +1084,7 @@ function isIsoDateTime(s) {
     && dt.getUTCHours() === hh && dt.getUTCMinutes() === mi && dt.getUTCSeconds() === se;
 }
 
-app.post('/api/admin/sports', requireAdmin, (req, res, next) => {
+app.post('/api/admin/sports', requireAdmin, limit('admin'), (req, res, next) => {
   const name = String((req.body || {}).name || '').trim();
   if (!name) return res.status(400).json({ error: 'name required' });
   const slug = slugify(name);
@@ -957,7 +1099,7 @@ app.post('/api/admin/sports', requireAdmin, (req, res, next) => {
   res.status(201).json({ sport: db.prepare('SELECT * FROM sports WHERE slug = ?').get(slug) });
 });
 
-app.post('/api/admin/competitions', requireAdmin, (req, res, next) => {
+app.post('/api/admin/competitions', requireAdmin, limit('admin'), (req, res, next) => {
   const { sport_id, name, country } = req.body || {};
   if (!Number.isInteger(Number(sport_id)) || !String(name || '').trim()) {
     return res.status(400).json({ error: 'sport_id and name required' });
@@ -974,7 +1116,7 @@ app.post('/api/admin/competitions', requireAdmin, (req, res, next) => {
   res.status(201).json({ competition: comp });
 });
 
-app.post('/api/admin/events', requireAdmin, (req, res, next) => {
+app.post('/api/admin/events', requireAdmin, limit('admin'), (req, res, next) => {
   const { sport_id, competition_id, name, starts_at } = req.body || {};
   const startsAt = String(starts_at || '').trim();
   if (!Number.isInteger(Number(sport_id)) || !String(name || '').trim() || !startsAt) {
@@ -1011,7 +1153,7 @@ app.post('/api/admin/events', requireAdmin, (req, res, next) => {
   res.status(201).json({ event: ev });
 });
 
-app.post('/api/admin/markets', requireAdmin, (req, res, next) => {
+app.post('/api/admin/markets', requireAdmin, limit('admin'), (req, res, next) => {
   const { event_id, name } = req.body || {};
   if (!Number.isInteger(Number(event_id)) || !String(name || '').trim()) {
     return res.status(400).json({ error: 'event_id and name required' });
@@ -1026,7 +1168,7 @@ app.post('/api/admin/markets', requireAdmin, (req, res, next) => {
   res.status(201).json({ market: m });
 });
 
-app.post('/api/admin/selections', requireAdmin, (req, res, next) => {
+app.post('/api/admin/selections', requireAdmin, limit('admin'), (req, res, next) => {
   const { market_id, name, fair_price } = req.body || {};
   if (!Number.isInteger(Number(market_id)) || !String(name || '').trim()) {
     return res.status(400).json({ error: 'market_id and name required' });
@@ -1062,7 +1204,7 @@ app.post('/api/admin/selections', requireAdmin, (req, res, next) => {
   res.status(201).json({ selection: sel });
 });
 
-app.patch('/api/admin/markets/:id', requireAdmin, (req, res) => {
+app.patch('/api/admin/markets/:id', requireAdmin, limit('admin'), (req, res) => {
   const status = (req.body || {}).status;
   if (!['open', 'suspended'].includes(status)) return res.status(400).json({ error: 'status must be open or suspended' });
   const m = db.prepare('SELECT * FROM markets WHERE id = ?').get(intId(req.params.id));
@@ -1080,7 +1222,7 @@ app.patch('/api/admin/markets/:id', requireAdmin, (req, res) => {
   res.json({ market: db.prepare('SELECT * FROM markets WHERE id = ?').get(m.id) });
 });
 
-app.post('/api/admin/markets/:id/settle', requireAdmin, (req, res) => {
+app.post('/api/admin/markets/:id/settle', requireAdmin, limit('admin'), (req, res) => {
   const body = req.body || {};
   const mid = intId(req.params.id);
   // Pass the caller's values through UNCHANGED: lib/settle.js validates
@@ -1110,7 +1252,7 @@ app.post('/api/admin/markets/:id/settle', requireAdmin, (req, res) => {
   res.json(result);
 });
 
-app.get('/api/admin/stats', requireAdmin, (req, res) => {
+app.get('/api/admin/stats', requireAdmin, limit('admin'), (req, res) => {
   const markets = db
     .prepare(
       `SELECT m.id, m.name, m.status, m.total_matched_cents, e.name AS event_name,
@@ -1126,7 +1268,7 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
 });
 
 // Competitions for a sport — the admin desk's create form needs the list.
-app.get('/api/admin/competitions', requireAdmin, (req, res) => {
+app.get('/api/admin/competitions', requireAdmin, limit('admin'), (req, res) => {
   const sportId = Number(req.query.sport_id);
   if (!Number.isInteger(sportId)) return res.status(400).json({ error: 'sport_id required' });
   const competitions = db
@@ -1209,6 +1351,20 @@ function main() {
     drift.startDrift(db, { intervalMs: config.DRIFT_INTERVAL_MS, broadcast });
     console.log('[drift] on');
   }
+  // An operator who has not configured a backup has no backup, and the
+  // failure is discovered on the day the disk dies. Said loudly, at boot,
+  // every time — this is the last moment it is cheap to act on.
+  if (!config.BACKUP_DIR) {
+    console.warn(
+      '[ops] NO BACKUP CONFIGURED. Set BACKUP_DIR to take scheduled snapshots.\n' +
+      '[ops] This database holds player balances; without a snapshot there is no\n' +
+      '[ops] recovery path if the disk is lost. Press Enter at any time.'
+    );
+  }
+  if (!config.OPS_TOKEN) {
+    console.warn('[ops] OPS_TOKEN unset — /metrics and the backup control return 404.');
+  }
+
   warnDefaultCredentials();
   if (config.FEED_ENABLED) {
     FEED.health()
@@ -1235,4 +1391,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, resetLoginLimiter };
+module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, OPS };
