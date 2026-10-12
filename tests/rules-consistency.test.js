@@ -66,7 +66,7 @@ check('S3 a finished greyhound race with a winner PAYS the winner', () => {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Greyhounds', 'greyhounds')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='greyhounds'").get();
-  db.prepare("INSERT INTO events (sport_id, name, starts_at, status) VALUES (?, 'R1', datetime('now','-2 hours'), 'live')").run(sp.id);
+  db.prepare("INSERT INTO events (sport_id, name, starts_at, status) VALUES (?, 'R1', datetime('now','+2 hours'), 'live')").run(sp.id);
   const ev = db.prepare('SELECT id FROM events WHERE name = ?').get('R1');
   db.prepare("INSERT INTO markets (event_id, name) VALUES (?, 'Winner')").run(ev.id);
   const mkt = db.prepare('SELECT id FROM markets WHERE event_id=?').get(ev.id);
@@ -94,7 +94,7 @@ check('S4 a finished basketball game with a winner PAYS the winner', () => {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Basketball', 'basketball')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='basketball'").get();
-  db.prepare("INSERT INTO events (sport_id, name, starts_at, status) VALUES (?, 'G1', datetime('now','-2 hours'), 'live')").run(sp.id);
+  db.prepare("INSERT INTO events (sport_id, name, starts_at, status) VALUES (?, 'G1', datetime('now','+2 hours'), 'live')").run(sp.id);
   const ev = db.prepare('SELECT id FROM events WHERE name = ?').get('G1');
   db.prepare("INSERT INTO markets (event_id, name) VALUES (?, 'Money Line')").run(ev.id);
   const mkt = db.prepare('SELECT id FROM markets WHERE event_id=?').get(ev.id);
@@ -120,7 +120,7 @@ check('S5 horse racing is seeded and settles a dead heat as a joint favourite', 
   seed.seed(db);
   const sp = db.prepare("SELECT id FROM sports WHERE slug='horse_racing'").get();
   assert.ok(sp, 'horse racing exists in the seed');
-  db.prepare("INSERT INTO events (sport_id, name, starts_at, status) VALUES (?, 'DH', datetime('now','-2 hours'), 'live')").run(sp.id);
+  db.prepare("INSERT INTO events (sport_id, name, starts_at, status) VALUES (?, 'DH', datetime('now','+2 hours'), 'live')").run(sp.id);
   const ev = db.prepare('SELECT id FROM events WHERE name = ?').get('DH');
   db.prepare("INSERT INTO markets (event_id, name) VALUES (?, 'Winner')").run(ev.id);
   const mkt = db.prepare('SELECT id FROM markets WHERE event_id=?').get(ev.id);

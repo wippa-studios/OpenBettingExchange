@@ -295,9 +295,30 @@ this is a consumer, not a rewrite. Requirements beyond calling it:
 - Disputed outcomes, held rather than settled, with a manual release path.
 - The feed's own audit: every outcome settled is traceable to a source event.
 
-**In-play.** Bet delay modelling, a traded-volume ladder, and a clear statement
-of the latency you actually offer. In-play without honest delay modelling is
-where a venue loses money to sharps.
+**In-play. ❌ WITHDRAWN — the venue is PRE-OFF ONLY.** The product decision is
+that bets may only be placed before an event's off time, and cash-out is closed
+at off with it. In-play without honest delay modelling is where a venue loses
+money to sharps; removing in-play removes that whole class of sharp rather than
+managing it. `lib/inplay.js` and `orders.eligible_at` stay in the tree — they
+are tested, and `eligible_at` is the only mechanism that could carry the gate if
+in-play is ever revisited — but they no longer have a caller driving an in-play
+suspension, and `lib/offtime.js` is now the control that closes markets.
+
+**The off-time gate — `lib/offtime.js` ✅.** Nothing tied tradability to
+`events.starts_at` before this: the in-play gate checked *suspension*, and with
+the feed off nothing suspended a market at kick-off. A control with no driver —
+the dead-control shape this repo keeps finding. The gate:
+- closes order placement AND cash-out at `events.starts_at`, in the engine
+  (not the routes), so a future caller cannot walk out with venue money;
+- refuses *before* any collateral is frozen;
+- treats an unparseable off time as CLOSED, because a bad catalogue row must
+  never silently re-open in-play trading;
+- resolves every admin-accepted datetime form to UTC, so the off time does not
+  move when the server's timezone does.
+
+**Cash-out at off is part of the gate, not an afterthought.** Banning in-play
+betting while leaving cash-out open would have kept in-play *risk*: the venue
+still owes money on a position whose price just moved on a goal.
 
 **Feed resilience.** ✅ Investigated, and the answer is that the risk is not
 real *as the system stands*. `FEED_STALE_SECONDS` reports staleness and does not
@@ -451,7 +472,7 @@ conversation.
 ## 6. Immediate next actions
 
 Reassessed after Phases 1–4, the follow-on work, and the first outside
-review of the money path. The suite is now **448 checks across 36 suites**,
+review of the money path. The suite is now **539 checks across 36 suites**,
 plus a live smoke script and a 71-check browser suite, all green.
 
 ### Recently completed since the first plan
@@ -653,7 +674,7 @@ BACK position, which masked the broken branch. Now regression-tested both
 sides (cashout2 C8/C13).
 
 The lesson the project takes from this: **an author cannot review their own
-money path.** The self-authored suite grew from 340 to 407 checks and every
+money path.** The self-authored suite grew from 340 to 539 checks and every
 one of the ten findings was reproducible as a test — but none of them was
 FOUND by the suite, because the suite tested what the author intended, and
 the code did something else. A second outside reading before real money

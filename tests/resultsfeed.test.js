@@ -43,7 +43,7 @@ const run = async () => {
     // complete() when the test wants the market pending — the state a results
     // feed actually sees, which is never the state the bets were placed in.
     db.prepare(
-      "INSERT INTO events (sport_id, name, starts_at, status) VALUES (?, ?, datetime('now','-2 hours'), 'live')"
+      "INSERT INTO events (sport_id, name, starts_at, status) VALUES (?, ?, datetime('now','+2 hours'), 'live')"
     ).run(sp.id, `Ev ${n}`);
     const ev = db.prepare('SELECT id FROM events WHERE name = ?').get(`Ev ${n}`);
     db.prepare("INSERT INTO markets (event_id, name) VALUES (?, 'Match Odds')").run(ev.id);

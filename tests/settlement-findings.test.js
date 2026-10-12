@@ -28,7 +28,7 @@ function venue(sport) {
   db.prepare('INSERT INTO sports (name, slug) VALUES (?, ?)').run(sport, sport);
   const sp = db.prepare('SELECT id FROM sports WHERE slug=?').get(sport);
   n++;
-  db.prepare("INSERT INTO events (sport_id,name,starts_at,status) VALUES (?, ?, datetime('now','-2 hours'), 'live')").run(sp.id, `E${n}`);
+  db.prepare("INSERT INTO events (sport_id,name,starts_at,status) VALUES (?, ?, datetime('now','+2 hours'), 'live')").run(sp.id, `E${n}`);
   const ev = db.prepare('SELECT id FROM events WHERE name=?').get(`E${n}`);
   db.prepare("INSERT INTO markets (event_id,name) VALUES (?, 'M')").run(ev.id);
   const m = db.prepare('SELECT id FROM markets WHERE event_id=?').get(ev.id);

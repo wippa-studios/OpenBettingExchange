@@ -38,7 +38,7 @@ function fixture(sport = 'football', fair = 2.0) {
   const sp = db.prepare('SELECT id FROM sports WHERE slug=?').get(sport);
   n++;
   // 'live' so bets can be placed; the feed transitions it to 'completed'.
-  db.prepare("INSERT INTO events (sport_id, name, starts_at, status) VALUES (?, ?, datetime('now','-2 hours'), 'live')")
+  db.prepare("INSERT INTO events (sport_id, name, starts_at, status) VALUES (?, ?, datetime('now','+2 hours'), 'live')")
     .run(sp.id, `Ev ${n}`);
   const ev = db.prepare('SELECT id FROM events WHERE name = ?').get(`Ev ${n}`);
   db.prepare("INSERT INTO markets (event_id, name) VALUES (?, 'Match Odds')").run(ev.id);
