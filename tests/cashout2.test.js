@@ -364,6 +364,46 @@ check('C14 a suspended selection the player holds DECLINES the quote', async () 
   assert.ok(cashout.cashoutQuote(db, alice, marketId), 'and it is quoted again once restored');
 });
 
+// ── #19: a fully cashed-out market must LEAVE the positions view ───────────
+//
+// myMatchedBets filters `mt.cashout = 0` and says why. The enclosing market
+// list in positionsFor did not, so the market row was still produced while its
+// legs came back empty — /api/positions listed a market with no legs and no
+// quote after the player deliberately closed the position.
+//
+// The double cash-out itself was already prevented, but by a second query
+// rather than by this one, so the protection was incidental.
+check('C15 a fully cashed-out market drops out of the positions view', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
+
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
+
+  // Control: the position is visible BEFORE the cash-out.
+  const before = M.positionsFor(db, alice.id);
+  assert.ok(
+    before.some((m) => m.market_id === marketId),
+    'the open position is listed'
+  );
+
+  cashout.cashoutMarket(db, alice, marketId);
+
+  const after = M.positionsFor(db, alice.id);
+  const stillThere = after.find((m) => m.market_id === marketId);
+  assert.strictEqual(
+    stillThere,
+    undefined,
+    `the closed market is gone from the positions view (still listed as ${JSON.stringify(stillThere)})`
+  );
+
+  // The counterparty, whose position was NOT bought off, still has theirs.
+  const bobSees = M.positionsFor(db, bob.id);
+  assert.ok(
+    bobSees.some((m) => m.market_id === marketId),
+    "the counterparty's position is untouched"
+  );
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -380,6 +420,6 @@ check('C14 a suspended selection the player holds DECLINES the quote', async () 
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 14) { console.error("expected 14 checks"); process.exit(1); }
+  if (passed < 15) { console.error("expected 15 checks"); process.exit(1); }
   console.log(`\ncashout2.test.js: ${passed} checks passed`);
 })();
