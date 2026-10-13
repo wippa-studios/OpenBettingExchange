@@ -427,6 +427,63 @@ check('A13 (F8) the faucet is per-deposit, and that is documented and deliberate
   clean(db);
 });
 
+// ── #38: the vocabulary was advertising three events nothing wrote ────────
+//
+// USER_REGISTER, RESULT_APPLIED and RESULT_HELD were defined in ACTIONS and
+// referenced nowhere in production code, so the schema claimed to be a record
+// of registrations, applied results and held results while being none of those
+// things. An operator reading the log schema would look for a category the code
+// said existed and find nothing.
+//
+// The other three are now written by lib/auth.js, and THIS is the check that
+// can tell a written row from a defined constant: it asserts on the rows in
+// audit_log, not on the presence of a key. A test over ACTIONS alone would
+// have passed against the original, broken code.
+check('A14 (#38) logins, failed logins and logouts are ACTUALLY WRITTEN to the log', async () => {
+  const { db, alice } = (await fixture());
+  const AUDIT = require('../lib/audit');
+  const rows = (action) => db.prepare('SELECT * FROM audit_log WHERE action = ? ORDER BY id').all(action);
+
+  // A successful login is recorded against the account that proved the password.
+  const { token } = (await A.loginUser(db, { username: 'alice', password: 'pw-alice-123' }));
+  const logins = rows(AUDIT.ACTIONS.USER_LOGIN);
+  assert.strictEqual(logins.length, 1, 'a login row exists');
+  assert.strictEqual(logins[0].actor_id, alice.id, 'attributed to the account');
+  assert.strictEqual(logins[0].target, `user:${alice.id}`);
+
+  // A FAILED login is the sharpest of the three: the per-IP and per-username
+  // lockouts are live counters with no history behind them, so a brute-force
+  // pattern is invisible once the counter resets.
+  await assert.rejects(A.loginUser(db, { username: 'alice', password: 'wrong-one' }), (e) => e.status === 401);
+  await assert.rejects(A.loginUser(db, { username: 'ghost', password: 'wrong-one' }), (e) => e.status === 401);
+  const failed = rows(AUDIT.ACTIONS.USER_LOGIN_FAILED);
+  assert.strictEqual(failed.length, 2, 'both attempts are recorded');
+  // The ACTOR MUST BE NULL even for the attempt against a real account:
+  // writing the user id would let the audit log confirm which usernames exist,
+  // which is precisely what the single generic 401 exists to prevent.
+  assert.ok(failed.every((r) => r.actor_id === null), 'never attributed to the account being probed');
+  assert.ok(failed.some((r) => r.reason === null || JSON.parse(r.after).reason === 'bad-password'));
+  assert.ok(failed.some((r) => JSON.parse(r.after).reason === 'no-such-user'));
+  // …and it must not leak the submitted password.
+  assert.ok(!JSON.stringify(failed).includes('wrong-one'), 'the attempted secret is never written');
+
+  // Logout is recorded by destroySession, and a logout of nothing records nothing.
+  A.destroySession(db, token);
+  const outs = rows(AUDIT.ACTIONS.USER_LOGOUT);
+  assert.strictEqual(outs.length, 1, 'the logout is recorded');
+  assert.strictEqual(outs[0].actor_id, alice.id);
+  A.destroySession(db, null);
+  A.destroySession(db, 'no-such-token');
+  assert.strictEqual(rows(AUDIT.ACTIONS.USER_LOGOUT).length, 1, 'a no-op logout records nothing');
+
+  // And the removed entries really are gone, rather than merely unused.
+  for (const gone of ['user.register', 'result.applied', 'result.held']) {
+    assert.strictEqual(AUDIT.ACTIONS[gone.toUpperCase().replace('.', '_')], undefined,
+      `${gone} is no longer advertised as a category nothing writes`);
+    assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM audit_log WHERE action = ?').get(gone).c, 0);
+  }
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -443,6 +500,6 @@ check('A13 (F8) the faucet is per-deposit, and that is documented and deliberate
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 14) { console.error('expected 14 checks'); process.exit(1); }
+  if (passed < 15) { console.error("expected 15 checks"); process.exit(1); }
   console.log(`\naudit.test.js: ${passed} checks passed`);
 })();
