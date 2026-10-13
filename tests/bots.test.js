@@ -126,6 +126,48 @@ check('B4 quoteAllMarkets isolates one failing market and keeps quoting the rest
   assert.strictEqual(countIn('B-normal'), 6, 'the market after the failure is fully quoted');
 });
 
+// ── #17: a cancelled bot order must not keep claiming collateral ───────────
+//
+// cancelBotOrders re-derived the escrow from the formula instead of releasing
+// the TRACKED column, and never zeroed orders.frozen_cents. A cancelled row
+// was left claiming collateral the wallet no longer held — and its own comment
+// denied the thing it was doing ("never a re-derived copy of the formula").
+//
+// No balance is wrong today: every reader of this column filters
+// status='open'. That is exactly why it is worth closing — the invariant
+// "cancelled implies frozen_cents = 0" was true only because nobody had
+// written the query that would catch a violation.
+check('B5 a cancelled bot order leaves frozen_cents at zero', async () => {
+  const { db, marketId } = (await fixture());
+  bots.quoteMarket(db, marketId);
+
+  const quoted = db.prepare("SELECT COUNT(*) n FROM orders WHERE status = 'open'").get().n;
+  assert.ok(quoted > 0, 'the bot really did quote');
+  const frozenBefore = db.prepare("SELECT COALESCE(SUM(frozen_cents),0) s FROM orders WHERE status='open'").get().s;
+  assert.ok(frozenBefore > 0, 'and the orders hold escrow to begin with');
+
+  // Requote: cancel-then-replace, the path that hits cancelBotOrders.
+  bots.quoteMarket(db, marketId);
+
+  const stale = db
+    .prepare("SELECT id, frozen_cents FROM orders WHERE status = 'cancelled' AND frozen_cents <> 0")
+    .all();
+  assert.deepStrictEqual(stale, [], 'no cancelled row still claims collateral');
+
+  // The wallet agrees: every cent still frozen is claimed by a LIVE order, so
+  // a cancel released rather than stranded. The engine's own invariant, stated
+  // without re-deriving any formula.
+  const bot = db.prepare('SELECT id, frozen_cents FROM users WHERE is_bot = 1').get();
+  const claimedByLiveOrders = db
+    .prepare("SELECT COALESCE(SUM(frozen_cents), 0) s FROM orders WHERE user_id = ? AND status <> 'cancelled'")
+    .get(bot.id).s;
+  assert.strictEqual(
+    bot.frozen_cents,
+    claimedByLiveOrders,
+    'the bot wallet holds exactly what its live orders claim — no orphaned collateral'
+  );
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
