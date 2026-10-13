@@ -118,7 +118,83 @@ async function signIn(page, base, user, pass) {
   await page.fill('#authUser', user);
   await page.fill('#authPass', pass);
   await page.click('#authGo');
-  await page.waitForFunction(() => !document.querySelector('#authModal')?.open, null, { timeout: 8000 });
+  // `.show`, NOT `[open]`. #authModal is a <div>, not a <dialog> — it carries no
+  // `open` property at all, so `!document.querySelector('#authModal')?.open`
+  // was `!undefined` = true from the very first poll. The wait therefore
+  // returned instantly, before the login had been through fetch(), and the
+  // captures downstream were of a half-rendered board. core.js openOverlay
+  // shows and hides overlays with the `.show` class, which is what this must
+  // wait on (the #accountModal wait below already said so in a comment).
+  await page.waitForFunction(() => !document.querySelector('#authModal.show'), null, { timeout: 8000 });
+  // …and it is only a real wait if the modal was actually OPEN when we started
+  // waiting. Otherwise the predicate is vacuously true and the whole step is a
+  // no-op — the exact class of bug this line used to be.
+  must(await page.locator('#authBtn').textContent().then((t) => t.trim() === 'Sign out'), 'the sign-in completed');
+}
+
+/**
+ * Tripwire: the browser is the only place the frontend's errors exist, and a
+ * page error or a console.error leaves the UI looking merely quiet rather than
+ * broken — the screenshots still capture, the run still passes. Before this,
+ * the only 'console' output in the whole run was this script's own console.log,
+ * so nothing in the browser was being watched at all.
+ *
+ * Collected, not thrown, so the run finishes and reports every fault; the
+ * assertions below turn any of them into a failure.
+ */
+/**
+ * Tripwire: the browser is the only place the frontend's errors exist, and a
+ * page error or a console.error leaves the UI looking merely quiet rather than
+ * broken — the screenshots still capture, the run still passes. Before this,
+ * the only 'console' output in the whole run was this script's own console.log,
+ * so nothing in the browser was being watched at all.
+ *
+ * Collected, not thrown, so the run finishes and reports every fault;
+ * assertNoFaults below turns any of them into a failure.
+ *
+ * Calibrated so it FAILS on real faults and stays quiet on designed ones.
+ * A tripwire that fires on every run is a tripwire people switch off, and this
+ * one has to earn its keep:
+ *
+ *   · an uncaught exception, and any console.error the APP ITSELF wrote — never
+ *     suppressed. That is the app saying something is wrong.
+ *   · an HTTP 4xx Chrome reports as "Failed to load resource" — suppressed.
+ *     These are answers the app asked for and handled: core.js probes /api/me
+ *     on every boot and a signed-out 401 is that endpoint working. A 5xx is
+ *     NOT suppressed, because a server error is never designed.
+ *   · net::ERR_ABORTED on a request — suppressed. That is a cancellation (the
+ *     SSE stream at /api/stream being torn down on sign-out or navigation),
+ *     not a failure. Every OTHER request failure still trips.
+ */
+function watchBrowser(page) {
+  const faults = [];
+  const CHROME_4XX = /^Failed to load resource: the server responded with a status of 4\d\d\b/;
+  page.on('pageerror', (e) => faults.push(`pageerror: ${e && e.message ? e.message : e}`));
+  page.on('console', (m) => {
+    if (m.type() !== 'error' && m.type() !== 'warning') return;
+    const text = m.text();
+    if (/favicon/i.test(text)) return;
+    if (CHROME_4XX.test(text)) return;
+    const at = m.location() && m.location().url ? ` <${m.location().url}>` : '';
+    faults.push(`console.${m.type()}: ${text}${at}`);
+  });
+  page.on('requestfailed', (r) => {
+    if (/favicon/i.test(r.url())) return;
+    const err = (r.failure() && r.failure().errorText) || 'unknown';
+    if (err === 'net::ERR_ABORTED') return;
+    faults.push(`requestfailed: ${r.url()} — ${err}`);
+  });
+  return faults;
+}
+
+/** Must be called before browser.close(), or there is nothing left to read. */
+function assertNoFaults(faults, where) {
+  if (faults.length) {
+    throw new Error(
+      `browser reported ${faults.length} error(s) during ${where}:\n  ${faults.join('\n  ')}`
+    );
+  }
+  assertions++;
 }
 
 // ── pass 1: seeded mode ──────────────────────────────────────────────────────
@@ -155,6 +231,7 @@ async function seededPass() {
       deviceScaleFactor: 2,
     });
     const page = await ctx.newPage();
+    const faults = watchBrowser(page);
 
     // STATE, via the API, so the wallet and positions shots have real content.
     //
@@ -259,9 +336,15 @@ async function seededPass() {
     await page.waitForFunction(() => document.getElementById('adminBody')?.textContent.length > 100, null, { timeout: 8000 });
     await cap(page, 'admin-markets');
 
+    must(await page.locator('[data-view="users"]').count() > 0, 'a users view tab to click');
     await page.locator('[data-view="users"]').click();
     await page.waitForFunction(() => /demo|admin/i.test(document.getElementById('adminBody')?.textContent || ''), null, { timeout: 8000 });
     await cap(page, 'admin-users');
+
+    // The tripwire fires LAST, after every capture, so a fault anywhere in the
+    // run — including a sign-in that silently threw — fails the run instead of
+    // quietly shipping a screenshot of a broken page.
+    assertNoFaults(faults, 'the seeded pass');
 
     await browser.close();
     rmSync(db, { force: true });
@@ -303,6 +386,7 @@ async function feedPass() {
       deviceScaleFactor: 2,
     });
     const page = await ctx.newPage();
+    const faults = watchBrowser(page);
     await page.goto(base);
 
     // In FEED mode the rail renders the deep nav tree, not the seeded sport
@@ -345,6 +429,8 @@ async function feedPass() {
     must(!/pick a race|no open events/i.test(pageText), 'the board is showing a market, not an empty state');
     await sleep(700);
     await cap(page, 'feed-board');
+
+    assertNoFaults(faults, 'the feed pass');
 
     await browser.close();
     rmSync(db, { force: true });
