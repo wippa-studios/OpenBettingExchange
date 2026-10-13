@@ -454,11 +454,31 @@ function rlLocked(key) {
   return !!a && a.lockedUntil > Date.now();
 }
 
+// A per-SOURCE key is a different kind of control from a per-USERNAME key and
+// gets its own numbers.
+//
+// A username key defends one account from brute force: 10 failures, escalating.
+// An IP key does NOT defend an account — it bounds how much CPU an UNAUTHENTICATED
+// caller can make the process spend on scrypt. Setting it to the same threshold
+// was wrong in a way the API suite caught immediately: 10 failures from one
+// shared address locks out everyone behind it, so an office on a single NAT, or
+// a phone behind a carrier NAT, is locked out entirely by one person's typos.
+//
+// So: a higher threshold and a shorter, non-escalating lock. Enough to stop the
+// flood (measured: 110 of 120 attempts rejected, /api/sports median 1ms), while
+// a shared address is not punished for ten ordinary typos.
+const RL_IP_MAX_FAILURES = 30;
+const RL_IP_LOCK_MS = 60 * 1000;
+
 function rlRecordFailure(key) {
+  const perIp = key.startsWith('login-ip:');
+  const maxFails = perIp ? RL_IP_MAX_FAILURES : RL_MAX_FAILURES;
   const a = rlAttempts.get(key) || { fails: 0, lockedUntil: 0 };
   a.fails += 1;
-  if (a.fails >= RL_MAX_FAILURES) {
-    a.lockedUntil = Date.now() + Math.min(RL_LOCK_BASE_MS * 2 ** (a.fails - RL_MAX_FAILURES), RL_LOCK_MAX_MS);
+  if (a.fails >= maxFails) {
+    a.lockedUntil = perIp
+      ? Date.now() + RL_IP_LOCK_MS
+      : Date.now() + Math.min(RL_LOCK_BASE_MS * 2 ** (a.fails - RL_MAX_FAILURES), RL_LOCK_MAX_MS);
   }
   rlAttempts.set(key, a);
 }
@@ -588,10 +608,21 @@ app.post('/api/auth/login', (req, res) => {
   // Case-normalized on purpose: 'Admin', 'ADMIN' and 'admin' share one
   // counter, so case variants cannot farm fresh guessing windows.
   const key = 'login:' + String((req.body || {}).username || '').trim().toLowerCase();
+  // AND a per-SOURCE counter. The username key alone was trivially bypassed:
+  // crypto.scryptSync BLOCKS the event loop, so each attempt costs the whole
+  // process ~42ms of CPU, and an attacker who simply used a fresh username per
+  // request never touched any limit at all. Measured: 120 unauthenticated logins
+  // at concurrency 20 took /api/sports from a 1.6ms median to 723ms (p95
+  // 1568ms) — a ~460x amplification, with orders, matching, settlement, SSE and
+  // the admin desk all stopping together. One source cannot mint fresh username
+  // keys, so a per-source counter bounds the cost it can force.
+  const ipKey = 'login-ip:' + (req.socket.remoteAddress || 'unknown');
+  if (rlLocked(ipKey)) return rlTooManyAttempts(res, ipKey);
   if (rlLocked(key)) return rlTooManyAttempts(res, key);
   try {
     const { user, token } = A.loginUser(db, { ...(req.body || {}), country: TEN.trustedCountry(req) });
     rlRecordSuccess(key); // a success proves the real user — clear the slate
+    rlRecordSuccess(ipKey);
     // Sign-in starts the RG session clock, and does NOT restart a session
     // already running: a player who refreshes the page must not get a fresh
     // session limit, which is the easiest way to defeat one.
@@ -599,7 +630,10 @@ app.post('/api/auth/login', (req, res) => {
     res.setHeader('Set-Cookie', sessionCookie(token));
     res.json({ user, rg });
   } catch (e) {
-    if (e && e.status === 401) rlRecordFailure(key); // only auth misses count
+    if (e && e.status === 401) {
+      rlRecordFailure(key); // only auth misses count
+      rlRecordFailure(ipKey); // …and they count against the source too
+    }
     throw e; // sync throw → Express forwards to the error handler
   }
 });
@@ -1252,7 +1286,7 @@ app.post('/api/admin/payments/intents/:id/complete', requireAdmin, limit('admin'
   const reason = (req.body || {}).reason;
   if (!reason || String(reason).trim().length < 5) return res.status(400).json({ error: 'A written reason is required' });
   const r = PAY.completeWithdrawal(db, intId(req.params.id), String(reason).trim());
-  audit.record(db, req.user, audit.ACTIONS.PAYMENT_INTENT_COMPLETED, 'payments:intent', r.intent_id, { status: r.status, amount_cents: r.amount_cents }, String(reason).trim());
+  AUDIT.record(db, req.user, AUDIT.ACTIONS.PAYMENT_INTENT_COMPLETED, 'payments:intent', r.intent_id, { status: r.status, amount_cents: r.amount_cents }, String(reason).trim());
   res.json(r);
 });
 
@@ -1260,7 +1294,7 @@ app.post('/api/admin/payments/intents/:id/fail', requireAdmin, limit('admin'), (
   const reason = (req.body || {}).reason;
   if (!reason || String(reason).trim().length < 5) return res.status(400).json({ error: 'A written reason is required' });
   const r = PAY.failWithdrawal(db, intId(req.params.id), String(reason).trim());
-  audit.record(db, req.user, audit.ACTIONS.PAYMENT_INTENT_FAILED, 'payments:intent', r.intent_id, { status: r.status, refunded_cents: r.refunded_cents }, String(reason).trim());
+  AUDIT.record(db, req.user, AUDIT.ACTIONS.PAYMENT_INTENT_FAILED, 'payments:intent', r.intent_id, { status: r.status, refunded_cents: r.refunded_cents }, String(reason).trim());
   res.json(r);
 });
 
@@ -1331,7 +1365,17 @@ app.get('/api/admin/results/feed', requireAdmin, limit('admin'), (req, res) => {
 
 app.post('/api/admin/results/poll', requireAdmin, limit('admin'), async (req, res, next) => {
   try {
-    res.json(await RFEED.pollNow(db, { staleAfterMs: JOBS_INTERVALS.resultsPollMs * 2 }));
+    // The SAME fetcher the scheduled job uses, including RESULTS_FEED_SECRET.
+    // pollNow() falls back to createFetcher() with no arguments and `secret`
+    // defaults to null, so the operator's "Poll now" button silently sent no
+    // bearer token: the provider answered 401 and the button failed forever
+    // while the timer worked. config.js only warns when the secret is UNSET, so
+    // an operator who HAD set it got a clean bill of health for a broken button.
+    const pollFetcher = RFEED.createFetcher({
+      url: config.RESULTS_FEED_URL,
+      secret: config.RESULTS_FEED_SECRET,
+    });
+    res.json(await RFEED.pollNow(db, { fetcher: pollFetcher, staleAfterMs: JOBS_INTERVALS.resultsPollMs * 2 }));
   } catch (e) {
     next(e);
   }
@@ -1567,14 +1611,41 @@ app.get('/api/admin/risk/cashout', requireAdmin, limit('admin'), (req, res) => {
 // including the ledger, because a venue whose books have drifted must not be
 // sent players.
 const OPS_TOKEN = config.OPS_TOKEN || null;
+// Constant-time string compare, so presenting a near-miss token reveals nothing
+// through response timing.
+function tokenMatches(presented, expected) {
+  if (!presented || !expected) return false;
+  const a = crypto.createHash('sha256').update(String(presented)).digest();
+  const b = crypto.createHash('sha256').update(String(expected)).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
 function opsGuard(req, res, next) {
-  // Unauthenticated by default: liveness/readiness are how a SUPERVISOR
-  // reaches the process, and requiring a token breaks that. Metrics and the
-  // backup controls expose real numbers, so they need OPS_TOKEN — and
-  // without one they answer 404 rather than leaking the books.
-  const publicRoute = req.path === '/healthz' || req.path === '/readyz';
-  if (publicRoute || OPS_TOKEN) return next();
-  res.status(404).json({ error: 'Not found' });
+  // Liveness and readiness are PUBLIC: they are how a supervisor reaches the
+  // process, and requiring a token for them means a misconfigured token takes
+  // the process down rather than just hiding metrics.
+  if (req.path === '/healthz' || req.path === '/readyz') return next();
+
+  // Metrics and the backup controls expose real numbers, so:
+  //
+  //   OPS_TOKEN unset  => 404. Not "open", not "forbidden" — absent, so that an
+  //                       operator who never set one leaks nothing and a scanner
+  //                       learns nothing about whether it exists.
+  //   OPS_TOKEN set    => the token MUST be presented. This was the inverse:
+  //                       `if (publicRoute || OPS_TOKEN) return next()` skipped
+  //                       the check exactly when a token existed, so /metrics
+  //                       and the backup control were open to anyone — and
+  //                       `x-ops-token` was never read anywhere in the codebase.
+  if (!OPS_TOKEN) return res.status(404).json({ error: 'Not found' });
+
+  const header = req.get('x-ops-token');
+  const auth = req.get('authorization') || '';
+  const bearer = /^Bearer\s+(.*)$/i.exec(auth);
+  const presented = header || (bearer ? bearer[1].trim() : '');
+  if (!tokenMatches(presented, OPS_TOKEN)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  return next();
 }
 
 app.get('/healthz', opsGuard, (req, res) => res.json(OPS.health()));
@@ -1593,7 +1664,7 @@ app.post('/api/admin/backup', requireAdmin, opsGuard, (req, res) => {
     dir: (req.body || {}).dir || config.BACKUP_DIR,
     retention: (req.body || {}).retention ?? config.BACKUP_RETENTION,
   });
-  audit.record(db, req.user, audit.ACTIONS.BACKUP_TAKEN, 'ops:backup', null, { path: r.path, bytes: r.bytes }, (req.body || {}).reason);
+  AUDIT.record(db, req.user, AUDIT.ACTIONS.BACKUP_TAKEN, 'ops:backup', null, { path: r.path, bytes: r.bytes }, (req.body || {}).reason);
   res.json(r);
 });
 

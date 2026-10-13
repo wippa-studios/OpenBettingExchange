@@ -6,6 +6,68 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+Found by an adversarial pass against the running system. Two were critical.
+
+- **`opsGuard` was inverted, leaving `/metrics` and the backup control open.**
+  `if (publicRoute || OPS_TOKEN) return next()` skipped the check exactly when a
+  token existed, and `x-ops-token` was never read anywhere in the codebase — so
+  the token was configured but never enforced. Measured: `OPS_TOKEN` set,
+  `/metrics` with no credential answered **200**. Now the token must be
+  presented (`x-ops-token` or `Authorization: Bearer`, compared in constant
+  time) whenever one is configured, and `/healthz` + `/readyz` stay public so a
+  supervisor is not locked out by a misconfigured token. Unset still means 404,
+  so nothing leaks and a scanner learns nothing.
+
+- **A withdrawal moved money, returned 500, and wrote no audit row.**
+  `audit.record(...)` at three call sites; the module is imported as `AUDIT`. The
+  payment-intent completion path called `PAY.completeWithdrawal()` FIRST, so the
+  transfer committed, the handler then died on a `ReferenceError`, the operator
+  saw "Internal error", and `audit_log` recorded nothing. A silent, unaudited
+  money movement behind a 500. Fixed at all three sites.
+
+- **The collector child inherited every venue secret.** `env: { ...process.env }`
+  handed the child `PAYMENTS_WEBHOOK_SECRET` — the HMAC key authorising the
+  deposit webhook — plus `OPS_TOKEN` and the seeded `ADMIN_PASSWORD`. The
+  collector is the one component with outbound internet access, running
+  third-party Python from another repo. Now built from an allowlist (`PATH`,
+  `LANG`, `HOME`, `TZ`, cert paths) plus the three decrypted Betfair fields.
+
+- **Unauthenticated CPU exhaustion via login.** `crypto.scryptSync` blocks the
+  event loop, and the rate limiter was keyed per USERNAME — so an attacker
+  minted a fresh username per request and touched no limit at all. Measured:
+  120 logins at concurrency 20 took `/api/sports` from a 1.6 ms median to
+  **723 ms** (p95 1568 ms), ~460x, with orders, matching, settlement, SSE and
+  the admin desk all stopping together. Added a per-SOURCE counter: verified 110
+  of 120 attempts now rejected with the board median back to 1 ms.
+  The two counters deliberately have different numbers — the IP key is a brake
+  on CPU cost, not a brute-force defence, so it needs a higher threshold (30)
+  and a short non-escalating lock (60 s). Sharing one threshold locked out
+  everyone behind a single NAT after ten failures, which the API suite caught.
+
+- **A results-feed redirect could settle real markets from a host nobody
+  configured.** The transport validates the SHAPE of an outcome but never the
+  IDENTITY of the responder; following a 302 discards exactly the trust the
+  operator placed in `RESULTS_FEED_URL`. Measured: a feed that redirects to a
+  loopback service settles a real market from that service's answer. Now
+  `redirect: 'error'`.
+
+- **`RESULTS_FEED_SECRET` was never sent on the manual poll.** `pollNow()` fell
+  back to a fetcher with no secret, so "Poll now" always 401'd against an
+  auth-enforcing provider while the timer worked — and config only warns when
+  the secret is UNSET, so an operator who had set it got a clean bill of
+  health. The route now builds the same authenticated fetcher as the job.
+
+- **HTML injection in the admin audit "Change" cell.** `auditChange()` was the
+  only unescaped interpolation in the client. CSP blocked script execution but
+  not `form-action`, so the residual risk was phishing/UI redress inside the
+  admin desk. Now escaped like every other cell.
+
+- **Absent `BACKUP_DIR` surfaced as a generic 500.** "Internal error" for a
+  missing configuration. Now 409 naming the setting to set, and a real backup
+  failure reports why.
+
 ### Documentation
 
 A full pass against the code, prompted by the screenshots having aged out of

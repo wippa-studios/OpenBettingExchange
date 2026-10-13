@@ -476,6 +476,48 @@ const check = async (name, fn) => {
       assert.strictEqual(ok.status, 200);
     });
 
+    await check('a per-SOURCE counter stops the fresh-username flood', async () => {
+      // The per-username lockout is trivially bypassed: crypto.scryptSync blocks
+      // the event loop, so the attack is to mint a FRESH username per request and
+      // never touch any username counter at all. Measured before this counter
+      // existed: /api/sports went from a 1.6ms median to 723ms (p95 1568ms) —
+      // a ~460x amplification, with orders, matching, settlement and the admin
+      // desk all stopping together.
+      srv.resetLoginLimiter();
+      let reached = 0;
+      let rejected = 0;
+      for (let i = 0; i < 40; i++) {
+        const r = await j('POST', '/api/auth/login', {
+          body: { username: `flood_${i}_${Math.random().toString(36).slice(2, 7)}`, password: 'wrong-pw' },
+        });
+        if (r.status === 401) reached++;
+        if (r.status === 429) rejected++;
+      }
+      // The source counter must bite well before every attempt costs a scrypt.
+      assert.ok(rejected > 0, `the per-source counter engaged (${reached} reached scrypt, ${rejected} rejected)`);
+      assert.ok(reached < 40, 'the flood was cut short rather than all reaching the KDF');
+      // And the server is still serving: the control works by refusing work,
+      // not by wedging the process.
+      const alive = await j('GET', '/api/sports');
+      assert.strictEqual(alive.status, 200, 'the server still answers after the flood');
+      srv.resetLoginLimiter();
+    });
+
+    await check('the per-source lock does not fire on ordinary shared-IP use', async () => {
+      // Ten failures must lock the TARGET USERNAME, not every other user behind
+      // the same address. An office on one NAT, or a phone behind a carrier NAT,
+      // is the same address as its users — locking them out would punish a
+      // shared connection for one person's typos. Caught by the API suite when
+      // both counters shared a threshold.
+      srv.resetLoginLimiter();
+      for (let i = 0; i < 10; i++) {
+        await j('POST', '/api/auth/login', { body: { username: 'nat_victim', password: 'wrong-pw' } });
+      }
+      const other = await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } });
+      assert.strictEqual(other.status, 200, 'an unrelated account on the same address is unaffected');
+      srv.resetLoginLimiter();
+    });
+
     await check('interleaved successes reset the failure counter', async () => {
       srv.resetLoginLimiter();
       await j('POST', '/api/auth/register', { body: { username: 'rl_inter', password: 'secret1' } });

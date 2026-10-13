@@ -190,7 +190,7 @@
           <td class="tn">${e.actor_id === null ? '<span class="muted">system</span>' : '#' + e.actor_id}</td>
           <td>${esc(e.action)}</td>
           <td class="tn">${esc(e.target || '')}</td>
-          <td class="muted fineprint">${auditChange(e)}</td>
+          <td class="muted fineprint">${OB.esc(auditChange(e))}</td>
           <td class="muted">${esc(e.reason || '')}</td>
         </tr>`).join('')}</tbody>
       </table>`;
