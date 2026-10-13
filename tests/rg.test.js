@@ -533,6 +533,91 @@ check('G14 the deposit limit is enforced at credit, not at intent creation', asy
   }
 });
 
+// ── #31: self-exclusion FAILED OPEN on a non-ISO end date ──────────────────
+//
+// exclude() validated with Date.parse, which accepts anything V8 can make
+// sense of — including "15 Jan 2030". That value then passed through
+// `.replace('T', ' ').slice(0, 19)` UNCHANGED and landed in a column compared
+// LEXICOGRAPHICALLY against 'YYYY-MM-DD HH:MM:SS'. "15 Jan 2030" sorts before
+// "2026-…" because '1' precedes '2', so exclusionOf() returned null — not
+// excluded — the instant the exclusion was recorded.
+//
+// The control failed open on its own happy path. A player asking to be
+// excluded was re-admitted immediately, and nothing anywhere reported it.
+check('G15 a non-ISO exclusion end date is refused, not silently lapsed', async () => {
+  const f = (await fixture());
+  // The exact input that failed open.
+  assert.throws(
+    () => L.exclude(f.db, { actor: null, userId: f.alice.id, until: '15 Jan 2030', reason: 'test' }),
+    (e) => e.status === 400,
+    '"15 Jan 2030" is refused outright'
+  );
+  // …and nothing was written, so the account was never excluded at all.
+  assert.strictEqual(
+    f.db.prepare('SELECT self_excluded FROM users WHERE id = ?').get(f.alice.id).self_excluded,
+    0,
+    'and no half-made exclusion is left behind'
+  );
+
+  // Other shapes Date.parse would happily swallow.
+  for (const bad of ['', 'garbage', '2030-02-31', '2030-13-01', '2030-01-15T25:00', '01/15/2030']) {
+    assert.throws(
+      () => L.exclude(f.db, { actor: null, userId: f.alice.id, until: bad, reason: 'test' }),
+      (e) => e.status === 400,
+      `${JSON.stringify(bad)} is refused`
+    );
+  }
+});
+
+// ── #31: and a FUTURE ISO end date is honoured, end to end ─────────────────
+check('G16 a timed exclusion is stored in UTC and blocks trading until it lapses', async () => {
+  const f = (await fixture());
+  const far = '2099-01-15T00:00:00+05:00'; // midnight local, i.e. 19:00 UTC on the 14th
+  L.exclude(f.db, { actor: null, userId: f.alice.id, until: far, reason: 'test' });
+
+  // Stored as the UTC INSTANT, not as the wall-clock digits with the offset
+  // stripped — which is what the old code did, ending the exclusion five hours
+  // early.
+  assert.strictEqual(
+    f.db.prepare('SELECT excluded_until FROM users WHERE id = ?').get(f.alice.id).excluded_until,
+    '2099-01-14 19:00:00',
+    'stored as UTC, offset applied'
+  );
+  assert.ok(L.exclusionOf(f.db, f.alice.id), 'and it is in force');
+  assert.throws(
+    () => bet(f, f.alice),
+    (e) => e.details.code === 'self_excluded',
+    'so the account cannot trade'
+  );
+
+  // A date in the past is accepted as a date but has already lapsed.
+  L.exclude(f.db, { actor: null, userId: f.alice.id, until: '2000-01-01T00:00:00Z', reason: 'test' });
+  assert.strictEqual(L.exclusionOf(f.db, f.alice.id), null, 'a lapsed exclusion reads as none');
+});
+
+// ── #31: a MALFORMED stored value must fail CLOSED ─────────────────────────
+// Validation at write time stops new rows, but a database written before this
+// fix — or edited by hand — can still hold a value in the old shape. Silently
+// re-admitting a player who asked to stop is the one failure this control
+// must never have, so an unrecognised value keeps the exclusion in force.
+check('G17 an unrecognised stored end date keeps the exclusion in force', async () => {
+  const f = (await fixture());
+  L.exclude(f.db, { actor: null, userId: f.alice.id, until: '2099-01-01T00:00:00Z', reason: 'test' });
+
+  // Exactly what the old code would have stored for "15 Jan 2030".
+  f.db.prepare('UPDATE users SET excluded_until = ? WHERE id = ?').run('15 Jan 2030', f.alice.id);
+  assert.strictEqual(
+    L.exclusionOf(f.db, f.alice.id),
+    'permanent',
+    'a malformed end date does NOT lapse the exclusion'
+  );
+  assert.throws(
+    () => bet(f, f.alice),
+    (e) => e.details.code === 'self_excluded',
+    'and the account still cannot trade'
+  );
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -549,6 +634,6 @@ check('G14 the deposit limit is enforced at credit, not at intent creation', asy
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 15) { console.error('expected 15 checks'); process.exit(1); }
+  if (passed < 18) { console.error('expected 18 checks'); process.exit(1); }
   console.log(`\nrg.test.js: ${passed} checks passed`);
 })();

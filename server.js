@@ -6,6 +6,7 @@ const config = require('./lib/config');
 const { openStore } = require('./lib/store');
 const { seedIfNeeded, rollForwardEvents } = require('./lib/seed');
 const A = require('./lib/auth');
+const { isIsoDateTime } = require('./lib/util');
 const L = require('./lib/ledger');
 const M = require('./lib/match');
 // Two aliases with a reason each. MATCH is the engine under the name the
@@ -1859,30 +1860,11 @@ function isSqliteConstraint(e) {
 }
 
 // ── starts_at validation ───────────────────────────────────────────────────
-// ISO-8601 date or datetime, in the forms the desk actually sends:
-//   2030-01-01 | 2030-01-01T12:00 | 2030-01-01 12:00[:00[.ffffff]][Z|±HH:MM]
-// (the admin form and smoke.sh both send a SPACE-separated datetime). The
-// column stores TEXT and the board sorts it lexically, so format matters
-// beyond parseability — a non-ISO string would also sort wrong on the board.
-const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
-function isIsoDateTime(s) {
-  if (!ISO_DATETIME_RE.test(s)) return false;
-  // A syntactically valid string can still be a non-date (2030-02-31) or a
-  // non-time (25:00). Date.parse is lenient — V8 rolls Feb 31 into Mar 3 —
-  // so verify the calendar by round-trip: every component must survive.
-  const [d, t] = s.split(/[T ]/);
-  const [y, mo, da] = d.split('-').map(Number);
-  let hh = 0, mi = 0, se = 0;
-  if (t) {
-    const z = t.match(/(Z|[+-]\d{2}:?\d{2})$/);
-    const body = z ? t.slice(0, z.index) : t;
-    const parts = body.split(':').map((x) => Math.floor(Number(x)));
-    hh = parts[0] ?? 0; mi = parts[1] ?? 0; se = parts[2] ?? 0;
-  }
-  const dt = new Date(Date.UTC(y, mo - 1, da, hh, mi, se));
-  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === da
-    && dt.getUTCHours() === hh && dt.getUTCMinutes() === mi && dt.getUTCSeconds() === se;
-}
+// ISO-8601 date or datetime validation lives in lib/util.js — one definition,
+// shared with lib/limits.js, which validates the self-exclusion end date with
+// the same predicate. The column stores TEXT and the board sorts it lexically,
+// so format matters beyond parseability — a non-ISO string would also sort
+// wrong on the board.
 
 app.post('/api/admin/sports', requireAdmin, limit('admin'), (req, res, next) => {
   const name = String((req.body || {}).name || '').trim();
