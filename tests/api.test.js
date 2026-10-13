@@ -349,7 +349,74 @@ const check = async (name, fn) => {
       assert.strictEqual(forbidden.status, 403);
     });
 
-    // ── #23: PATCH /api/admin/users/:id is ONE unit of work ────────────────
+    // ── #25: the risk-cap route must not call every fault a 400 ──────────────
+    //
+    // The route caught everything and stamped `e.status = 400` on whatever
+    // lacked one, so a SQLITE_BUSY during a restore, a constraint violation or
+    // a TypeError all answered 400 — which errorHandler does not log (it only
+    // logs at >= 500). The operator setting a bot's liability cap got "your
+    // input was rejected", concluded nothing changed, and nothing was written
+    // down anywhere. A risk control that silently failed to apply.
+    await check('a genuine server fault on the risk route is 5xx, not a silent 400', async () => {
+      const desk = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      const bot = srv.db.prepare('SELECT id FROM users WHERE is_bot = 1 LIMIT 1').get();
+      assert.ok(bot, 'a bot account exists to configure');
+
+      // INPUT errors are the operator's own, and are still 4xx. These prove the
+      // fix did not simply turn every failure into a 500.
+      const badCap = await j('PUT', `/api/admin/risk/bots/${bot.id}`, {
+        body: { max_liability_cents: 0 },
+        cookie: desk,
+      });
+      assert.strictEqual(badCap.status, 400, 'a non-positive cap is still a 400');
+      assert.match(badCap.json.error, /positive integer/, 'and says why');
+
+      const badSkew = await j('PUT', `/api/admin/risk/bots/${bot.id}`, {
+        body: { quote_skew: 7 },
+        cookie: desk,
+      });
+      assert.strictEqual(badSkew.status, 400, 'an out-of-range skew is still a 400');
+
+      // A FAULT, injected at the module boundary so the route cannot
+      // misclassify it: a plain Error with no status, exactly the shape the
+      // blanket `if (!e.status) e.status = 400` used to stamp a 400 onto.
+      // (Closing the database would prove the same thing but destroys every
+      // check after it, so the seam used here is the module object itself.)
+      const RISK = require('../lib/risk');
+      const realConfigure = RISK.configure;
+      const logged = [];
+      const realConsoleError = console.error;
+      console.error = (...a) => { logged.push(a.join(' ')); };
+      RISK.configure = () => { throw new Error('SQLITE_BUSY: database is locked'); };
+      try {
+        const faulted = await j('PUT', `/api/admin/risk/bots/${bot.id}`, {
+          body: { max_liability_cents: 250000 },
+          cookie: desk,
+        });
+        assert.strictEqual(faulted.status, 500, `a real fault is a 500, got ${faulted.status}`);
+        assert.strictEqual(
+          faulted.json.error,
+          'Internal error',
+          'and the internals are not leaked to the client'
+        );
+        // errorHandler only logs at >= 500, so the OLD route produced a 400 and
+        // therefore NO log line at all — nothing to reconcile against later.
+        assert.ok(
+          logged.some((l) => /database is locked/.test(l)),
+          `the fault is logged, got ${JSON.stringify(logged)}`
+        );
+      } finally {
+        RISK.configure = realConfigure;
+        console.error = realConsoleError;
+      }
+
+      // And the route still works afterwards.
+      const good = await j('PUT', `/api/admin/risk/bots/${bot.id}`, {
+        body: { max_liability_cents: 250000 },
+        cookie: desk,
+      });
+      assert.strictEqual(good.status, 200, `a valid cap still applies (${JSON.stringify(good.json || {})})`);
+    });
     //
     // The route applied status and role in sequence, each through lib/admin.js
     // which opens its OWN transaction(). So the role half could 400 AFTER the

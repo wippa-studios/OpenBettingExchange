@@ -1253,26 +1253,34 @@ app.post('/api/admin/risk/withdraw', requireAdmin, limit('admin'), (req, res) =>
   res.json(bots.withdrawAll(db));
 });
 
-app.put('/api/admin/risk/bots/:id', requireAdmin, limit('admin'), (req, res) => {
+// No `wrap` indirection: it was invoked exactly once, immediately, and existed
+// only to obscure the error handling. The blanket `if (!e.status) e.status =
+// 400` inside it stamped a CLIENT error onto anything thrown — a SQLITE_BUSY
+// during a restore, a constraint violation, a TypeError — and errorHandler only
+// logs at status >= 500, so a genuine fault produced a 400 to the operator AND
+// no log line at all. That contradicts the rule this same file enforces a few
+// hundred lines down ("Only schema constraints get a fabricated message;
+// anything else is a real fault and MUST surface as a 5xx").
+//
+// lib/risk.js now says 400 at the source for the errors that really are the
+// operator's input, so everything else can be forwarded as-is and keep its own
+// classification.
+app.put('/api/admin/risk/bots/:id', requireAdmin, limit('admin'), (req, res, next) => {
   const b = req.body || {};
-  const wrap = (req, res, next) => {
-    try {
-      res.json(
-        RISK.configure(db, {
-          actor: req.user,
-          botId: Number(req.params.id),
-          ...(b.max_liability_cents === undefined ? {} : { max_liability_cents: Number(b.max_liability_cents) }),
-          ...(b.max_daily_loss_cents === undefined ? {} : { max_daily_loss_cents: Number(b.max_daily_loss_cents) }),
-          ...(b.quote_skew === undefined ? {} : { quote_skew: Number(b.quote_skew) }),
-          ...(b.enabled === undefined ? {} : { enabled: !!b.enabled }),
-        })
-      );
-    } catch (e) {
-      if (!e.status) e.status = 400;
-      next(e);
-    }
-  };
-  wrap(req, res, next);
+  try {
+    res.json(
+      RISK.configure(db, {
+        actor: req.user,
+        botId: Number(req.params.id),
+        ...(b.max_liability_cents === undefined ? {} : { max_liability_cents: Number(b.max_liability_cents) }),
+        ...(b.max_daily_loss_cents === undefined ? {} : { max_daily_loss_cents: Number(b.max_daily_loss_cents) }),
+        ...(b.quote_skew === undefined ? {} : { quote_skew: Number(b.quote_skew) }),
+        ...(b.enabled === undefined ? {} : { enabled: !!b.enabled }),
+      })
+    );
+  } catch (e) {
+    next(e);
+  }
 });
 
 // ── Payments (Phase 3) ──────────────────────────────────────────────────────
