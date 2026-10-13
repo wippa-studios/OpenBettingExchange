@@ -139,8 +139,51 @@ check('L6 daily cap stops matching but the order still rests', async () => {
   assert.strictEqual(L.marketLiability(db, alice.id, MKT), 5000);
 });
 
-// L7: net, not gross. A cap on gross would be defeated by churn and would
+// ── #18: NET has to mean net of the FEE as well as the losses ──────────────
+//
+// L7 above claims to prove "net, not gross", but every settlement it inserts
+// carries commission_cents = 0. SUM(pnl_cents) and SUM(pnl_cents −
+// commission_cents) are identical for that data, so the check could not tell
+// the two implementations apart — it passed against the gross sum it was
+// written to disprove.
+//
+// The comment on netSettledToday asserted "pnl_cents is already net of
+// commission at write time". That was false: lib/settle.js writes the gross
+// delta to pnl_cents and the fee to its own column, so the cap counted a
+// player's winnings gross of what the venue charged them.
+check('L7b the daily cap is net of COMMISSION, not just of losses', async () => {
+  const { db, alice, marketId: MKT } = (await fixture());
+  // The reviewer's measured case: a win of 10000 with commission 250.
+  db.prepare(
+    "INSERT INTO settlements (market_id,user_id,credit_cents,commission_cents,pnl_cents) VALUES (?,?,0,?,?)"
+  ).run(MKT, alice.id, 250, 10000);
+
+  const raw = db
+    .prepare("SELECT pnl_cents p, commission_cents c FROM settlements WHERE user_id = ?")
+    .get(alice.id);
+  assert.strictEqual(raw.p, 10000, 'the row stores the GROSS delta');
+  assert.strictEqual(raw.c, 250, 'and the fee separately — so the sum must subtract it');
+
+  assert.strictEqual(
+    L.netSettledToday(db, alice.id),
+    9750,
+    'the cap counts 9750 net, not the 10000 gross pnl_cents'
+  );
+
+  // A LOSING settlement is charged no commission (lib/settle.js: commission is
+  // only taken when pnl > 0), so subtracting it must leave a loss unchanged —
+  // otherwise the cap would silently under-count losses too.
+  db.prepare(
+    "INSERT INTO settlements (market_id,user_id,credit_cents,commission_cents,pnl_cents) VALUES (?,?,0,0,?)"
+  ).run(MKT, alice.id, -5000);
+  assert.strictEqual(L.netSettledToday(db, alice.id), 4750, 'a loss still counts in full');
+});
+
+// L8: net, not gross. A cap on gross would be defeated by churn and would
 // effectively no-op for anyone net-flat — the opposite of the intent.
+//
+// NOTE: this one passes against the gross sum as well, because every row it
+// inserts has commission_cents = 0. L7b below is the check that can fail.
 check('L7 daily cap counts NET settlement, not gross', async () => {
   const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   db.prepare("INSERT INTO settlements (market_id,user_id,credit_cents,commission_cents,pnl_cents) VALUES (?,?,0,0,?)").run(MKT, alice.id, -40000);
@@ -295,6 +338,6 @@ check('L16 invalid limit values are refused, not coerced', async () => {
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 16) { console.error('expected 16 checks'); process.exit(1); }
+  if (passed < 17) { console.error("expected 17 checks"); process.exit(1); }
   console.log(`\nlimits.test.js: ${passed} checks passed`);
 })();
