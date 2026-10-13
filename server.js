@@ -1722,10 +1722,48 @@ app.get('/metrics', opsGuard, (req, res) => {
 
 // Backup/restore are deliberately POST and token-gated. `fs` handles the
 // snapshot; this only decides WHEN.
+//
+// NEITHER THE DESTINATION NOR THE RETENTION IS TAKEN FROM THE BODY.
+//
+// `dir` used to be `req.body.dir || config.BACKUP_DIR`, and lib/ops.js
+// mkdirSync's whatever it is handed before VACUUM INTO writes there. So any
+// caller who could reach this route could choose the directory, and the route
+// is reachable by any ADMIN plus the ops token. That is a write primitive over
+// the whole filesystem, and the obvious target is `public/` — which
+// express.static serves at the bottom of this file with NO authentication. A
+// snapshot dropped there is a complete copy of the players' funds database,
+// published to anyone who can fetch a URL.
+//
+// The destination is now config.BACKUP_DIR and nothing else. An operator who
+// wants a different one sets BACKUP_DIR and restarts, which is auditable from
+// the environment rather than from whatever the last request said. This is
+// deliberately stricter than "confine it to a subpath of BACKUP_DIR": a
+// destination that cannot move at runtime is a property you can read off the
+// code, and a subpath rule still has to be reasoned about per request.
+//
+// `retention` is still honoured, because "keep more snapshots than usual for
+// this one" is a reasonable thing to ask for — but it is CLAMPED to the same
+// 1..1000 range lib/config.js already validates for BACKUP_RETENTION. The
+// body could previously send 0, which switches pruning off entirely and lets
+// snapshots accumulate until the disk fills, or a number large enough to keep
+// every snapshot ever taken.
+const BACKUP_RETENTION_MIN = 1;
+const BACKUP_RETENTION_MAX = 1000;
+const backupRetentionFrom = (raw) => {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return config.BACKUP_RETENTION;
+  return Math.min(BACKUP_RETENTION_MAX, Math.max(BACKUP_RETENTION_MIN, Math.trunc(n)));
+};
+
 app.post('/api/admin/backup', requireAdmin, opsGuard, (req, res) => {
+  if (!config.BACKUP_DIR) {
+    return res.status(400).json({
+      error: 'No backup directory configured — set BACKUP_DIR and restart',
+    });
+  }
   const r = OPS.backup(db, {
-    dir: (req.body || {}).dir || config.BACKUP_DIR,
-    retention: (req.body || {}).retention ?? config.BACKUP_RETENTION,
+    dir: config.BACKUP_DIR,
+    retention: backupRetentionFrom((req.body || {}).retention ?? config.BACKUP_RETENTION),
   });
   AUDIT.record(db, req.user, AUDIT.ACTIONS.BACKUP_TAKEN, 'ops:backup', null, { path: r.path, bytes: r.bytes }, (req.body || {}).reason);
   res.json(r);
