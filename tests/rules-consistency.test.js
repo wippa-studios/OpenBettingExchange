@@ -82,7 +82,11 @@ check('S3 a finished greyhound race with a winner PAYS the winner', async () => 
   M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 3.0, stake_cents: 1000 });
   M.placeOrder(db, bob, { selection_id: s1, side: 'lay', price: 3.0, stake_cents: 1000 });
 
-  db.prepare("UPDATE events SET status = 'completed' WHERE id = ?").run(ev.id);
+  // The race has gone OFF - the one transition a real venue reaches on its own.
+  // This used to set status='completed', which lib/settle.js only writes once
+  // EVERY market on the event has settled, so the flag described a state the
+  // event could not be in while this market was still open.
+  db.prepare("UPDATE events SET starts_at = datetime('now','-2 hours') WHERE id = ?").run(ev.id);
   const r = R.applyOutcome(db, mkt.id, { status: 'completed', winners: [s1] });
   assert.strictEqual(r.outcome, 'settled', 'a finished race settles (it used to VOID)');
   const a = db.prepare('SELECT balance_cents b FROM users WHERE username=?').get('alice');
@@ -110,7 +114,11 @@ check('S4 a finished basketball game with a winner PAYS the winner', async () =>
   M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 1000 });
   M.placeOrder(db, bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 1000 });
 
-  db.prepare("UPDATE events SET status = 'completed' WHERE id = ?").run(ev.id);
+  // The race has gone OFF - the one transition a real venue reaches on its own.
+  // This used to set status='completed', which lib/settle.js only writes once
+  // EVERY market on the event has settled, so the flag described a state the
+  // event could not be in while this market was still open.
+  db.prepare("UPDATE events SET starts_at = datetime('now','-2 hours') WHERE id = ?").run(ev.id);
   const r = R.applyOutcome(db, mkt.id, { status: 'completed', winners: [s1] });
   assert.strictEqual(r.outcome, 'settled');
   assert.strictEqual(db.prepare('SELECT balance_cents b FROM users WHERE username=?').get('alice').b, 100000 + 1000 - 25, 'paid');
@@ -136,7 +144,11 @@ check('S5 horse racing is seeded and settles a dead heat as a joint favourite', 
   M.placeOrder(db, alice, { selection_id: red, side: 'back', price: 2.5, stake_cents: 1000 });
   M.placeOrder(db, bob, { selection_id: red, side: 'lay', price: 2.5, stake_cents: 1000 });
 
-  db.prepare("UPDATE events SET status = 'completed' WHERE id = ?").run(ev.id);
+  // The race has gone OFF - the one transition a real venue reaches on its own.
+  // This used to set status='completed', which lib/settle.js only writes once
+  // EVERY market on the event has settled, so the flag described a state the
+  // event could not be in while this market was still open.
+  db.prepare("UPDATE events SET starts_at = datetime('now','-2 hours') WHERE id = ?").run(ev.id);
   const r = R.applyOutcome(db, mkt.id, { status: 'completed', dead_heat: true, winners: [red, blue] });
   assert.strictEqual(r.outcome, 'settled', 'the dead heat settles');
   const m = db.prepare('SELECT dead_heat d, joint_winners j FROM markets WHERE id=?').get(mkt.id);

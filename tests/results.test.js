@@ -54,8 +54,15 @@ async function fixture(sport = 'football', fair = 2.0) {
 }
 
 // bet: a matched position so settlement has something to do.
-// The feed's precondition: the event has finished.
-const completeEvent = (f) => f.db.prepare("UPDATE events SET status='completed' WHERE id=(SELECT event_id FROM markets WHERE id=?)").run(f.marketId);
+// The feed's precondition: the event has gone OFF.
+//
+// This used to hand-write `UPDATE events SET status='completed'`, which is how
+// lib/results.js used to decide a market was pending — and which production can
+// only write once every market on the event has already settled, so no row
+// could ever satisfy it. The fixture manufactured a state no real venue reaches.
+// Off time is what actually reaches it, so that is what the fixture moves.
+const completeEvent = (f) =>
+  f.db.prepare("UPDATE events SET starts_at = datetime('now','-2 hours') WHERE id=(SELECT event_id FROM markets WHERE id=?)").run(f.marketId);
 
 const bet = (f) => {
   M.placeOrder(f.db, f.alice, { selection_id: f.s1, side: 'back', price: 2.0, stake_cents: 10000 });

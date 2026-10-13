@@ -63,12 +63,26 @@ const run = async () => {
   // bet() with a real counterparty: two backs never match.
   const bet = (f, who) => M.placeOrder(f.db, who, { selection_id: f.s1, side: 'back', price: 2.0, stake_cents: 1000 });
   const lay = (f, who) => M.placeOrder(f.db, who, { selection_id: f.s1, side: 'lay', price: 2.0, stake_cents: 1000 });
-  // The transition the feed exists to react to: the event finishes, and only
-  // THEN does the market become the feed's business.
-  const complete = (f) =>
-    f.db.prepare("UPDATE events SET status='completed' WHERE id = (SELECT event_id FROM markets WHERE id = ?)").run(f.marketId);
-  // Bet, then complete — the normal life of a market on the way to settlement.
-  const backed = (f) => { bet(f, f.alice); lay(f, f.bob); complete(f); return f; };
+  // THE TRANSITION THE FEED EXISTS TO REACT TO — reached HONESTLY.
+  //
+  // This used to be `UPDATE events SET status='completed'`, which hand-wrote
+  // the one flag that lib/results.js used to ask "is there a result yet?" and
+  // which production can only ever set AFTER every market on the event is
+  // already settled. The tests manufactured the exact state a real venue can
+  // never reach, which is why an unsatisfiable predicate sat behind a green
+  // suite and the poll settled nothing while reporting success forever.
+  //
+  // What actually happens is the clock moving: the race starts, betting closes,
+  // and a result becomes possible. So the fixture moves the off time into the
+  // past — the one thing a running venue does on its own — and leaves
+  // events.status alone. `pendingMarkets` must now return the market because
+  // the event is OFF, not because anybody wrote a flag.
+  const goOff = (f) =>
+    f.db.prepare(
+      "UPDATE events SET starts_at = datetime('now','-2 hours') WHERE id = (SELECT event_id FROM markets WHERE id = ?)"
+    ).run(f.marketId);
+  // Bet, then go off — the normal life of a market on the way to settlement.
+  const backed = (f) => { bet(f, f.alice); lay(f, f.bob); goOff(f); return f; };
 
   // A fake transport that records what it was asked and replies with a script.
   function stub(handler, calls) {
@@ -117,8 +131,8 @@ const run = async () => {
   await check('T2 the feed is asked for precisely the pending set', async () => {
     const f = (await fixture());
     backed(f);
-    // A second market that is NOT pending (its event is still live) must not be
-    // asked about, or the provider wastes work and we misread the answer.
+    // A second market that is NOT pending (its event has not gone off) must not
+    // be asked about, or the provider wastes work and we misread the answer.
     f.db.prepare(
       "INSERT INTO events (sport_id, name, starts_at, status) VALUES ((SELECT id FROM sports LIMIT 1), 'Later', datetime('now','+2 hours'), 'live')"
     ).run();
@@ -130,7 +144,7 @@ const run = async () => {
       fetchImpl: stub(() => jsonReply({ outcomes: {} }), calls),
     });
     const pending = R.pendingMarkets(f.db).map((m) => m.id);
-    assert.deepStrictEqual(pending, [f.marketId], 'only the completed event is pending');
+    assert.deepStrictEqual(pending, [f.marketId], 'only the event that is off is pending');
     await RF.pollNow(f.db, { fetcher });
     assert.strictEqual(calls.length, 1);
     const asked = calls[0].body.markets.map((m) => m.id);
@@ -340,9 +354,10 @@ const run = async () => {
   // nobody reads.
   await check('T10 an empty pending set is a successful poll', async () => {
     RF.resetState();
-    // An event still live: nothing pending.
+    // A fixture event two hours in the future: not off yet, so nothing pending.
+    // (This used to assert `status='live'` to say the same thing, which is the
+    // flag the old predicate read — a flag whose value here meant nothing.)
     const f = (await fixture());
-    f.db.prepare("UPDATE events SET status='live'").run();
     let called = false;
     const fetcher = RF.createFetcher({
       url: 'https://results.example/v1/outcomes',
@@ -500,6 +515,82 @@ const run = async () => {
     assert.strictEqual(RF.health().last_dropped, 0);
   });
 
+  // T19: THE TEST THAT WOULD HAVE CAUGHT #39, AND IT NEEDS NO FLAG.
+  //
+  // Every other test in this file made `pendingMarkets` return rows by hand-
+  // writing `UPDATE events SET status='completed'` — the one value production
+  // can only reach AFTER every market on the event has settled, so no row could
+  // ever satisfy the old predicate. Those fixtures manufactured the exact state
+  // the query could not return, and that is the whole reason the dead control
+  // shipped green.
+  //
+  // So this one builds the state the CLOCK builds: an event two hours in the
+  // past, an open market on it, nothing flagged. Nothing else is touched, and
+  // `events.status` is asserted to be exactly what it always was — because a
+  // test that only passes when a human has set the right flag is a test of the
+  // fixture, not of the product.
+  await check('T19 a market whose event is OFF is pending, with no hand-set flag', async () => {
+    RF.resetState();
+    const f = (await fixture());
+    // Before off: nothing pending. This is the honest precondition — a race
+    // that has not started cannot have a result.
+    assert.deepStrictEqual(R.pendingMarkets(f.db), [], 'a future event is not pending');
+    backed(f); // bets, then the off time passes
+    const pending = R.pendingMarkets(f.db);
+    assert.deepStrictEqual(pending.map((m) => m.id), [f.marketId], 'the off market IS pending');
+    // And the state a real venue is in: nobody wrote 'completed'. If this
+    // assertion ever needs to change, the test is asking a flag rather than a
+    // behaviour.
+    assert.notStrictEqual(
+      f.db.prepare('SELECT status s FROM events WHERE id = (SELECT event_id FROM markets WHERE id = ?)').get(f.marketId).s,
+      'completed',
+      "the event's status was never hand-set; the clock did this"
+    );
+    // The set survives the settled market: settlement removes it by closing the
+    // market, which is the same thing production does.
+    const fetcher = RF.createFetcher({
+      url: 'https://results.example/v1/outcomes',
+      fetchImpl: stub(() => jsonReply({ outcomes: { [f.marketId]: { status: 'completed', winners: [f.s1] } } }), []),
+    });
+    await RF.pollNow(f.db, { fetcher });
+    assert.deepStrictEqual(R.pendingMarkets(f.db), [], 'and it leaves the set once settled');
+
+    // A HELD market stays out even when off — the hold is a human decision and
+    // the feed must not be asked to overrule it.
+    const g = (await fixture());
+    backed(g);
+    g.db.prepare('UPDATE markets SET settlement_hold = 1 WHERE id = ?').run(g.marketId);
+    assert.deepStrictEqual(R.pendingMarkets(g.db), [], 'a held market is not pending, off or not');
+  });
+
+  // T20: THE SEEDED VENUE, UNMODIFIED. The assertion the issue asked for by
+  // name: for every event whose off time has passed, the pending set is
+  // non-empty. Stated against the real seed rather than a hand-built fixture,
+  // because the defect was never in the query — it was that the query asked for
+  // something no real venue state could satisfy.
+  await check('T20 a seeded venue with an off event has a non-empty pending set', async () => {
+    RF.resetState();
+    await require('../lib/bots').primeBotHash();
+    const db = openStore(':memory:');
+    await require('../lib/seed').seed(db);
+    // Everything the clock alone would do: today's fixtures go off.
+    db.prepare("UPDATE events SET starts_at = datetime('now','-1 hour') WHERE is_demo = 1").run();
+    const pending = R.pendingMarkets(db);
+    assert.ok(pending.length > 0, 'the seeded venue has something awaiting a result');
+    // And it is exactly the off events, not a superset: an event still in the
+    // future must not be in there, or the feed is asked about races that have
+    // not started.
+    db.prepare("UPDATE events SET starts_at = datetime('now','+2 hours') WHERE id NOT IN (SELECT event_id FROM markets WHERE status='open')").run();
+    const later = R.pendingMarkets(db);
+    for (const m of later) {
+      assert.ok(
+        Date.parse(db.prepare('SELECT starts_at s FROM events WHERE id = ?').get(m.event_id).s.replace(' ', 'T') + 'Z') <= Date.now(),
+        'every pending market belongs to an event that is off'
+      );
+    }
+    db.close();
+  });
+
   // T13: the secret is sent as a bearer token, and a feed with no secret does
   // not invent one.
   await check('T13 the feed is authenticated when a secret is configured', async () => {
@@ -586,7 +677,7 @@ const run = async () => {
   });
 
   console.log(`\nresultsfeed.test.js: ${passed} checks passed`);
-  if (passed < 19) { console.error('expected 19 checks'); process.exit(1); }
+  if (passed < 21) { console.error('expected 21 checks'); process.exit(1); }
 };
 
 run().catch((e) => { console.error(e); process.exit(1); });

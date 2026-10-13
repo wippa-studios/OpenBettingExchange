@@ -433,9 +433,47 @@ sport ──< competition ──< event ──< market ──< runner
   settlement until a human releases it with a written reason. A disputed or
   unrecognised outcome parks here rather than being settled or voided, because
   settling picks a side and voiding may give away money the venue owes.
-- An event is **completed** when all of its markets are settled.
+- An event is **completed** when all of its markets are settled. That flag is a
+  *settlement* fact and is deliberately NOT what makes a market eligible for
+  automatic settlement: it can only be true once every market on the event has
+  already settled, so requiring it would make the pending set empty by
+  construction. What makes a market eligible is that it is **off** — see
+  [Automatic settlement](#automatic-settlement).
 - Events whose start time has passed roll from `upcoming` to `live` at boot, so a
   demo left running does not slowly empty its own board.
+
+### Automatic settlement
+
+A market is **pending** — the set a results-feed poll asks about — when it is
+`open`, not on a settlement hold, and its event is **off**. Off is the whole
+condition, and it is deliberately not a flag anyone writes:
+
+- `events.status = 'completed'` cannot serve. It is written only once every
+  market on the event is already `settled`, so an event that is completed has no
+  open market, and an event with an open market is never completed. The two
+  halves of "open market on a completed event" cannot both hold, which made the
+  pending set empty by construction: the poll reported success on every cycle
+  while settling nothing.
+- **Off time** is reached by the clock. It is also the honest question to ask —
+  "might a result exist for this market?" is about whether the race has happened,
+  not about whether we have already been told the answer.
+
+The comparison runs through `lib/offtime.js`, not SQL string comparison, because
+`events.starts_at` is text in several formats and one codebase must have one
+answer to "is this event off?". An event whose off time is missing or
+unparseable is treated as **off** here. That is the opposite of the betting
+gate, and both are right: for placing a bet "cannot prove it is pre-off" must
+refuse, while for settling "cannot prove it has not finished" must still ask.
+
+One definition serves both sides. `lib/results.js` `pendingMarkets` is the single
+query, used by the consumer (`pollOnce`) and by the transport, which POSTs
+precisely that set — a transport asking about a different set would look healthy
+while outcomes never arrived.
+
+**The transport is a signal, not an authority.** A response the venue cannot
+read raises rather than being read as "no outcomes", and a payload containing
+entries of which none parsed is a shape change, not an absence of results. Both
+were silent successes that settled nothing while reporting healthy forever.
 
 ## Limits and configuration
 
