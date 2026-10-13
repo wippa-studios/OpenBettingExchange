@@ -16,7 +16,12 @@ const { openStore } = require('../lib/store');
 const A = require('../lib/auth');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 // The lock lives in server.js middleware, so the rules it encodes are tested
 // here as a specification of what that middleware must do.
@@ -28,20 +33,20 @@ const ALLOWLIST = [
   'DELETE /api/auth/sessions/:id',
 ];
 
-function fixture() {
+async function fixture() {
   const db = openStore(':memory:');
-  const demo = A.registerUser(db, { username: 'demo', password: 'demo123', balance_cents: 1000 });
-  const admin = A.createAccount(db, { username: 'admin', password: 'admin123', role: 'admin', is_admin: 1, balance_cents: 0 });
+  const demo = (await A.registerUser(db, { username: 'demo', password: 'demo123', balance_cents: 1000 }));
+  const admin = (await A.createAccount(db, { username: 'admin', password: 'admin123', role: 'admin', is_admin: 1, balance_cents: 0 }));
   db.prepare('UPDATE users SET must_change_password = 1 WHERE username IN (?,?)').run('demo', 'admin');
-  const safe = A.registerUser(db, { username: 'safe', password: 'a-real-password', balance_cents: 1000 });
+  const safe = (await A.registerUser(db, { username: 'safe', password: 'a-real-password', balance_cents: 1000 }));
   return { db, demo, admin, safe };
 }
 
 const flag = (db, id) => db.prepare('SELECT must_change_password f FROM users WHERE id=?').get(id).f === 1;
 
 // F1: an account on a demo password is flagged; one with a real password is not.
-check('F1 the lock flags only accounts on a seeded demo password', () => {
-  const { db, demo, admin, safe } = fixture();
+check('F1 the lock flags only accounts on a seeded demo password', async () => {
+  const { db, demo, admin, safe } = (await fixture());
   assert.strictEqual(flag(db, demo.id), true, 'demo is flagged');
   assert.strictEqual(flag(db, admin.id), true, 'admin is flagged');
   assert.strictEqual(flag(db, safe.id), false, 'a real password is not flagged');
@@ -49,7 +54,7 @@ check('F1 the lock flags only accounts on a seeded demo password', () => {
 
 // F2: the allowlist is the MINIMUM needed to reach the fix. An allowlist that
 // grew by accident is how a "lock" quietly becomes no lock.
-check('F2 the allowlist is exactly what is needed to reach the fix', () => {
+check('F2 the allowlist is exactly what is needed to reach the fix', async () => {
   assert.deepStrictEqual(ALLOWLIST.sort(), [
     'DELETE /api/auth/sessions/:id',
     'GET /api/auth/sessions',
@@ -70,27 +75,27 @@ check('F2 the allowlist is exactly what is needed to reach the fix', () => {
 
 // F3: changing the password CLEARS the flag. This is the only path that does,
 // which is what makes the lock escapable and impossible to leave stuck.
-check('F3 changing the password releases the lock', () => {
-  const { db, demo } = fixture();
+check('F3 changing the password releases the lock', async () => {
+  const { db, demo } = (await fixture());
   assert.strictEqual(flag(db, demo.id), true);
-  A.changePassword(db, { userId: demo.id, currentPassword: 'demo123', newPassword: 'a-new-real-password' });
+  await A.changePassword(db, { userId: demo.id, currentPassword: 'demo123', newPassword: 'a-new-real-password' });
   assert.strictEqual(flag(db, demo.id), false, 'lock released');
 });
 
 // F4: the demo password no longer works after the change — the lock is not a
 // UI suggestion, the credential genuinely changed.
-check('F4 the seeded password stops working after the change', () => {
-  const { db, demo } = fixture();
-  A.changePassword(db, { userId: demo.id, currentPassword: 'demo123', newPassword: 'a-new-real-password' });
-  assert.throws(() => A.loginUser(db, { username: 'demo', password: 'demo123' }), (e) => e.status === 401);
-  const u = A.loginUser(db, { username: 'demo', password: 'a-new-real-password' });
+check('F4 the seeded password stops working after the change', async () => {
+  const { db, demo } = (await fixture());
+  await A.changePassword(db, { userId: demo.id, currentPassword: 'demo123', newPassword: 'a-new-real-password' });
+  await assert.rejects(A.loginUser(db, { username: 'demo', password: 'demo123' }), (e) => e.status === 401);
+  const u = (await A.loginUser(db, { username: 'demo', password: 'a-new-real-password' }));
   assert.ok(u.token, 'and the new one works');
 });
 
 // F5: an admin left on admin123 is the WORST state this project can be
 // deployed in, so the ledger and balance-movement routes must be unreachable.
-check('F5 a locked admin cannot reach the ledger or move balances', () => {
-  const { db, admin } = fixture();
+check('F5 a locked admin cannot reach the ledger or move balances', async () => {
+  const { db, admin } = (await fixture());
   // The routes are enforced in server.js middleware; what is asserted here is
   // that the FLAG is set on the account that would be allowed to reach them.
   assert.strictEqual(flag(db, admin.id), true, 'the admin is flagged');
@@ -102,9 +107,9 @@ check('F5 a locked admin cannot reach the ledger or move balances', () => {
 
 // F6: sessions survive the lock. Being locked out entirely would leave the
 // operator with no route to the panel that fixes it.
-check('F6 a locked account can still hold a session', () => {
-  const { db, demo } = fixture();
-  const { token, user } = A.loginUser(db, { username: 'demo', password: 'demo123' });
+check('F6 a locked account can still hold a session', async () => {
+  const { db, demo } = (await fixture());
+  const { token, user } = (await A.loginUser(db, { username: 'demo', password: 'demo123' }));
   assert.ok(token, 'sign-in still works while locked');
   assert.strictEqual(user.must_change_password, true, 'and the client is told');
   const live = A.sessionUser(db, token);
@@ -114,11 +119,11 @@ check('F6 a locked account can still hold a session', () => {
 
 // F7: the flag reaches the CLIENT, so the UI can route to the password panel
 // rather than letting the operator discover the lock by clicking.
-check('F7 the flag is exposed on the sanitized user', () => {
-  const { db, demo, safe } = fixture();
-  const locked = A.loginUser(db, { username: 'demo', password: 'demo123' }).user;
+check('F7 the flag is exposed on the sanitized user', async () => {
+  const { db, demo, safe } = (await fixture());
+  const locked = (await A.loginUser(db, { username: 'demo', password: 'demo123' })).user;
   assert.strictEqual(locked.must_change_password, true);
-  const free = A.loginUser(db, { username: 'safe', password: 'a-real-password' }).user;
+  const free = (await A.loginUser(db, { username: 'safe', password: 'a-real-password' })).user;
   assert.strictEqual(free.must_change_password, false);
   // And it is never undefined, so the UI can branch on it directly.
   assert.notStrictEqual(locked.must_change_password, undefined);
@@ -127,11 +132,11 @@ check('F7 the flag is exposed on the sanitized user', () => {
 
 // F8: a migrated database gains the column and defaults to UNLOCKED. Defaulting
 // to locked would brick an existing venue on upgrade.
-check('F8 the column migrates with a safe default', () => {
+check('F8 the column migrates with a safe default', async () => {
   const db = openStore(':memory:');
   const col = db.prepare("SELECT name FROM pragma_table_info('users') WHERE name='must_change_password'").get();
   assert.ok(col, 'column exists');
-  const u = A.registerUser(db, { username: 'zoe', password: 'a-real-password' });
+  const u = (await A.registerUser(db, { username: 'zoe', password: 'a-real-password' }));
   assert.strictEqual(flag(db, u.id), false, 'new accounts are not locked');
 });
 
@@ -152,7 +157,7 @@ check('F8 the column migrates with a safe default', () => {
 //
 // This is asserted as a SPECIFICATION of server.js, the same way the rest of
 // this suite specifies the middleware it cannot import.
-check('F-lock the lock covers routes with optional auth, which bypass requireAuth', () => {
+check('F-lock the lock covers routes with optional auth, which bypass requireAuth', async () => {
   const src = require('fs').readFileSync(require.resolve('../server'), 'utf8');
   // requireAuth performs the check, so every route that authenticates is covered
   // regardless of where it sits in the file.
@@ -170,5 +175,22 @@ check('F-lock the lock covers routes with optional auth, which bypass requireAut
   }
 });
 
-console.log(`\nsetup.test.js: ${passed} checks passed`);
-if (passed < 9) { console.error('expected 8 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 9) { console.error('expected 8 checks'); process.exit(1); }
+  console.log(`\nsetup.test.js: ${passed} checks passed`);
+})();

@@ -30,10 +30,19 @@ const acc = require('../lib/accounts');
 const config = require('./../lib/config');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 let n = 0;
-function fixture(selections = [['Alpha', 2.0], ['Beta', 2.0]]) {
+async function fixture(selections = [['Alpha', 2.0], ['Beta', 2.0]]) {
+  // ensureBot() is synchronous (it runs inside transactions in lib/settle.js and
+  // lib/cashoutrisk.js) and so cannot derive the house password hash itself.
+  // This venue is hand-built rather than seeded, so prime it explicitly.
+  await require('../lib/bots').primeBotHash();
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sport = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -47,8 +56,8 @@ function fixture(selections = [['Alpha', 2.0], ['Beta', 2.0]]) {
     db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, ?)').run(mkt.id, nm, fair);
     ids[nm] = db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, nm).id;
   }
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 1000000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 1000000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 1000000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 1000000 }));
   return { db, alice, bob, marketId: mkt.id, ids };
 }
 
@@ -56,8 +65,8 @@ const wallet = (db, id) => db.prepare('SELECT balance_cents b, frozen_cents f FR
 
 // C1: the quote is a VALUATION over outcomes, and it works for more than one
 // selection — which is the whole point of the change.
-check('C1 a multi-selection position is quotable', () => {
-  const { db, alice, bob, marketId, ids } = fixture();
+check('C1 a multi-selection position is quotable', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
   M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
   M.placeOrder(db, alice, { selection_id: ids.Beta, side: 'back', price: 3.0, stake_cents: 10000 });
@@ -80,9 +89,9 @@ check('C1 a multi-selection position is quotable', () => {
 
 // C2: OVERROUND IS REMOVED. A book summing to more than 100% must not pay the
 // player the difference — that would be a free 5% handed out by a pricing bug.
-check('C2 an overround book does not pay out the overround', () => {
+check('C2 an overround book does not pay out the overround', async () => {
   // Two selections both at 1.9 -> implied probs sum to 1/1.9*2 = 1.0526.
-  const { db, alice, bob, marketId, ids } = fixture([['Alpha', 1.9], ['Beta', 1.9]]);
+  const { db, alice, bob, marketId, ids } = (await fixture([['Alpha', 1.9], ['Beta', 1.9]]));
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
   M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
   const plan = cashout.cashoutQuote(db, alice, marketId);
@@ -94,8 +103,8 @@ check('C2 an overround book does not pay out the overround', () => {
 
 // C3: an underwater position is refused. Paying a player to take on risk they
 // did not want is how a venue hands out free money.
-check('C3 an underwater position is not bought out', () => {
-  const { db, alice, bob, marketId, ids } = fixture();
+check('C3 an underwater position is not bought out', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
   // Fair is 2.0, so backing at 1.2 buys a selection WORTH 2.0 at 1.2 — that is
   // backwards. (Backing at 3.0 would be the opposite: paying 3.0 for something
   // worth 2.0, which is in the money and correctly quotable.)
@@ -111,8 +120,8 @@ check('C3 an underwater position is not bought out', () => {
 // C4: an unpriced selection makes the valuation untrustworthy, so no quote.
 // Treating an unpriceable runner as "certain not to win" would produce a
 // payout that ignores a real outcome.
-check('C4 an unpriced selection suppresses the quote', () => {
-  const { db, alice, bob, marketId, ids } = fixture();
+check('C4 an unpriced selection suppresses the quote', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
   db.prepare('UPDATE selections SET fair_price = NULL WHERE id = ?').run(ids.Beta);
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
   M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
@@ -123,8 +132,8 @@ check('C4 an unpriced selection suppresses the quote', () => {
 // implementation of the settlement arithmetic; a one-cent disagreement would
 // mean the quoted cash-out differs from the settlement the player was
 // avoiding — exactly the drift an exchange cannot afford.
-check('C5 quoted payouts match what settlement would actually pay', () => {
-  const { db, alice, bob, marketId, ids } = fixture();
+check('C5 quoted payouts match what settlement would actually pay', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
   M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
 
@@ -135,7 +144,7 @@ check('C5 quoted payouts match what settlement would actually pay', () => {
     const selId = ids[selName];
     const quote = payouts.find((p) => p.selection_id === selId).payout_cents;
     // Settle a FRESH identical market and read the real settlement P&L.
-    const f2 = fixture();
+    const f2 = (await fixture());
     M.placeOrder(f2.db, f2.alice, { selection_id: f2.ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
     M.placeOrder(f2.db, f2.bob, { selection_id: f2.ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
     settle.settleMarket(f2.db, f2.marketId, { winner_selection_id: selId });
@@ -146,8 +155,8 @@ check('C5 quoted payouts match what settlement would actually pay', () => {
 
 // C6: the buyout releases the player's collateral and pays the quote. The
 // stake comes back — a cash-out sells the POSITION, it does not confiscate it.
-check('C6 executing a buyout returns the stake AND pays the quote', () => {
-  const { db, alice, bob, marketId, ids } = fixture();
+check('C6 executing a buyout returns the stake AND pays the quote', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
   M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
   const plan = cashout.cashoutQuote(db, alice, marketId);
@@ -166,8 +175,8 @@ check('C6 executing a buyout returns the stake AND pays the quote', () => {
 // C7: THE ONE THAT MATTERS MOST. A settled market must NOT pay the position a
 // second time. Skipping the cashout marker is a double-settlement, which is
 // not a rounding error.
-check('C7 a cashed-out position is NOT settled again', () => {
-  const { db, alice, bob, marketId, ids } = fixture();
+check('C7 a cashed-out position is NOT settled again', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
   M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
   const plan = cashout.cashoutQuote(db, alice, marketId);
@@ -185,8 +194,8 @@ check('C7 a cashed-out position is NOT settled again', () => {
 
 // C8: the counterparty still settles normally. Cashing out one side must not
 // rob the other side of the match — they are owed the pot either way.
-check('C8 the counterparty is unaffected by the player cashing out', () => {
-  const { db, alice, bob, marketId, ids } = fixture();
+check('C8 the counterparty is unaffected by the player cashing out', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
   M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
   const bobBefore = wallet(db, bob.id);
@@ -203,8 +212,8 @@ check('C8 the counterparty is unaffected by the player cashing out', () => {
 
 // C9: resting orders in the market are cancelled so they cannot be matched
 // into a position the player no longer holds.
-check('C9 resting orders in the market are cancelled by the buyout', () => {
-  const { db, alice, bob, marketId, ids } = fixture([['Alpha', 2.0], ['Beta', 2.0], ['Gamma', 2.0]]);
+check('C9 resting orders in the market are cancelled by the buyout', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture([['Alpha', 2.0], ['Beta', 2.0], ['Gamma', 2.0]]));
   // Three runners at fair 2.0 means each is worth 1/3. Backing at 2.5 would be
   // UNDERWATER here (EV = 1/3*1.5s - 2/3*s < 0), so this prices at 3.5:
   // payouts +75000 / -30000 / -30000 -> mean +5000.
@@ -221,8 +230,8 @@ check('C9 resting orders in the market are cancelled by the buyout', () => {
 
 // C10: the books stay whole through the whole flow, including a void after a
 // buyout (the case where a double-payment is most likely).
-check('C10 books balance through buyout then void', () => {
-  const { db, alice, bob, marketId, ids } = fixture();
+check('C10 books balance through buyout then void', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
   M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
   cashout.cashoutMarket(db, alice, marketId);
@@ -235,8 +244,8 @@ check('C10 books balance through buyout then void', () => {
 });
 
 // C11: cashing out twice is refused, not double-paid.
-check('C11 a second cash-out of the same position is refused', () => {
-  const { db, alice, bob, marketId, ids } = fixture();
+check('C11 a second cash-out of the same position is refused', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
   M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
   cashout.cashoutMarket(db, alice, marketId);
@@ -247,11 +256,11 @@ check('C11 a second cash-out of the same position is refused', () => {
 });
 
 // C12: a player with no position gets no quote, and neither does the house.
-check('C12 no position, or the house, gets no quote', () => {
-  const { db, alice, bob, marketId, ids } = fixture();
+check('C12 no position, or the house, gets no quote', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
   M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
-  const carol = A.registerUser(db, { username: 'carol', password: 'pw-carol-123', balance_cents: 100000 });
+  const carol = (await A.registerUser(db, { username: 'carol', password: 'pw-carol-123', balance_cents: 100000 }));
   assert.strictEqual(cashout.cashoutQuote(db, carol, marketId), null, 'no position');
   void config;
 });
@@ -265,8 +274,8 @@ check('C12 no position, or the house, gets no quote', () => {
 // a bricked market, no repair path, on the second-most-natural trade on the
 // board. This test mirrors C8 with the sides swapped, and asserts settlement
 // completes with the counterparty paid EXACTLY.
-check('C13 the LAY side cashes out and the BACK counterparty is preserved exactly', () => {
-  const { db, alice, bob, marketId, ids } = fixture();
+check('C13 the LAY side cashes out and the BACK counterparty is preserved exactly', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
   // Bob LAYS a profitable price (1.5), so his position is quotable: laying at
   // 2.5 in a 2.0/2.0 book is value-destroying and correctly gets no quote.
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
@@ -303,5 +312,22 @@ check('C13 the LAY side cashes out and the BACK counterparty is preserved exactl
   assert.strictEqual(acc.assertConserved(db), 0, 'and the books still balance');
 });
 
-console.log(`\ncashout2.test.js: ${passed} checks passed`);
-if (passed < 13) { console.error("expected 13 checks"); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 13) { console.error("expected 13 checks"); process.exit(1); }
+  console.log(`\ncashout2.test.js: ${passed} checks passed`);
+})();

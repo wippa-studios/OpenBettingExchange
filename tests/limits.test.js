@@ -25,10 +25,15 @@ const M = require('../lib/match');
 const ledger = require('../lib/ledger');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 // Fresh graph: one market, one selection, two players, funded.
-function fixture() {
+async function fixture() {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sport = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -38,8 +43,8 @@ function fixture() {
   const mkt = db.prepare("SELECT id FROM markets WHERE event_id=?").get(ev.id);
   db.prepare("INSERT INTO selections (market_id, name, fair_price) VALUES (?, 'Runner', 2.0)").run(mkt.id);
   const sel = db.prepare("SELECT id FROM selections WHERE market_id=?").get(mkt.id);
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 1000000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 1000000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 1000000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 1000000 }));
   return { db, alice, bob, marketId: mkt.id, selId: sel.id };
 }
 
@@ -47,8 +52,8 @@ const status = (e) => { try { throw e; } catch (x) { return { status: x.status, 
 const codeOf = (fn) => { try { fn(); return null; } catch (e) { return e.details && e.details.code; } };
 
 // L1: no limits row means NO CAP on every axis — never a cap of zero.
-check('L1 absent limits row means unlimited, not zero', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L1 absent limits row means unlimited, not zero', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   const eff = L.effective(db, alice.id, MKT);
   assert.strictEqual(eff.max_open_stake_cents, null);
   assert.strictEqual(eff.max_market_liability_cents, null);
@@ -57,8 +62,8 @@ check('L1 absent limits row means unlimited, not zero', () => {
 });
 
 // L2: a stake cap refuses placement, with a DISTINCT code (not a generic 400).
-check('L2 stake cap refuses placement with a distinct code', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L2 stake cap refuses placement with a distinct code', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global', max_open_stake_cents: 1000 });
   assert.throws(() => M.placeOrder(db, alice, { selection_id: SEL, side: 'back', price: 2.0, stake_cents: 5000 }),
     (e) => e.status === 429 && e.details.code === 'stake_limit_exceeded');
@@ -68,8 +73,8 @@ check('L2 stake cap refuses placement with a distinct code', () => {
 
 // L3: market liability is checked against RESTING escrow, and the refusal
 // carries the cap and the current figure so the UI can explain itself.
-check('L3 market liability cap refuses the order that breaches it', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L3 market liability cap refuses the order that breaches it', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   L.setLimits(db, { actor: alice, userId: alice.id, scope: L.marketScope(MKT), max_market_liability_cents: 3000 });
   M.placeOrder(db, alice, { selection_id: SEL, side: 'back', price: 2.0, stake_cents: 2000 });
   assert.strictEqual(L.marketLiability(db, alice.id, MKT), 2000);
@@ -86,8 +91,8 @@ check('L3 market liability cap refuses the order that breaches it', () => {
 // L4: cancelling releases escrow and frees the liability headroom again.
 // Without this a limit would be a one-way ratchet that permanently strands
 // an account once it had been reached.
-check('L4 cancel releases liability headroom', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L4 cancel releases liability headroom', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   L.setLimits(db, { actor: alice, userId: alice.id, scope: L.marketScope(MKT), max_market_liability_cents: 3000 });
   const o = M.placeOrder(db, alice, { selection_id: SEL, side: 'back', price: 2.0, stake_cents: 2000 }).order;
   assert.strictEqual(L.marketLiability(db, alice.id, MKT), 2000);
@@ -98,8 +103,8 @@ check('L4 cancel releases liability headroom', () => {
 
 // L5: a market scope overrides global PER AXIS, not wholesale. Setting a
 // market liability cap must not silently clear the user's global daily cap.
-check('L5 market scope overrides per axis only', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L5 market scope overrides per axis only', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global', max_open_stake_cents: 1000, max_daily_settled_cents: 5000 });
   L.setLimits(db, { actor: alice, userId: alice.id, scope: L.marketScope(MKT), max_market_liability_cents: 7000 });
   const eff = L.effective(db, alice.id, MKT);
@@ -114,8 +119,8 @@ check('L5 market scope overrides per axis only', () => {
 
 // L6: the daily cap STOPS MATCHING but still lets the order REST. It must not
 // cancel: a vanished order changes the book for everyone else watching it.
-check('L6 daily cap stops matching but the order still rests', () => {
-  const { db, alice, bob, marketId: MKT, selId: SEL } = fixture();
+check('L6 daily cap stops matching but the order still rests', async () => {
+  const { db, alice, bob, marketId: MKT, selId: SEL } = (await fixture());
   // Bob rests a back at 2.0 that Alice would match.
   M.placeOrder(db, bob, { selection_id: SEL, side: 'back', price: 2.0, stake_cents: 5000 });
   // Alice already settled to exactly her daily cap today.
@@ -136,8 +141,8 @@ check('L6 daily cap stops matching but the order still rests', () => {
 
 // L7: net, not gross. A cap on gross would be defeated by churn and would
 // effectively no-op for anyone net-flat — the opposite of the intent.
-check('L7 daily cap counts NET settlement, not gross', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L7 daily cap counts NET settlement, not gross', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   db.prepare("INSERT INTO settlements (market_id,user_id,credit_cents,commission_cents,pnl_cents) VALUES (?,?,0,0,?)").run(MKT, alice.id, -40000);
   db.prepare("INSERT INTO settlements (market_id,user_id,credit_cents,commission_cents,pnl_cents) VALUES (?,?,0,0,?)").run(MKT, alice.id, 45000);
   assert.strictEqual(L.netSettledToday(db, alice.id), 5000, 'net of the loss');
@@ -146,15 +151,15 @@ check('L7 daily cap counts NET settlement, not gross', () => {
 });
 
 // L8: a suspended account cannot trade.
-check('L8 suspended account is refused with its own code', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L8 suspended account is refused with its own code', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   db.prepare("UPDATE users SET status='suspended' WHERE id=?").run(alice.id);
   assert.strictEqual(codeOf(() => M.placeOrder(db, alice, { selection_id: SEL, side: 'back', price: 2.0, stake_cents: 1000 })), 'account_suspended');
 });
 
 // L9: self-exclusion is absolute, cancels RESTING orders and releases escrow.
-check('L9 exclusion cancels resting orders and releases escrow', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L9 exclusion cancels resting orders and releases escrow', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   M.placeOrder(db, alice, { selection_id: SEL, side: 'back', price: 2.0, stake_cents: 2000 });
   assert.strictEqual(L.marketLiability(db, alice.id, MKT), 2000);
   const before = db.prepare('SELECT frozen_cents f, balance_cents b FROM users WHERE id=?').get(alice.id);
@@ -174,8 +179,8 @@ check('L9 exclusion cancels resting orders and releases escrow', () => {
 // L10: exclusion MUST NOT touch matched positions. Those are collateralised on
 // both sides and have to settle; releasing them would mean the venue chooses
 // which side of a matched bet to honour, at the counterparty's expense.
-check('L10 exclusion leaves MATCHED positions alone', () => {
-  const { db, alice, bob, marketId: MKT, selId: SEL } = fixture();
+check('L10 exclusion leaves MATCHED positions alone', async () => {
+  const { db, alice, bob, marketId: MKT, selId: SEL } = (await fixture());
   M.placeOrder(db, bob, { selection_id: SEL, side: 'back', price: 2.0, stake_cents: 5000 });
   const r = M.placeOrder(db, alice, { selection_id: SEL, side: 'lay', price: 2.0, stake_cents: 5000 });
   assert.strictEqual(r.fills.length, 1);
@@ -194,8 +199,8 @@ check('L10 exclusion leaves MATCHED positions alone', () => {
 });
 
 // L11: a TIMED exclusion lapses; a permanent one does not.
-check('L11 timed exclusion lapses, permanent does not', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L11 timed exclusion lapses, permanent does not', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   L.exclude(db, { actor: alice, userId: alice.id, until: '2000-01-01 00:00:00', reason: 'test' });
   assert.strictEqual(L.exclusionOf(db, alice.id), null, 'a past date is not an exclusion');
   assert.ok(M.placeOrder(db, alice, { selection_id: SEL, side: 'back', price: 2.0, stake_cents: 1000 }).order.id,
@@ -207,8 +212,8 @@ check('L11 timed exclusion lapses, permanent does not', () => {
 
 // L12: the refund is real money back — exclusion must not confiscate. (Ties
 // the whole module to the escrow invariant the engine exists to protect.)
-check('L12 exclusion never leaves funds trapped in escrow', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L12 exclusion never leaves funds trapped in escrow', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   const start = db.prepare('SELECT balance_cents b, frozen_cents f FROM users WHERE id=?').get(alice.id);
   for (const stake of [1000, 2500, 700]) {
     const o = M.placeOrder(db, alice, { selection_id: SEL, side: 'lay', price: 3.0, stake_cents: stake }).order;
@@ -227,8 +232,8 @@ check('L12 exclusion never leaves funds trapped in escrow', () => {
 // second placement cannot slip past the cap because it re-reads inside its own
 // transaction. Sequential-with-shared-state is the honest simulation here
 // (DatabaseSync is single-threaded, so a true interleaving is not expressible).
-check('L13 placement limit re-reads current liability, so it cannot be raced', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L13 placement limit re-reads current liability, so it cannot be raced', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   L.setLimits(db, { actor: alice, userId: alice.id, scope: L.marketScope(MKT), max_market_liability_cents: 3000 });
   M.placeOrder(db, alice, { selection_id: SEL, side: 'back', price: 2.0, stake_cents: 2000 });
   // A second placement reads the SAME database inside its own transaction and
@@ -240,8 +245,8 @@ check('L13 placement limit re-reads current liability, so it cannot be raced', (
 
 // L14: 0 is a real cap, not "unlimited". Reading a missing/zero cap as
 // unlimited is how a limit silently stops limiting.
-check('L14 a zero cap is a real zero, not unlimited', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L14 a zero cap is a real zero, not unlimited', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global', max_open_stake_cents: 0 });
   assert.strictEqual(L.effective(db, alice.id, MKT).max_open_stake_cents, 0);
   assert.strictEqual(codeOf(() => M.placeOrder(db, alice, { selection_id: SEL, side: 'back', price: 2.0, stake_cents: 1000 })), 'stake_limit_exceeded');
@@ -249,9 +254,9 @@ check('L14 a zero cap is a real zero, not unlimited', () => {
 
 // L15: a limit breach is AUDITED. The player will appeal, so the cause has to
 // be retrievable months later rather than living only in a log line.
-check('L15 limit changes and exclusions are audited', () => {
-  const { db, alice, bob, marketId: MKT, selId: SEL } = fixture();
-  const adm = A.registerUser(db, { username: 'ops', password: 'pw-ops-123' });
+check('L15 limit changes and exclusions are audited', async () => {
+  const { db, alice, bob, marketId: MKT, selId: SEL } = (await fixture());
+  const adm = (await A.registerUser(db, { username: 'ops', password: 'pw-ops-123' }));
   db.prepare("UPDATE users SET role='admin', is_admin=1 WHERE id=?").run(adm.id);
   L.setLimits(db, { actor: adm, userId: alice.id, scope: 'global', max_open_stake_cents: 1000 });
   L.exclude(db, { actor: adm, userId: bob.id, until: null, reason: 'operator decision' });
@@ -266,13 +271,30 @@ check('L15 limit changes and exclusions are audited', () => {
 
 // L16: limits reject nonsense rather than coercing it. A negative cap that
 // became "no cap" would be a silent bypass.
-check('L16 invalid limit values are refused, not coerced', () => {
-  const { db, alice, marketId: MKT, selId: SEL } = fixture();
+check('L16 invalid limit values are refused, not coerced', async () => {
+  const { db, alice, marketId: MKT, selId: SEL } = (await fixture());
   assert.throws(() => L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global', max_open_stake_cents: -5 }), /non-negative/);
   assert.throws(() => L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global', max_open_stake_cents: 1.5 }), /non-negative/);
   assert.throws(() => L.setLimits(db, { actor: alice, userId: alice.id, scope: 'evil"; DROP TABLE users;--' }), /Invalid limit scope/);
   assert.strictEqual(L.effective(db, alice.id, MKT).max_open_stake_cents, null, 'nothing was written');
 });
 
-console.log(`\nlimits.test.js: ${passed} checks passed`);
-if (passed < 16) { console.error('expected 16 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 16) { console.error('expected 16 checks'); process.exit(1); }
+  console.log(`\nlimits.test.js: ${passed} checks passed`);
+})();

@@ -69,7 +69,7 @@ const GOOD = { appKey: 'TESTKEYnotreal12', username: 'test.bettfair-demo', passw
 const db = openStore(':memory:');
 FRUN.setDb(db);
 const tenant = tenants.defaultTenant(db);
-const admin = auth.registerUser(db, { username: 'admin', password: 'pw-admin-1234', balance_cents: 0 });
+const admin = (await auth.registerUser(db, { username: 'admin', password: 'pw-admin-1234', balance_cents: 0 }));
 db.prepare("UPDATE users SET role='admin' WHERE id=?").run(admin.id);
 
 /** Poll until `fn()` is truthy, so tests never assert on a race. */
@@ -85,7 +85,7 @@ async function until(fn, what, timeoutMs = 6000) {
 
 // ── readiness ────────────────────────────────────────────────────────────────
 
-await check('R1 readiness names the SPECIFIC missing condition, never just false', () => {
+await check('R1 readiness names the SPECIFIC missing condition, never just false', async () => {
   const cases = [
     [{ FEED_ENABLED: false, FEED_RUNNER_ENABLED: true, FEED_DATABASE_URL: 'postgresql://a:b@h/x', FEED_CREDENTIALS_KEY: 'k' }, /FEED_ENABLED/],
     [{ FEED_ENABLED: true, FEED_RUNNER_ENABLED: false, FEED_DATABASE_URL: 'postgresql://a:b@h/x', FEED_CREDENTIALS_KEY: 'k' }, /FEED_RUNNER_ENABLED/],
@@ -115,7 +115,7 @@ await check('R1 readiness names the SPECIFIC missing condition, never just false
   config.FEED_CREDENTIALS_KEY = Buffer.from(process.env.FEED_CREDENTIALS_KEY, 'hex');
 });
 
-await check('R2 with no stored credential, start() refuses and explains — it does not launch a doomed child', () => {
+await check('R2 with no stored credential, start() refuses and explains — it does not launch a doomed child', async () => {
   const r = FRUN.start(tenant.id);
   assert.strictEqual(r.started, false);
   assert.match(r.reason, /no Betfair credentials stored/);
@@ -124,7 +124,7 @@ await check('R2 with no stored credential, start() refuses and explains — it d
 
 // ── redaction ────────────────────────────────────────────────────────────────
 
-await check('R3 redact removes every known secret and leaves ordinary text intact', () => {
+await check('R3 redact removes every known secret and leaves ordinary text intact', async () => {
   const secrets = [GOOD.appKey, GOOD.username, GOOD.password];
   const line = `auth failed for ${GOOD.username} using ${GOOD.password} (key ${GOOD.appKey})`;
   const out = FRUN.redact(line, secrets);
@@ -141,7 +141,7 @@ await check('R3 redact removes every known secret and leaves ordinary text intac
 
 // ── backoff ──────────────────────────────────────────────────────────────────
 
-await check('R4 backoff grows and is capped, so a bad credential cannot hammer Betfair', () => {
+await check('R4 backoff grows and is capped, so a bad credential cannot hammer Betfair', async () => {
   const state = { consecutiveFailures: 0 };
   const at = (n) => {
     state.consecutiveFailures = n;
@@ -193,7 +193,7 @@ await check('R6 child output that ECHOES THE PASSWORD is redacted before storage
   assert.ok(log.includes('started'), 'the start line is recorded');
 });
 
-await check('R7 health() returns no credential at all — not via status, not via env', () => {
+await check('R7 health() returns no credential at all — not via status, not via env', async () => {
   const h = FRUN.health(tenant.id);
   const serialised = JSON.stringify(h);
   for (const s of [GOOD.appKey, GOOD.username, GOOD.password]) {

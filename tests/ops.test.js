@@ -23,7 +23,12 @@ const OPS = require('../lib/ops');
 const acc = require('../lib/accounts');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 const tmpdir = (tag) => {
   const d = path.join(os.tmpdir(), `obx_ops_${tag}_${process.pid}`);
@@ -35,7 +40,7 @@ const tmpdir = (tag) => {
 // O1: liveness must NOT touch the database. A liveness probe that queries a
 // dependency restarts the process when that dependency blips, turning a
 // database outage into a crash loop — the outage makes it worse.
-check('O1 health reports liveness without touching the database', () => {
+check('O1 health reports liveness without touching the database', async () => {
   const h = OPS.health();
   assert.strictEqual(h.status, 'ok');
   assert.strictEqual(typeof h.uptime_seconds, 'number');
@@ -45,7 +50,7 @@ check('O1 health reports liveness without touching the database', () => {
 // O2: readiness DOES check, and it checks the LEDGER. A venue whose books
 // have drifted must not be sent players — it would be trading on a book
 // nobody can defend.
-check('O2 readiness verifies the database and the ledger', () => {
+check('O2 readiness verifies the database and the ledger', async () => {
   const db = openStore(':memory:');
   const r = OPS.readiness(db);
   assert.strictEqual(r.status, 'ready');
@@ -55,9 +60,9 @@ check('O2 readiness verifies the database and the ledger', () => {
   db.close();
 });
 
-check('O3 readiness reports NOT READY when the ledger drifts', () => {
+check('O3 readiness reports NOT READY when the ledger drifts', async () => {
   const db = openStore(':memory:');
-  const u = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
+  const u = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
   // Force an unbalanced posting, past the guard, to prove the probe catches it.
   const txId = Number(db.prepare("INSERT INTO transactions (user_id,type,amount_cents,balance_after,frozen_after) VALUES (?,'deposit',1,1,0)").run(u.id).lastInsertRowid);
   db.prepare("INSERT INTO entries (transaction_id, account_id, direction, amount_cents) VALUES (?,?,'credit',500)").run(txId, acc.accountId(db, 'house_float', null));
@@ -69,7 +74,7 @@ check('O3 readiness reports NOT READY when the ledger drifts', () => {
 
 // O4: metrics are the ones an operator actually watches on an exchange —
 // match rate and unmatched ratio, not CPU.
-check('O4 metrics expose match rate, unmatched ratio and drift', () => {
+check('O4 metrics expose match rate, unmatched ratio and drift', async () => {
   const db = openStore(':memory:');
   const m = OPS.metrics(db);
   assert.ok(m.includes('obx_match_rate'), 'match rate');
@@ -83,12 +88,12 @@ check('O4 metrics expose match rate, unmatched ratio and drift', () => {
 
 // O5: BACKUP. The real test: the snapshot must be restorable, not merely
 // present. A backup nobody has ever opened is a hope, not a backup.
-check('O5 backup produces a snapshot that opens, passes integrity, and restores', () => {
+check('O5 backup produces a snapshot that opens, passes integrity, and restores', async () => {
   const dir = tmpdir('backup');
   const dbPath = path.join(dir, 'live.db');
   const db = openStore(dbPath);
-  A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
-  A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 50000 });
+  await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
+  await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 50000 });
   db.close();
 
   const live = openStore(dbPath);
@@ -115,14 +120,14 @@ check('O5 backup produces a snapshot that opens, passes integrity, and restores'
 // O6: backup works on a LIVE database. This is the whole reason for using
 // VACUUM INTO rather than copying the file — a plain copy of a WAL database
 // can be torn.
-check('O6 backup is consistent while the database is open for writes', () => {
+check('O6 backup is consistent while the database is open for writes', async () => {
   const dir = tmpdir('live');
   const dbPath = path.join(dir, 'live.db');
   const db = openStore(dbPath);
-  const u = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
+  const u = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
   const snap = OPS.backup(db, { dir: path.join(dir, 'snap'), retention: 3 });
   // Write AFTER the snapshot: the snapshot must not contain it.
-  A.registerUser(db, { username: 'later', password: 'pw-later-123', balance_cents: 1000 });
+  await A.registerUser(db, { username: 'later', password: 'pw-later-123', balance_cents: 1000 });
   db.close();
 
   const snapDb = openStore(snap.path);
@@ -136,7 +141,7 @@ check('O6 backup is consistent while the database is open for writes', () => {
 
 // O7: retention. A backup timer with no pruning fills the disk, and a full
 // disk stops the venue as surely as a lost one.
-check('O7 retention prunes old snapshots and keeps the newest', () => {
+check('O7 retention prunes old snapshots and keeps the newest', async () => {
   const dir = tmpdir('retain');
   const snapDir = path.join(dir, 'snap');
   const dbPath = path.join(dir, 'live.db');
@@ -153,11 +158,11 @@ check('O7 retention prunes old snapshots and keeps the newest', () => {
 // O8: restore refuses to clobber a live venue without an explicit force.
 // Silently overwriting a book of balances is the operation that must be
 // impossible to do by accident.
-check('O8 restore refuses a non-empty target unless forced', () => {
+check('O8 restore refuses a non-empty target unless forced', async () => {
   const dir = tmpdir('restore');
   const dbPath = path.join(dir, 'live.db');
   const db = openStore(dbPath);
-  A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
+  await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
   const snap = OPS.backup(db, { dir: path.join(dir, 'snap') });
   db.close();
 
@@ -169,7 +174,7 @@ check('O8 restore refuses a non-empty target unless forced', () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-check('O9 restore rejects a corrupt snapshot rather than installing it', () => {
+check('O9 restore rejects a corrupt snapshot rather than installing it', async () => {
   const dir = tmpdir('corrupt');
   const bad = path.join(dir, 'bad.db');
   fs.writeFileSync(bad, 'this is not a database');
@@ -180,10 +185,10 @@ check('O9 restore rejects a corrupt snapshot rather than installing it', () => {
 
 // O10: maintenance. A long-running venue's -wal grows without bound unless
 // something checkpoints it.
-check('O10 maintenance checkpoints the WAL', () => {
+check('O10 maintenance checkpoints the WAL', async () => {
   const dir = tmpdir('maint');
   const db = openStore(path.join(dir, 'live.db'));
-  A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
+  await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
   const m = OPS.maintenance(db);
   assert.strictEqual(m.ok, true);
   db.close();
@@ -192,7 +197,7 @@ check('O10 maintenance checkpoints the WAL', () => {
 
 // R1: the volume limiter caps requests from a caller making only VALID
 // requests — the case the failure-based login limiter cannot see at all.
-check('R1 volume limiting caps a burst of valid requests', () => {
+check('R1 volume limiting caps a burst of valid requests', async () => {
   const { limit, volumeExceeded, resetVolumeLimits } = require('../server');
   resetVolumeLimits(); // isolate from any earlier test's counters
   const req = { user: { id: 1 }, socket: { remoteAddress: '127.0.0.1' } };
@@ -205,7 +210,7 @@ check('R1 volume limiting caps a burst of valid requests', () => {
 
 // R2: the budget is PER USER, not per IP. One noisy client must not exhaust
 // everyone else's budget behind the same NAT or proxy.
-check('R2 the volume budget is per user, not per IP', () => {
+check('R2 the volume budget is per user, not per IP', async () => {
   const { volumeExceeded, resetVolumeLimits } = require('../server');
   resetVolumeLimits();
   const noisy = { user: { id: 7 }, socket: { remoteAddress: '10.0.0.1' } };
@@ -217,7 +222,7 @@ check('R2 the volume budget is per user, not per IP', () => {
 
 // R3: buckets are independent. Exhausting trading budget must not lock a user
 // out of reading their own balance.
-check('R3 buckets are independent of one another', () => {
+check('R3 buckets are independent of one another', async () => {
   const { volumeExceeded, resetVolumeLimits } = require('../server');
   resetVolumeLimits();
   const req = { user: { id: 9 }, socket: { remoteAddress: '127.0.0.1' } };
@@ -227,5 +232,22 @@ check('R3 buckets are independent of one another', () => {
   resetVolumeLimits();
 });
 
-console.log(`\nops.test.js: ${passed} checks passed`);
-if (passed < 13) { console.error('expected 13 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 13) { console.error('expected 13 checks'); process.exit(1); }
+  console.log(`\nops.test.js: ${passed} checks passed`);
+})();

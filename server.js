@@ -154,7 +154,18 @@ const db = openStore(config.DB_PATH);
 // The feed supervisor reads its credentials from this same handle. Injected after
 // openStore so lib/feedrunner.js never has to import lib/store.js.
 FRUN.setDb(db);
-seedIfNeeded(db);
+// Seeding derives three password hashes, and each derivation now runs on
+// libuv's threadpool instead of blocking this thread. That makes the seed
+// genuinely asynchronous — which lib/tx.js cannot tolerate inside its
+// synchronous transaction, and which is exactly why lib/seed.js derives every
+// hash BEFORE opening that transaction (see the note there).
+//
+// The bootstrap is therefore a PROMISE, exported as `ready`. main() awaits it
+// before listening, and anything else that requires this module awaits it
+// before it assumes the catalogue exists. Nothing here is fire-and-forget:
+// a test that read the board while the seed was mid-flight would see an empty
+// venue and draw conclusions from it.
+const ready = seedIfNeeded(db);
 // Housekeeping: drop expired sessions at boot, and hourly while running —
 // a long-lived demo otherwise accumulates dead rows forever. The interval is
 // unref'd so it never keeps the process (or a test run) alive by itself.
@@ -581,14 +592,19 @@ function resetVolumeLimits() {
   volumeHits.clear();
 }
 
-app.post('/api/auth/register', (req, res) => {
+// async because A.registerUser derives the password hash, and that derivation
+// runs on libuv's threadpool rather than on this thread. Express 4 does not
+// await a handler, so every error must be caught INSIDE and re-thrown onto the
+// error handler explicitly — an async handler's rejection is an unhandled
+// promise rejection, not a 500.
+app.post('/api/auth/register', async (req, res, next) => {
   const { username, password, email } = req.body || {};
   // Registration abuse is account-farming or identity enumeration from one
   // machine, so the counter keys on the caller's IP.
   const key = 'register:' + (req.socket.remoteAddress || 'unknown');
   if (rlLocked(key)) return rlTooManyAttempts(res, key);
   try {
-    const user = A.registerUser(db, { username, password, email });
+    const user = await A.registerUser(db, { username, password, email });
     rlRecordSuccess(key);
     // Jurisdiction gate at session mint, not at bet placement. The country is
     // read ONLY from a proxy-overwritten header, and only when the operator has
@@ -600,27 +616,32 @@ app.post('/api/auth/register', (req, res) => {
     // A refused registration (validation, duplicate username) is a failed
     // attempt; anything else (a server fault) is not.
     if (e && (e.status === 400 || e.status === 409)) rlRecordFailure(key);
-    throw e;
+    next(e);
   }
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res, next) => {
   // Case-normalized on purpose: 'Admin', 'ADMIN' and 'admin' share one
   // counter, so case variants cannot farm fresh guessing windows.
   const key = 'login:' + String((req.body || {}).username || '').trim().toLowerCase();
-  // AND a per-SOURCE counter. The username key alone was trivially bypassed:
-  // crypto.scryptSync BLOCKS the event loop, so each attempt costs the whole
-  // process ~42ms of CPU, and an attacker who simply used a fresh username per
-  // request never touched any limit at all. Measured: 120 unauthenticated logins
-  // at concurrency 20 took /api/sports from a 1.6ms median to 723ms (p95
-  // 1568ms) — a ~460x amplification, with orders, matching, settlement, SSE and
-  // the admin desk all stopping together. One source cannot mint fresh username
-  // keys, so a per-source counter bounds the cost it can force.
+  // AND a per-SOURCE counter. The username key alone was trivially bypassed by
+  // an attacker who simply used a fresh username per request. That counter
+  // exists because key derivation used to BLOCK the event loop — every attempt
+  // froze the whole process, so 120 logins at concurrency 20 took /api/sports
+  // from a 1.6ms median to 723ms (p95 1568ms), a ~460x amplification, with
+  // orders, matching, settlement, SSE and the admin desk all stopping together.
+  //
+  // lib/auth.js now derives on libuv's threadpool, so a login no longer stalls
+  // concurrent requests. The limiter is KEPT rather than retired: it is still
+  // the thing that bounds how much CPU an unauthenticated caller can ask for,
+  // and threadpool parallelism moved that cost rather than deleting it — four
+  // concurrent guesses still occupy four pool slots. It is no longer the only
+  // thing standing between the venue and that, though.
   const ipKey = 'login-ip:' + (req.socket.remoteAddress || 'unknown');
   if (rlLocked(ipKey)) return rlTooManyAttempts(res, ipKey);
   if (rlLocked(key)) return rlTooManyAttempts(res, key);
   try {
-    const { user, token } = A.loginUser(db, { ...(req.body || {}), country: TEN.trustedCountry(req) });
+    const { user, token } = await A.loginUser(db, { ...(req.body || {}), country: TEN.trustedCountry(req) });
     rlRecordSuccess(key); // a success proves the real user — clear the slate
     rlRecordSuccess(ipKey);
     // Sign-in starts the RG session clock, and does NOT restart a session
@@ -634,7 +655,9 @@ app.post('/api/auth/login', (req, res) => {
       rlRecordFailure(key); // only auth misses count
       rlRecordFailure(ipKey); // …and they count against the source too
     }
-    throw e; // sync throw → Express forwards to the error handler
+    // Async handler: hand the error to Express explicitly. A throw here would
+    // reject the handler's promise and Express 4 would never see it.
+    next(e);
   }
 });
 
@@ -660,14 +683,15 @@ app.get('/api/me', requireAuth, (req, res) => {
 // Changing a password revokes every OTHER session, so the response reports how
 // many were invalidated — that count is the user's evidence that the action
 // did what they think it did.
-app.post('/api/auth/change-password', requireAuth, (req, res) => {
+app.post('/api/auth/change-password', requireAuth, async (req, res, next) => {
   const { currentPassword, newPassword } = req.body || {};
-  const r = A.changePassword(db, {
-    userId: req.user.id,
-    currentPassword,
-    newPassword,
-    keepToken: req.token,
-  });
+  try {
+    const r = await A.changePassword(db, {
+      userId: req.user.id,
+      currentPassword,
+      newPassword,
+      keepToken: req.token,
+    });
   // Audited as an account-security event: when an operator later investigates
   // a compromised account, "the password was changed at 14:02 by its owner"
   // and "changed at 14:02 by someone else" are both load-bearing facts. The
@@ -676,6 +700,9 @@ app.post('/api/auth/change-password', requireAuth, (req, res) => {
     sessions_revoked: r.sessionsRevoked,
   });
   res.json({ ok: true, sessions_revoked: r.sessionsRevoked });
+  } catch (e) {
+    next(e); // async handler — Express 4 cannot see a rejected promise
+  }
 });
 
 app.get('/api/auth/sessions', requireAuth, (req, res) => {
@@ -726,10 +753,10 @@ function mustChangePassword(user) {
  * ever SETS the flag — an account whose password has been changed is never
  * re-flagged, so a boot cannot lock out a venue that has already sorted itself.
  */
-function enforceFirstRunLock() {
+async function enforceFirstRunLock() {
   let flagged = 0;
   for (const name of ['admin', 'demo']) {
-    if (!isDefaultCredential(name)) continue;
+    if (!(await isDefaultCredential(name))) continue;
     const r = db.prepare('UPDATE users SET must_change_password = 1 WHERE username = ? AND must_change_password = 0').run(name);
     flagged += r.changes;
   }
@@ -2027,9 +2054,9 @@ app.use(errorHandler);
 // its well-known demo password. Checked against the STORED hash, so it stays
 // truthful for pre-existing databases — and stops warning exactly when the
 // operator changes the password or seeds a custom one.
-function warnDefaultCredentials() {
+async function warnDefaultCredentials() {
   for (const name of ['admin', 'demo']) {
-    if (!isDefaultCredential(name)) continue;
+    if (!(await isDefaultCredential(name))) continue;
     console.warn(
       `[security] "${name}" still accepts its seeded demo password and must change it before trading.`
     );
@@ -2044,13 +2071,19 @@ function warnDefaultCredentials() {
  * returns false immediately, whereas comparing config would keep flagging an
  * account that is already safe and train the operator to ignore the warning.
  */
-function isDefaultCredential(username) {
+async function isDefaultCredential(username) {
   const DEFAULTS = { admin: 'admin123', demo: 'demo123' };
   const row = db.prepare('SELECT pass_hash FROM users WHERE username = ?').get(username);
-  return !!row && A.verifyPassword(DEFAULTS[username], row.pass_hash);
+  return !!row && (await A.verifyPassword(DEFAULTS[username], row.pass_hash));
 }
 
-function main() {
+async function main() {
+  // The seed derives its password hashes off the event loop, so the catalogue
+  // is not there yet at require() time. Everything below — rolling events
+  // forward, quoting the bots' ladders, flipping the first-run lock — reads it,
+  // and a venue that listened before the seed landed would answer its first
+  // request from an empty board.
+  await ready;
   const rolled = rollForwardEvents(db);
   if (rolled) console.log(`[board] ${rolled} past-due event(s) moved to live`);
   startHeartbeat();
@@ -2115,8 +2148,12 @@ function main() {
     );
   }
 
-  enforceFirstRunLock();
-  warnDefaultCredentials();
+  // Both verify a stored hash, so both are async now that key derivation runs
+  // off the event loop. Awaited rather than fired: the lock has to be in place
+  // BEFORE the socket accepts a connection, or the first request of a fresh
+  // deployment would be served unlocked.
+  await enforceFirstRunLock();
+  await warnDefaultCredentials();
   if (config.FEED_ENABLED) {
     FEED.health()
       .then((h) => {
@@ -2140,6 +2177,18 @@ function main() {
   server.on('close', () => { FEED.close().catch(() => {}); });
 }
 
-if (require.main === module) main();
+// main() is async (it awaits the seed bootstrap and the first-run lock's key
+// derivations). A rejection here would otherwise be an unhandled rejection and
+// the process would sit there having never listened — which reads exactly like a
+// healthy start with no port bound.
+if (require.main === module) {
+  main().catch((e) => {
+    console.error('[boot] failed:', e && e.stack ? e.stack : e);
+    process.exit(1);
+  });
+}
 
-module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, OPS };
+// `ready` is exported so anything that requires this module can await the
+// seed before assuming the catalogue exists. tests/api.test.js, feed.test.js,
+// feed_nav.test.js and feedadmin.test.js all listen on `app` themselves.
+module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, ready, OPS };

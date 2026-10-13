@@ -20,16 +20,21 @@ const M = require('../lib/match');
 const S = require('../lib/settle'); // E17 closes its scenario end-to-end
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 let evCounter = 0;
 
-function fresh() {
+async function fresh() {
   const db = openStore(':memory:');
-  const mk = (name, bal) => A.registerUser(db, { username: name, password: 'secret1', balance_cents: bal });
+  const mk = async (name, bal) => A.registerUser(db, { username: name, password: 'secret1', balance_cents: bal });
   return {
     db,
-    users: { alice: mk('alice', 100000), bob: mk('bob', 100000), carol: mk('carol', 100000), dave: mk('dave', 100000) },
+    users: { alice: (await mk('alice', 100000)), bob: (await mk('bob', 100000)), carol: (await mk('carol', 100000)), dave: (await mk('dave', 100000)) },
   };
 }
 
@@ -67,8 +72,8 @@ const matchesFor = (db, marketId) =>
   db.prepare('SELECT price, stake_cents s FROM matches WHERE market_id = ? ORDER BY id').all(marketId).map((r) => ({ price: r.price, stake: r.s }));
 
 // E1: back taker matches a resting lay AT THE RESTING PRICE.
-check('E1 back matches resting lay at resting price', () => {
-  const { db, users } = fresh();
+check('E1 back matches resting lay at resting price', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   const a = M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 }).order;
   assert.deepStrictEqual(orderOf(db, a.id), { matched: 0, status: 'open' }); // no liquidity yet
@@ -82,8 +87,8 @@ check('E1 back matches resting lay at resting price', () => {
 });
 
 // E2: partial fill — remainder rests.
-check('E2 partial fill', () => {
-  const { db, users } = fresh();
+check('E2 partial fill', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   const a = M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 }).order;
   const b = M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 6000 });
@@ -94,8 +99,8 @@ check('E2 partial fill', () => {
 });
 
 // E3: lay taker matched at P < own price Q releases (Q-P)*fill excess.
-check('E3 lay excess escrow released', () => {
-  const { db, users } = fresh();
+check('E3 lay excess escrow released', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   const a = M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 }).order; // rests
   const b = M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.1, stake_cents: 10000 });
@@ -108,8 +113,8 @@ check('E3 lay excess escrow released', () => {
 });
 
 // E4: back taker sweeps resting lays HIGHEST price first (best-for-taker).
-check('E4 back sweep highest-first', () => {
-  const { db, users } = fresh();
+check('E4 back sweep highest-first', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.06, stake_cents: 10000 });
   M.placeOrder(db, users.carol, { selection_id: s1, side: 'lay', price: 2.02, stake_cents: 5000 });
@@ -126,8 +131,8 @@ check('E4 back sweep highest-first', () => {
 });
 
 // E5: lay taker sweeps resting backs LOWEST price first (least liability).
-check('E5 lay sweep lowest-first', () => {
-  const { db, users } = fresh();
+check('E5 lay sweep lowest-first', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 1.98, stake_cents: 10000 }); // rests
   M.placeOrder(db, users.dave, { selection_id: s1, side: 'back', price: 2.04, stake_cents: 5000 }); // rests
@@ -147,8 +152,8 @@ check('E5 lay sweep lowest-first', () => {
 });
 
 // E6: self-match guard — a user never matches their own resting order.
-check('E6 self-match guard', () => {
-  const { db, users } = fresh();
+check('E6 self-match guard', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
   const l = M.placeOrder(db, users.alice, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
@@ -158,8 +163,8 @@ check('E6 self-match guard', () => {
 });
 
 // E7: cancel releases the stake escrow; double-cancel and foreign orders reject.
-check('E7 cancel back order', () => {
-  const { db, users } = fresh();
+check('E7 cancel back order', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   const a = M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 }).order;
   const cancelled = M.cancelOrder(db, users.alice, a.id);
@@ -171,8 +176,8 @@ check('E7 cancel back order', () => {
 });
 
 // E8: cancel a resting lay releases the FULL liability escrow.
-check('E8 cancel lay order', () => {
-  const { db, users } = fresh();
+check('E8 cancel lay order', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   const l = M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.1, stake_cents: 10000 }).order;
   assert.deepStrictEqual(balances(db, users.bob.id), { b: 100000, f: 11000 });
@@ -181,8 +186,8 @@ check('E8 cancel lay order', () => {
 });
 
 // E9: order validation — stake bounds, side, suspended market.
-check('E9 validation', () => {
-  const { db, users } = fresh();
+check('E9 validation', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   assert.throws(() => M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 50 }), (e) => e.status === 400); // below MIN 100
   assert.throws(() => M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: '10000' }), (e) => e.status === 400);
@@ -193,8 +198,8 @@ check('E9 validation', () => {
 });
 
 // E10: LTP, trade tape and market volume update on fills.
-check('E10 LTP + trade tape + volume', () => {
-  const { db, users } = fresh();
+check('E10 LTP + trade tape + volume', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
@@ -207,8 +212,8 @@ check('E10 LTP + trade tape + volume', () => {
 });
 
 // E11: bookFor aggregates sizes at each price level, back DESC / lay ASC.
-check('E11 book aggregation + ordering', () => {
-  const { db, users } = fresh();
+check('E11 book aggregation + ordering', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
@@ -226,8 +231,8 @@ check('E11 book aggregation + ordering', () => {
 });
 
 // E12: lay escrow rounding is exact at 2dp prices (single rounding point).
-check('E12 escrow float exactness', () => {
-  const { db, users } = fresh();
+check('E12 escrow float exactness', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.02], ['Beta', 3.0]]);
   const l = M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.02, stake_cents: 10000 }).order;
   assert.deepStrictEqual(balances(db, users.bob.id), { b: 100000, f: 10200 }); // round(1.02*10000)
@@ -236,8 +241,8 @@ check('E12 escrow float exactness', () => {
 
 // E13: FIFO within a price level — two resting lays at the SAME price, the
 // older order must fill first (price-time priority, not arbitrary).
-check('E13 FIFO within a price level', () => {
-  const { db, users } = fresh();
+check('E13 FIFO within a price level', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 4000 });
   M.placeOrder(db, users.carol, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 4000 });
@@ -263,8 +268,8 @@ check('E13 FIFO within a price level', () => {
 // @ 1.03. Old formula released round((Q-P)*fill) = 2 and left 4 frozen while
 // settlement must release 5 — a permanently unsettleable market. New rule:
 // release = frozen - (fill liability + remainder escrow) = 6 - (5 + 0) = 1.
-check('E14 repro A: lay 150 @ 1.04 matched @ 1.03 releases 1, keeps 5', () => {
-  const { db, users } = fresh();
+check('E14 repro A: lay 150 @ 1.04 matched @ 1.03 releases 1, keeps 5', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   const a = M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 1.03, stake_cents: 150 }).order; // rests
   const b = M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 1.04, stake_cents: 150 });
@@ -279,8 +284,8 @@ check('E14 repro A: lay 150 @ 1.04 matched @ 1.03 releases 1, keeps 5', () => {
 // E15 (Critical-1 repro B): lay 155 @ 1.10 matched @ 1.02. Old formula left
 // 4 frozen while settlement releases 3 — one cent stranded forever. New rule:
 // release = 16 - (3 + 0) = 13; frozen 3 = exactly what settlement releases.
-check('E15 repro B: lay 155 @ 1.10 matched @ 1.02 keeps exactly 3', () => {
-  const { db, users } = fresh();
+check('E15 repro B: lay 155 @ 1.10 matched @ 1.02 keeps exactly 3', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 1.02, stake_cents: 155 }); // rests
   const b = M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 1.10, stake_cents: 155 });
@@ -295,8 +300,8 @@ check('E15 repro B: lay 155 @ 1.10 matched @ 1.02 keeps exactly 3', () => {
 // flawed release could strand. The sweep (lowest price first) releases
 // round(0.51*200) - 52 = 50 on the first fill; the wallet ends holding
 // exactly 52 = what settlement will release.
-check('E16 repro C: multi-fill lay 200 @ 1.51 ends with frozen == sum of fill liabilities', () => {
-  const { db, users } = fresh();
+check('E16 repro C: multi-fill lay 200 @ 1.51 ends with frozen == sum of fill liabilities', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.carol, { selection_id: s1, side: 'back', price: 1.01, stake_cents: 100 }); // rests
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 1.51, stake_cents: 100 }); // rests
@@ -318,8 +323,8 @@ check('E16 repro C: multi-fill lay 200 @ 1.51 ends with frozen == sum of fill li
 // fill time. Cancelling then releases exactly the tracked remainder (26),
 // the matched liability survives for settlement, and settling zeroes
 // everything.
-check('E17 taker 1-cent top-up, cancel releases tracked remainder, settle -> 0', () => {
-  const { db, users } = fresh();
+check('E17 taker 1-cent top-up, cancel releases tracked remainder, settle -> 0', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1, s2 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 1.51, stake_cents: 150 }); // rests 150
   M.placeOrder(db, users.carol, { selection_id: s1, side: 'lay', price: 1.51, stake_cents: 100 }); // fills 100, leaves avail 50
@@ -345,8 +350,8 @@ check('E17 taker 1-cent top-up, cancel releases tracked remainder, settle -> 0',
 // taken on the resting layer's account (they must have the cent available).
 // A 50-fill needs legal stakes: alice's back 150 sweeps dave's higher lay
 // (100 @ 2.0) first, leaving exactly 50 for carol's resting lay at 1.51.
-check('E18 resting-lay multi-fill top-up keeps the invariant', () => {
-  const { db, users } = fresh();
+check('E18 resting-lay multi-fill top-up keeps the invariant', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.dave, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 100 }); // rests, higher price
   const l = M.placeOrder(db, users.carol, { selection_id: s1, side: 'lay', price: 1.51, stake_cents: 100 }).order; // rests
@@ -363,8 +368,8 @@ check('E18 resting-lay multi-fill top-up keeps the invariant', () => {
 
 // E19: self-match guard, back-taker side (mirror of E6): a user's own
 // resting lay is skipped even when it is the best eligible price.
-check('E19 back-taker self-match guard', () => {
-  const { db, users } = fresh();
+check('E19 back-taker self-match guard', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 }); // rests
   const b = M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
@@ -375,8 +380,8 @@ check('E19 back-taker self-match guard', () => {
 
 // E20: FIFO within a price level, lay-taker side (mirror of E13): two
 // resting backs at the same price, the older one fills first.
-check('E20 lay-taker FIFO within a price level', () => {
-  const { db, users } = fresh();
+check('E20 lay-taker FIFO within a price level', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   const bobOrder = M.placeOrder(db, users.bob, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 4000 }).order;
   const carolOrder = M.placeOrder(db, users.carol, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 4000 }).order;
@@ -401,8 +406,8 @@ check('E20 lay-taker FIFO within a price level', () => {
 // E21 (Critical-2 half-cent battery): lay 101 @ 1.5 -> escrow round(50.5) = 51.
 // Math.round rounds .5 UP — a floor-based liability would freeze 50 and the
 // exact asserts here would fail.
-check('E21 half-cent escrow: lay 101 @ 1.5 freezes exactly 51', () => {
-  const { db, users } = fresh();
+check('E21 half-cent escrow: lay 101 @ 1.5 freezes exactly 51', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   const l = M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 1.5, stake_cents: 101 }).order;
   assert.deepStrictEqual(balances(db, users.bob.id), { b: 100000, f: 51 });
@@ -415,8 +420,8 @@ check('E21 half-cent escrow: lay 101 @ 1.5 freezes exactly 51', () => {
 // E22 (Critical-2): lay 101 @ 2.5 filling a resting back @ 2.0 — escrow
 // round(151.5) = 152, the fill keeps round(1.0*101) = 101, so the excess
 // release is exactly 51.
-check('E22 half-cent excess: lay 101 @ 2.5 matched @ 2.0 releases exactly 51', () => {
-  const { db, users } = fresh();
+check('E22 half-cent excess: lay 101 @ 2.5 matched @ 2.0 releases exactly 51', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 101 }); // rests
   const b = M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.5, stake_cents: 101 });
@@ -427,8 +432,8 @@ check('E22 half-cent excess: lay 101 @ 2.5 matched @ 2.0 releases exactly 51', (
 
 // E23 (Critical-2): lay 5050 @ 1.01 -> escrow round(50.5) = 51 even at the
 // bottom tick of the ladder.
-check('E23 half-cent escrow at the ladder floor: lay 5050 @ 1.01 freezes 51', () => {
-  const { db, users } = fresh();
+check('E23 half-cent escrow at the ladder floor: lay 5050 @ 1.01 freezes 51', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 1.01, stake_cents: 5050 }); // rests
   const b = M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 1.01, stake_cents: 5050 });
@@ -441,8 +446,8 @@ check('E23 half-cent escrow at the ladder floor: lay 5050 @ 1.01 freezes 51', ()
 // 2.017 rounds to cents 202 -> stored 2.02 -> escrow round(1.02*10000) = 10200.
 // (2.013 lands on cents 201, an exact gap tie, which the ladder resolves
 // DOWN to the lower band edge 2.00 — asserted too.)
-check('E24 off-ladder snap-through: escrow follows the stored ladder price', () => {
-  const { db, users } = fresh();
+check('E24 off-ladder snap-through: escrow follows the stored ladder price', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   const up = M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.017, stake_cents: 10000 }).order;
   assert.strictEqual(up.price, 2.02);
@@ -455,8 +460,8 @@ check('E24 off-ladder snap-through: escrow follows the stored ladder price', () 
 // E25: stake bounds are INCLUSIVE — exactly MIN and exactly MAX are accepted
 // (a resting order suffices; no match needed). One cent outside either bound
 // rejects.
-check('E25 stake boundaries accepted at exactly 100 and 100000', () => {
-  const { db, users } = fresh();
+check('E25 stake boundaries accepted at exactly 100 and 100000', async () => {
+  const { db, users } = (await fresh());
   const { s1, s2 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   // Backs on s1, lays on s2: on a shared selection a lay @ 1000 would sweep
   // the 1.01 backs (P <= Q) and the boundary orders would match each other.
@@ -472,8 +477,8 @@ check('E25 stake boundaries accepted at exactly 100 and 100000', () => {
 
 // E26: selection_id type validation (W4) — garbage must be a 400, never a
 // TypeError 500; and a suspended SELECTION rejects orders with 409.
-check('E26 selection_id validation + suspended selection 409', () => {
-  const { db, users } = fresh();
+check('E26 selection_id validation + suspended selection 409', async () => {
+  const { db, users } = (await fresh());
   const { s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   assert.throws(() => M.placeOrder(db, users.alice, { selection_id: 'abc', side: 'back', price: 2.0, stake_cents: 10000 }), (e) => e.status === 400);
   assert.throws(() => M.placeOrder(db, users.alice, { selection_id: undefined, side: 'back', price: 2.0, stake_cents: 10000 }), (e) => e.status === 400);
@@ -482,4 +487,21 @@ check('E26 selection_id validation + suspended selection 409', () => {
   assert.throws(() => M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 }), (e) => e.status === 409);
 });
 
-console.log(`\nmatch.test.js: ${passed} checks passed`);
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  console.log(`\nmatch.test.js: ${passed} checks passed`);
+})();

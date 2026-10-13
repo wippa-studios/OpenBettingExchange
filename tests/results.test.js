@@ -32,7 +32,7 @@ let passed = 0;
 const check = (name, fn) => { pending.push([name, fn]); };
 
 let n = 0;
-function fixture(sport = 'football', fair = 2.0) {
+async function fixture(sport = 'football', fair = 2.0) {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES (?, ?)").run(sport, sport);
   const sp = db.prepare('SELECT id FROM sports WHERE slug=?').get(sport);
@@ -48,8 +48,8 @@ function fixture(sport = 'football', fair = 2.0) {
     db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, ?)').run(mkt.id, nm, fair);
     ids.push(db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, nm).id);
   }
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 }));
   return { db, alice, bob, marketId: mkt.id, s1: ids[0], s2: ids[1] };
 }
 
@@ -65,7 +65,7 @@ const status = (db, id) => db.prepare('SELECT status, settlement_hold, hold_reas
 
 // V1: the SAME physical fact is void under one sport and settled under another.
 // That is why this is a rule table and not a boolean.
-check('V1 abandoned after a red card is void in football but settles elsewhere', () => {
+check('V1 abandoned after a red card is void in football but settles elsewhere', async () => {
   const sig = { status: 'abandoned', red_card: true };
   assert.strictEqual(VR.resolve('football', sig).decision, VR.VOID);
   // No rule for a red card in greyhound racing -> HELD, not guessed. The slug
@@ -79,7 +79,7 @@ check('V1 abandoned after a red card is void in football but settles elsewhere',
 });
 
 // V2: a rained-off race and a walkover void. Nobody ran / nobody competed.
-check('V2 non-runners and walkovers void', () => {
+check('V2 non-runners and walkovers void', async () => {
   assert.strictEqual(VR.resolve('horse_racing', { status: 'abandoned', non_runners: [1] }).decision, VR.VOID);
   assert.strictEqual(VR.resolve('football', { status: 'walkover' }).decision, VR.VOID);
   assert.strictEqual(VR.resolve('tennis', { status: 'walkover' }).decision, VR.VOID);
@@ -87,7 +87,7 @@ check('V2 non-runners and walkovers void', () => {
 
 // V3: a DISPUTE IS HELD, and it outranks every published rule. Settling picks
 // a side; voiding gives away money the venue may owe.
-check('V3 a disputed outcome is held, outranking the sport rules', () => {
+check('V3 a disputed outcome is held, outranking the sport rules', async () => {
   const d = VR.resolve('football', { status: 'completed', winners: [1], disputed: true });
   assert.strictEqual(d.decision, VR.HOLD);
   assert.strictEqual(d.rule, 'disputed');
@@ -97,7 +97,7 @@ check('V3 a disputed outcome is held, outranking the sport rules', () => {
 
 // V4: an unrecognised outcome is HELD. A feed that does not model a case must
 // escalate, not default to void (giving money back without cause) or settle.
-check('V4 an unrecognised signal is held, never guessed', () => {
+check('V4 an unrecognised signal is held, never guessed', async () => {
   const r = VR.resolve('football', { status: 'something-new', winners: [1] });
   assert.strictEqual(r.decision, VR.HOLD);
   assert.strictEqual(r.rule, 'unrecognised');
@@ -105,7 +105,7 @@ check('V4 an unrecognised signal is held, never guessed', () => {
 
 // V5: a sport with NO rules defaults to VOID — bounded and recoverable — while
 // a KNOWN signal with no outcome data is HELD.
-check('V5 unknown sports default to void; missing winners hold', () => {
+check('V5 unknown sports default to void; missing winners hold', async () => {
   const unknown = VR.resolve('curling', { status: 'completed', winners: [1] });
   assert.strictEqual(unknown.decision, VR.VOID);
   // A rule that settles but supplies no winner cannot be executed.
@@ -116,8 +116,8 @@ check('V5 unknown sports default to void; missing winners hold', () => {
 
 // R1: a normal completion settles the market and records PROVENANCE. A
 // settlement with no source row is one nobody can defend in a dispute.
-check('R1 a completed event settles with a recorded source', () => {
-  const f = fixture();
+check('R1 a completed event settles with a recorded source', async () => {
+  const f = (await fixture());
   bet(f);
   const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', winners: [f.s1] }, { source: 'poll', externalId: 'feed-1' });
   assert.strictEqual(r.outcome, 'settled');
@@ -132,8 +132,8 @@ check('R1 a completed event settles with a recorded source', () => {
 
 // R2: RE-DELIVERY IS IDEMPOTENT. A feed re-delivers; re-delivering must not
 // pay twice or error out of the batch.
-check('R2 re-delivering an outcome is idempotent', () => {
-  const f = fixture();
+check('R2 re-delivering an outcome is idempotent', async () => {
+  const f = (await fixture());
   bet(f);
   R.applyOutcome(f.db, f.marketId, { status: 'completed', winners: [f.s1] }, { externalId: 'feed-x' });
   const after = f.db.prepare('SELECT balance_cents b, frozen_cents fr FROM users WHERE id=?').get(f.alice.id);
@@ -146,8 +146,8 @@ check('R2 re-delivering an outcome is idempotent', () => {
 
 // R3: a disputed outcome HOLDS the market — it stays OPEN (the player really
 // does hold a position) but is excluded from automatic settlement.
-check('R3 a disputed market is held open, not settled or voided', () => {
-  const f = fixture();
+check('R3 a disputed market is held open, not settled or voided', async () => {
+  const f = (await fixture());
   bet(f);
   const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', winners: [f.s1], disputed: true });
   assert.strictEqual(r.outcome, 'held');
@@ -162,7 +162,7 @@ check('R3 a disputed market is held open, not settled or voided', () => {
 // R4: a held market is excluded from the polling cycle, so the feed cannot
 // settle it behind the operator's back on the next tick.
 check('R4 held markets are excluded from the poll cycle', async () => {
-  const f = fixture();
+  const f = (await fixture());
   bet(f);
   R.applyOutcome(f.db, f.marketId, { status: 'completed', winners: [f.s1], disputed: true });
   completeEvent(f);
@@ -176,11 +176,11 @@ check('R4 held markets are excluded from the poll cycle', async () => {
 
 // R5: releasing a hold is explicit and leaves an audit trail. The whole point
 // of holding is that a machine could not decide it.
-check('R5 releasing a hold requires a reason and is audited', () => {
-  const f = fixture();
+check('R5 releasing a hold requires a reason and is audited', async () => {
+  const f = (await fixture());
   bet(f);
   R.applyOutcome(f.db, f.marketId, { status: 'completed', winners: [f.s1], disputed: true });
-  const ops = A.registerUser(f.db, { username: 'ops', password: 'pw-ops-1234', balance_cents: 0 });
+  const ops = (await A.registerUser(f.db, { username: 'ops', password: 'pw-ops-1234', balance_cents: 0 }));
   f.db.prepare("UPDATE users SET role='admin', is_admin=1 WHERE id=?").run(ops.id);
 
   assert.throws(() => R.releaseHold(f.db, { actor: ops, marketId: f.marketId, decision: 'settle', winnerSelectionId: f.s1, reason: '' }), /reason is required/);
@@ -199,8 +199,8 @@ check('R5 releasing a hold requires a reason and is audited', () => {
 
 // R6: a winner from ANOTHER market is refused, not silently settled. Paying
 // the wrong selection is worse than refusing.
-check('R6 a winner outside the market is held, not settled', () => {
-  const f = fixture();
+check('R6 a winner outside the market is held, not settled', async () => {
+  const f = (await fixture());
   bet(f);
   const foreign = 99999;
   const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', winners: [foreign] });
@@ -222,8 +222,8 @@ check('R6 a winner outside the market is held, not settled', () => {
 // The rules table is the authority on whether a sport pays a joint favourite. A
 // signal naming two winners is only evidence about what happened. So the two
 // cases are genuinely different now, and both are asserted.
-check('R7 multiple winners under a dead-heat rule settle as a joint favourite', () => {
-  const f = fixture('horse_racing', 2.0);
+check('R7 multiple winners under a dead-heat rule settle as a joint favourite', async () => {
+  const f = (await fixture('horse_racing', 2.0));
   bet(f);
   const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', dead_heat: true, winners: [f.s1, f.s2] });
   assert.strictEqual(r.outcome, 'settled', 'a racing dead heat settles');
@@ -237,8 +237,8 @@ check('R7 multiple winners under a dead-heat rule settle as a joint favourite', 
 // R7a: and under a SINGLE-WINNER rule it is HELD. A feed naming two winners of
 // a football match is either broken or describing something nobody has
 // modelled, and both deserve a human rather than a halved payout.
-check('R7a multiple winners under a single-winner rule are held', () => {
-  const f = fixture('football');
+check('R7a multiple winners under a single-winner rule are held', async () => {
+  const f = (await fixture('football'));
   bet(f);
   const before = f.db.prepare('SELECT balance_cents b FROM users WHERE id = ?').get(f.alice.id).b;
   const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', winners: [f.s1, f.s2] });
@@ -258,8 +258,8 @@ check('R7a multiple winners under a single-winner rule are held', () => {
 // uses a HORSE-RACING fixture, because the sport table is per sport and
 // football has no dead_heat rule at all (so it holds for a different, also
 // correct, reason — see R7c).
-check('R7b a dead heat naming one winner is held, not halved', () => {
-  const f = fixture('horse_racing', 4.0); // the SEEDED slug, underscored
+check('R7b a dead heat naming one winner is held, not halved', async () => {
+  const f = (await fixture('horse_racing', 4.0)); // the SEEDED slug, underscored
   bet(f);
   const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', dead_heat: true, winners: [f.s1] });
   assert.strictEqual(r.outcome, 'held');
@@ -274,8 +274,8 @@ check('R7b a dead heat naming one winner is held, not halved', () => {
 // R7c: a dead heat in a sport with NO dead-heat rule is held, not settled on
 // the sport's `completed` rule. The rule table is per sport for a reason: a
 // football abandonment after a red card voids, a racing one settles.
-check('R7c a dead heat in a sport without that rule is held', () => {
-  const f = fixture('football');
+check('R7c a dead heat in a sport without that rule is held', async () => {
+  const f = (await fixture('football'));
   bet(f);
   const r = R.applyOutcome(f.db, f.marketId, { status: 'completed', dead_heat: true, winners: [f.s1, f.s2] });
   assert.strictEqual(r.outcome, 'held');
@@ -289,14 +289,14 @@ check('R7c a dead heat in a sport without that rule is held', () => {
 // applied nothing for any transport that was not a local synchronous read — see
 // the note on pollOnce and tests/resultsfeed.test.js T16.
 check('R8 a poll cycle settles only markets the feed has outcomes for', async () => {
-  const f = fixture();
+  const f = (await fixture());
   bet(f);
   completeEvent(f);
   const run = await R.pollOnce(f.db, () => ({ [f.marketId]: { status: 'completed', winners: [f.s2] } }));
   assert.strictEqual(run.applied, 1);
   assert.strictEqual(run.results[0].outcome, 'settled');
   // A market with no signal is untouched.
-  const g = fixture();
+  const g = (await fixture());
   bet(g);
   const run2 = await R.pollOnce(g.db, () => ({}));
   assert.strictEqual(run2.applied, 0);
@@ -305,7 +305,7 @@ check('R8 a poll cycle settles only markets the feed has outcomes for', async ()
 
 // J1: reconciliation on a HEALTHY book finds nothing and invents no findings.
 check('J1 a healthy book reconciles clean', async () => {
-  const f = fixture();
+  const f = (await fixture());
   bet(f);
   const r = await JOBS.reconcileOnce(f.db);
   assert.strictEqual(r.ok, true, 'no findings');
@@ -317,7 +317,7 @@ check('J1 a healthy book reconciles clean', async () => {
 // only closed by a human with a reason. A discrepancy that vanishes when
 // nobody looks is not a control.
 check('J2 drift persists, re-surfaces, and closes only with a reason', async () => {
-  const f = fixture();
+  const f = (await fixture());
   bet(f);
   // Corrupt the cache column directly: the postings stay right, the screen
   // goes wrong — exactly the failure the cache check exists to catch.
@@ -337,7 +337,7 @@ check('J2 drift persists, re-surfaces, and closes only with a reason', async () 
   assert.strictEqual(second.open.length >= 1, true, 'and it keeps surfacing');
 
   // Closing needs a human and a written reason.
-  const ops = A.registerUser(f.db, { username: 'ops', password: 'pw-ops-1234', balance_cents: 0 });
+  const ops = (await A.registerUser(f.db, { username: 'ops', password: 'pw-ops-1234', balance_cents: 0 }));
   assert.throws(() => JOBS.resolveFinding(f.db, { actor: ops, id: rows[0].id, reason: '' }), /reason is required/);
   JOBS.resolveFinding(f.db, { actor: ops, id: rows[0].id, reason: 'Ledger rebuild verified against provider statement' });
   const closed = f.db.prepare('SELECT * FROM reconciliation_findings WHERE id=?').get(rows[0].id);
@@ -351,7 +351,7 @@ check('J2 drift persists, re-surfaces, and closes only with a reason', async () 
 // J3: global conservation drift outranks everything. If the ledger itself is
 // corrupt, that is the finding an operator must see first.
 check('J3 conservation drift is reported as a finding', async () => {
-  const f = fixture();
+  const f = (await fixture());
   bet(f);
   // Write an UNBALANCED posting directly — the exact corruption the guard in
   // lib/accounts.js exists to prevent, forced past it to prove the reconciler

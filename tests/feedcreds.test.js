@@ -37,17 +37,17 @@ function check(name, fn) {
 
 const GOOD = { appKey: 'TESTKEYnotreal12', username: 'test.bettfair-demo', password: 'not-a-real-password' };
 
-function venue() {
+async function venue() {
   const db = openStore(':memory:');
   const tenant = tenants.defaultTenant(db);
-  const admin = auth.registerUser(db, { username: 'admin', password: 'pw-admin-1234', balance_cents: 0 });
+  const admin = (await auth.registerUser(db, { username: 'admin', password: 'pw-admin-1234', balance_cents: 0 }));
   db.prepare("UPDATE users SET role='admin' WHERE id=?").run(admin.id);
   return { db, tenant, admin };
 }
 
 // ── the cipher ───────────────────────────────────────────────────────────────
 
-check('K1 a sealed envelope round-trips, and is version-tagged', () => {
+check('K1 a sealed envelope round-trips, and is version-tagged', async () => {
   const key = crypto.randomBytes(32);
   for (const value of ['', 'a', 'hunter2', 'pässwörd-ü-漢字', 'x'.repeat(4096)]) {
     const env = FC.seal(key, value);
@@ -60,13 +60,13 @@ check('K1 a sealed envelope round-trips, and is version-tagged', () => {
   }
 });
 
-check('K2 the same plaintext seals differently every time (random IV)', () => {
+check('K2 the same plaintext seals differently every time (random IV)', async () => {
   const key = crypto.randomBytes(32);
   const seals = new Set(Array.from({ length: 50 }, () => FC.seal(key, 'same-secret')));
   assert.strictEqual(seals.size, 50, 'a fixed IV would make identical credentials comparable at rest');
 });
 
-check('K3 tampered ciphertext is REFUSED, not silently decrypted', () => {
+check('K3 tampered ciphertext is REFUSED, not silently decrypted', async () => {
   // GCM's whole point. A database edit that changes a credential must fail
   // loudly; returning plausible garbage would let a modified password be
   // presented as the real one.
@@ -79,12 +79,12 @@ check('K3 tampered ciphertext is REFUSED, not silently decrypted', () => {
   assert.throws(() => FC.open(key, parts.join(':')), (e) => e.status === 500);
 });
 
-check('K4 the WRONG key is refused, and says so as an integrity failure', () => {
+check('K4 the WRONG key is refused, and says so as an integrity failure', async () => {
   const env = FC.seal(crypto.randomBytes(32), 'secret');
   assert.throws(() => FC.open(crypto.randomBytes(32), env), (e) => /key may have changed/.test(e.message));
 });
 
-check('K5 an unrecognised envelope version is refused, not guessed at', () => {
+check('K5 an unrecognised envelope version is refused, not guessed at', async () => {
   const key = crypto.randomBytes(32);
   assert.throws(() => FC.open(key, 'v9:a:b:c'), (e) => /unrecognised format/.test(e.message));
   assert.throws(() => FC.open(key, 'not-an-envelope'), (e) => /unrecognised format/.test(e.message));
@@ -92,7 +92,7 @@ check('K5 an unrecognised envelope version is refused, not guessed at', () => {
 
 // ── refusing to store without a key ──────────────────────────────────────────
 
-check('K6 with no encryption key, a credential is REFUSED and nothing is written', () => {
+check('K6 with no encryption key, a credential is REFUSED and nothing is written', async () => {
   // The single most important behaviour here. The alternative — warn and store
   // plaintext — puts a Betfair password in a SQLite file beside player balances.
   const key = config.FEED_CREDENTIALS_KEY;
@@ -102,7 +102,7 @@ check('K6 with no encryption key, a credential is REFUSED and nothing is written
   const savedKey = unconfigured.FEED_CREDENTIALS_KEY;
   unconfigured.FEED_CREDENTIALS_KEY = null;
 
-  const { db, tenant, admin } = venue();
+  const { db, tenant, admin } = (await venue());
   const FC2 = require('../lib/feedcreds');
   try {
     assert.strictEqual(FC2.status(db, tenant.id).storage_available, false, 'status says storage is unavailable');
@@ -119,8 +119,8 @@ check('K6 with no encryption key, a credential is REFUSED and nothing is written
 
 // ── what an API is allowed to return ─────────────────────────────────────────
 
-check('K7 status() reveals WHICH fields exist and never their values', () => {
-  const { db, tenant, admin } = venue();
+check('K7 status() reveals WHICH fields exist and never their values', async () => {
+  const { db, tenant, admin } = (await venue());
   const before = FC.status(db, tenant.id);
   assert.strictEqual(before.configured, false);
 
@@ -142,7 +142,7 @@ check('K7 status() reveals WHICH fields exist and never their values', () => {
   db.close();
 });
 
-check('K8 no exported function returns plaintext except forCollector()', () => {
+check('K8 no exported function returns plaintext except forCollector()', async () => {
   // The module's shape is the control. A future "reveal the password" route
   // would have to call forCollector or add an export; this makes adding one a
   // deliberate act rather than a convenience.
@@ -159,7 +159,7 @@ check('K8 no exported function returns plaintext except forCollector()', () => {
 
 // ── round trip through storage ───────────────────────────────────────────────
 
-check('K9 stored credentials survive a REOPEN and decrypt correctly', () => {
+check('K9 stored credentials survive a REOPEN and decrypt correctly', async () => {
   // An in-memory database would not catch an envelope that only reads back in
   // the same process. This writes, closes, and reads from disk.
   const path = `/tmp/feedcreds-test-${process.pid}.db`;
@@ -168,7 +168,7 @@ check('K9 stored credentials survive a REOPEN and decrypt correctly', () => {
   try {
     const db = openStore(path);
     const t = tenants.defaultTenant(db);
-    const admin = auth.registerUser(db, { username: 'admin', password: 'pw-admin-1234', balance_cents: 0 });
+    const admin = (await auth.registerUser(db, { username: 'admin', password: 'pw-admin-1234', balance_cents: 0 }));
     db.prepare("UPDATE users SET role='admin' WHERE id=?").run(admin.id);
     FC.setCredentials(db, { actor: admin, tenantId: t.id, ...GOOD });
     tenantId = t.id;
@@ -187,10 +187,10 @@ check('K9 stored credentials survive a REOPEN and decrypt correctly', () => {
   }
 });
 
-check('K10 the raw database row does not contain the plaintext', () => {
+check('K10 the raw database row does not contain the plaintext', async () => {
   // Belt and braces: even the column is ciphertext, so a `SELECT *` dump, a
   // backup file, or an over-broad admin query cannot leak it.
-  const { db, tenant, admin } = venue();
+  const { db, tenant, admin } = (await venue());
   FC.setCredentials(db, { actor: admin, tenantId: tenant.id, ...GOOD });
   const row = db.prepare('SELECT * FROM feed_credentials WHERE tenant_id = ?').get(tenant.id);
   const serialised = JSON.stringify(row);
@@ -203,8 +203,8 @@ check('K10 the raw database row does not contain the plaintext', () => {
 
 // ── input validation ─────────────────────────────────────────────────────────
 
-check('K11 malformed credentials are refused with 400, not stored and failed later', () => {
-  const { db, tenant, admin } = venue();
+check('K11 malformed credentials are refused with 400, not stored and failed later', async () => {
+  const { db, tenant, admin } = (await venue());
   const cases = [
     [{ ...GOOD, appKey: 'too-short' }, /16-character/],
     [{ ...GOOD, appKey: '' }, /16-character/],
@@ -224,8 +224,8 @@ check('K11 malformed credentials are refused with 400, not stored and failed lat
   db.close();
 });
 
-check('K12 an unknown tenant is 404, and credentials are strictly per-tenant', () => {
-  const { db, tenant, admin } = venue();
+check('K12 an unknown tenant is 404, and credentials are strictly per-tenant', async () => {
+  const { db, tenant, admin } = (await venue());
   assert.throws(
     () => FC.setCredentials(db, { actor: admin, tenantId: 99999, ...GOOD }),
     (e) => e.status === 404,
@@ -246,8 +246,8 @@ check('K12 an unknown tenant is 404, and credentials are strictly per-tenant', (
 
 // ── clearing ─────────────────────────────────────────────────────────────────
 
-check('K13 clearing removes the credential and says so', () => {
-  const { db, tenant, admin } = venue();
+check('K13 clearing removes the credential and says so', async () => {
+  const { db, tenant, admin } = (await venue());
   FC.setCredentials(db, { actor: admin, tenantId: tenant.id, ...GOOD });
   const r = FC.clearCredentials(db, { actor: admin, tenantId: tenant.id });
   assert.strictEqual(r.cleared, true);
@@ -259,10 +259,10 @@ check('K13 clearing removes the credential and says so', () => {
 
 // ── audit ────────────────────────────────────────────────────────────────────
 
-check('K14 setting and clearing are AUDITED, and the trail holds no plaintext', () => {
+check('K14 setting and clearing are AUDITED, and the trail holds no plaintext', async () => {
   // Removal is an event, not an absence: "who took the credential away" is the
   // first question asked after an incident.
-  const { db, tenant, admin } = venue();
+  const { db, tenant, admin } = (await venue());
   FC.setCredentials(db, { actor: admin, tenantId: tenant.id, ...GOOD });
   FC.clearCredentials(db, { actor: admin, tenantId: tenant.id });
   const rows = db
@@ -276,8 +276,8 @@ check('K14 setting and clearing are AUDITED, and the trail holds no plaintext', 
   db.close();
 });
 
-check('K15 statusAll() reports every tenant and leaks nothing', () => {
-  const { db, tenant, admin } = venue();
+check('K15 statusAll() reports every tenant and leaks nothing', async () => {
+  const { db, tenant, admin } = (await venue());
   FC.setCredentials(db, { actor: admin, tenantId: tenant.id, ...GOOD });
   const all = FC.statusAll(db);
   assert.ok(Array.isArray(all) && all.length >= 1);

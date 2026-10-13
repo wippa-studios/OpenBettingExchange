@@ -47,10 +47,15 @@ const M = require('../lib/match');
 const acc = require('../lib/accounts');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 let n = 0;
-function venue() {
+async function venue() {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -61,7 +66,7 @@ function venue() {
   const mkt = db.prepare('SELECT id FROM markets WHERE event_id=?').get(ev.id);
   db.prepare("INSERT INTO selections (market_id, name, fair_price) VALUES (?, 'Alpha', 2.0)").run(mkt.id);
   const s1 = db.prepare('SELECT id FROM selections WHERE market_id=?').get(mkt.id).id;
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
   return { db, marketId: mkt.id, s1, alice };
 }
 
@@ -72,8 +77,8 @@ const FEED_SELECTION_ID = 58805; // "The Draw", reused in every soccer 1X2 marke
 
 // F1: a feed market has no local row, so there is nothing for a staleness guard
 // to suspend and nothing for a player to bet on.
-check('F1 a feed market has no local row', () => {
-  const f = venue();
+check('F1 a feed market has no local row', async () => {
+  const f = (await venue());
   const found = f.db
     .prepare('SELECT COUNT(*) c FROM markets WHERE CAST(id AS TEXT) = ?')
     .get(FEED_MARKET_ID).c;
@@ -83,8 +88,8 @@ check('F1 a feed market has no local row', () => {
 // F2: THE ENFORCEMENT IS SERVER-SIDE. This is the check that matters: the
 // client refusing is a courtesy, and a courtesy is not a control. The engine
 // refuses a feed selection id on its own.
-check('F2 the engine refuses an order on a feed selection id', () => {
-  const f = venue();
+check('F2 the engine refuses an order on a feed selection id', async () => {
+  const f = (await venue());
   assert.throws(
     () => M.placeOrder(f.db, f.alice, { selection_id: FEED_SELECTION_ID, side: 'back', price: 2.0, stake_cents: 1000 }),
     (e) => e.status === 404 && /selection not found/i.test(e.message),
@@ -102,8 +107,8 @@ check('F2 the engine refuses an order on a feed selection id', () => {
 // market id in the string shape Betfair actually uses, and for a selection id
 // that happens to exist locally but in a DIFFERENT market, which is the shape
 // that would be dangerous if ids were matched loosely.
-check('F3 the refusal is not id-shape dependent', () => {
-  const f = venue();
+check('F3 the refusal is not id-shape dependent', async () => {
+  const f = (await venue());
   // A local selection id, but asked for as a string.
   assert.throws(
     () => M.placeOrder(f.db, f.alice, { selection_id: String(f.s1), side: 'back', price: 2.0, stake_cents: 1000 }),
@@ -123,7 +128,7 @@ check('F3 the refusal is not id-shape dependent', () => {
 // its own book is unquoted. This is the honest description of feed mode, and
 // asserting it here is what stops someone reading "odds feed integration" and
 // assuming the venue trades those markets.
-check('F4 feed mode leaves the venue own book unquoted', () => {
+check('F4 feed mode leaves the venue own book unquoted', async () => {
   const config = require('../lib/config');
   // The invariant that matters is the LOGIC of the hoist in server.js, not the
   // value of FEED_ENABLED in this suite (which is false). Recomputed with the
@@ -161,14 +166,31 @@ check('F4 feed mode leaves the venue own book unquoted', () => {
 // F5: and the venue's own markets remain tradeable when the feed is on, because
 // they are the venue's own. Without this the suite would be asserting a system
 // that cannot trade at all, which would be a different (and wrong) conclusion.
-check('F5 the venue own markets are unaffected by feed display', () => {
-  const f = venue();
-  const bob = A.registerUser(f.db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 });
+check('F5 the venue own markets are unaffected by feed display', async () => {
+  const f = (await venue());
+  const bob = (await A.registerUser(f.db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 }));
   M.placeOrder(f.db, f.alice, { selection_id: f.s1, side: 'back', price: 2.0, stake_cents: 1000 });
   const r = M.placeOrder(f.db, bob, { selection_id: f.s1, side: 'lay', price: 2.0, stake_cents: 1000 });
   assert.strictEqual(r.fills.length, 1, 'the venue own market still matches');
   assert.strictEqual(acc.assertConserved(f.db), 0);
 });
 
-console.log(`\nfeed-display-only.test.js: ${passed} checks passed`);
-if (passed < 5) { console.error('expected 5 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 5) { console.error('expected 5 checks'); process.exit(1); }
+  console.log(`\nfeed-display-only.test.js: ${passed} checks passed`);
+})();

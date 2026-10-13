@@ -6,11 +6,16 @@ const path = require('path');
 const { loadConfig } = require('../lib/config');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 const load = (over) => loadConfig('/nonexistent/.env', over);
 
 // C1: defaults.
-check('C1 defaults', () => {
+check('C1 defaults', async () => {
   const c = load();
   assert.strictEqual(c.PORT, 7777);
   assert.strictEqual(c.HOST, '127.0.0.1');
@@ -21,7 +26,7 @@ check('C1 defaults', () => {
 });
 
 // C2: loopback-only binding — a routable interface must abort the launch.
-check('C2 loopback-only HOST', () => {
+check('C2 loopback-only HOST', async () => {
   for (const host of ['127.0.0.1', 'localhost', '::1']) {
     assert.strictEqual(load({ HOST: host }).HOST, host);
   }
@@ -34,7 +39,7 @@ check('C2 loopback-only HOST', () => {
 });
 
 // C3: numeric ranges abort with a clear message instead of failing later.
-check('C3 numeric validation', () => {
+check('C3 numeric validation', async () => {
   assert.throws(() => load({ PORT: 'abc' }), /PORT must be an integer/);
   assert.throws(() => load({ PORT: 0 }), /PORT must be an integer/);
   assert.throws(() => load({ PORT: 70000 }), /PORT must be an integer/);
@@ -49,7 +54,7 @@ check('C3 numeric validation', () => {
 // N, so SCRYPT_N=2 would make every password trivially crackable while still
 // looking correctly formatted. The floor is the cost the pre-2.4 hashes used,
 // so any value at or above it is a strict improvement over what is stored.
-check('C3b SCRYPT_N floor and default', () => {
+check('C3b SCRYPT_N floor and default', async () => {
   assert.strictEqual(load({}).SCRYPT_N, 65536, 'OWASP floor is the default');
   assert.strictEqual(load({ SCRYPT_N: 16384 }).SCRYPT_N, 16384);
   assert.strictEqual(load({ SCRYPT_N: 262144 }).SCRYPT_N, 262144);
@@ -59,7 +64,7 @@ check('C3b SCRYPT_N floor and default', () => {
 });
 
 // C4: booleans accept only real booleans / 'true' / 'false'.
-check('C4 boolean validation', () => {
+check('C4 boolean validation', async () => {
   assert.strictEqual(load({ DRIFT_ENABLED: 'false' }).DRIFT_ENABLED, false);
   assert.strictEqual(load({ BOT_ENABLED: 'true' }).BOT_ENABLED, true);
   assert.strictEqual(load({ BOT_ENABLED: false }).BOT_ENABLED, false);
@@ -68,7 +73,7 @@ check('C4 boolean validation', () => {
 });
 
 // C5: DB_PATH resolves against the project root; ':memory:' stays special.
-check('C5 DB_PATH resolution', () => {
+check('C5 DB_PATH resolution', async () => {
   assert.ok(load({ DB_PATH: ':memory:' }).DB_PATH === ':memory:');
   const c = load({ DB_PATH: 'data/x.db' });
   // Derived from THIS repository's own location rather than a hardcoded folder
@@ -85,7 +90,7 @@ check('C5 DB_PATH resolution', () => {
 // C6: seeded-credential overrides pass through verbatim — no trimming, no
 // charset policy (a password is whatever the operator says it is);
 // unset or empty → null, meaning "use the seeded demo defaults".
-check('C6 ADMIN_PASSWORD / DEMO_PASSWORD passthrough', () => {
+check('C6 ADMIN_PASSWORD / DEMO_PASSWORD passthrough', async () => {
   assert.strictEqual(load().ADMIN_PASSWORD, null);
   assert.strictEqual(load().DEMO_PASSWORD, null);
   assert.strictEqual(load({ ADMIN_PASSWORD: 'hunter2' }).ADMIN_PASSWORD, 'hunter2');
@@ -97,4 +102,21 @@ check('C6 ADMIN_PASSWORD / DEMO_PASSWORD passthrough', () => {
   assert.strictEqual(load({ ADMIN_PASSWORD: null }).ADMIN_PASSWORD, null);
 });
 
-console.log(`\nconfig.test.js: ${passed} checks passed`);
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  console.log(`\nconfig.test.js: ${passed} checks passed`);
+})();

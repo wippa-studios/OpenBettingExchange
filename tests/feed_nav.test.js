@@ -48,7 +48,7 @@ const FEED_ON = process.env.FEED_ENABLED === 'true';
 (async () => {
   console.log(`  (feed ${FEED_ON ? 'ENABLED' : 'disabled'} for this run)`);
 
-  await check('a /api/feed/nav route is registered', () => {
+  await check('a /api/feed/nav route is registered', async () => {
     const srv = require('../server');
     assert.ok(findNavHandler(srv.app), 'handler found on the Express stack');
   });

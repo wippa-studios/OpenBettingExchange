@@ -19,11 +19,16 @@ const ADM = require('../lib/admin');
 const config = require('../lib/config');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
-function fixture() {
+async function fixture() {
   const db = openStore(':memory:');
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
   return { db, alice };
 }
 
@@ -36,8 +41,8 @@ function makeTenant(db, { slug, name, commission_bps, jurisdictions, brand }) {
 
 // T1: the default tenant always exists, so a single-operator install needs no
 // configuration and no migration step to work.
-check('T1 the default tenant exists and carries config commission', () => {
-  const { db } = fixture();
+check('T1 the default tenant exists and carries config commission', async () => {
+  const { db } = (await fixture());
   const t = T.defaultTenant(db);
   assert.strictEqual(t.slug, 'default');
   assert.strictEqual(t.commission_bps, 250, '2.5% of the global default, in bps');
@@ -46,16 +51,16 @@ check('T1 the default tenant exists and carries config commission', () => {
 
 // T2: NULL tenant_id means the default tenant. This is what lets every
 // existing row keep working untouched.
-check('T2 a user with no tenant belongs to the default', () => {
-  const { db, alice } = fixture();
+check('T2 a user with no tenant belongs to the default', async () => {
+  const { db, alice } = (await fixture());
   assert.strictEqual(db.prepare('SELECT tenant_id FROM users WHERE id=?').get(alice.id).tenant_id, null);
   assert.strictEqual(T.ofUser(db, alice.id).id, T.defaultTenant(db).id);
 });
 
 // T3: commission is read PER TENANT, in basis points, and an unconfigured
 // tenant falls back to the global rate rather than to zero.
-check('T3 commission is per tenant, in basis points', () => {
-  const { db, alice } = fixture();
+check('T3 commission is per tenant, in basis points', async () => {
+  const { db, alice } = (await fixture());
   const t2 = makeTenant(db, { slug: 'vip', name: 'VIP', commission_bps: 175 });
   assert.strictEqual(T.commissionBps(db, t2), 175);
   assert.strictEqual(T.commissionBps(db, T.defaultTenant(db).id), 250);
@@ -66,8 +71,8 @@ check('T3 commission is per tenant, in basis points', () => {
 
 // T4: an out-of-range commission is refused, not clamped. Clamping 5000bps to
 // 2000 would quietly charge a different rate than the operator configured.
-check('T4 an invalid commission is refused, not clamped', () => {
-  const { db } = fixture();
+check('T4 an invalid commission is refused, not clamped', async () => {
+  const { db } = (await fixture());
   const ops = { actor: { id: 1 }, tenantId: T.defaultTenant(db).id };
   assert.throws(() => T.configure(db, { ...ops, commission_bps: -1 }), /commission_bps/);
   assert.throws(() => T.configure(db, { ...ops, commission_bps: 2001 }), /commission_bps/);
@@ -77,8 +82,8 @@ check('T4 an invalid commission is refused, not clamped', () => {
 
 // T5: branding is a CONFIG READ. No build step — which is the reason the
 // no-build frontend survives multi-tenancy instead of being the blocker.
-check('T5 branding is a per-tenant config read', () => {
-  const { db } = fixture();
+check('T5 branding is a per-tenant config read', async () => {
+  const { db } = (await fixture());
   const t2 = makeTenant(db, {
     slug: 'vip', name: 'VIP Exchange', commission_bps: 100,
     brand: { name: 'VIP Exchange', logo: '/assets/logo.png', terms_url: '/terms', palette: { accent: '#c00' } },
@@ -93,8 +98,8 @@ check('T5 branding is a per-tenant config read', () => {
 
 // T6: malformed brand JSON falls back rather than taking the venue down. A
 // bad config must not be a boot-time crash for every player.
-check('T6 malformed tenant config degrades, never crashes', () => {
-  const { db } = fixture();
+check('T6 malformed tenant config degrades, never crashes', async () => {
+  const { db } = (await fixture());
   db.prepare("UPDATE tenants SET brand = 'not json at all', jurisdictions = '{{{bad' WHERE id=?").run(T.defaultTenant(db).id);
   const b = T.branding(db, T.defaultTenant(db).id);
   assert.ok(b.name, 'fell back to a usable default');
@@ -104,8 +109,8 @@ check('T6 malformed tenant config degrades, never crashes', () => {
 // T7: JURISDICTION IS ENFORCED AT SESSION CREATION. A blocked player must
 // never hold a live position — once they do, refusing to serve them leaves
 // the venue choosing which side of a matched bet to honour.
-check('T7 a blocked jurisdiction is refused at session creation', () => {
-  const { db, alice } = fixture();
+check('T7 a blocked jurisdiction is refused at session creation', async () => {
+  const { db, alice } = (await fixture());
   db.prepare("UPDATE tenants SET jurisdictions = ? WHERE id=?").run(JSON.stringify(['GB', 'IE']), T.defaultTenant(db).id);
   assert.throws(() => A.createSession(db, alice.id, { country: 'FR' }), (e) => e.status === 403 && e.details.code === 'jurisdiction-not-allowed');
   // An allowed country gets a session.
@@ -114,8 +119,8 @@ check('T7 a blocked jurisdiction is refused at session creation', () => {
 
 // T8: "not supplied" and "not allowed" are DIFFERENT errors. Conflating them
 // produces support tickets for a problem the player cannot solve.
-check('T8 missing jurisdiction is distinguishable from a blocked one', () => {
-  const { db, alice } = fixture();
+check('T8 missing jurisdiction is distinguishable from a blocked one', async () => {
+  const { db, alice } = (await fixture());
   db.prepare("UPDATE tenants SET jurisdictions = ? WHERE id=?").run(JSON.stringify(['GB']), T.defaultTenant(db).id);
   assert.throws(() => A.createSession(db, alice.id, {}), (e) => e.details.code === 'no-jurisdiction-supplied');
   assert.throws(() => A.createSession(db, alice.id, { country: 'US' }), (e) => e.details.code === 'jurisdiction-not-allowed');
@@ -124,16 +129,16 @@ check('T8 missing jurisdiction is distinguishable from a blocked one', () => {
 // T9: an EMPTY allowlist means unrestricted — the single-operator case. An
 // operator who has not configured jurisdictions must not be locked out of
 // their own venue.
-check('T9 an empty allowlist is unrestricted, not blocked-everyone', () => {
-  const { db, alice } = fixture();
+check('T9 an empty allowlist is unrestricted, not blocked-everyone', async () => {
+  const { db, alice } = (await fixture());
   assert.ok(A.createSession(db, alice.id, { country: 'ZZ' }), 'no configuration, no block');
   assert.strictEqual(T.jurisdictionRefusal(db, T.defaultTenant(db).id, 'ZZ'), null);
 });
 
 // T10: jurisdiction comparison is case-insensitive, because a country code
 // from a header arrives in whatever case the client sent.
-check('T10 jurisdiction matching is case-insensitive', () => {
-  const { db, alice } = fixture();
+check('T10 jurisdiction matching is case-insensitive', async () => {
+  const { db, alice } = (await fixture());
   db.prepare("UPDATE tenants SET jurisdictions = ? WHERE id=?").run(JSON.stringify(['gb']), T.defaultTenant(db).id);
   assert.ok(A.createSession(db, alice.id, { country: 'GB' }));
   assert.ok(A.createSession(db, alice.id, { country: 'gb' }));
@@ -142,8 +147,8 @@ check('T10 jurisdiction matching is case-insensitive', () => {
 // T11: ADMIN IS SCOPED TO A TENANT, and the scope is structural — there is no
 // argument value that means "every tenant". A forgotten scope on an admin
 // route would be a cross-tenant read.
-check('T11 admin user listing cannot cross tenants', () => {
-  const { db, alice } = fixture();
+check('T11 admin user listing cannot cross tenants', async () => {
+  const { db, alice } = (await fixture());
   const t2 = makeTenant(db, { slug: 'vip', name: 'VIP', commission_bps: 100 });
   db.prepare('UPDATE users SET tenant_id=? WHERE id=?').run(t2, alice.id);
 
@@ -159,8 +164,8 @@ check('T11 admin user listing cannot cross tenants', () => {
 
 // T12: a row with tenant_id NULL still belongs to the default tenant, so the
 // migration does not orphan every pre-existing account.
-check('T12 pre-existing NULL-tenant rows are reachable via the default scope', () => {
-  const { db, alice } = fixture();
+check('T12 pre-existing NULL-tenant rows are reachable via the default scope', async () => {
+  const { db, alice } = (await fixture());
   const list = ADM.listUsers(db, { tenantId: null });
   assert.ok(list.total >= 1, 'the NULL-tenant account is visible in the default tenant');
   assert.ok(list.users.some((u) => u.id === alice.id));
@@ -168,8 +173,8 @@ check('T12 pre-existing NULL-tenant rows are reachable via the default scope', (
 
 // T13: every operational table got tenant_id with a LEADING index — leading
 // because every operational query scopes by tenant first.
-check('T13 tenant_id exists on every operational table, indexed', () => {
-  const { db } = fixture();
+check('T13 tenant_id exists on every operational table, indexed', async () => {
+  const { db } = (await fixture());
   const tables = ['users', 'sessions', 'orders', 'matches', 'settlements', 'transactions', 'price_history', 'limits', 'risk_bots', 'payment_intents', 'audit_log', 'sports', 'competitions', 'events', 'markets', 'selections'];
   for (const t of tables) {
     const col = db.prepare('SELECT name FROM pragma_table_info(?) WHERE name=?').get(t, 'tenant_id');
@@ -181,9 +186,9 @@ check('T13 tenant_id exists on every operational table, indexed', () => {
 
 // T14: tenant configuration is AUDITED — commission and jurisdiction are
 // commercial and legal facts, and who set them has to be answerable.
-check('T14 tenant configuration is audited', () => {
-  const { db } = fixture();
-  const adm = A.registerUser(db, { username: 'ops', password: 'pw-ops-123', balance_cents: 0 });
+check('T14 tenant configuration is audited', async () => {
+  const { db } = (await fixture());
+  const adm = (await A.registerUser(db, { username: 'ops', password: 'pw-ops-123', balance_cents: 0 }));
   db.prepare("UPDATE users SET role='admin', is_admin=1 WHERE id=?").run(adm.id);
   T.configure(db, { actor: adm, tenantId: T.defaultTenant(db).id, commission_bps: 300, jurisdictions: ['GB'] });
   const A2 = require('../lib/audit');
@@ -195,15 +200,15 @@ check('T14 tenant configuration is audited', () => {
 });
 
 // T15: configuring a tenant that does not exist is a 404, not a silent no-op.
-check('T15 an unknown tenant is a 404, not a silent no-op', () => {
-  const { db } = fixture();
+check('T15 an unknown tenant is a 404, not a silent no-op', async () => {
+  const { db } = (await fixture());
   assert.throws(() => T.configure(db, { actor: { id: 1 }, tenantId: 4242, name: 'Ghost' }), (e) => e.status === 404);
 });
 
 // T16: the session row records the tenant it was minted for, so an audit of
 // "who could act here, and when" is possible.
-check('T16 sessions record the tenant they were minted for', () => {
-  const { db, alice } = fixture();
+check('T16 sessions record the tenant they were minted for', async () => {
+  const { db, alice } = (await fixture());
   const t2 = makeTenant(db, { slug: 'vip', name: 'VIP', commission_bps: 100 });
   db.prepare('UPDATE users SET tenant_id=? WHERE id=?').run(t2, alice.id);
   A.createSession(db, alice.id);
@@ -215,8 +220,8 @@ check('T16 sessions record the tenant they were minted for', () => {
 // With TRUST_PROXY_JURISDICTION off the header is ignored entirely — trusting
 // it would make the control defeatable by editing one header while still
 // being recorded as enforced.
-check('T17 a client-supplied country header is ignored by default', () => {
-  const { db, alice } = fixture();
+check('T17 a client-supplied country header is ignored by default', async () => {
+  const { db, alice } = (await fixture());
   db.prepare("UPDATE tenants SET jurisdictions = ? WHERE id=?").run(JSON.stringify(['GB']), T.defaultTenant(db).id);
   const spoof = { headers: { 'cf-ipcountry': 'GB', 'x-jurisdiction': 'GB' } };
   // Flag is off in this suite: nothing the client sends is evidence.
@@ -229,7 +234,7 @@ check('T17 a client-supplied country header is ignored by default', () => {
 // T18: with the flag on, only a well-formed ISO code from the header counts.
 // A misconfigured proxy must not be able to smuggle arbitrary strings into the
 // audit trail, and the conventional "unknown" sentinels carry no information.
-check('T18 a trusted header is validated and sentinels discarded', () => {
+check('T18 a trusted header is validated and sentinels discarded', async () => {
   const mk = (h) => {
     const prev = config.TRUST_PROXY_JURISDICTION;
     config.TRUST_PROXY_JURISDICTION = true;
@@ -247,11 +252,28 @@ check('T18 a trusted header is validated and sentinels discarded', () => {
 // source exists. Blocking every login is the correct behaviour — the
 // alternative is silently disabling the control because geolocation was never
 // wired up.
-check('T19 an allowlist with no trusted source fails closed', () => {
-  const { db, alice } = fixture();
+check('T19 an allowlist with no trusted source fails closed', async () => {
+  const { db, alice } = (await fixture());
   db.prepare("UPDATE tenants SET jurisdictions = ? WHERE id=?").run(JSON.stringify(['GB']), T.defaultTenant(db).id);
   assert.throws(() => A.createSession(db, alice.id, { country: null }), (e) => e.status === 403 && e.details.code === 'no-jurisdiction-supplied');
 });
 
-console.log(`\ntenants.test.js: ${passed} checks passed`);
-if (passed < 19) { console.error('expected 19 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 19) { console.error('expected 19 checks'); process.exit(1); }
+  console.log(`\ntenants.test.js: ${passed} checks passed`);
+})();

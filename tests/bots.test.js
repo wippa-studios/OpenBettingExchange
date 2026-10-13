@@ -22,11 +22,20 @@ const M = require('../lib/match');
 const A = require('../lib/auth');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 // One open market with one fair-priced selection (the minimum the bot needs
 // to quote). Fresh :memory: db per example — no shared state.
-function fixture(opts = {}) {
+async function fixture(opts = {}) {
+  // ensureBot() is synchronous (it runs inside transactions in lib/settle.js and
+  // lib/cashoutrisk.js) and so cannot derive the house password hash itself.
+  // This venue is hand-built rather than seeded, so prime it explicitly.
+  await require('../lib/bots').primeBotHash();
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('S', 's')").run();
   db.prepare("INSERT INTO events (sport_id, name, starts_at) VALUES (1, 'E', '2099-01-01 00:00:00')").run();
@@ -43,8 +52,8 @@ function fixture(opts = {}) {
 // B1: the market-status guard quoteMarket previously lacked (its sibling
 // requoteSelection had it): a suspended market gains no fresh bot quotes —
 // and no bot account is minted for a market that will not be quoted.
-check('B1 quoteMarket places nothing on a suspended market', () => {
-  const { db, marketId } = fixture({ marketStatus: 'suspended' });
+check('B1 quoteMarket places nothing on a suspended market', async () => {
+  const { db, marketId } = (await fixture({ marketStatus: 'suspended' }));
   bots.quoteMarket(db, marketId);
   assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM orders').get().n, 0, 'no orders placed');
   assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM users WHERE is_bot = 1').get().n, 0, 'no bot minted');
@@ -53,8 +62,8 @@ check('B1 quoteMarket places nothing on a suspended market', () => {
 // B2: quoting an open market lays a 3-tick spread around fair: lay offers
 // ABOVE fair (users back into them), back offers BELOW fair (users lay into
 // them). fair 2.5 → lays 2.52/2.54/2.56, backs 2.48/2.46/2.44.
-check('B2 quoteMarket quotes 3 lay levels above and 3 back levels below fair', () => {
-  const { db, marketId, selectionId } = fixture({ fair: 2.5 });
+check('B2 quoteMarket quotes 3 lay levels above and 3 back levels below fair', async () => {
+  const { db, marketId, selectionId } = (await fixture({ fair: 2.5 }));
   bots.quoteMarket(db, marketId);
   const bot = db.prepare('SELECT * FROM users WHERE is_bot = 1').get();
   assert.ok(bot, 'the bot account exists after quoting');
@@ -71,8 +80,8 @@ check('B2 quoteMarket quotes 3 lay levels above and 3 back levels below fair', (
 // B3: escrow parity — the bot froze exactly escrowFor(side, price, stake)
 // per order (the engine's one formula; the bot must never carry a re-derived
 // copy), and the wallet's frozen total is the sum of the order escrows.
-check('B3 every quoted order froze exactly escrowFor(side, price, stake)', () => {
-  const { db, marketId } = fixture({ fair: 3.05 });
+check('B3 every quoted order froze exactly escrowFor(side, price, stake)', async () => {
+  const { db, marketId } = (await fixture({ fair: 3.05 }));
   bots.quoteMarket(db, marketId);
   const bot = db.prepare('SELECT * FROM users WHERE is_bot = 1').get();
   const orders = db.prepare("SELECT * FROM orders WHERE user_id = ? AND status = 'open'").all(bot.id);
@@ -91,7 +100,7 @@ check('B3 every quoted order froze exactly escrowFor(side, price, stake)', () =>
 // transaction rolls back; market B (quoted AFTER A) must still get its full
 // spread. B's worst-case need is 152,400 cents (3 lays at 2.52-2.56 plus
 // 3 backs, max size 20000), inside the 200,000-cent bank.
-check('B4 quoteAllMarkets isolates one failing market and keeps quoting the rest', () => {
+check('B4 quoteAllMarkets isolates one failing market and keeps quoting the rest', async () => {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('S', 's')").run();
   db.prepare("INSERT INTO events (sport_id, name, starts_at) VALUES (1, 'E', '2099-01-01 00:00:00')").run();
@@ -102,7 +111,7 @@ check('B4 quoteAllMarkets isolates one failing market and keeps quoting the rest
   };
   addMarket('A-exhausts-bot', 990); // created first: fails before B is reached
   addMarket('B-normal', 2.5);
-  A.createAccount(db, {
+  await A.createAccount(db, {
     username: bots.BOT_USERNAME,
     password: bots.BOT_PASSWORD,
     is_bot: 1,
@@ -117,4 +126,21 @@ check('B4 quoteAllMarkets isolates one failing market and keeps quoting the rest
   assert.strictEqual(countIn('B-normal'), 6, 'the market after the failure is fully quoted');
 });
 
-console.log(`\nbots.test.js: ${passed} checks passed`);
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  console.log(`\nbots.test.js: ${passed} checks passed`);
+})();

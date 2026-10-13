@@ -28,13 +28,22 @@ const settle = require('../lib/settle');
 const config = require('../lib/config');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 let evCounter = 0;
-function fresh() {
+async function fresh() {
+  // ensureBot() is synchronous (it runs inside transactions in lib/settle.js and
+  // lib/cashoutrisk.js) and so cannot derive the house password hash itself.
+  // This venue is hand-built rather than seeded, so prime it explicitly.
+  await require('../lib/bots').primeBotHash();
   const db = openStore(':memory:');
-  const mk = (name) => A.registerUser(db, { username: name, password: 'secret1', balance_cents: 100000 });
-  return { db, users: { alice: mk('alice'), bob: mk('bob'), carol: mk('carol'), dave: mk('dave') } };
+  const mk = async (name) => A.registerUser(db, { username: name, password: 'secret1', balance_cents: 100000 });
+  return { db, users: { alice: (await mk('alice')), bob: (await mk('bob')), carol: (await mk('carol')), dave: (await mk('dave')) } };
 }
 
 function mkMarket(db, selections) {
@@ -73,8 +82,8 @@ function inTheMoney(db, users) {
 // C1: a quote is a QUOTE. It must not move money, place orders, or change a
 // single balance. A "peek" that executed would be catastrophic on a UI that
 // re-quotes on every render.
-check('C1 quoting does not execute', () => {
-  const { db, users } = fresh();
+check('C1 quoting does not execute', async () => {
+  const { db, users } = (await fresh());
   const market_id = inTheMoney(db, users);
   const before = balances(db, users.alice.id);
   const ordersBefore = db.prepare('SELECT COUNT(*) c FROM orders').get().c;
@@ -87,8 +96,8 @@ check('C1 quoting does not execute', () => {
 });
 
 // C2: no position, no quote and a refused execution.
-check('C2 no position is refused', () => {
-  const { db, users } = fresh();
+check('C2 no position is refused', async () => {
+  const { db, users } = (await fresh());
   const market_id = inTheMoney(db, users);
   assert.strictEqual(C.cashoutQuote(db, users.carol, market_id), null, 'carol holds nothing');
   assert.throws(() => C.cashoutMarket(db, users.carol, market_id), /unavailable/);
@@ -97,8 +106,8 @@ check('C2 no position is refused', () => {
 
 // C3: a SETTLED market cannot be cashed out — the position is already gone,
 // and paying again would be a double-settlement.
-check('C3 a settled market is refused', () => {
-  const { db, users } = fresh();
+check('C3 a settled market is refused', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.0]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.5, stake_cents: 10000 });
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.5, stake_cents: 10000 });
@@ -112,8 +121,8 @@ check('C3 a settled market is refused', () => {
 // C4: atomicity. A refused buyout must leave the position intact and every
 // balance exactly where it was — the player must still be able to try again
 // once whatever blocked it is resolved.
-check('C4 a refused buyout is atomic and leaves the position intact', () => {
-  const { db, users } = fresh();
+check('C4 a refused buyout is atomic and leaves the position intact', async () => {
+  const { db, users } = (await fresh());
   const market_id = inTheMoney(db, users);
   const before = balances(db, users.alice.id);
   assert.throws(() => C.cashoutMarket(db, users.carol, market_id), /unavailable/);
@@ -126,8 +135,8 @@ check('C4 a refused buyout is atomic and leaves the position intact', () => {
 
 // C5: CASHING OUT IS SWITCHABLE. An operator who does not want to offer it
 // must be able to turn it off without a code change.
-check('C5 cash-out can be disabled', () => {
-  const { db, users } = fresh();
+check('C5 cash-out can be disabled', async () => {
+  const { db, users } = (await fresh());
   const market_id = inTheMoney(db, users);
   assert.ok(C.cashoutQuote(db, users.alice, market_id), 'enabled by default');
 
@@ -144,8 +153,8 @@ check('C5 cash-out can be disabled', () => {
 // C6: MIXED positions are now SUPPORTED, not refused. The v1 suite asserted
 // this was refused; that assertion is the thing this change reverses, so it
 // is pinned explicitly rather than quietly dropped.
-check('C6 a mixed back/lay position across runners is now supported', () => {
-  const { db, users } = fresh();
+check('C6 a mixed back/lay position across runners is now supported', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1, s2 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.0]]);
   // Mixed sides across runners, and deliberately PRICED so the position is
   // worth something: back Alpha at 2.5 (favourable against fair 2.0) and lay
@@ -163,10 +172,11 @@ check('C6 a mixed back/lay position across runners is now supported', () => {
 
 // C7: the house cannot cash itself out. The venue quoting to itself would be
 // a self-dealing loop.
-check('C7 the house account is not given a cash-out quote', () => {
-  const { db, users } = fresh();
+check('C7 the house account is not given a cash-out quote', async () => {
+  const { db, users } = (await fresh());
   const market_id = inTheMoney(db, users);
   const bots = require('../lib/bots');
+  await bots.primeBotHash(); // ensureBot() is synchronous and cannot hash for itself
   const bot = bots.ensureBot(db);
   // Give the house a position against a player.
   M.placeOrder(db, bot, { selection_id: 1, side: 'lay', price: 3.5, stake_cents: 10000 });
@@ -176,5 +186,22 @@ check('C7 the house account is not given a cash-out quote', () => {
   assert.strictEqual(plan, null, 'and in fact refused outright');
 });
 
-console.log(`\ncashout.test.js: ${passed} checks passed`);
-if (passed < 7) { console.error('expected 7 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 7) { console.error('expected 7 checks'); process.exit(1); }
+  console.log(`\ncashout.test.js: ${passed} checks passed`);
+})();

@@ -35,10 +35,19 @@ const S = require('../lib/settle');
 const config = require('../lib/config');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 let n = 0;
-function fixture() {
+async function fixture() {
+  // ensureBot() is synchronous (it runs inside transactions in lib/settle.js and
+  // lib/cashoutrisk.js) and so cannot derive the house password hash itself.
+  // This venue is hand-built rather than seeded, so prime it explicitly.
+  await require('../lib/bots').primeBotHash();
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -51,8 +60,8 @@ function fixture() {
     db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 2.0)').run(mkt.id, nm);
   }
   const s1 = db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, 'Alpha').id;
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 1000000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 1000000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 1000000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 1000000 }));
   return { db, alice, bob, marketId: mkt.id, s1, s2: s1 + 1 };
 }
 
@@ -67,8 +76,8 @@ const CFG = (over = {}) => ({
 // were wrong — it is that nothing ever wrote the data they read, so a venue
 // could execute thirty buyouts and the desk would still show zero exposure
 // and full headroom.
-check('X1 a REAL cash-out is recorded and the desk reads it', () => {
-  const f = fixture();
+check('X1 a REAL cash-out is recorded and the desk reads it', async () => {
+  const f = (await fixture());
   M.placeOrder(f.db, f.alice, { selection_id: f.s1, side: 'back', price: 2.5, stake_cents: 10000 });
   M.placeOrder(f.db, f.bob, { selection_id: f.s1, side: 'lay', price: 2.5, stake_cents: 10000 });
   const C = require('../lib/cashout');
@@ -91,8 +100,8 @@ check('X1 a REAL cash-out is recorded and the desk reads it', () => {
 });
 
 // X2: exposure is the fair value of UNRESOLVED buyouts only.
-check('X2 exposure counts only unresolved markets', () => {
-  const f = fixture();
+check('X2 exposure counts only unresolved markets', async () => {
+  const f = (await fixture());
   M.placeOrder(f.db, f.alice, { selection_id: f.s1, side: 'back', price: 2.5, stake_cents: 10000 });
   M.placeOrder(f.db, f.bob, { selection_id: f.s1, side: 'lay', price: 2.5, stake_cents: 10000 });
   require('../lib/cashout').cashoutMarket(f.db, f.alice, f.marketId);
@@ -103,8 +112,8 @@ check('X2 exposure counts only unresolved markets', () => {
 });
 
 // X3: the venue exposure cap stops quoting.
-check('X3 the venue exposure cap stops quoting', () => {
-  const f = fixture();
+check('X3 the venue exposure cap stops quoting', async () => {
+  const f = (await fixture());
   // Exposure is the FAIR VALUE of unresolved buyouts; outlay is what was
   // PAID. To isolate the exposure cap, keep the outlay under the daily cap
   // ($50000) while the fair value sits at the exposure cap ($100000).
@@ -119,8 +128,8 @@ check('X3 the venue exposure cap stops quoting', () => {
 // whole venue budget in a session. The holder is refused; a fresh player is
 // not — otherwise the per-user cap would just ration the venue to whoever
 // arrived first.
-check('X4 a per-user cap stops the HOLDER, not everyone', () => {
-  const f = fixture();
+check('X4 a per-user cap stops the HOLDER, not everyone', async () => {
+  const f = (await fixture());
   // Five unresolved buyouts at fair value 6000 each: 30000 exposure, well
   // under the venue cap of 100000, over the per-user cap of 25000.
   for (let i = 0; i < 5; i++) {
@@ -138,8 +147,8 @@ check('X4 a per-user cap stops the HOLDER, not everyone', () => {
 // X5: the DAILY cap gates on outlay — what has been PAID today — because it
 // is known at decision time. Realised loss is backward-looking: by the time
 // it is measurable the money is gone.
-check('X5 the daily cap gates on outlay paid today', () => {
-  const f = fixture();
+check('X5 the daily cap gates on outlay paid today', async () => {
+  const f = (await fixture());
   CR.recordBuyout(f.db, { userId: f.alice.id, marketId: f.marketId, fairValueCents: 60000, paidCents: 50000, houseMatchIds: [] });
   const r = CR.refusal(f.db, f.bob.id, CFG());
   assert.ok(r, 'refused on outlay, not exposure');
@@ -165,8 +174,8 @@ function realBuyout(f) {
   return { ...f, plan, row };
 }
 
-check('X6 settling the WINNING side records the venue profit as a negative loss', () => {
-  const f = realBuyout(fixture());
+check('X6 settling the WINNING side records the venue profit as a negative loss', async () => {
+  const f = realBuyout((await fixture()));
   // The house took over Alice's BACK at 2.5 for stake 10000; her selection
   // wins, so the house receives 15000 for the 9804 it paid (quote ≈ 98% of
   // fair 10000... plan.value). Loss = paid − 15000, negative: a profitable buyout.
@@ -179,8 +188,8 @@ check('X6 settling the WINNING side records the venue profit as a negative loss'
   assert.ok(CR.realisedLossToday(f.db) === 0, 'a profitable buyout is not counted as a loss');
 });
 
-check('X7 settling the LOSING side records the full true cost', () => {
-  const f = realBuyout(fixture());
+check('X7 settling the LOSING side records the full true cost', async () => {
+  const f = realBuyout((await fixture()));
   // Alice's selection loses: the house's taken-over back stake is gone, and it
   // ALSO paid her the quote. The true loss is paid + stake — which the old
   // fair−paid metric could never show.
@@ -191,8 +200,8 @@ check('X7 settling the LOSING side records the full true cost', () => {
   assert.strictEqual(CR.realisedLossToday(f.db), f.plan.value_cents + 10000, 'the desk reads the real loss');
 });
 
-check('X8 a VOID market costs the venue the whole payout', () => {
-  const f = realBuyout(fixture());
+check('X8 a VOID market costs the venue the whole payout', async () => {
+  const f = realBuyout((await fixture()));
   S.settleMarket(f.db, f.marketId, { void: true });
   const q = f.db.prepare('SELECT * FROM cashout_quotes').get();
   assert.strictEqual(q.proceeds_cents, 0, 'stake returned, nothing won');
@@ -202,15 +211,15 @@ check('X8 a VOID market costs the venue the whole payout', () => {
 
 // X9: zero caps mean unlimited, not never-quote — reading zero as a hard stop
 // would take the venue offline by misconfiguration.
-check('X9 zero caps mean unlimited rather than never-quote', () => {
-  const f = fixture();
+check('X9 zero caps mean unlimited rather than never-quote', async () => {
+  const f = (await fixture());
   CR.recordBuyout(f.db, { userId: f.alice.id, marketId: f.marketId, fairValueCents: 99999, paidCents: 99999, houseMatchIds: [] });
   assert.strictEqual(CR.refusal(f.db, f.alice.id, { venueMaxOutstandingCents: 0, venueMaxDailyLossCents: 0 }), null);
 });
 
 // X10: caps of zero report unlimited headroom as null, not a fake number.
-check('X10 the desk reports unlimited headroom as null', () => {
-  const f = fixture();
+check('X10 the desk reports unlimited headroom as null', async () => {
+  const f = (await fixture());
   const d = CR.desk(f.db, { venueMaxOutstandingCents: 0, venueMaxDailyLossCents: 0 });
   assert.strictEqual(d.outstanding_headroom_cents, null);
   assert.strictEqual(d.daily_outlay_headroom_cents, null);
@@ -228,9 +237,9 @@ check('X10 the desk reports unlimited headroom as null', () => {
 // (correct) reason, which made this check fail for the wrong cause. Alice's
 // position must be untouched by the saturation step so the cap is the only
 // variable.
-check('X11 the cap is enforced in the real quote path', () => {
-  const f = fixture();
-  const carol = A.registerUser(f.db, { username: 'carol', password: 'pw-carol-123', balance_cents: 1000000 });
+check('X11 the cap is enforced in the real quote path', async () => {
+  const f = (await fixture());
+  const carol = (await A.registerUser(f.db, { username: 'carol', password: 'pw-carol-123', balance_cents: 1000000 }));
   const C = require('../lib/cashout');
   // Alice's position: a clean in-the-money back, matched by Bob.
   M.placeOrder(f.db, f.alice, { selection_id: f.s1, side: 'back', price: 2.5, stake_cents: 10000 });
@@ -256,5 +265,22 @@ check('X11 the cap is enforced in the real quote path', () => {
   assert.ok(C.cashoutQuote(f.db, f.alice, f.marketId), 'and it returns when the cap lifts');
 });
 
-console.log(`\ncashoutrisk.test.js: ${passed} checks passed`);
-if (passed < 11) { console.error('expected 11 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 11) { console.error('expected 11 checks'); process.exit(1); }
+  console.log(`\ncashoutrisk.test.js: ${passed} checks passed`);
+})();

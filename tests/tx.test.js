@@ -14,17 +14,22 @@ const M = require('../lib/match');
 const { transaction, inTransaction } = require('../lib/tx');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
-function fresh() {
+async function fresh() {
   const db = openStore(':memory:');
-  const u = A.registerUser(db, { username: 'joel', password: 'secret1', balance_cents: 100000 });
+  const u = (await A.registerUser(db, { username: 'joel', password: 'secret1', balance_cents: 100000 }));
   return { db, u };
 }
 
 // X1: a committed transaction persists; a failed one leaves nothing behind.
-check('X1 commit and rollback', () => {
-  const { db } = fresh();
+check('X1 commit and rollback', async () => {
+  const { db } = (await fresh());
   transaction(db, () => db.prepare("UPDATE users SET balance_cents = 7").run());
   assert.strictEqual(db.prepare('SELECT balance_cents b FROM users').get().b, 7);
   assert.strictEqual(inTransaction(), false);
@@ -40,8 +45,8 @@ check('X1 commit and rollback', () => {
 
 // X2: nesting uses SAVEPOINTs (SQLite forbids a nested BEGIN) and the inner
 // failure rolls back only the inner work.
-check('X2 nested savepoints', () => {
-  const { db, u } = fresh();
+check('X2 nested savepoints', async () => {
+  const { db, u } = (await fresh());
   transaction(db, () => {
     db.prepare('UPDATE users SET balance_cents = 50').run();
     assert.strictEqual(inTransaction(), true);
@@ -60,8 +65,8 @@ check('X2 nested savepoints', () => {
 });
 
 // X3: depth always unwinds, even when the body throws a non-Error.
-check('X3 depth unwinds on throw', () => {
-  const { db } = fresh();
+check('X3 depth unwinds on throw', async () => {
+  const { db } = (await fresh());
   assert.throws(() => transaction(db, () => { throw 'a string'; }));
   assert.strictEqual(inTransaction(), false);
   // and the connection is still usable afterwards
@@ -71,8 +76,8 @@ check('X3 depth unwinds on throw', () => {
 
 // X4: placeOrderTx refuses to run outside a transaction — the whole point of
 // exporting it separately is that the CALLER owns the rollback.
-check('X4 placeOrderTx requires a transaction', () => {
-  const { db, u } = fresh();
+check('X4 placeOrderTx requires a transaction', async () => {
+  const { db, u } = (await fresh());
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football','football')").run();
   db.prepare("INSERT INTO events (sport_id, name, starts_at) VALUES (1,'E',datetime('now','+2 hours'))").run();
   db.prepare("INSERT INTO markets (event_id, name) VALUES (1,'Match Odds')").run();
@@ -89,8 +94,8 @@ check('X4 placeOrderTx requires a transaction', () => {
 
 // X5: a ledger op called standalone is still atomic (it opens its own
 // transaction), and two of them compose into one.
-check('X5 standalone and composed ledger ops', () => {
-  const { db, u } = fresh();
+check('X5 standalone and composed ledger ops', async () => {
+  const { db, u } = (await fresh());
   L.escrow(db, u.id, 1000);           // standalone
   assert.deepStrictEqual([L.availableOf(db.prepare('SELECT * FROM users WHERE id=?').get(u.id))], [99000]);
   L.escrow(db, u.id, 2000);
@@ -100,15 +105,15 @@ check('X5 standalone and composed ledger ops', () => {
 });
 
 // X6: a failed service op leaves the wallet AND the order book untouched.
-check('X6 failed place is all-or-nothing', () => {
-  const { db } = fresh();
-  const mk = (n, bal) => A.registerUser(db, { username: n, password: 'secret1', balance_cents: bal });
+check('X6 failed place is all-or-nothing', async () => {
+  const { db } = (await fresh());
+  const mk = async (n, bal) => A.registerUser(db, { username: n, password: 'secret1', balance_cents: bal });
   db.prepare("INSERT INTO sports (name, slug) VALUES ('F','f')").run();
   db.prepare("INSERT INTO events (sport_id, name, starts_at) VALUES (1,'E',datetime('now','+2 hours'))").run();
   db.prepare("INSERT INTO markets (event_id, name) VALUES (1,'M')").run();
   db.prepare("INSERT INTO selections (market_id, name, fair_price) VALUES (1,'A',2.0)").run();
   const sel = db.prepare('SELECT id FROM selections').get().id;
-  const poor = mk('poor', 500);
+  const poor = (await mk('poor', 500));
   // stake escrow (2000) exceeds the balance (500) -> the whole op must abort
   assert.throws(() => M.placeOrder(db, poor, { selection_id: sel, side: 'back', price: 2.0, stake_cents: 2000 }), /Insufficient/);
   assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM orders').get().n, 0);
@@ -118,4 +123,21 @@ check('X6 failed place is all-or-nothing', () => {
   assert.strictEqual(inTransaction(), false);
 });
 
-console.log(`\ntx.test.js: ${passed} checks passed`);
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  console.log(`\ntx.test.js: ${passed} checks passed`);
+})();

@@ -32,13 +32,18 @@ const R = require('../lib/results');
 const acc = require('../lib/accounts');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 // S1: EVERY seeded sport has a rule set. This is the check whose absence let a
 // finished race be voided.
-check('S1 every seeded sport has a rule set', () => {
+check('S1 every seeded sport has a rule set', async () => {
   const db = openStore(':memory:');
-  seed.seed(db);
+  await seed.seed(db);
   const slugs = db.prepare('SELECT slug FROM sports ORDER BY slug').all().map((r) => r.slug);
   assert.ok(slugs.length > 0, 'the seed creates sports');
   const missing = slugs.filter((s) => !rules.hasRules(s));
@@ -48,9 +53,9 @@ check('S1 every seeded sport has a rule set', () => {
 
 // S2: and the reverse — every rule set names a sport that exists, so a typo in
 // the table is caught as a typo rather than as a silently-voided market.
-check('S2 every rule set names a real sport', () => {
+check('S2 every rule set names a real sport', async () => {
   const db = openStore(':memory:');
-  seed.seed(db);
+  await seed.seed(db);
   const slugs = new Set(db.prepare('SELECT slug FROM sports').all().map((r) => r.slug));
   const orphans = Object.keys(rules.RULES).filter((k) => !slugs.has(k));
   assert.deepStrictEqual(orphans, [], `rule sets for sports that are not seeded: ${orphans.join(', ')}`);
@@ -62,7 +67,7 @@ check('S2 every rule set names a real sport', () => {
 // before the key was aligned, and it is worth having in this exact form
 // because it is the only place the whole chain (feed signal -> rule -> settle
 // -> payout) is exercised against a seeded sport.
-check('S3 a finished greyhound race with a winner PAYS the winner', () => {
+check('S3 a finished greyhound race with a winner PAYS the winner', async () => {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Greyhounds', 'greyhounds')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='greyhounds'").get();
@@ -72,8 +77,8 @@ check('S3 a finished greyhound race with a winner PAYS the winner', () => {
   const mkt = db.prepare('SELECT id FROM markets WHERE event_id=?').get(ev.id);
   for (const n of ['Red', 'Blue']) db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 3.0)').run(mkt.id, n);
   const s1 = db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, 'Red').id;
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 }));
   M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 3.0, stake_cents: 1000 });
   M.placeOrder(db, bob, { selection_id: s1, side: 'lay', price: 3.0, stake_cents: 1000 });
 
@@ -90,7 +95,7 @@ check('S3 a finished greyhound race with a winner PAYS the winner', () => {
 });
 
 // S4: the same for basketball, the other sport that had no rules at all.
-check('S4 a finished basketball game with a winner PAYS the winner', () => {
+check('S4 a finished basketball game with a winner PAYS the winner', async () => {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Basketball', 'basketball')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='basketball'").get();
@@ -100,8 +105,8 @@ check('S4 a finished basketball game with a winner PAYS the winner', () => {
   const mkt = db.prepare('SELECT id FROM markets WHERE event_id=?').get(ev.id);
   for (const n of ['Home', 'Away']) db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 2.0)').run(mkt.id, n);
   const s1 = db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, 'Home').id;
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 }));
   M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 1000 });
   M.placeOrder(db, bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 1000 });
 
@@ -115,9 +120,9 @@ check('S4 a finished basketball game with a winner PAYS the winner', () => {
 
 // S5: horse racing is seeded, and its dead-heat rule is reachable — the
 // capability is not dead code behind a sport that does not exist.
-check('S5 horse racing is seeded and settles a dead heat as a joint favourite', () => {
+check('S5 horse racing is seeded and settles a dead heat as a joint favourite', async () => {
   const db = openStore(':memory:');
-  seed.seed(db);
+  await seed.seed(db);
   const sp = db.prepare("SELECT id FROM sports WHERE slug='horse_racing'").get();
   assert.ok(sp, 'horse racing exists in the seed');
   db.prepare("INSERT INTO events (sport_id, name, starts_at, status) VALUES (?, 'DH', datetime('now','+2 hours'), 'live')").run(sp.id);
@@ -126,8 +131,8 @@ check('S5 horse racing is seeded and settles a dead heat as a joint favourite', 
   const mkt = db.prepare('SELECT id FROM markets WHERE event_id=?').get(ev.id);
   for (const n of ['Red', 'Blue']) db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 2.5)').run(mkt.id, n);
   const [red, blue] = db.prepare('SELECT id FROM selections WHERE market_id=? ORDER BY id').all(mkt.id).map((r) => r.id);
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 }));
   M.placeOrder(db, alice, { selection_id: red, side: 'back', price: 2.5, stake_cents: 1000 });
   M.placeOrder(db, bob, { selection_id: red, side: 'lay', price: 2.5, stake_cents: 1000 });
 
@@ -144,5 +149,22 @@ check('S5 horse racing is seeded and settles a dead heat as a joint favourite', 
   db.close();
 });
 
-console.log(`\nrules-consistency.test.js: ${passed} checks passed`);
-if (passed < 5) { console.error('expected 5 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 5) { console.error('expected 5 checks'); process.exit(1); }
+  console.log(`\nrules-consistency.test.js: ${passed} checks passed`);
+})();

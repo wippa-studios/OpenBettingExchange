@@ -28,10 +28,19 @@ const acc = require('../lib/accounts');
 const config = require('../lib/config');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 let n = 0;
-function fixture() {
+async function fixture() {
+  // ensureBot() is synchronous (it runs inside transactions in lib/settle.js and
+  // lib/cashoutrisk.js) and so cannot derive the house password hash itself.
+  // This venue is hand-built rather than seeded, so prime it explicitly.
+  await require('../lib/bots').primeBotHash();
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -42,8 +51,8 @@ function fixture() {
   const mkt = db.prepare('SELECT id FROM markets WHERE event_id=?').get(ev.id);
   db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 2.0)').run(mkt.id, 'Alpha');
   const s1 = db.prepare('SELECT id FROM selections WHERE market_id=?').get(mkt.id).id;
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 }));
   return { db, alice, bob, marketId: mkt.id, s1 };
 }
 
@@ -65,14 +74,14 @@ const age = (f, { session = 0, check = 0 } = {}) => {
 // G1: with NOTHING configured, play is unaffected. The controls are
 // operator-configured, so the default must be a venue that works — the boot
 // warning is what makes the default honest, not a refusal that breaks the demo.
-check('G1 unconfigured RG controls change nothing', () => {
+check('G1 unconfigured RG controls change nothing', async () => {
   const prev = [config.RG_SESSION_MINUTES, config.RG_REALITY_CHECK_MINUTES, config.RG_DEPOSIT_DAILY_CENTS];
   config.RG_SESSION_MINUTES = 0;
   config.RG_REALITY_CHECK_MINUTES = 0;
   config.RG_DEPOSIT_DAILY_CENTS = 0;
   try {
     assert.strictEqual(RG.configured(), false, 'reported as unconfigured');
-    const f = fixture();
+    const f = (await fixture());
     assert.ok(bet(f, f.alice).order.id, 'play is unaffected');
     ledger.deposit(f.db, f.alice.id, 500000, config.FAUCET_MAX_CENTS);
     assert.strictEqual(bal(f, 'alice').b, 100000 + 500000, 'deposits are unaffected');
@@ -83,11 +92,11 @@ check('G1 unconfigured RG controls change nothing', () => {
 
 // G2: THE SESSION LIMIT. Age the session past the configured limit and play
 // stops — at the engine, not in the UI.
-check('G2 a session limit stops play at the limit', () => {
+check('G2 a session limit stops play at the limit', async () => {
   const prev = config.RG_SESSION_MINUTES;
   config.RG_SESSION_MINUTES = 60;
   try {
-    const f = fixture();
+    const f = (await fixture());
     RG.startSession(f.db, f.alice.id);
     assert.ok(bet(f, f.alice).order.id, 'play works inside the limit');
     age(f, { session: 61 });
@@ -113,12 +122,12 @@ check('G2 a session limit stops play at the limit', () => {
 // The reset condition is now IDLE, measured from last_active_at (stamped by
 // requireAuth on real use), so signing out cannot start a new session while
 // walking away and coming back does.
-check('G3 the session clock survives logout and resets only after an idle gap', () => {
+check('G3 the session clock survives logout and resets only after an idle gap', async () => {
   const prev = [config.RG_SESSION_MINUTES, config.RG_SESSION_IDLE_RESET_MINUTES];
   config.RG_SESSION_MINUTES = 60;
   config.RG_SESSION_IDLE_RESET_MINUTES = 15;
   try {
-    const f = fixture();
+    const f = (await fixture());
     RG.startSession(f.db, f.alice.id);
     age(f, { session: 61 });
     const first = RG.stateOf(f.db, f.alice.id).session_started_at;
@@ -159,12 +168,12 @@ check('G3 the session clock survives logout and resets only after an idle gap', 
 // G3b: ONE logout must not clear another session's clock. Because the clock is
 // per-user, a per-session reset is the only way to be sure — and it is exactly
 // what the old `endSession` did, from any session.
-check('G3b a logout cannot clear a clock another session is still playing', () => {
+check('G3b a logout cannot clear a clock another session is still playing', async () => {
   const prev = [config.RG_SESSION_MINUTES, config.RG_SESSION_IDLE_RESET_MINUTES];
   config.RG_SESSION_MINUTES = 60;
   config.RG_SESSION_IDLE_RESET_MINUTES = 15;
   try {
-    const f = fixture();
+    const f = (await fixture());
     RG.startSession(f.db, f.alice.id);
     age(f, { session: 61 });
     const before = RG.stateOf(f.db, f.alice.id).session_started_at;
@@ -183,11 +192,11 @@ check('G3b a logout cannot clear a clock another session is still playing', () =
 // G4: THE REALITY CHECK. The ENGINE decides one is due, and only the
 // acknowledgement clears it. A check the player can skip by not clicking is
 // not a check.
-check('G4 a due reality check blocks play until acknowledged', () => {
+check('G4 a due reality check blocks play until acknowledged', async () => {
   const prev = config.RG_REALITY_CHECK_MINUTES;
   config.RG_REALITY_CHECK_MINUTES = 20;
   try {
-    const f = fixture();
+    const f = (await fixture());
     RG.startSession(f.db, f.alice.id);
     assert.strictEqual(RG.realityCheckDue(f.db, f.alice.id).due, false, 'not due at the start');
     assert.ok(bet(f, f.alice).order.id, 'play works');
@@ -211,11 +220,11 @@ check('G4 a due reality check blocks play until acknowledged', () => {
 
 // G5: the acknowledgement records the player's OWN net position, so the
 // summary shown to them is auditable rather than a client-side number.
-check('G5 a reality check records the player own net position', () => {
+check('G5 a reality check records the player own net position', async () => {
   const prev = config.RG_REALITY_CHECK_MINUTES;
   config.RG_REALITY_CHECK_MINUTES = 20;
   try {
-    const f = fixture();
+    const f = (await fixture());
     RG.startSession(f.db, f.alice.id);
     // Give alice a settled win so there is a real net to report. bob LAYS:
     // two backs would never match and she would have nothing settled.
@@ -242,11 +251,11 @@ check('G5 a reality check records the player own net position', () => {
 
 // G6: THE DEPOSIT LIMIT, on BOTH deposit paths. A limit that only guards the
 // faucet is defeated by using the payment intent instead.
-check('G6 the deposit limit applies to both deposit paths', () => {
+check('G6 the deposit limit applies to both deposit paths', async () => {
   const prev = config.RG_DEPOSIT_DAILY_CENTS;
   config.RG_DEPOSIT_DAILY_CENTS = 100000;
   try {
-    const f = fixture();
+    const f = (await fixture());
     ledger.deposit(f.db, f.alice.id, 60000, config.FAUCET_MAX_CENTS); // the faucet
     assert.strictEqual(RG.depositedInWindow(f.db, f.alice.id), 60000);
     // 40000 more fits; 40001 does not.
@@ -264,11 +273,11 @@ check('G6 the deposit limit applies to both deposit paths', () => {
 // G7: the deposit limit is a ROLLING window, so it cannot be reset by waiting
 // for midnight — a calendar-day limit is trivially gamed by depositing at
 // 23:59 and 00:01.
-check('G7 the deposit window is rolling, not a calendar day', () => {
+check('G7 the deposit window is rolling, not a calendar day', async () => {
   const prev = config.RG_DEPOSIT_DAILY_CENTS;
   config.RG_DEPOSIT_DAILY_CENTS = 100000;
   try {
-    const f = fixture();
+    const f = (await fixture());
     ledger.deposit(f.db, f.alice.id, 60000, config.FAUCET_MAX_CENTS);
     // Age that deposit to 23 hours ago: still inside the rolling 24h window.
     f.db.prepare("UPDATE transactions SET at = datetime('now','-23 hours') WHERE user_id = ? AND type='deposit'").run(f.alice.id);
@@ -285,12 +294,12 @@ check('G7 the deposit window is rolling, not a calendar day', () => {
 // G8: THE CONTROLS ARE NOT A BYPASS AROUND EXCLUSION OR SUSPENSION. They sit
 // inside the same gate, and a self-excluded account is still refused with the
 // exclusion message — not a session message that invites an argument.
-check('G8 exclusion still outranks the RG controls', () => {
+check('G8 exclusion still outranks the RG controls', async () => {
   const prev = [config.RG_SESSION_MINUTES, config.RG_REALITY_CHECK_MINUTES];
   config.RG_SESSION_MINUTES = 60;
   config.RG_REALITY_CHECK_MINUTES = 20;
   try {
-    const f = fixture();
+    const f = (await fixture());
     RG.startSession(f.db, f.alice.id);
     L.exclude(f.db, { actor: null, userId: f.alice.id, until: null, reason: 'test' });
     assert.throws(
@@ -306,13 +315,13 @@ check('G8 exclusion still outranks the RG controls', () => {
 // G9: status() is what the client renders, and it must not disagree with the
 // gate. If the countdown says 0 remaining and play still works, the UI is
 // lying and the player finds out at the worst moment.
-check('G9 the client status agrees with the gate', () => {
+check('G9 the client status agrees with the gate', async () => {
   const prev = [config.RG_SESSION_MINUTES, config.RG_REALITY_CHECK_MINUTES, config.RG_DEPOSIT_DAILY_CENTS];
   config.RG_SESSION_MINUTES = 60;
   config.RG_REALITY_CHECK_MINUTES = 20;
   config.RG_DEPOSIT_DAILY_CENTS = 100000;
   try {
-    const f = fixture();
+    const f = (await fixture());
     RG.startSession(f.db, f.alice.id);
     let st = RG.status(f.db, f.alice.id);
     assert.strictEqual(st.configured, true, 'configured');
@@ -333,11 +342,11 @@ check('G9 the client status agrees with the gate', () => {
 
 // G10: no state, no session. A user who has never signed in has no row and
 // must not be blocked — otherwise a fresh account cannot play at all.
-check('G10 a user with no RG state is not blocked', () => {
+check('G10 a user with no RG state is not blocked', async () => {
   const prev = config.RG_SESSION_MINUTES;
   config.RG_SESSION_MINUTES = 60;
   try {
-    const f = fixture();
+    const f = (await fixture());
     assert.strictEqual(f.db.prepare('SELECT COUNT(*) c FROM user_rg_state').get().c, 0, 'no row yet');
     assert.ok(bet(f, f.alice).order.id, 'and play works');
     assert.doesNotThrow(() => RG.assertSession(f.db, f.alice.id));
@@ -357,14 +366,14 @@ check('G10 a user with no RG state is not blocked', () => {
 // one place in the codebase — order placement — so a permanently self-excluded
 // account was refused on POST /api/orders and then walked out through
 // POST /api/markets/:id/cashout with the venue's money.
-check('G11 cash-out is gated exactly like placing a bet', () => {
+check('G11 cash-out is gated exactly like placing a bet', async () => {
   const C = require('../lib/cashout');
   const prev = [config.RG_SESSION_MINUTES, config.RG_REALITY_CHECK_MINUTES];
   config.RG_SESSION_MINUTES = 60;
   config.RG_REALITY_CHECK_MINUTES = 20;
   try {
     // A real position to cash out, or the gate is never reached.
-    const f = fixture();
+    const f = (await fixture());
     bet(f, f.alice);
     M.placeOrder(f.db, f.bob, { selection_id: f.s1, side: 'lay', price: 2.0, stake_cents: 1000 });
     // The position must be worth MORE than its stake, or the plan is refused as
@@ -377,7 +386,7 @@ check('G11 cash-out is gated exactly like placing a bet', () => {
     assert.ok(C.cashoutMarket(f.db, f.alice, f.marketId), 'a healthy player can cash out');
 
     // Self-excluded: the gate must refuse, in the ENGINE.
-    const g = fixture();
+    const g = (await fixture());
     bet(g, g.alice);
     M.placeOrder(g.db, g.bob, { selection_id: g.s1, side: 'lay', price: 2.0, stake_cents: 1000 });
     g.db.prepare('UPDATE selections SET fair_price = 1.5 WHERE id = ?').run(g.s1);
@@ -396,7 +405,7 @@ check('G11 cash-out is gated exactly like placing a bet', () => {
 
     // Past the session limit, and with a reality check owed: also refused.
     for (const [label, ages] of [['session limit', { session: 61 }], ['reality check', { check: 21 }]]) {
-      const h = fixture();
+      const h = (await fixture());
       bet(h, h.alice);
       M.placeOrder(h.db, h.bob, { selection_id: h.s1, side: 'lay', price: 2.0, stake_cents: 1000 });
       h.db.prepare('UPDATE selections SET fair_price = 1.5 WHERE id = ?').run(h.s1);
@@ -413,11 +422,11 @@ check('G11 cash-out is gated exactly like placing a bet', () => {
 // the clock unconditionally, so calling it whenever the player liked kept the
 // countdown permanently fresh: the gate never fired and no summary was ever
 // shown. Twenty parallel calls all returned 200.
-check('G12 acknowledging a check that is not due is refused', () => {
+check('G12 acknowledging a check that is not due is refused', async () => {
   const prev = config.RG_REALITY_CHECK_MINUTES;
   config.RG_REALITY_CHECK_MINUTES = 20;
   try {
-    const f = fixture();
+    const f = (await fixture());
     // The clock only starts when the player actually plays: a REFUSED
     // acknowledgement rolls back the row it would have created, so a refused
     // call on a virgin account leaves no trace at all — which is correct, and
@@ -448,12 +457,12 @@ check('G12 acknowledging a check that is not due is refused', () => {
 // sees is never "sign out and come back in". A permanently excluded account was
 // being told its session limit had been reached — advice that leads straight
 // back in, on an account that can never come back in.
-check('G13 self-exclusion is reported ahead of any session-limit message', () => {
+check('G13 self-exclusion is reported ahead of any session-limit message', async () => {
   const prev = [config.RG_SESSION_MINUTES, config.RG_REALITY_CHECK_MINUTES];
   config.RG_SESSION_MINUTES = 60;
   config.RG_REALITY_CHECK_MINUTES = 20;
   try {
-    const f = fixture();
+    const f = (await fixture());
     RG.startSession(f.db, f.alice.id);
     // BOTH conditions breached, plus a cancelled resting order from exclusion.
     L.exclude(f.db, { actor: null, userId: f.alice.id, until: null, reason: 'test' });
@@ -477,11 +486,11 @@ check('G13 self-exclusion is reported ahead of any session-limit message', () =>
 // when the intent was CREATED, which moves no money — so N intents each passed a
 // check that consumed nothing, and every one of them was credited. Measured: a
 // $1,000 limit and $6,000 deposited, stopped only by an unrelated venue cap.
-check('G14 the deposit limit is enforced at credit, not at intent creation', () => {
+check('G14 the deposit limit is enforced at credit, not at intent creation', async () => {
   const prev = config.RG_DEPOSIT_DAILY_CENTS;
   config.RG_DEPOSIT_DAILY_CENTS = 100000; // $1,000
   try {
-    const f = fixture();
+    const f = (await fixture());
     const PAY = require('../lib/payments');
     // Open MANY intents, each individually under the cap. This is what defeated
     // the control: creating an intent costs nothing, so any number of them can
@@ -524,5 +533,22 @@ check('G14 the deposit limit is enforced at credit, not at intent creation', () 
   }
 });
 
-console.log(`\nrg.test.js: ${passed} checks passed`);
-if (passed < 15) { console.error('expected 15 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 15) { console.error('expected 15 checks'); process.exit(1); }
+  console.log(`\nrg.test.js: ${passed} checks passed`);
+})();

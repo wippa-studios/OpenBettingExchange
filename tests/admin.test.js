@@ -23,7 +23,12 @@ const ADM = require('../lib/admin');
 const AUDIT = require('../lib/audit');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 let evCounter = 0;
 function mkMarket(db) {
@@ -46,11 +51,11 @@ function mkMarket(db) {
 }
 
 // An admin plus two players, on a fresh in-memory database.
-function fixture() {
+async function fixture() {
   const db = openStore(':memory:');
-  const admin = A.createAccount(db, { username: 'boss', password: 'secret1', role: 'admin', balance_cents: 1000000 });
-  const alice = A.registerUser(db, { username: 'alice', password: 'secret1', balance_cents: 100000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'secret1', balance_cents: 100000, email: 'Bob@Example.com' });
+  const admin = (await A.createAccount(db, { username: 'boss', password: 'secret1', role: 'admin', balance_cents: 1000000 }));
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'secret1', balance_cents: 100000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'secret1', balance_cents: 100000, email: 'Bob@Example.com' }));
   return { db, admin, alice, bob };
 }
 const balanceOf = (db, id) => {
@@ -59,12 +64,12 @@ const balanceOf = (db, id) => {
 };
 
 // P2: search and filter behaviour.
-check('P2 search matches username or email; bots excluded', () => {
+check('P2 search matches username or email; bots excluded', async () => {
   const db = openStore(':memory:');
-  const admin = A.createAccount(db, { username: 'boss', password: 'secret1', role: 'admin' });
-  const alice = A.registerUser(db, { username: 'alice', password: 'secret1', balance_cents: 1000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'secret1', balance_cents: 1000, email: 'Bob@Example.com' });
-  A.createAccount(db, { username: 'HouseBot', password: 'botpw123', is_bot: 1, balance_cents: 500 });
+  const admin = (await A.createAccount(db, { username: 'boss', password: 'secret1', role: 'admin' }));
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'secret1', balance_cents: 1000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'secret1', balance_cents: 1000, email: 'Bob@Example.com' }));
+  await A.createAccount(db, { username: 'HouseBot', password: 'botpw123', is_bot: 1, balance_cents: 500 });
   db.prepare("UPDATE users SET status='suspended' WHERE id=?").run(alice.id);
 
   assert.strictEqual(ADM.listUsers(db).total, 3, 'boss, alice, bob — the bot is excluded');
@@ -84,8 +89,8 @@ check('P2 search matches username or email; bots excluded', () => {
 
 // P3: suspending releases resting escrow and kills live sessions. A suspended
 // holder whose orders still rest has money they can never trade again.
-check('P3 suspension releases escrow and revokes sessions', () => {
-  const { db, admin, alice, bob } = fixture();
+check('P3 suspension releases escrow and revokes sessions', async () => {
+  const { db, admin, alice, bob } = (await fixture());
   const m = mkMarket(db);
   // Alice rests an unmatched back: 100 @ 2.0 freezes the full 10000c stake.
   const o = M.placeOrder(db, alice, { selection_id: m.s1, side: 'back', price: 2.0, stake_cents: 10000 }).order;
@@ -99,13 +104,13 @@ check('P3 suspension releases escrow and revokes sessions', () => {
   assert.deepStrictEqual(balanceOf(db, alice.id), { b: 100000, f: 0 }, 'escrow fully released');
   assert.strictEqual(M.openOrdersFor(db, alice.id).length, 0);
   assert.strictEqual(A.sessionUser(db, session), null, 'the live token stops working');
-  assert.throws(() => A.loginUser(db, { username: 'alice', password: 'secret1' }), (e) => e.status === 403);
+  await assert.rejects(A.loginUser(db, { username: 'alice', password: 'secret1' }), (e) => e.status === 403);
 });
 
 // P4: suspension must NOT unwind matched positions. They are collateralised on
 // both sides; choosing which side to honour is not the operator's decision.
-check('P4 suspension leaves matched positions intact', () => {
-  const { db, admin, alice, bob } = fixture();
+check('P4 suspension leaves matched positions intact', async () => {
+  const { db, admin, alice, bob } = (await fixture());
   const m = mkMarket(db);
   const lay = M.placeOrder(db, alice, { selection_id: m.s1, side: 'lay', price: 2.0, stake_cents: 10000 }).order;
   const back = M.placeOrder(db, bob, { selection_id: m.s1, side: 'back', price: 2.0, stake_cents: 10000 }).order;
@@ -122,8 +127,8 @@ check('P4 suspension leaves matched positions intact', () => {
 });
 
 // P5: the lockout guards. Each prevents a distinct unadministrable state.
-check('P5 lockout guards', () => {
-  const { db, admin } = fixture();
+check('P5 lockout guards', async () => {
+  const { db, admin } = (await fixture());
   const asActor = { id: admin.id };
 
   // Self-harm is refused outright, whatever the reason.
@@ -140,14 +145,14 @@ check('P5 lockout guards', () => {
   assert.throws(() => ADM.setRole(db, { actor: stranger, userId: admin.id, role: 'user', reason: 'x' }), (e) => e.status === 400);
 
   // With a second ACTIVE admin present, the first may be demoted.
-  const boss2 = A.createAccount(db, { username: 'boss2', password: 'secret1', role: 'admin' });
+  const boss2 = (await A.createAccount(db, { username: 'boss2', password: 'secret1', role: 'admin' }));
   assert.strictEqual(ADM.setRole(db, { actor: asActor, userId: boss2.id, role: 'user', reason: 'handover' }).role, 'user');
   // Now `admin` is the only admin again, and the guard closes behind it.
   assert.throws(() => ADM.setRole(db, { actor: stranger, userId: admin.id, role: 'user', reason: 'x' }), (e) => e.status === 400);
 
   // A SUSPENDED admin is not a spare. boss3 is created, immediately suspended,
   // and must not then count as a second admin who could be left behind.
-  const boss3 = A.createAccount(db, { username: 'boss3', password: 'secret1', role: 'admin' });
+  const boss3 = (await A.createAccount(db, { username: 'boss3', password: 'secret1', role: 'admin' }));
   ADM.setStatus(db, { actor: asActor, userId: boss3.id, status: 'suspended', reason: 'review' });
   assert.throws(() => ADM.setStatus(db, { actor: stranger, userId: admin.id, status: 'suspended', reason: 'x' }), (e) => e.status === 400);
   // Reinstating boss3 re-opens the door — and the successful demotion below is
@@ -162,8 +167,8 @@ check('P5 lockout guards', () => {
 });
 
 // P6: a reason is required for anything that changes money or access.
-check('P6 reason is mandatory', () => {
-  const { db, admin, alice } = fixture();
+check('P6 reason is mandatory', async () => {
+  const { db, admin, alice } = (await fixture());
   for (const missing of [undefined, '', '   ', null]) {
     assert.throws(() => ADM.adjustBalance(db, { actor: admin, userId: alice.id, deltaCents: 100, reason: missing }), (e) => e.status === 400, String(missing));
     assert.throws(() => ADM.setStatus(db, { actor: admin, userId: alice.id, status: 'suspended', reason: missing }), (e) => e.status === 400, String(missing));
@@ -175,8 +180,8 @@ check('P6 reason is mandatory', () => {
 // P7: the escrow floor. An adjustment must never leave matched liability
 // uncollateralised — that would convert a solvent book into an unbacked one,
 // and it is the single most dangerous thing this endpoint could do.
-check('P7 adjustment cannot eat into escrow', () => {
-  const { db, admin, alice } = fixture();
+check('P7 adjustment cannot eat into escrow', async () => {
+  const { db, admin, alice } = (await fixture());
   const m = mkMarket(db);
   M.placeOrder(db, alice, { selection_id: m.s1, side: 'back', price: 2.0, stake_cents: 10000 });
   assert.deepStrictEqual(balanceOf(db, alice.id), { b: 100000, f: 10000 });
@@ -194,8 +199,8 @@ check('P7 adjustment cannot eat into escrow', () => {
 
 // P8: adjustment writes BOTH records — a ledger row (the money) and an audit
 // row (the authority and the reason). One without the other is incomplete.
-check('P8 adjustment writes ledger and audit together', () => {
-  const { db, admin, alice } = fixture();
+check('P8 adjustment writes ledger and audit together', async () => {
+  const { db, admin, alice } = (await fixture());
   ADM.adjustBalance(db, { actor: admin, userId: alice.id, deltaCents: 2500, reason: 'goodwill credit' });
   ADM.adjustBalance(db, { actor: admin, userId: alice.id, deltaCents: -500, reason: 'correction' });
 
@@ -220,8 +225,8 @@ check('P8 adjustment writes ledger and audit together', () => {
 
 // P9: refusals are input validation, not audit events. A rejected request is
 // not an action taken, and recording it as one would make the log lie.
-check('P9 a refused action leaves no audit row', () => {
-  const { db, admin, alice } = fixture();
+check('P9 a refused action leaves no audit row', async () => {
+  const { db, admin, alice } = (await fixture());
   assert.throws(() => ADM.adjustBalance(db, { actor: admin, userId: alice.id, deltaCents: 0, reason: 'zero' }), (e) => e.status === 400);
   assert.throws(() => ADM.adjustBalance(db, { actor: admin, userId: alice.id, deltaCents: 10.5, reason: 'fraction' }), (e) => e.status === 400);
   assert.throws(() => ADM.setRole(db, { actor: admin, userId: alice.id, role: 'superuser', reason: 'nope' }), (e) => e.status === 400);
@@ -232,8 +237,8 @@ check('P9 a refused action leaves no audit row', () => {
 
 // P10: the audit trail distinguishes a human actor from the system, and never
 // leaks a session token even in the admin detail view.
-check('P10 audit separates system from human, leaks nothing', () => {
-  const { db, admin, alice } = fixture();
+check('P10 audit separates system from human, leaks nothing', async () => {
+  const { db, admin, alice } = (await fixture());
   AUDIT.record(db, admin, AUDIT.ACTIONS.USER_LOGIN, `user:${alice.id}`);
   AUDIT.record(db, null, 'market.settled', 'market:1'); // system action
   const rows = AUDIT.list(db, {});
@@ -250,8 +255,8 @@ check('P10 audit separates system from human, leaks nothing', () => {
 
 // P11: role changes keep the legacy is_admin mirror in step, so a caller that
 // has not been migrated cannot read a stale privilege flag.
-check('P11 role change moves the legacy mirror too', () => {
-  const { db, admin, alice } = fixture();
+check('P11 role change moves the legacy mirror too', async () => {
+  const { db, admin, alice } = (await fixture());
   assert.strictEqual(ADM.setRole(db, { actor: admin, userId: alice.id, role: 'admin', reason: 'promoted' }).role, 'admin');
   // Field-by-field rather than deepStrictEqual: node:sqlite hands back
   // null-prototype row objects, which deepStrictEqual refuses to match against
@@ -267,4 +272,21 @@ check('P11 role change moves the legacy mirror too', () => {
   assert.throws(() => ADM.setRole(db, { actor: admin, userId: alice.id, role: 'user', reason: 'again' }), (e) => e.status === 400);
 });
 
-console.log(`\nadmin.test.js: ${passed} checks passed`);
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  console.log(`\nadmin.test.js: ${passed} checks passed`);
+})();

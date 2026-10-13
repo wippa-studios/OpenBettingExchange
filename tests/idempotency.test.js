@@ -23,10 +23,15 @@ const acc = require('../lib/accounts');
 const settle = require('../lib/settle');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 let n = 0;
-function fixture() {
+async function fixture() {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sport = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -40,8 +45,8 @@ function fixture() {
     db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 2.0)').run(mkt.id, nm);
     sels.push(db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, nm).id);
   }
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 }));
   return { db, alice, bob, marketId: mkt.id, s1: sels[0], s2: sels[1] };
 }
 
@@ -51,8 +56,8 @@ const orderCount = (db, userId) => db.prepare('SELECT COUNT(*) c FROM orders WHE
 // I1: a repeated request returns the SAME order and changes nothing. The
 // escrow is the thing that would actually hurt, so it is asserted directly
 // rather than inferred from the order count.
-check('I1 a repeat request returns the same order and takes no second escrow', () => {
-  const { db, alice, s1 } = fixture();
+check('I1 a repeat request returns the same order and takes no second escrow', async () => {
+  const { db, alice, s1 } = (await fixture());
   const req = { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000, client_order_id: 'retry-me-1' };
   const first = M.placeOrder(db, alice, req);
   const w1 = wallet(db, alice.id);
@@ -69,8 +74,8 @@ check('I1 a repeat request returns the same order and takes no second escrow', (
 
 // I2: without a key, behaviour is unchanged. Every existing caller omits it
 // and must keep placing orders normally — this feature is opt-in.
-check('I2 orders without a key are unaffected', () => {
-  const { db, alice, s1 } = fixture();
+check('I2 orders without a key are unaffected', async () => {
+  const { db, alice, s1 } = (await fixture());
   const a = M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000 });
   const b = M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000 });
   assert.notStrictEqual(a.order.id, b.order.id, 'two distinct orders');
@@ -82,8 +87,8 @@ check('I2 orders without a key are unaffected', () => {
 // I3: keys are scoped PER USER. Two players may legitimately generate the
 // same key; neither being blocked is the correct outcome, and a collision
 // must never let one player read or interfere with another's order.
-check('I3 the same key from two users creates two orders', () => {
-  const { db, alice, bob, s1 } = fixture();
+check('I3 the same key from two users creates two orders', async () => {
+  const { db, alice, bob, s1 } = (await fixture());
   const a = M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000, client_order_id: 'same-key' });
   const b = M.placeOrder(db, bob, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000, client_order_id: 'same-key' });
   assert.notStrictEqual(a.order.id, b.order.id);
@@ -95,8 +100,8 @@ check('I3 the same key from two users creates two orders', () => {
 // I4: a replay returns the order to its OWNER only. Alice replaying with
 // Bob's key must not hand her Bob's order — that would be an IDOR created by
 // the idempotency feature itself.
-check('I4 a replay never returns another user\'s order', () => {
-  const { db, alice, bob, s1 } = fixture();
+check('I4 a replay never returns another user\'s order', async () => {
+  const { db, alice, bob, s1 } = (await fixture());
   const bobs = M.placeOrder(db, bob, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000, client_order_id: 'bob-key' });
   const asAlice = M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000, client_order_id: 'bob-key' });
   assert.notStrictEqual(asAlice.order.id, bobs.order.id, 'alice got her OWN order');
@@ -107,8 +112,8 @@ check('I4 a replay never returns another user\'s order', () => {
 // I5: a replay must not re-run the match sweep. If the first order matched,
 // the replay reports the SAME fills rather than matching again — otherwise
 // "idempotent" would mean idempotent only for resting orders.
-check('I5 a replay of a MATCHED order does not match again', () => {
-  const { db, alice, bob, s1 } = fixture();
+check('I5 a replay of a MATCHED order does not match again', async () => {
+  const { db, alice, bob, s1 } = (await fixture());
   M.placeOrder(db, bob, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000 });
   const req = { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 5000, client_order_id: 'match-once' };
   const first = M.placeOrder(db, alice, req);
@@ -122,8 +127,8 @@ check('I5 a replay of a MATCHED order does not match again', () => {
 
 // I6: the money path is untouched by a replay. Conservation and the
 // cache/postings agreement must still hold after a duplicate submit.
-check('I6 a duplicate submit leaves the books exactly as one submit would', () => {
-  const { db, alice, s1 } = fixture();
+check('I6 a duplicate submit leaves the books exactly as one submit would', async () => {
+  const { db, alice, s1 } = (await fixture());
   const req = { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000, client_order_id: 'money-once' };
   M.placeOrder(db, alice, req);
   for (let i = 0; i < 5; i++) M.placeOrder(db, alice, req);
@@ -134,8 +139,8 @@ check('I6 a duplicate submit leaves the books exactly as one submit would', () =
 
 // I7: the UNIQUE index is the real guard, not the read. Simulate the race by
 // inserting a conflicting order directly and confirming the index refuses it.
-check('I7 the unique index refuses a duplicate key even without the read check', () => {
-  const { db, alice, s1 } = fixture();
+check('I7 the unique index refuses a duplicate key even without the read check', async () => {
+  const { db, alice, s1 } = (await fixture());
   M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000, client_order_id: 'db-guard' });
   assert.throws(
     () => db.prepare(
@@ -148,8 +153,8 @@ check('I7 the unique index refuses a duplicate key even without the read check',
 
 // I8: NULL keys do not collide. Ordinary orders must remain ordinary — if
 // NULLs collided, every non-idempotent order would become a singleton.
-check('I8 orders with no key do not collide with each other', () => {
-  const { db, alice, s1 } = fixture();
+check('I8 orders with no key do not collide with each other', async () => {
+  const { db, alice, s1 } = (await fixture());
   for (let i = 0; i < 3; i++) {
     assert.ok(M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 1000 }).order.id);
   }
@@ -159,8 +164,8 @@ check('I8 orders with no key do not collide with each other', () => {
 // I9: a malformed key is refused rather than silently coerced. A key that
 // came from a client doing something unsupported should be an error the client
 // can see, not a mangled value stored in the book.
-check('I9 malformed idempotency keys are refused, not coerced', () => {
-  const { db, alice, s1 } = fixture();
+check('I9 malformed idempotency keys are refused, not coerced', async () => {
+  const { db, alice, s1 } = (await fixture());
   const bad = [
     'x'.repeat(65),              // too long
     'has space',                  // whitespace
@@ -184,8 +189,8 @@ check('I9 malformed idempotency keys are refused, not coerced', () => {
 // I10: a replay survives settlement. If the original order settles and the
 // client retries, the replay must still return the settled order rather than
 // erroring or re-placing.
-check('I10 a replay after settlement still returns the original order', () => {
-  const { db, alice, bob, marketId, s1 } = fixture();
+check('I10 a replay after settlement still returns the original order', async () => {
+  const { db, alice, bob, marketId, s1 } = (await fixture());
   const req = { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000, client_order_id: 'settled-then-retried' };
   const first = M.placeOrder(db, alice, req);
   M.placeOrder(db, bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 5000 });
@@ -197,5 +202,22 @@ check('I10 a replay after settlement still returns the original order', () => {
   assert.strictEqual(acc.assertConserved(db), 0);
 });
 
-console.log(`\nidempotency.test.js: ${passed} checks passed`);
-if (passed < 10) { console.error('expected 10 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 10) { console.error('expected 10 checks'); process.exit(1); }
+  console.log(`\nidempotency.test.js: ${passed} checks passed`);
+})();

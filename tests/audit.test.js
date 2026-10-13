@@ -32,7 +32,12 @@ const S = require('../lib/settle');
 const T = require('../lib/tenants');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 const bal = (db, id) => db.prepare('SELECT balance_cents b, frozen_cents f FROM users WHERE id=?').get(id);
 const clean = (db) => {
@@ -40,9 +45,9 @@ const clean = (db) => {
   assert.deepStrictEqual(acc.assertUserAgrees(db), [], 'cache diverged from postings');
 };
 
-function fixture() {
+async function fixture() {
   const db = openStore(':memory:');
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
   return { db, alice };
 }
 
@@ -57,7 +62,7 @@ function fixture() {
 // $500,000. The per-intent cap refuses the OPEN now — before the
 // confirmation question can even arise.
 check('A1 (F1) the 50,000,000-cent exploit is refused at intent creation', async () => {
-  const { db, alice } = fixture();
+  const { db, alice } = (await fixture());
   await assert.rejects(
     () => pay.openDeposit(db, alice.id, 50000000),
     (e) => e.status === 400 && /per-intent cap/.test(e.message)
@@ -72,7 +77,7 @@ check('A1 (F1) the 50,000,000-cent exploit is refused at intent creation', async
 // the admin desk. This test documents the trust boundary: what a PLAYER can
 // reach is open + read, never confirm.
 check('A2 (F1) confirmation resolves by EXTERNAL id — a player cannot name an intent id', async () => {
-  const { db, alice } = fixture();
+  const { db, alice } = (await fixture());
   const intent = await pay.openDeposit(db, alice.id, 25000);
   assert.strictEqual(bal(db, alice.id).b, 100000, 'opening an intent credits nothing');
   // confirmByExternalId is the ONLY programmatic confirm, and it takes the
@@ -91,7 +96,7 @@ check('A2 (F1) confirmation resolves by EXTERNAL id — a player cannot name an 
 // the original path could credit unbounded amounts in one day; now the
 // per-user-per-day total refuses.
 check('A3 (F1) a compromised webhook is bounded by the daily cumulative cap', async () => {
-  const { db, alice } = fixture();
+  const { db, alice } = (await fixture());
   // Cap the day at 100000 cents; ask for two intents of 60000 each.
   const prev = config.DEPOSIT_DAILY_MAX_CENTS;
   config.DEPOSIT_DAILY_MAX_CENTS = 100000;
@@ -113,7 +118,7 @@ check('A3 (F1) a compromised webhook is bounded by the daily cumulative cap', as
 // provider event claiming a different amount was never compared — a padded
 // replay is a finding, not a credit.
 check('A4 (F1) a webhook amount disagreeing with the intent is refused', async () => {
-  const { db, alice } = fixture();
+  const { db, alice } = (await fixture());
   const intent = await pay.openDeposit(db, alice.id, 25000);
   assert.throws(
     () => pay.confirmByExternalId(db, { provider: 'reference', externalId: intent.external_id, amountCents: 999999 }),
@@ -132,7 +137,7 @@ check('A4 (F1) a webhook amount disagreeing with the intent is refused', async (
 // through the app — done here at the module boundary instead, because the
 // property that matters is that the route is unreachable unsigned, which is
 // enforced by the route's own guard.
-check('A5 (F1) the HMAC secret makes signatures non-forgeable', () => {
+check('A5 (F1) the HMAC secret makes signatures non-forgeable', async () => {
   // The route-level behaviour is covered by the smoke suite; here the
   // property under test is that a signature over a DIFFERENT body cannot
   // authenticate this body — the reason the route verifies the raw bytes.
@@ -152,7 +157,7 @@ check('A5 (F1) the HMAC secret makes signatures non-forgeable', () => {
 // releasing another market's escrow to cover it, then bricked that market's
 // settlement. The caller checked market state; the primitive now does too,
 // so no second caller can inherit an unguarded money path.
-check('A6 (F3) cashoutPosition refuses a settled market even when called directly', () => {
+check('A6 (F3) cashoutPosition refuses a settled market even when called directly', async () => {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -164,8 +169,8 @@ check('A6 (F3) cashoutPosition refuses a settled market even when called directl
   db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 2.0)').run(mkt.id, 'Beta');
   const s1 = db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, 'Alpha').id;
   const s2 = s1 + 1;
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 }));
   M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 1000 });
   M.placeOrder(db, bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 1000 });
   S.settleMarket(db, mkt.id, { winner_selection_id: s1 });
@@ -183,7 +188,7 @@ check('A6 (F3) cashoutPosition refuses a settled market even when called directl
 
 // A7: a HELD market cannot be settled through the plain route. The reasoned
 // release (a written reason, recorded in the audit log) is the only way out.
-check('A7 (F4) a held market cannot be settled through the plain path', () => {
+check('A7 (F4) a held market cannot be settled through the plain path', async () => {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -206,8 +211,8 @@ check('A7 (F4) a held market cannot be settled through the plain path', () => {
 // A8: a withdrawal can now COMPLETE. Before, money sat in gateway_clearing
 // forever: no route could finish it, and failDeposit did not even check the
 // kind, so failing a withdrawal neither refunded nor re-credited.
-check('A8 (F5) a withdrawal completes and the clearing position is reported', () => {
-  const { db, alice } = fixture();
+check('A8 (F5) a withdrawal completes and the clearing position is reported', async () => {
+  const { db, alice } = (await fixture());
   // The player's OPENING balance also posts through gateway_clearing, so the
   // assertions are DELTAS against a baseline — an absolute figure here would
   // depend on how the account was funded, not on the withdrawal.
@@ -232,8 +237,8 @@ check('A8 (F5) a withdrawal completes and the clearing position is reported', ()
 // A9: a withdrawal can FAIL and the player is refunded IN FULL, through the
 // ledger, with the reverse posting — the books return to the state before
 // the request.
-check('A9 (F5) a failed withdrawal refunds the player exactly', () => {
-  const { db, alice } = fixture();
+check('A9 (F5) a failed withdrawal refunds the player exactly', async () => {
+  const { db, alice } = (await fixture());
   const clearingBefore = acc.balanceOf(db, acc.accountId(db, 'gateway_clearing', null));
   pay.openWithdrawal(db, alice.id, 40000, 'player request');
   const intentId = db.prepare("SELECT id FROM payment_intents WHERE kind='withdrawal'").get().id;
@@ -253,7 +258,7 @@ check('A9 (F5) a failed withdrawal refunds the player exactly', () => {
 
 // ── F6/F7: commission is the tenant's, and rounding is house-favourable ────
 
-function settleFixture() {
+async function settleFixture() {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -263,16 +268,16 @@ function settleFixture() {
   const mkt = db.prepare('SELECT id FROM markets WHERE event_id=?').get(ev.id);
   db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 2.0)').run(mkt.id, 'Alpha');
   const s1 = db.prepare('SELECT id FROM selections WHERE market_id=?').get(mkt.id).id;
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 }));
   return { db, mkt, s1, alice, bob };
 }
 
 // A10: a tenant negotiated down to 100 bps pays 100 bps. The audit's F6 was
 // that the configurable figure was stored, audited, displayed in the admin
 // UI — and never consulted at settlement.
-check('A10 (F6) settlement charges the TENANT commission, not the global rate', () => {
-  const { db, mkt, s1, alice, bob } = settleFixture();
+check('A10 (F6) settlement charges the TENANT commission, not the global rate', async () => {
+  const { db, mkt, s1, alice, bob } = (await settleFixture());
   // Alice backs 10000 @ 2.0 and wins 10000; at the default 250 bps the
   // commission is 250, at 100 bps it is 100.
   M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
@@ -290,14 +295,14 @@ check('A10 (F6) settlement charges the TENANT commission, not the global rate', 
 // (round), split as 2099+2099 it paid 52+52=104 — a splitter could shave the
 // fee. With ceil, splitting can only pay MORE, so the exploit direction is
 // gone.
-check('A11 (F7) splitting a win can no longer underpay commission', () => {
+check('A11 (F7) splitting a win can no longer underpay commission', async () => {
   // Two markets, identical shape: a back of 2099 @ 2.0 wins 2099 each.
   // Commission each = ceil(2099 * 0.025) = ceil(52.475) = 53. Two markets
   // pay 53+53 = 106, versus the single-market 4198 win paying
   // ceil(4198 * 0.025) = ceil(104.95) = 105. Splitting pays MORE, not less.
   const results = [];
   for (let i = 0; i < 2; i++) {
-    const { db, mkt, s1, alice, bob } = settleFixture();
+    const { db, mkt, s1, alice, bob } = (await settleFixture());
     M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 2099 });
     M.placeOrder(db, bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 2099 });
     S.settleMarket(db, mkt.id, { winner_selection_id: s1 });
@@ -324,7 +329,7 @@ check('A11 (F7) splitting a win can no longer underpay commission', () => {
 //
 // The fixture reproduces the bug-shaped state directly — cache and postings
 // kept in agreement — because no ledger operation can (correctly) express it.
-check('A12 (F10) the house can settle negative without bricking the market', () => {
+check('A12 (F10) the house can settle negative without bricking the market', async () => {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -334,8 +339,11 @@ check('A12 (F10) the house can settle negative without bricking the market', () 
   const mkt = db.prepare('SELECT id FROM markets WHERE event_id=?').get(ev.id);
   db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 2.0)').run(mkt.id, 'Alpha');
   const s1 = db.prepare('SELECT id FROM selections WHERE market_id=?').get(mkt.id).id;
+  // ensureBot() is synchronous (it runs inside transactions elsewhere) and so
+  // cannot derive the house password hash itself — prime it first.
+  await require('../lib/bots').primeBotHash();
   const house = require('../lib/bots').ensureBot(db);
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
   M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 1000 });
   M.placeOrder(db, { id: house.id }, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 1000 });
 
@@ -370,12 +378,29 @@ check('A12 (F10) the house can settle negative without bricking the market', () 
 // repetition is ACCEPTABLE for a demo, but the property must be explicit,
 // and the deposit-intent path that IS bounded must not be reachable from
 // the faucet.
-check('A13 (F8) the faucet is per-deposit, and that is documented and deliberate', () => {
-  const { db, alice } = fixture();
+check('A13 (F8) the faucet is per-deposit, and that is documented and deliberate', async () => {
+  const { db, alice } = (await fixture());
   for (let i = 0; i < 12; i++) ledger.deposit(db, alice.id, 100000, config.FAUCET_MAX_CENTS);
   assert.strictEqual(bal(db, alice.id).b, 100000 + 12 * 100000, 'the paper faucet repeats: fine for a demo');
   clean(db);
 });
 
-console.log(`\naudit.test.js: ${passed} checks passed`);
-if (passed < 13) { console.error('expected 13 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 13) { console.error('expected 13 checks'); process.exit(1); }
+  console.log(`\naudit.test.js: ${passed} checks passed`);
+})();

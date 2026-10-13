@@ -40,7 +40,12 @@ const REP = require('../lib/reports');
 const config = require('../lib/config');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 /**
  * A minimal RFC 4180 reader: fields separated by commas, double-quoted fields
@@ -79,14 +84,14 @@ let n = 0;
  * so her net is zero but she has traded — which is the shape that distinguishes
  * "no activity" from "activity that nets out".
  */
-function book({ delayMs = 0 } = {}) {
+async function book({ delayMs = 0 } = {}) {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
-  const mk = (u) => A.registerUser(db, { username: u, password: `pw-${u}-1234`, balance_cents: 500000 });
-  const alice = mk('alice');
-  const bob = mk('bob');
-  const carol = mk('carol');
+  const mk = async (u) => A.registerUser(db, { username: u, password: `pw-${u}-1234`, balance_cents: 500000 });
+  const alice = (await mk('alice'));
+  const bob = (await mk('bob'));
+  const carol = (await mk('carol'));
 
   function market() {
     n++;
@@ -121,8 +126,8 @@ const p = () => REP.period();
 // exactly 0 and commission is charged on top of that pool. The first version
 // asserted `SUM(pnl) + SUM(commission) = 0` and reported a 750-cent failure on
 // a perfectly correct book — wrong by exactly the fee.
-check('R1 SUM(pnl) equals the buyout identity, and commission is reported apart', () => {
-  const b = book();
+check('R1 SUM(pnl) equals the buyout identity, and commission is reported apart', async () => {
+  const b = (await book());
   const m1 = b.market();
   b.trade(m1);
   b.settle(m1, m1.s1); // alice and carol win
@@ -144,8 +149,8 @@ check('R1 SUM(pnl) equals the buyout identity, and commission is reported apart'
 // R2: THE SELF-CHECK CAN FAIL, and must not be hard-coded to pass. A check that
 // always says OK is decoration. Corrupt a settlement row and the report must
 // say so rather than filing the corruption as normal.
-check('R2 the self-check reports a failure rather than always passing', () => {
-  const b = book();
+check('R2 the self-check reports a failure rather than always passing', async () => {
+  const b = (await book());
   const m = b.market();
   b.trade(m);
   b.settle(m, m.s1);
@@ -173,8 +178,8 @@ check('R2 the self-check reports a failure rather than always passing', () => {
 // A control that is always red is worse than no control: it is one operators
 // learn to ignore. So this asserts the self-check is GREEN on a book that used
 // cash-out — which it could not be before.
-check('R2b the self-check stays ok on a book that used cash-out', () => {
-  const b = book();
+check('R2b the self-check stays ok on a book that used cash-out', async () => {
+  const b = (await book());
   const m = b.market();
   b.trade(m);
 
@@ -256,8 +261,8 @@ check('R2b the self-check stays ok on a book that used cash-out', () => {
 
 // R3: THE GGR DEFINITION IS STATED, and the arithmetic is checkable by hand.
 // An operator must be able to take the components and reproduce the headline.
-check('R3 GGR is defined in the payload and its components reconcile', () => {
-  const b = book();
+check('R3 GGR is defined in the payload and its components reconcile', async () => {
+  const b = (await book());
   const m1 = b.market();
   b.trade(m1);
   b.settle(m1, m1.s1);
@@ -286,8 +291,8 @@ check('R3 GGR is defined in the payload and its components reconcile', () => {
 // R4: deposits are NOT turnover. Matched stakes are not money entering the
 // venue, and counting them as "staked" would overstate exposure by an order of
 // magnitude — the single most common way an exchange's volume report lies.
-check('R4 deposits are reported separately from turnover', () => {
-  const b = book();
+check('R4 deposits are reported separately from turnover', async () => {
+  const b = (await book());
   const m = b.market();
   b.trade(m);
   b.settle(m, m.s1);
@@ -304,8 +309,8 @@ check('R4 deposits are reported separately from turnover', () => {
 // R5: money is reported in cents AND as a decimal. Cents are what the ledger
 // uses and must never be rounded for display; the decimal is what a finance
 // team types into a spreadsheet. Both, or someone rounds a rounding error.
-check('R5 money is reported in exact cents and as a decimal', () => {
-  const b = book();
+check('R5 money is reported in exact cents and as a decimal', async () => {
+  const b = (await book());
   const m = b.market();
   b.trade(m);
   b.settle(m, m.s1);
@@ -324,8 +329,8 @@ check('R5 money is reported in exact cents and as a decimal', () => {
 // settled. A statement showing only net winnings cannot answer "how much did I
 // turn over", which is the question a regulator asks about turnover
 // responsibility.
-check('R6 a statement reports staked, net and commission per player', () => {
-  const b = book();
+check('R6 a statement reports staked, net and commission per player', async () => {
+  const b = (await book());
   const m1 = b.market();
   b.trade(m1);
   b.settle(m1, m1.s1);
@@ -359,12 +364,13 @@ check('R6 a statement reports staked, net and commission per player', () => {
 // LABELLED. A regulatory export that silently omitted the venue's own accounts
 // would understate turnover; one that mixed them in without a flag would
 // misattribute the house's trading as player activity.
-check('R7 statements label the venue own accounts as bots', () => {
-  const b = book();
+check('R7 statements label the venue own accounts as bots', async () => {
+  const b = (await book());
   const m = b.market();
   b.trade(m);
   b.settle(m, m.s1);
   const bots = require('../lib/bots');
+  await bots.primeBotHash(); // ensureBot() is synchronous and cannot hash for itself
   const bot = bots.ensureBot(b.db);
   // The house settles nothing here, so just prove the flag is derivable and
   // that a bot with a settlement would be labelled.
@@ -385,8 +391,8 @@ check('R7 statements label the venue own accounts as bots', () => {
 // R8: volume is grouped per market with the event and sport, which is what a
 // regulator reconciles against, and turnover is ordered so the biggest market
 // is first (an operator reads the top of the list).
-check('R8 volume is per market with event and sport, biggest first', () => {
-  const b = book();
+check('R8 volume is per market with event and sport, biggest first', async () => {
+  const b = (await book());
   const m1 = b.market();
   b.trade(m1);
   b.settle(m1, m1.s1);
@@ -405,8 +411,8 @@ check('R8 volume is per market with event and sport, biggest first', () => {
 
 // R9: volume by selection, because a regulatory view is per-outcome, not just
 // per-event.
-check('R9 volume is available per selection', () => {
-  const b = book();
+check('R9 volume is available per selection', async () => {
+  const b = (await book());
   const m = b.market();
   b.trade(m);
   b.settle(m, m.s1);
@@ -423,8 +429,8 @@ check('R9 volume is available per selection', () => {
 // row pay the global COMMISSION_RATE, so reporting COALESCE(t.commission_bps, 0)
 // tells an operator they charged nothing when they charged the full rate — the
 // kind of report that gets filed.
-check('R10 commission reports the EFFECTIVE rate, not the stored one', () => {
-  const b = book();
+check('R10 commission reports the EFFECTIVE rate, not the stored one', async () => {
+  const b = (await book());
   const m = b.market();
   b.trade(m);
   b.settle(m, m.s1);
@@ -445,8 +451,8 @@ check('R10 commission reports the EFFECTIVE rate, not the stored one', () => {
 
 // R11: a tenant with its OWN rate reports that rate, so a per-tenant fee is not
 // averaged away into a blended figure.
-check('R11 a tenant own rate is reported as its own', () => {
-  const b = book();
+check('R11 a tenant own rate is reported as its own', async () => {
+  const b = (await book());
   // The DEFAULT tenant already exists and carries its own rate, so use it: a
   // per-tenant fee is the point of this check and it must not be a tenant this
   // codebase happens not to have created.
@@ -484,8 +490,8 @@ check('R11 a tenant own rate is reported as its own', () => {
 // orders that carried a delay. This figure is only meaningful because the delay
 // is enforced; for months the venue reported a delay and matched instantly, so
 // this would have been a measurement of nothing.
-check('R12 the average bet delay is measured from real fill times', () => {
-  const b = book();
+check('R12 the average bet delay is measured from real fill times', async () => {
+  const b = (await book());
   const m = b.market();
   IP.setInplay(b.db, { marketId: m.id, inplay: true, delayMs: 60000 });
   IP.releaseKickoffSuspension(b.db, m.id);
@@ -516,8 +522,8 @@ check('R12 the average bet delay is measured from real fill times', () => {
 // R13: operational rates are guarded against a zero denominator. A venue with
 // no orders must report null, not NaN or Infinity — an operator filing "NaN"
 // in a regulatory return is a self-inflicted wound.
-check('R13 rates are null on an empty book, never NaN', () => {
-  const b = book();
+check('R13 rates are null on an empty book, never NaN', async () => {
+  const b = (await book());
   const op = REP.operational(b.db, p());
   for (const k of ['match_rate', 'unmatched_ratio', 'average_bet_delay_ms']) {
     assert.strictEqual(op.rates[k], null, `${k} is null, not NaN`);
@@ -547,16 +553,15 @@ check('R13 rates are null on an empty book, never NaN', () => {
 // So this is defence in depth, and it lives at the export boundary rather than
 // in each name field, because a boundary guard survives the next field that
 // forgets and each field's own policy does not.
-check('R14 CSV neutralises formula injection in free-text fields', () => {
-  const b = book();
+check('R14 CSV neutralises formula injection in free-text fields', async () => {
+  const b = (await book());
   const m = b.market();
   b.trade(m);
   b.settle(m, m.s1);
 
   // The upstream policy that closes the username vector, stated so the CSV guard
   // is not mistaken for the only defence.
-  assert.throws(
-    () => A.registerUser(b.db, { username: '=cmd', password: 'pw-x-1234', balance_cents: 1000 }),
+  await assert.rejects(A.registerUser(b.db, { username: '=cmd', password: 'pw-x-1234', balance_cents: 1000 }),
     (e) => e.status === 400 && /Username/.test(e.message),
     'usernames cannot carry a formula anyway'
   );
@@ -593,8 +598,8 @@ check('R14 CSV neutralises formula injection in free-text fields', () => {
 // R15: CSV quoting is correct for the shapes that appear in real data — commas
 // in a market name, quotes in a username, a newline in an event name. A report
 // that mis-quotes one row is worse than no report, because it is wrong silently.
-check('R15 CSV quoting survives commas, quotes and newlines', () => {
-  const b = book();
+check('R15 CSV quoting survives commas, quotes and newlines', async () => {
+  const b = (await book());
   const m = b.market();
   b.db.prepare("UPDATE markets SET name = ? WHERE id = ?").run('Match, Odds "2"\nSecond line', m.id);
   b.trade(m);
@@ -635,8 +640,8 @@ check('R15 CSV quoting survives commas, quotes and newlines', () => {
 
 // R16: every CSV has a header an operator can read and a stable column order.
 // An export without headers is a spreadsheet someone has to reverse-engineer.
-check('R16 every CSV export carries a header row', () => {
-  const b = book();
+check('R16 every CSV export carries a header row', async () => {
+  const b = (await book());
   const m = b.market();
   b.trade(m);
   b.settle(m, m.s1);
@@ -661,7 +666,7 @@ check('R16 every CSV export carries a header row', () => {
 
 // R17: the period is validated, not defaulted silently. An operator who asked
 // for a month and was handed the lifetime total would file it.
-check('R17 the reporting period is validated and bounded', () => {
+check('R17 the reporting period is validated and bounded', async () => {
   assert.throws(() => REP.period('nope'), (e) => e.status === 400);
   assert.throws(() => REP.period('2026-01-01', 'nope'), (e) => e.status === 400);
   // EITHER parameter alone, which is the shape a query string actually arrives
@@ -692,8 +697,8 @@ check('R17 the reporting period is validated and bounded', () => {
 // R18: the window is INCLUSIVE of the `to` day. A settlement at 14:00 on the
 // last day of the period belongs in the report; an off-by-one here silently
 // drops a day's money from a regulatory return.
-check('R18 the window includes the whole of the final day', () => {
-  const b = book();
+check('R18 the window includes the whole of the final day', async () => {
+  const b = (await book());
   const m = b.market();
   b.trade(m);
   b.settle(m, m.s1);
@@ -707,5 +712,22 @@ check('R18 the window includes the whole of the final day', () => {
   assert.strictEqual(prev.activity.settlements, 0, "and not in yesterday's");
 });
 
-console.log(`\nreports.test.js: ${passed} checks passed`);
-if (passed < 18) { console.error('expected 18 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 18) { console.error('expected 18 checks'); process.exit(1); }
+  console.log(`\nreports.test.js: ${passed} checks passed`);
+})();

@@ -55,7 +55,7 @@ function check(name, fn) {
 // a given off-time. `status` defaults to 'upcoming' so the EVENT's own status is
 // never the thing refusing the order — we are testing the off time in
 // isolation, not the other guards.
-function venue() {
+async function venue() {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sport = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -80,11 +80,11 @@ function venue() {
     const selection = db.prepare('SELECT id FROM selections WHERE market_id = ?').get(market.id);
     return { eventId: ev.id, marketId: market.id, selectionId: selection.id };
   }
-  const user = auth.registerUser(db, {
+  const user = (await auth.registerUser(db, {
     username: 'alice',
     password: 'pw-alice-1234',
     balance_cents: 100000,
-  });
+  }));
   const back = (selectionId, stake = 10000) =>
     match.placeOrder(db, user, { selection_id: selectionId, side: 'back', price: 2.0, stake_cents: stake });
   const balance = () => db.prepare('SELECT balance_cents FROM users WHERE id = ?').get(user.id).balance_cents;
@@ -95,8 +95,8 @@ function venue() {
 const FUTURE = '2030-01-01 12:00:00';
 const PAST = '2020-01-01 12:00:00';
 
-check('O1 a PRE-OFF order still places — the gate does not break the product', () => {
-  const v = venue();
+check('O1 a PRE-OFF order still places — the gate does not break the product', async () => {
+  const v = (await venue());
   const e = v.event(FUTURE);
   const r = v.back(e.selectionId);
   assert.ok(r && (r.order || r.id), 'order accepted pre-off');
@@ -104,18 +104,18 @@ check('O1 a PRE-OFF order still places — the gate does not break the product',
   assert.strictEqual(acc.assertConserved(v.db), 0, 'books balance');
 });
 
-check('O2 a POST-OFF order is refused with 409', () => {
-  const v = venue();
+check('O2 a POST-OFF order is refused with 409', async () => {
+  const v = (await venue());
   const e = v.event(PAST);
   assert.throws(() => v.back(e.selectionId), (err) => err.status === 409 && /off/i.test(err.message),
     'refused because the event is off');
 });
 
-check('O3 a refused POST-OFF order moves NO money and freezes NO collateral', () => {
+check('O3 a refused POST-OFF order moves NO money and freezes NO collateral', async () => {
   // The important half of O2: the refusal must happen before escrow is taken,
   // not after. A gate that fires late still shows a frozen stake the player
   // never asked for.
-  const v = venue();
+  const v = (await venue());
   const e = v.event(PAST);
   const before = v.balance();
   try { v.back(e.selectionId); } catch { /* expected */ }
@@ -125,24 +125,24 @@ check('O3 a refused POST-OFF order moves NO money and freezes NO collateral', ()
   assert.strictEqual(acc.assertConserved(v.db), 0, 'books balance');
 });
 
-check('O4 an order exactly AT the off time is refused (off is inclusive)', () => {
+check('O4 an order exactly AT the off time is refused (off is inclusive)', async () => {
   // `nowMs >= off` means the instant of off is closed. Betting "up to and
   // including" the off would leave a zero-width window at the boundary and a
   // clock-skew argument about who got in first.
-  const v = venue();
+  const v = (await venue());
   const e = v.event(PAST);
   assert.throws(() => v.back(e.selectionId), (err) => err.status === 409);
 });
 
-check('O5 POST-OFF CASH-OUT is refused — the control that is easy to forget', () => {
+check('O5 POST-OFF CASH-OUT is refused — the control that is easy to forget', async () => {
   // Build a real matched position PRE-OFF, then move the off time into the
   // past (as if the event kicked off), then try to cash out. This must be
   // refused: paying a cash-out after off is in-play RISK even though in-play
   // betting is banned. If the gate is missing, the venue pays the player
   // against a fair price that a goal has just moved.
-  const v = venue();
+  const v = (await venue());
   const e = v.event(FUTURE);
-  const bob = auth.registerUser(v.db, { username: 'bob', password: 'pw-bob-1234', balance_cents: 100000 });
+  const bob = (await auth.registerUser(v.db, { username: 'bob', password: 'pw-bob-1234', balance_cents: 100000 }));
   // Match alice back against bob lay so alice has a live position.
   match.placeOrder(v.db, v.user, { selection_id: e.selectionId, side: 'back', price: 2.0, stake_cents: 10000 });
   match.placeOrder(v.db, bob, { selection_id: e.selectionId, side: 'lay', price: 2.0, stake_cents: 10000 });
@@ -157,11 +157,11 @@ check('O5 POST-OFF CASH-OUT is refused — the control that is easy to forget', 
   );
 });
 
-check('O6 a MISSING off time is treated as CLOSED (fail-closed)', () => {
+check('O6 a MISSING off time is treated as CLOSED (fail-closed)', async () => {
   // A bad/missing catalogue row must never be read as "no off => open forever",
   // or a single malformed row silently re-opens in-play trading. starts_at is
   // NOT NULL in the schema, so we test the unparseable-string path directly.
-  const v = venue();
+  const v = (await venue());
   const e = v.event(FUTURE);
   db_setStartsAt(v.db, e.eventId, 'not-a-date');
   assert.strictEqual(offtime.isOffReached(v.db, e.eventId), true, 'unparseable off time reads as off');
@@ -172,7 +172,7 @@ function db_setStartsAt(db, eventId, value) {
   db.prepare('UPDATE events SET starts_at = ? WHERE id = ?').run(value, eventId);
 }
 
-check('O7 the off time parses identically from every admin-accepted format', () => {
+check('O7 the off time parses identically from every admin-accepted format', async () => {
   // POST /api/admin/events accepts an ISO date or datetime, and the admin UI
   // composes "Event Start Date" + "Event Start Time". All of these are the same
   // instant, so none of them can accidentally read as a different off time.
@@ -188,20 +188,20 @@ check('O7 the off time parses identically from every admin-accepted format', () 
   assert.strictEqual(offtime.offTimeMs(null), null, 'null is not an off time');
 });
 
-check('O8 secondsUntilOff is a sane countdown: positive pre-off, 0 at/after', () => {
-  const v = venue();
+check('O8 secondsUntilOff is a sane countdown: positive pre-off, 0 at/after', async () => {
+  const v = (await venue());
   const future = v.event(FUTURE);
   const past = v.event(PAST);
   assert.ok(offtime.secondsUntilOff(v.db, future.eventId) > 0, 'future event counts down');
   assert.strictEqual(offtime.secondsUntilOff(v.db, past.eventId), 0, 'past event is 0, not negative');
 });
 
-check('O9 the gate reads the off time, not the event status', () => {
+check('O9 the gate reads the off time, not the event status', async () => {
   // A market still flagged status='upcoming' but whose off time has passed must
   // be closed: status is metadata, the off time is the control. Conversely a
   // status='completed' event is closed too (guarded elsewhere) — this asserts
   // the off time is what closes an 'upcoming'-flagged event.
-  const v = venue();
+  const v = (await venue());
   const e = v.event(PAST, { status: 'upcoming' });
   assert.strictEqual(v.db.prepare('SELECT status FROM events WHERE id = ?').get(e.eventId).status, 'upcoming');
   assert.strictEqual(offtime.isOffReached(v.db, e.eventId), true, 'off time closes it regardless of status');

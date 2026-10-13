@@ -20,16 +20,21 @@ const S = require('../lib/settle');
 const { prevTick } = require('../lib/odds');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 let evCounter = 0;
 
-function fresh() {
+async function fresh() {
   const db = openStore(':memory:');
-  const mk = (name, bal) => A.registerUser(db, { username: name, password: 'secret1', balance_cents: bal });
+  const mk = async (name, bal) => A.registerUser(db, { username: name, password: 'secret1', balance_cents: bal });
   return {
     db,
-    users: { alice: mk('alice', 100000), bob: mk('bob', 100000), carol: mk('carol', 100000), dave: mk('dave', 100000) },
+    users: { alice: (await mk('alice', 100000)), bob: (await mk('bob', 100000)), carol: (await mk('carol', 100000)), dave: (await mk('dave', 100000)) },
   };
 }
 
@@ -64,8 +69,8 @@ const balances = (db, id) => {
 // S1: back wins — pot s*Q to the backer, commission on net winnings.
 // alice back 10000 @ 2.0 vs bob lay 10000 @ 2.0; winner Alpha.
 // alice: +10000 profit, -250 commission -> 109750; bob: -10000 -> 90000.
-check('S1 back wins', () => {
-  const { db, users } = fresh();
+check('S1 back wins', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
@@ -89,8 +94,8 @@ check('S1 back wins', () => {
 });
 
 // S2: back loses — the layer wins and pays the commission.
-check('S2 back loses (layer wins)', () => {
-  const { db, users } = fresh();
+check('S2 back loses (layer wins)', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1, s2 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
@@ -101,8 +106,8 @@ check('S2 back loses (layer wins)', () => {
 
 // S3: lay win at high odds — full liability escrow returned (E3b regression
 // at settlement): bob lay 10000 @ 3.0 (escrow 20000) + profit 10000 - 250.
-check('S3 lay wins at high odds returns escrow', () => {
-  const { db, users } = fresh();
+check('S3 lay wins at high odds returns escrow', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1, s2 } = mkMarket(db, [['Alpha', 3.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 3.0, stake_cents: 10000 });
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 3.0, stake_cents: 10000 }); // sweeps bob's lay
@@ -115,8 +120,8 @@ check('S3 lay wins at high odds returns escrow', () => {
 });
 
 // S4: market void — everyone gets their own contribution back, untouched.
-check('S4 void refunds own contributions', () => {
-  const { db, users } = fresh();
+check('S4 void refunds own contributions', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
@@ -134,8 +139,8 @@ check('S4 void refunds own contributions', () => {
 
 // S5: unmatched orders auto-cancel at settlement (escrow released, no
 // settlement rows for users without matches).
-check('S5 unmatched auto-cancelled', () => {
-  const { db, users } = fresh();
+check('S5 unmatched auto-cancelled', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 }); // rests
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 1.98, stake_cents: 5000 }); // rests
@@ -149,8 +154,8 @@ check('S5 unmatched auto-cancelled', () => {
 });
 
 // S6: re-settling a settled market is a hard error — no double-pay.
-check('S6 re-settle guard', () => {
-  const { db, users } = fresh();
+check('S6 re-settle guard', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
@@ -162,8 +167,8 @@ check('S6 re-settle guard', () => {
 // S7: commission charges the NET across matches, not per-match:
 // alice wins 5050+5050 = 10100 -> commission round(10100*0.025) = 253
 // (per-match rounding would give 126+126 = 252).
-check('S7 commission on net', () => {
-  const { db, users } = fresh();
+check('S7 commission on net', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5050 });
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 5050 });
@@ -178,8 +183,8 @@ check('S7 commission on net', () => {
 });
 
 // S8: an event completes only when ALL of its markets are settled.
-check('S8 event completion across markets', () => {
-  const { db, users } = fresh();
+check('S8 event completion across markets', async () => {
+  const { db, users } = (await fresh());
   const { market_id: mA, s1: a1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   const evId = db.prepare('SELECT event_id FROM markets WHERE id = ?').get(mA).event_id;
   db.prepare("INSERT INTO markets (event_id, name) VALUES (?, 'Over/Under 2.5')").run(evId);
@@ -194,8 +199,8 @@ check('S8 event completion across markets', () => {
 });
 
 // S9: settled markets reject new orders.
-check('S9 settled market frozen', () => {
-  const { db, users } = fresh();
+check('S9 settled market frozen', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   S.settleMarket(db, market_id, { winner_selection_id: s1 });
   assert.throws(
@@ -207,8 +212,8 @@ check('S9 settled market frozen', () => {
 // S10: void refunds a lay at its MATCH price liability (excess already
 // released at match time): bob lay 10000 @ 2.1 matched at 2.0 -> frozen
 // 10000 (not 11000); void refunds exactly 10000.
-check('S10 void after lay excess release', () => {
-  const { db, users } = fresh();
+check('S10 void after lay excess release', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 }); // rests
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.1, stake_cents: 10000 }); // matches at 2.0, excess 1000 released
@@ -221,8 +226,8 @@ check('S10 void after lay excess release', () => {
 // S11: strict input validation. Settlement is irreversible, so a coerced
 // value must never pick the outcome: {void:"false"} must NOT void, and
 // true must not become selection id 1.
-check('S11 strict settlement input', () => {
-  const { db, users } = fresh();
+check('S11 strict settlement input', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
@@ -246,8 +251,8 @@ check('S11 strict settlement input', () => {
 // exactly 5 frozen; settlement SUCCEEDS and every participant's frozen
 // returns to exactly 0 (the old formula froze 4 here — settlement
 // integrity error, market permanently unsettleable).
-check('S12 repro A settles cleanly: frozen -> 0 for everyone', () => {
-  const { db, users } = fresh();
+check('S12 repro A settles cleanly: frozen -> 0 for everyone', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 1.03, stake_cents: 150 }); // rests
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 1.04, stake_cents: 150 });
@@ -266,8 +271,8 @@ check('S12 repro A settles cleanly: frozen -> 0 for everyone', () => {
 
 // S13 (Critical-1 repro B end-to-end): lay 155 @ 1.10 matched @ 1.02 keeps
 // exactly 3 frozen (the old formula stranded 1 cent); settlement succeeds.
-check('S13 repro B settles cleanly: frozen -> 0 for everyone', () => {
-  const { db, users } = fresh();
+check('S13 repro B settles cleanly: frozen -> 0 for everyone', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 1.02, stake_cents: 155 }); // rests
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 1.10, stake_cents: 155 });
@@ -283,9 +288,9 @@ check('S13 repro B settles cleanly: frozen -> 0 for everyone', () => {
 // the multi-fill lay (200 @ 1.51, filling 100 @ 1.01 + 100 @ 1.51) settles
 // AND voids with every frozen returning to exactly 0 — including the void
 // refund of exactly 52 = the sum of the two per-fill liabilities.
-check('S14 repro C multi-fill: settle and void both zero out frozen', () => {
-  const settleLeg = (mode) => {
-    const { db, users } = fresh(); // each leg is hermetic: balances restart at 100000
+check('S14 repro C multi-fill: settle and void both zero out frozen', async () => {
+  const settleLeg = async (mode) => {
+    const { db, users } = (await fresh()); // each leg is hermetic: balances restart at 100000
     const { market_id, s1, s2 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
     M.placeOrder(db, users.carol, { selection_id: s1, side: 'back', price: 1.01, stake_cents: 100 }); // rests
     M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 1.51, stake_cents: 100 }); // rests
@@ -299,8 +304,8 @@ check('S14 repro C multi-fill: settle and void both zero out frozen', () => {
     assert.deepStrictEqual(balances(db, users.carol.id), { b: mode === 'void' ? 100000 : 99900, f: 0 });
     return { db, market_id };
   };
-  settleLeg('settle'); // +200 stakes - round(200*0.025)=5 commission -> +195
-  const { db: voidedDb, market_id: voidedMarket } = settleLeg('void');
+  (await settleLeg('settle')); // +200 stakes - round(200*0.025)=5 commission -> +195
+  const { db: voidedDb, market_id: voidedMarket } = (await settleLeg('void'));
   const refunds = voidedDb
     .prepare('SELECT user_id, amount_cents a FROM transactions WHERE type = ? AND market_id = ? ORDER BY user_id')
     .all('refund', voidedMarket)
@@ -311,8 +316,8 @@ check('S14 repro C multi-fill: settle and void both zero out frozen', () => {
 
 // S15 (Critical-2 half-cent battery, settle side): lay 101 @ 1.5 matched at
 // 1.5 — the liability round(50.5) = 51 is released at settlement exactly.
-check('S15 half-cent settle: 101 @ 1.5 releases exactly 51', () => {
-  const { db, users } = fresh();
+check('S15 half-cent settle: 101 @ 1.5 releases exactly 51', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1, s2 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 1.5, stake_cents: 101 }); // rests
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 1.5, stake_cents: 101 });
@@ -328,8 +333,8 @@ check('S15 half-cent settle: 101 @ 1.5 releases exactly 51', () => {
 // S16 (Critical-2 half-cent battery, void side): void refunds exactly the
 // frozen liability — 51 for 101 @ 1.5, 101 (not 152) for 101 @ 2.5 matched
 // @ 2.0, and 51 for 5050 @ 1.01.
-check('S16 half-cent voids refund exactly 51 / 101 / 51', () => {
-  const { db, users } = fresh();
+check('S16 half-cent voids refund exactly 51 / 101 / 51', async () => {
+  const { db, users } = (await fresh());
   const voidIt = (backPrice, layPrice, backStake) => {
     const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
     M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: backPrice, stake_cents: backStake });
@@ -347,8 +352,8 @@ check('S16 half-cent voids refund exactly 51 / 101 / 51', () => {
 
 // S17: a winner selection from ANOTHER market is a 400 — nothing moves, the
 // market stays open, and a valid settlement still works afterwards.
-check('S17 foreign winner rejected with 400, nothing moved', () => {
-  const { db, users } = fresh();
+check('S17 foreign winner rejected with 400, nothing moved', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   const foreign = mkMarket(db, [['Other Market Runner', 3.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
@@ -365,8 +370,8 @@ check('S17 foreign winner rejected with 400, nothing moved', () => {
 // S18: commission is charged on the NET across matches in one market —
 // alice wins 20000 on s1 and loses her 5000 stake on s2 in the SAME market:
 // fee = round(15000 * 0.025) = 375, not round(20000*0.025) = 500.
-check('S18 mixed win/loss: commission on NET only (375, not 500)', () => {
-  const { db, users } = fresh();
+check('S18 mixed win/loss: commission on NET only (375, not 500)', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1, s2 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 20000 }); // rests
   M.placeOrder(db, users.carol, { selection_id: s2, side: 'lay', price: 2.0, stake_cents: 5000 }); // rests
@@ -383,8 +388,8 @@ check('S18 mixed win/loss: commission on NET only (375, not 500)', () => {
 // S19: void with UNMATCHED orders in the market — matched contributions are
 // refunded, unmatched remainders are auto-cancelled and released, nobody's
 // balance moves, everything ends at frozen 0.
-check('S19 void with unmatched orders: release + refund, frozen -> 0', () => {
-  const { db, users } = fresh();
+check('S19 void with unmatched orders: release + refund, frozen -> 0', async () => {
+  const { db, users } = (await fresh());
   const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
   M.placeOrder(db, users.carol, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000 }); // rests
   M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 5000 }); // sweeps carol
@@ -416,13 +421,13 @@ check('S19 void with unmatched orders: release + refund, frozen -> 0', () => {
 // EXACTLY the sum of future settlement liabilities plus the tracked
 // remainder escrow (equality is stronger than >=), and after settle OR void
 // every participant's frozen returns to exactly 0.
-check('S20 escrow invariant property sweep (ticks x stakes)', () => {
+check('S20 escrow invariant property sweep (ticks x stakes)', async () => {
   const { escrowFor } = M;
   const db = openStore(':memory:');
-  const mk = (name) => A.registerUser(db, { username: name, password: 'secret1', balance_cents: 1000000 });
-  const bob = mk('layer');
-  const carol = mk('backer1');
-  const alice = mk('backer2');
+  const mk = async (name) => A.registerUser(db, { username: name, password: 'secret1', balance_cents: 1000000 });
+  const bob = (await mk('layer'));
+  const carol = (await mk('backer1'));
+  const alice = (await mk('backer2'));
   const stakes = [];
   for (let s = 100; s <= 500; s += 7) stakes.push(s);
   const ticks = [];
@@ -511,4 +516,21 @@ check('S20 escrow invariant property sweep (ticks x stakes)', () => {
   console.log(`    (sweep: ${scenarios} scenarios across ${ticks.length} ticks x ${stakes.length} stakes)`);
 });
 
-console.log(`\nsettle.test.js: ${passed} checks passed`);
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  console.log(`\nsettle.test.js: ${passed} checks passed`);
+})();

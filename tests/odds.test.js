@@ -5,11 +5,16 @@ const assert = require('assert');
 const O = require('../lib/odds');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 const near = (a, b, eps = 1e-9) => Math.abs(a - b) <= eps;
 
 // T1: snapToTick is identity on EVERY valid ladder tick (round-trip property).
-check('T1 identity on all ladder ticks', () => {
+check('T1 identity on all ladder ticks', async () => {
   for (const band of O.LADDER) {
     for (let c = band.lo; c <= band.hi; c += band.step) {
       const p = c / 100;
@@ -19,7 +24,7 @@ check('T1 identity on all ladder ticks', () => {
 });
 
 // T2: nearest-tick snapping across band boundaries and gaps.
-check('T2 nearest-tick snapping', () => {
+check('T2 nearest-tick snapping', async () => {
   assert.strictEqual(O.snapToTick(1.995), 2.0);   // mid-tick, half-up
   assert.strictEqual(O.snapToTick(1.984), 1.98);
   assert.strictEqual(O.snapToTick(3.02), 3.0);    // gap 3.00-3.05: nearer end
@@ -33,7 +38,7 @@ check('T2 nearest-tick snapping', () => {
 });
 
 // T3: clamps to the ladder extremes.
-check('T3 clamping', () => {
+check('T3 clamping', async () => {
   assert.strictEqual(O.snapToTick(0.5), 1.01);
   assert.strictEqual(O.snapToTick(5000), 1000);
   assert.strictEqual(O.snapToTick(-3), 1.01);
@@ -42,7 +47,7 @@ check('T3 clamping', () => {
 });
 
 // T4: next/prev walk band boundaries exactly (2.0→2.02, 10.0→10.5, 100→110...).
-check('T4 nextTick/prevTick across bands', () => {
+check('T4 nextTick/prevTick across bands', async () => {
   assert.strictEqual(O.nextTick(1.01), 1.02);
   assert.strictEqual(O.nextTick(2.0), 2.02);
   assert.strictEqual(O.prevTick(2.02), 2.0);
@@ -67,7 +72,7 @@ check('T4 nextTick/prevTick across bands', () => {
 });
 
 // T5: American conversion.
-check('T5 toAmerican', () => {
+check('T5 toAmerican', async () => {
   assert.strictEqual(O.toAmerican(2.5), '+150');
   assert.strictEqual(O.toAmerican(1.5), '-200');
   assert.strictEqual(O.toAmerican(3.0), '+200');
@@ -79,7 +84,7 @@ check('T5 toAmerican', () => {
 });
 
 // T6: fractional conversion (reduced, denominator ≤ 50).
-check('T6 toFractional', () => {
+check('T6 toFractional', async () => {
   assert.strictEqual(O.toFractional(2.5), '3/2');
   assert.strictEqual(O.toFractional(3.0), '2/1');
   assert.strictEqual(O.toFractional(1.5), '1/2');
@@ -98,7 +103,7 @@ check('T6 toFractional', () => {
 });
 
 // T7: implied probability.
-check('T7 impliedProb', () => {
+check('T7 impliedProb', async () => {
   assert.strictEqual(O.impliedProb(2.0), 0.5);
   assert.strictEqual(O.impliedProb(4.0), 0.25);
   assert.ok(near(O.impliedProb(1.25), 0.8));
@@ -112,7 +117,7 @@ check('T7 impliedProb', () => {
 });
 
 // T8: overround (book margin).
-check('T8 overround', () => {
+check('T8 overround', async () => {
   assert.ok(near(O.overround([2.0, 3.0, 4.0]), 1 / 12));
   assert.ok(near(O.overround([2.5, 3.4, 2.9]), 0.0389, 1e-3)); // ~3.9% book
   assert.ok(near(O.overround([2.0, 2.0]), 0)); // fair two-way
@@ -126,7 +131,7 @@ check('T8 overround', () => {
 });
 
 // T9: validTick discriminator.
-check('T9 validTick', () => {
+check('T9 validTick', async () => {
   assert.strictEqual(O.validTick(2.02), true);
   assert.strictEqual(O.validTick(1.01), true);
   assert.strictEqual(O.validTick(2.01), false);
@@ -137,7 +142,7 @@ check('T9 validTick', () => {
 });
 
 // T10: next/prev never leave the ladder range for arbitrary inputs.
-check('T10 range safety', () => {
+check('T10 range safety', async () => {
   for (let c = 50; c <= 100200; c += 137) {
     const p = O.snapToTick(c / 100);
     assert.ok(p >= 1.01 && p <= 1000, `range at ${c}`);
@@ -149,10 +154,27 @@ check('T10 range safety', () => {
 // silently mapping garbage to 1.01 (the cheapest price on the board). Finite
 // out-of-range values still CLAMP — that documented ladder behaviour is
 // distinct from garbage and stays pinned by T3 (-3 → 1.01, 5000 → 1000).
-check('T11 snapToTick throws on non-finite input', () => {
+check('T11 snapToTick throws on non-finite input', async () => {
   for (const bad of [NaN, Infinity, -Infinity, '2.5', null, undefined]) {
     assert.throws(() => O.snapToTick(bad), /finite number/, `snapToTick(${String(bad)})`);
   }
 });
 
-console.log(`\nodds.test.js: ${passed} checks passed`);
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  console.log(`\nodds.test.js: ${passed} checks passed`);
+})();

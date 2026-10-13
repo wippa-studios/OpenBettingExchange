@@ -27,10 +27,19 @@ const S = require('../lib/settle');
 const acc = require('../lib/accounts');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 let n = 0;
-function fixture(runners = ['Red', 'Blue', 'Green']) {
+async function fixture(runners = ['Red', 'Blue', 'Green']) {
+  // ensureBot() is synchronous (it runs inside transactions in lib/settle.js and
+  // lib/cashoutrisk.js) and so cannot derive the house password hash itself.
+  // This venue is hand-built rather than seeded, so prime it explicitly.
+  await require('../lib/bots').primeBotHash();
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Horse Racing', 'horse_racing')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='horse_racing'").get();
@@ -45,8 +54,8 @@ function fixture(runners = ['Red', 'Blue', 'Green']) {
     db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 3.0)').run(mkt.id, r);
     ids[r] = db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, r).id;
   }
-  const mk = (u) => A.registerUser(db, { username: u, password: `pw-${u}-1234`, balance_cents: 100000 });
-  return { db, marketId: mkt.id, ids, alice: mk('alice'), bob: mk('bob'), carol: mk('carol'), dave: mk('dave') };
+  const mk = async (u) => A.registerUser(db, { username: u, password: `pw-${u}-1234`, balance_cents: 100000 });
+  return { db, marketId: mkt.id, ids, alice: (await mk('alice')), bob: (await mk('bob')), carol: (await mk('carol')), dave: (await mk('dave')) };
 }
 
 const bal = (f, u) => f.db.prepare('SELECT balance_cents b, frozen_cents fz FROM users WHERE username=?').get(u);
@@ -56,8 +65,8 @@ const bet = (f, who, sel, side, price = 3.0, stake = 1000) =>
 // H1: the core property. Two joint winners in a 3-runner race: each winning
 // backer is paid the liability DIVIDED two ways; the losing backer is paid
 // nothing and loses their stake.
-check('H1 a dead heat pays each joint winner a SHARE of the liability', () => {
-  const f = fixture();
+check('H1 a dead heat pays each joint winner a SHARE of the liability', async () => {
+  const f = (await fixture());
   bet(f, f.alice, f.ids.Red, 'back');   // wins (joint)
   bet(f, f.bob, f.ids.Red, 'lay');
   bet(f, f.carol, f.ids.Blue, 'back');  // wins (joint)
@@ -90,9 +99,9 @@ check('H1 a dead heat pays each joint winner a SHARE of the liability', () => {
 // H2: EVERY participant's escrow returns to zero. A divided pot is where
 // stranded frozen would appear: if the stake were divided too, the unallocated
 // shares would have no one to release them.
-check('H2 every participant is fully unfrozen after a dead heat', () => {
+check('H2 every participant is fully unfrozen after a dead heat', async () => {
   for (const winners of [['Red', 'Blue'], ['Red', 'Blue', 'Green']]) {
-    const f = fixture();
+    const f = (await fixture());
     bet(f, f.alice, f.ids.Red, 'back');
     bet(f, f.bob, f.ids.Red, 'lay');
     bet(f, f.carol, f.ids.Blue, 'back');
@@ -113,8 +122,8 @@ check('H2 every participant is fully unfrozen after a dead heat', () => {
 // wins far more than the liability. The floor makes splitting pay LESS, so
 // there is no exploit: the same splitter arbitrage the audit found in
 // commission (F7) does not exist here.
-check('H3 the share is floored, so splitting cannot harvest rounding', () => {
-  const f = fixture();
+check('H3 the share is floored, so splitting cannot harvest rounding', async () => {
+  const f = (await fixture());
   // One 1-cent match per "split" is below MIN_STAKE, so use the smallest
   // legal stake and check the arithmetic directly through settlement.
   const stake = 100; // MIN_STAKE
@@ -132,8 +141,8 @@ check('H3 the share is floored, so splitting cannot harvest rounding', () => {
 // 3 winners: floor(1000/3) = 333 each, and the books still balance — the
 // sub-cent remainder is not minted, it simply never leaves the layer's own
 // collateral.
-check('H4 an indivisible liability floors and still balances', () => {
-  const f = fixture();
+check('H4 an indivisible liability floors and still balances', async () => {
+  const f = (await fixture());
   bet(f, f.alice, f.ids.Red, 'back', 3.0, 1001);
   bet(f, f.bob, f.ids.Red, 'lay', 3.0, 1001);
   bet(f, f.carol, f.ids.Blue, 'back', 3.0, 1001);
@@ -153,8 +162,8 @@ check('H4 an indivisible liability floors and still balances', () => {
 // H5: the ordinary single-winner path is UNCHANGED — floor(x/1) is x. The
 // most carefully tested path in the codebase is proved unchanged here rather
 // than asserted.
-check('H5 a single winner still pays the full liability', () => {
-  const f = fixture();
+check('H5 a single winner still pays the full liability', async () => {
+  const f = (await fixture());
   bet(f, f.alice, f.ids.Red, 'back', 3.0, 1000);
   bet(f, f.bob, f.ids.Red, 'lay', 3.0, 1000);
   S.settleMarket(f.db, f.marketId, { winner_selection_id: f.ids.Red });
@@ -165,8 +174,8 @@ check('H5 a single winner still pays the full liability', () => {
 
 // H6: validation. A dead heat is a SET of joint winners; anything else is a
 // caller mistake that must not silently settle something.
-check('H6 a malformed dead heat is refused', () => {
-  const f = fixture();
+check('H6 a malformed dead heat is refused', async () => {
+  const f = (await fixture());
   bet(f, f.alice, f.ids.Red, 'back');
   bet(f, f.bob, f.ids.Red, 'lay');
   const bad = [
@@ -201,8 +210,8 @@ check('H6 a malformed dead heat is refused', () => {
 
 // H7: terminality. A dead-heat market is settled; a second settlement is
 // refused, and cannot be re-opened as a single winner.
-check('H7 a dead-heat market is terminal', () => {
-  const f = fixture();
+check('H7 a dead-heat market is terminal', async () => {
+  const f = (await fixture());
   bet(f, f.alice, f.ids.Red, 'back');
   bet(f, f.bob, f.ids.Red, 'lay');
   S.settleMarket(f.db, f.marketId, { dead_heat: [f.ids.Red, f.ids.Blue] });
@@ -216,8 +225,8 @@ check('H7 a dead-heat market is terminal', () => {
 // H8: the record. A dead heat is distinguishable from a single win in the
 // database, because an operator (and a regulator) asking "how did this market
 // settle" needs the answer.
-check('H8 a dead heat is recorded as one', () => {
-  const f = fixture();
+check('H8 a dead heat is recorded as one', async () => {
+  const f = (await fixture());
   bet(f, f.alice, f.ids.Red, 'back');
   bet(f, f.bob, f.ids.Red, 'lay');
   S.settleMarket(f.db, f.marketId, { dead_heat: [f.ids.Red, f.ids.Blue] });
@@ -234,8 +243,8 @@ check('H8 a dead heat is recorded as one', () => {
 // H9: a dead heat on a market with cash-out buyouts. The venue took over a
 // player's side; the buyout's realised loss must be computed against the
 // JOINT set, or the desk reports a number the books do not support.
-check('H9 a cashed-out position resolves against the joint winner set', () => {
-  const f = fixture(['Red', 'Blue']);
+check('H9 a cashed-out position resolves against the joint winner set', async () => {
+  const f = (await fixture(['Red', 'Blue']));
   // Alice backs Red; Bob lays it. Alice cashes out, so the house takes her back
   // side and Bob's counterparty position is preserved.
   bet(f, f.alice, f.ids.Red, 'back', 2.5, 10000);
@@ -255,5 +264,22 @@ check('H9 a cashed-out position resolves against the joint winner set', () => {
   assert.deepStrictEqual(acc.assertUserAgrees(f.db), []);
 });
 
-console.log(`\ndeadheat.test.js: ${passed} checks passed`);
-if (passed < 9) { console.error('expected 9 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 9) { console.error('expected 9 checks'); process.exit(1); }
+  console.log(`\ndeadheat.test.js: ${passed} checks passed`);
+})();

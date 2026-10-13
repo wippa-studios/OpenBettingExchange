@@ -9,7 +9,12 @@ const { DatabaseSync } = require('node:sqlite');
 const { openStore } = require('../lib/store');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 const TABLES = [
   'users', 'sessions', 'sports', 'competitions', 'events', 'markets', 'selections',
@@ -18,7 +23,7 @@ const TABLES = [
 ];
 
 // D1: every table from the domain spec exists, and opening twice is safe.
-check('D1 schema is complete and idempotent', () => {
+check('D1 schema is complete and idempotent', async () => {
   const db = openStore(':memory:');
   for (const t of TABLES) {
     const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(t);
@@ -28,7 +33,7 @@ check('D1 schema is complete and idempotent', () => {
 });
 
 // D2: foreign keys are enforced (a match cannot point at a missing order).
-check('D2 foreign keys enforced', () => {
+check('D2 foreign keys enforced', async () => {
   const db = openStore(':memory:');
   assert.throws(() => {
     db.prepare("INSERT INTO sessions (token, user_id, expires_at) VALUES ('t', 999, datetime('now'))").run();
@@ -40,7 +45,7 @@ check('D2 foreign keys enforced', () => {
 
 // D3: the money invariants are enforced by the DATABASE, not only by service
 // code: integer cents, non-negative, matched <= stake, price on the ladder.
-check('D3 money CHECK constraints', () => {
+check('D3 money CHECK constraints', async () => {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('F','f')").run();
   db.prepare("INSERT INTO events (sport_id, name, starts_at) VALUES (1,'E',datetime('now'))").run();
@@ -71,7 +76,7 @@ check('D3 money CHECK constraints', () => {
 });
 
 // D4: settlement rows cannot record a negative commission.
-check('D4 settlement constraints', () => {
+check('D4 settlement constraints', async () => {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('F','f')").run();
   db.prepare("INSERT INTO events (sport_id, name, starts_at) VALUES (1,'E',datetime('now'))").run();
@@ -86,7 +91,7 @@ check('D4 settlement constraints', () => {
 // D5: a pre-migration database gains the account columns, and `role` is
 // derived from the legacy `is_admin` boolean exactly once. If the derivation
 // re-ran on every open it would silently undo a deliberate demotion.
-check('D5 accounts migration derives role from is_admin, once', () => {
+check('D5 accounts migration derives role from is_admin, once', async () => {
   const p = path.join(os.tmpdir(), `ob-migrate-${process.pid}.db`);
   fs.rmSync(p, { force: true });
   try {
@@ -127,7 +132,7 @@ check('D5 accounts migration derives role from is_admin, once', () => {
 
 // D6: email identifies at most one account, while accounts without an address
 // are unrestricted — NULL must not count as a shared value.
-check('D6 email uniqueness is partial', () => {
+check('D6 email uniqueness is partial', async () => {
   const db = openStore(':memory:');
   const ins = db.prepare('INSERT INTO users (username, pass_hash, email) VALUES (?,?,?)');
   ins.run('a', 'h', null);
@@ -146,7 +151,7 @@ check('D6 email uniqueness is partial', () => {
 // `CREATE INDEX ... ON orders (user_id, client_order_id)` in SCHEMA therefore
 // throws "no such column" against an old orders table, and the app cannot boot
 // at all — the feature would look fine in CI and break every existing install.
-check('D7 a pre-idempotency database upgrades and keeps its orders', () => {
+check('D7 a pre-idempotency database upgrades and keeps its orders', async () => {
   const { DatabaseSync } = require('node:sqlite');
   // A FILE, not :memory: — openStore needs to reopen a real database to see
   // it in its pre-migration shape.
@@ -181,4 +186,21 @@ check('D7 a pre-idempotency database upgrades and keeps its orders', () => {
   fs.rmSync(file, { force: true });
 });
 
-console.log(`\nstore.test.js: ${passed} checks passed`);
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  console.log(`\nstore.test.js: ${passed} checks passed`);
+})();

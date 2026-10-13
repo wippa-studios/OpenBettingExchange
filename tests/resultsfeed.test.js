@@ -33,7 +33,11 @@ const run = async () => {
   let n = 0;
   // A market whose event is completed, with real exposure — i.e. exactly what
   // a results feed has to be able to settle.
-  function fixture(sport = 'football') {
+  async function fixture(sport = 'football') {
+  // ensureBot() is synchronous (it runs inside transactions in lib/settle.js and
+  // lib/cashoutrisk.js) and so cannot derive the house password hash itself.
+  // This venue is hand-built rather than seeded, so prime it explicitly.
+  await require('../lib/bots').primeBotHash();
     RF.resetState();
     const db = openStore(':memory:');
     db.prepare('INSERT INTO sports (name, slug) VALUES (?, ?)').run(sport, sport);
@@ -52,8 +56,8 @@ const run = async () => {
       db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 2.0)').run(mkt.id, nm);
     }
     const s1 = db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, 'Alpha').id;
-    const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
-    const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 });
+    const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
+    const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 }));
     return { db, marketId: mkt.id, s1, alice, bob };
   }
   // bet() with a real counterparty: two backs never match.
@@ -87,7 +91,7 @@ const run = async () => {
   // T1: a poll settles a market end to end. Without this the transport is a
   // parser with no consumer, which is what shipped before.
   await check('T1 a poll applies outcomes and settles the market', async () => {
-    const f = fixture();
+    const f = (await fixture());
     backed(f);
     const calls = [];
     const fetcher = RF.createFetcher({
@@ -111,7 +115,7 @@ const run = async () => {
   // and the consumer's pending set come from one query. A transport that asked
   // about a different set would look healthy while outcomes never arrived.
   await check('T2 the feed is asked for precisely the pending set', async () => {
-    const f = fixture();
+    const f = (await fixture());
     backed(f);
     // A second market that is NOT pending (its event is still live) must not be
     // asked about, or the provider wastes work and we misread the answer.
@@ -140,7 +144,7 @@ const run = async () => {
   // different market must NOT settle — it is held, which is lib/results.js's
   // rule and the transport must not weaken it.
   await check('T3 the feed cannot settle a market it should not', async () => {
-    const f = fixture();
+    const f = (await fixture());
     backed(f);
     const before = f.db.prepare('SELECT balance_cents b FROM users WHERE username=?').get('alice').b;
     const fetcher = RF.createFetcher({
@@ -159,7 +163,7 @@ const run = async () => {
   // that outranks every published rule, and the reason a feed cannot shortcut a
   // human decision.
   await check('T4 a disputed feed outcome is held, not settled', async () => {
-    const f = fixture();
+    const f = (await fixture());
     backed(f);
     const fetcher = RF.createFetcher({
       url: 'https://results.example/v1/outcomes',
@@ -189,7 +193,7 @@ const run = async () => {
     ];
     for (const [expected, impl] of reasons) {
       RF.resetState();
-      const f = fixture();
+      const f = (await fixture());
       backed(f);
       const fetcher = RF.createFetcher({ url: 'https://results.example/v1/outcomes', fetchImpl: impl });
       const r = await RF.pollNow(f.db, { fetcher });
@@ -210,7 +214,7 @@ const run = async () => {
   // is enforced on the stream, so a provider lying about Content-Length does
   // not get past it.
   await check('T6 an oversized response is refused', async () => {
-    const f = fixture();
+    const f = (await fixture());
     backed(f);
     const big = { outcomes: { [f.marketId]: { status: 'completed', winners: [f.s1] } } };
     const fetcher = RF.createFetcher({
@@ -231,7 +235,7 @@ const run = async () => {
   await check('T7 a silent feed is distinguishable from a quiet one', async () => {
     RF.resetState();
     // Quiet: working, nothing to say.
-    const quiet = fixture();
+    const quiet = (await fixture());
     RF.resetState();
     let fetcher = RF.createFetcher({
       url: 'https://results.example/v1/outcomes',
@@ -242,7 +246,7 @@ const run = async () => {
 
     // Failing: says so, and keeps saying so.
     RF.resetState();
-    const f = fixture();
+    const f = (await fixture());
     backed(f);
     fetcher = RF.createFetcher({
       url: 'https://results.example/v1/outcomes',
@@ -265,7 +269,7 @@ const run = async () => {
   // deterministic: `health()` is asked what it would say an hour from now.
   await check('T8 a feed that stopped answering is stale, not ok', async () => {
     RF.resetState();
-    const f = fixture();
+    const f = (await fixture());
     // Nothing pending, so the transport short-circuits: this is exactly the
     // quiet-venue case, where a naive implementation records nothing at all.
     const fetcher = RF.createFetcher({
@@ -296,7 +300,7 @@ const run = async () => {
   // outage it was meant to prevent.
   await check('T8b a stale feed is reported and does not block trading', async () => {
     RF.resetState();
-    const f = fixture();
+    const f = (await fixture());
     const fetcher = RF.createFetcher({
       url: 'https://results.example/v1/outcomes',
       fetchImpl: stub(() => jsonReply({ outcomes: {} }), []),
@@ -320,7 +324,7 @@ const run = async () => {
   await check('T9 an unconfigured feed is not_configured, not failing', async () => {
     RF.resetState();
     const fetcher = RF.createFetcher({ url: null, fetchImpl: stub(() => jsonReply({}), []) });
-    const f = fixture();
+    const f = (await fixture());
     backed(f);
     const r = await RF.pollNow(f.db, { fetcher });
     // With no URL the fetcher returns {} without calling anything: no
@@ -337,7 +341,7 @@ const run = async () => {
   await check('T10 an empty pending set is a successful poll', async () => {
     RF.resetState();
     // An event still live: nothing pending.
-    const f = fixture();
+    const f = (await fixture());
     f.db.prepare("UPDATE events SET status='live'").run();
     let called = false;
     const fetcher = RF.createFetcher({
@@ -354,7 +358,7 @@ const run = async () => {
 
   // T11: normalisation is strict about ids and honest about absence. A string
   // that coerced into a selection id is how the wrong runner gets paid.
-  await check('T11 signals are normalised strictly', () => {
+  await check('T11 signals are normalised strictly', async () => {
     assert.deepStrictEqual(RF.normaliseSignal({ status: 'completed', winners: ['3', 'x', -1] }), {
       status: 'completed',
       winners: [3],
@@ -375,7 +379,7 @@ const run = async () => {
   // T12: both realistic response shapes parse, and neither is read as "no
   // outcomes" if it is malformed — because "no outcomes" and "I could not read
   // you" look identical to the operator and are not the same thing.
-  await check('T12 response shapes parse and malformed bodies raise', () => {
+  await check('T12 response shapes parse and malformed bodies raise', async () => {
     assert.deepStrictEqual(RF.parseOutcomes({ outcomes: { 5: { status: 'completed', winners: [1] } } }), {
       5: { status: 'completed', winners: [1] },
     });
@@ -394,7 +398,7 @@ const run = async () => {
   // T13: the secret is sent as a bearer token, and a feed with no secret does
   // not invent one.
   await check('T13 the feed is authenticated when a secret is configured', async () => {
-    const f = fixture();
+    const f = (await fixture());
     backed(f);
     const calls = [];
     const fetcher = RF.createFetcher({
@@ -410,7 +414,7 @@ const run = async () => {
   // T14: a consumer-side fault is NOT hidden behind "the feed is down". If
   // settlement itself throws, that is an engine bug and it must surface.
   await check('T14 a consumer fault is surfaced, not blamed on the feed', async () => {
-    const f = fixture();
+    const f = (await fixture());
     backed(f);
     const fetcher = RF.createFetcher({
       url: 'https://results.example/v1/outcomes',
@@ -433,7 +437,7 @@ const run = async () => {
   // same answer must not settle twice — the property the whole settlement path
   // rests on, and the reason re-delivery is safe.
   await check('T15 a repeated poll settles once', async () => {
-    const f = fixture();
+    const f = (await fixture());
     backed(f);
     const answer = { outcomes: { [f.marketId]: { status: 'completed', winners: [f.s1] } } };
     const fetcher = RF.createFetcher({
@@ -459,7 +463,7 @@ const run = async () => {
   // not mistaken for an object. This is the test that would have caught the
   // HTTP results feed being wired and settling nothing.
   await check('T16 an async fetcher is awaited, not read as an object', async () => {
-    const f = fixture();
+    const f = (await fixture());
     backed(f);
     const answer = { outcomes: { [f.marketId]: { status: 'completed', winners: [f.s1] } } };
     // Deliberately ASYNC and deliberately a Promise. If pollOnce stops

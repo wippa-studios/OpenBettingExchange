@@ -38,10 +38,15 @@ const L = require('../lib/limits');
 const LIMITS = L;
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 let n = 0;
-function fixture() {
+async function fixture() {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sp = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -54,8 +59,8 @@ function fixture() {
     db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 2.0)').run(mkt.id, nm);
   }
   const s1 = db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, 'Alpha').id;
-  const mk = (u) => A.registerUser(db, { username: u, password: `pw-${u}-1234`, balance_cents: 100000 });
-  return { db, marketId: mkt.id, s1, alice: mk('alice'), bob: mk('bob'), carol: mk('carol'), dave: mk('dave') };
+  const mk = async (u) => A.registerUser(db, { username: u, password: `pw-${u}-1234`, balance_cents: 100000 });
+  return { db, marketId: mkt.id, s1, alice: (await mk('alice')), bob: (await mk('bob')), carol: (await mk('carol')), dave: (await mk('dave')) };
 }
 
 const order = (f, who, extra = {}) =>
@@ -74,8 +79,8 @@ const expireAll = (f) =>
 
 // D1: the regression. A delayed order must NOT match on arrival. This is the
 // exact call the reproduction made that matched anyway.
-check('D1 a delayed order does NOT match on arrival', () => {
-  const f = fixture();
+check('D1 a delayed order does NOT match on arrival', async () => {
+  const f = (await fixture());
   order(f, f.alice, { side: 'lay' }); // alice rests a lay
   goInPlay(f, 60000);
   const r = order(f, f.bob); // bob's back crosses it
@@ -89,8 +94,8 @@ check('D1 a delayed order does NOT match on arrival', () => {
 // D2: pre-match matching is unchanged — eligible_at is NULL, and orders cross
 // on arrival exactly as before. A delay feature that altered the pre-match
 // book would be a far worse regression than the bug.
-check('D2 a pre-match order has no delay and matches immediately', () => {
-  const f = fixture();
+check('D2 a pre-match order has no delay and matches immediately', async () => {
+  const f = (await fixture());
   order(f, f.alice, { side: 'lay' });
   const row = f.db.prepare('SELECT eligible_at e FROM orders ORDER BY id DESC LIMIT 1').get();
   assert.strictEqual(row.e, null, 'eligible_at is NULL pre-match — immediately eligible');
@@ -101,8 +106,8 @@ check('D2 a pre-match order has no delay and matches immediately', () => {
 // D3: the in-play delay of ZERO matches immediately. An operator who believes
 // their feed is fast enough must be able to say so, and the model must not
 // force a delay on them.
-check('D3 a zero delay matches immediately even in-play', () => {
-  const f = fixture();
+check('D3 a zero delay matches immediately even in-play', async () => {
+  const f = (await fixture());
   order(f, f.alice, { side: 'lay' });
   goInPlay(f, 0);
   const r = order(f, f.bob);
@@ -112,8 +117,8 @@ check('D3 a zero delay matches immediately even in-play', () => {
 // D4: a delayed order's timestamp is still its TRUE placement time. The tape
 // must not be told the order arrived later than it did, or the audit trail
 // misreports what the venue could have known.
-check('D4 eligible_at is separate from placed_at', () => {
-  const f = fixture();
+check('D4 eligible_at is separate from placed_at', async () => {
+  const f = (await fixture());
   goInPlay(f, 60000);
   const r = order(f, f.bob);
   const row = f.db.prepare('SELECT placed_at p, eligible_at e FROM orders WHERE id = ?').get(r.order.id);
@@ -127,8 +132,8 @@ check('D4 eligible_at is separate from placed_at', () => {
 // D5: an ELIGIBLE taker must not be able to sweep a DELAYED resting order.
 // One-sided enforcement (gating the taker only) would leave the delay
 // meaningless: any other player could take the delayed order instantly.
-check('D5 an eligible taker cannot sweep a delayed resting order', () => {
-  const f = fixture();
+check('D5 an eligible taker cannot sweep a delayed resting order', async () => {
+  const f = (await fixture());
   goInPlay(f, 60000);
   order(f, f.alice, { side: 'lay' }); // delayed resting lay
   const r = order(f, f.bob); // an (immediately eligible? no — also delayed) back
@@ -146,8 +151,8 @@ check('D5 an eligible taker cannot sweep a delayed resting order', () => {
 // D6: when the delay expires, the release pass MATCHES the order. Without this
 // the delay is not a feature, it is an outage: in-play orders would sit
 // unmatched until a taker happened to arrive.
-check('D6 the release pass matches a delayed order once the delay expires', () => {
-  const f = fixture();
+check('D6 the release pass matches a delayed order once the delay expires', async () => {
+  const f = (await fixture());
   goInPlay(f, 60000);
   order(f, f.alice, { side: 'lay' }); // delayed resting lay
   const bob = order(f, f.bob); // delayed back, rests
@@ -162,16 +167,16 @@ check('D6 the release pass matches a delayed order once the delay expires', () =
 
 // D7: the release pass is a NO-OP when nothing is delayed. A timer that does
 // work every tick regardless is a background load bug waiting to happen.
-check('D7 the release pass is a no-op with nothing delayed', () => {
-  const f = fixture();
+check('D7 the release pass is a no-op with nothing delayed', async () => {
+  const f = (await fixture());
   const r = M.releaseEligibleOrders(f.db);
   assert.deepStrictEqual(r, { considered: 0, released: 0, filled: 0, skipped: 0 });
 });
 
 // D8: a released order leaves the delayed set (eligible_at is cleared), so it
 // is not re-scanned forever. Once released it is an ordinary resting order.
-check('D8 a released order is no longer in the delayed set', () => {
-  const f = fixture();
+check('D8 a released order is no longer in the delayed set', async () => {
+  const f = (await fixture());
   goInPlay(f, 60000);
   order(f, f.alice, { side: 'lay', price: 5.0, stake_cents: 1000 }); // will not cross
   order(f, f.bob, { side: 'back', price: 2.0, stake_cents: 1000 });
@@ -187,8 +192,8 @@ check('D8 a released order is no longer in the delayed set', () => {
 // a LAY at 1.6; bob's delayed BACK is at 1.5. On release they cross, and the
 // fill must be at 1.5 (bob's price). Filling at the resting 1.6 would pay bob
 // more than his order said and silently change his stake x price arithmetic.
-check('D9 a released order fills at ITS price, never a better one', () => {
-  const f = fixture();
+check('D9 a released order fills at ITS price, never a better one', async () => {
+  const f = (await fixture());
   // alice's lay rests PRE-MATCH, so it is immediately eligible and can be hit.
   order(f, f.alice, { side: 'lay', price: 1.6, stake_cents: 1000 });
   goInPlay(f, 60000);
@@ -207,8 +212,8 @@ check('D9 a released order fills at ITS price, never a better one', () => {
 // D10: cancelling a delayed order is allowed and releases its escrow at once.
 // A player must not be locked into a position they cannot exit for the length
 // of the delay.
-check('D10 a delayed order can be cancelled and its escrow released', () => {
-  const f = fixture();
+check('D10 a delayed order can be cancelled and its escrow released', async () => {
+  const f = (await fixture());
   goInPlay(f, 60000);
   const r = order(f, f.bob);
   assert.ok(f.db.prepare('SELECT frozen_cents f FROM users WHERE id=?').get(f.bob.id).f > 0, 'escrowed');
@@ -219,8 +224,8 @@ check('D10 a delayed order can be cancelled and its escrow released', () => {
 
 // D11: a market that closed or was held mid-delay must NOT be released into.
 // Otherwise a delayed order is matched in a market that is settling.
-check('D11 a suspended market is not released into', () => {
-  const f = fixture();
+check('D11 a suspended market is not released into', async () => {
+  const f = (await fixture());
   goInPlay(f, 60000);
   order(f, f.alice, { side: 'lay' });
   const bob = order(f, f.bob);
@@ -242,8 +247,8 @@ check('D11 a suspended market is not released into', () => {
 // failed for that reason alone: the advisory is computed at call time, so it is
 // a few milliseconds later than the order's. The meaningful property is the
 // ORDER's own horizon.
-check('D12 the engine delay and the client advisory never disagree', () => {
-  const f = fixture();
+check('D12 the engine delay and the client advisory never disagree', async () => {
+  const f = (await fixture());
   goInPlay(f, 45000);
   assert.strictEqual(IP.delayMsFor(f.db, f.marketId), 45000, 'delayMsFor agrees');
   assert.strictEqual(IP.eligibility(f.db, f.marketId).delay_ms, 45000, 'eligibility agrees');
@@ -264,8 +269,8 @@ check('D12 the engine delay and the client advisory never disagree', () => {
 // unreportable (lib/reports.js could not compute it, and initially read
 // `eligible_at IS NOT NULL` and found nothing). `orders.delayed` is the durable
 // historical fact, kept separately from the scheduling state.
-check('D13 a released order is still identifiable as delayed', () => {
-  const f = fixture();
+check('D13 a released order is still identifiable as delayed', async () => {
+  const f = (await fixture());
   goInPlay(f, 60000);
   order(f, f.alice, { side: 'lay' });
   const bob = order(f, f.bob);
@@ -276,7 +281,7 @@ check('D13 a released order is still identifiable as delayed', () => {
   assert.strictEqual(after.d, 1, 'still flagged after release');
   assert.strictEqual(after.e, null, 'and out of the delayed set');
   // A pre-match order is never flagged, so the flag means what it says.
-  const g = fixture();
+  const g = (await fixture());
   const pre = order(g, g.alice);
   assert.strictEqual(g.db.prepare('SELECT delayed d FROM orders WHERE id=?').get(pre.order.id).d, 0);
 });
@@ -308,8 +313,8 @@ check('D13 a released order is still identifiable as delayed', () => {
 // row, and its only symptom appeared later, at cancel and settle. Asserting
 // conservation after a release — which every earlier check here does — cannot
 // see it.
-check('D14 a release never erases matched history or inflates escrow', () => {
-  const f = fixture();
+check('D14 a release never erases matched history or inflates escrow', async () => {
+  const f = (await fixture());
   goInPlay(f, 60000);
   // UNEQUAL stakes on purpose: the layer rests less than the backer wants, so
   // releasing the backer only PARTIALLY fills the layer.
@@ -348,8 +353,8 @@ check('D14 a release never erases matched history or inflates escrow', () => {
   assert.deepStrictEqual(acc.assertUserAgrees(f.db), [], 'and the cache agrees');
 });
 
-check('D14b a market that went through a release pass can still settle', () => {
-  const f = fixture();
+check('D14b a market that went through a release pass can still settle', async () => {
+  const f = (await fixture());
   goInPlay(f, 60000);
   order(f, f.alice, { side: 'lay', price: 2.0, stake_cents: 2000 });
   order(f, f.bob, { price: 2.0, stake_cents: 3000 });
@@ -384,8 +389,8 @@ check('D14b a market that went through a release pass can still settle', () => {
 // it declines, it must leave eligible_at alone: clearing it drops the order out
 // of the delayed set, and NULL means "immediately eligible", so the refusal
 // would hand the order straight to the next taker.
-check('D15 the release pass applies the same aggressor cap as the taker path', () => {
-  const f = fixture();
+check('D15 the release pass applies the same aggressor cap as the taker path', async () => {
+  const f = (await fixture());
   const capAt = (cents) =>
     L.setLimits(f.db, { actor: { id: f.alice.id, role: 'user' }, userId: f.alice.id, scope: 'global', max_daily_settled_cents: cents });
 
@@ -398,7 +403,7 @@ check('D15 the release pass applies the same aggressor cap as the taker path', (
   // ── Control: uncapped, the order IS released ────────────────────────────
   // Proven FIRST, so the assertions below cannot pass merely because the pass
   // is doing nothing — the usual failure mode of a "the control works" test.
-  const control = fixture();
+  const control = (await fixture());
   goInPlay(control, 60000);
   order(control, control.alice, { price: 2.0, stake_cents: 2000 });
   expireAll(control);
@@ -448,8 +453,8 @@ check('D15 the release pass applies the same aggressor cap as the taker path', (
 // suspended — the routine case being a feed outage — silently lost its delay
 // forever and then matched with no delay of its own. Skipping the sweep is not
 // the same as removing the protection.
-check('D15b a suspension does not strip the bet delay from a due order', () => {
-  const f = fixture();
+check('D15b a suspension does not strip the bet delay from a due order', async () => {
+  const f = (await fixture());
   goInPlay(f, 60000);
   order(f, f.alice, { side: 'lay', price: 2.0, stake_cents: 2000 });
   const bob = order(f, f.bob, { price: 2.0, stake_cents: 2000 });
@@ -475,5 +480,22 @@ check('D15b a suspension does not strip the bet delay from a due order', () => {
   assert.strictEqual(acc.assertConserved(f.db), 0);
 });
 
-console.log(`\ninplay2.test.js: ${passed} checks passed`);
-if (passed < 17) { console.error('expected 17 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 17) { console.error('expected 17 checks'); process.exit(1); }
+  console.log(`\ninplay2.test.js: ${passed} checks passed`);
+})();

@@ -18,7 +18,7 @@ const check = (name, fn) => {
 };
 
 // L1: the client table IS the engine table (both already integer cents).
-check('L1 client bands equal engine bands', () => {
+check('L1 client bands equal engine bands', async () => {
   assert.deepStrictEqual(client.LADDER, O.LADDER);
   assert.strictEqual(client.MIN_CENTS, 101);
   assert.strictEqual(client.MAX_CENTS, 100000);
@@ -27,7 +27,7 @@ check('L1 client bands equal engine bands', () => {
 // L2: every engine tick is a fixed point of the client snap, and one step
 // walks the whole ladder in lockstep with nextTick/prevTick — including the
 // band-edge jumps (2.0→2.02, 10.0→10.5, 100→110…).
-check('L2 snap identity + step parity on every tick', () => {
+check('L2 snap identity + step parity on every tick', async () => {
   for (const band of O.LADDER) {
     for (let c = band.lo; c <= band.hi; c += band.step) {
       const p = c / 100;
@@ -40,7 +40,7 @@ check('L2 snap identity + step parity on every tick', () => {
 
 // L3: snap parity across band gaps, the clamped extremes and every cent in
 // between — the client must agree with the engine on ANY price it is fed.
-check('L3 snap parity across the whole range', () => {
+check('L3 snap parity across the whole range', async () => {
   for (let c = 1; c <= 100100; c++) {
     const p = c / 100;
     assert.strictEqual(client.snapPrice(p), O.snapToTick(p), `snap(${p})`);
@@ -53,7 +53,7 @@ check('L3 snap parity across the whole range', () => {
 // L4: exposure preview stays in integer price-cents with ONE rounding at the
 // end — half-cent liabilities round half-up, matching the engine's
 // cents-domain accounting (a lay @1.5 stake $1.01 previews $0.51).
-check('L4 exposure in integer price-cents', () => {
+check('L4 exposure in integer price-cents', async () => {
   assert.strictEqual(client.exposureCents(1.5, 101), 51); // 50.5 → 51
   assert.strictEqual(client.exposureCents(2.4, 1000), 1400);
   assert.strictEqual(client.exposureCents(1.01, 100), 1);
@@ -63,7 +63,7 @@ check('L4 exposure in integer price-cents', () => {
 
 // L5: the client fails loudly on non-finite prices instead of silently
 // snapping garbage to 1.01 (mirrors the engine's fail-fast contract).
-check('L5 non-finite prices throw', () => {
+check('L5 non-finite prices throw', async () => {
   for (const bad of [NaN, Infinity, -Infinity, 'x', null, undefined]) {
     assert.throws(() => client.snapPrice(bad), TypeError);
     assert.throws(() => client.stepPrice(bad, 1), TypeError);

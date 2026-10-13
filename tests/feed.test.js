@@ -85,7 +85,7 @@ const odds = (back = [], lay = []) => ({ back, lay });
 // Only self-run when executed directly. tests/feed_nav.test.js imports this
 // file to reuse findNavHandler/navCall, and must not re-run these checks.
 if (require.main === module) (async () => {
-  await check('a single priced runner yields one market with both ladders', () => {
+  await check('a single priced runner yields one market with both ladders', async () => {
     const out = groupRows([
       row({ odds: odds([lv(2.4)], [lv(2.5)]) }),
     ]);
@@ -96,24 +96,24 @@ if (require.main === module) (async () => {
     assert.strictEqual(s.lay.length, 1);
   });
 
-  await check('back ladder is highest-first (best price to back)', () => {
+  await check('back ladder is highest-first (best price to back)', async () => {
     // Deliberately unsorted: Betfair does not return a ladder in order, and the
     // top of the back ladder is the best price to back.
     const out = groupRows([row({ odds: odds([lv(2.4), lv(2.6), lv(2.5)]) })]);
     assert.deepStrictEqual(out[0].selections[0].back.map((l) => l.price), [2.6, 2.5, 2.4]);
   });
 
-  await check('lay ladder is lowest-first (best price to lay)', () => {
+  await check('lay ladder is lowest-first (best price to lay)', async () => {
     const out = groupRows([row({ odds: odds([], [lv(2.9), lv(2.7), lv(2.8)]) })]);
     assert.deepStrictEqual(out[0].selections[0].lay.map((l) => l.price), [2.7, 2.8, 2.9]);
   });
 
-  await check('size converts from pounds to integer cents', () => {
+  await check('size converts from pounds to integer cents', async () => {
     const out = groupRows([row({ odds: odds([lv(2.4, 123.45)]) })]);
     assert.strictEqual(out[0].selections[0].back[0].size_cents, 12345);
   });
 
-  await check('two markets stay separate', () => {
+  await check('two markets stay separate', async () => {
     const out = groupRows([
       row({ market_id: '1.100', selection_id: 1 }),
       row({ market_id: '1.200', selection_id: 2 }),
@@ -121,7 +121,7 @@ if (require.main === module) (async () => {
     assert.strictEqual(out.length, 2);
   });
 
-  await check('multiple runners in one market are kept', () => {
+  await check('multiple runners in one market are kept', async () => {
     const out = groupRows([
       row({ selection_id: 1, odds: odds([lv(2.4)]) }),
       row({ selection_id: 2, runner_name: 'Chelsea', sort_priority: 2, odds: odds([lv(3.1)]) }),
@@ -142,12 +142,12 @@ if (require.main === module) (async () => {
   // These three cover the real cases now: a market the odds job has not reached,
   // a selection with genuinely no price, and a whole market from feed 1, which
   // has no price column at all.
-  await check('no level is ever flagged carried, because a poll is never partial', () => {
+  await check('no level is ever flagged carried, because a poll is never partial', async () => {
     const out = groupRows([row({ odds: odds([lv(2.4)]) })]);
     assert.strictEqual(out[0].selections[0].back[0].carried, undefined);
   });
 
-  await check('a runner with no odds at all still renders, with empty ladders', () => {
+  await check('a runner with no odds at all still renders, with empty ladders', async () => {
     // A market inside the fixtures scope that the odds job has not reached yet.
     const out = groupRows([row({ odds: null, odds_captured_at: null })]);
     assert.strictEqual(out[0].selections.length, 1, 'runner survives');
@@ -156,7 +156,7 @@ if (require.main === module) (async () => {
     assert.strictEqual(out[0].poll_age_seconds, null, 'and its age is honestly null, not zero');
   });
 
-  await check('a whole market priced as unpriced (feed 1) renders with empty ladders', () => {
+  await check('a whole market priced as unpriced (feed 1) renders with empty ladders', async () => {
     // feed 1 has no odds column, so `priced: false` is passed and nothing is
     // invented. The market must still appear — a fixture list is the point of
     // feed 1 — but with no prices, and marked stale so it cannot be mistaken
@@ -169,7 +169,7 @@ if (require.main === module) (async () => {
     assert.strictEqual(out[0].poll_age_seconds, null);
   });
 
-  await check('a null price never becomes a zero-price level', () => {
+  await check('a null price never becomes a zero-price level', async () => {
     const out = groupRows([row({ odds: odds([{ price: null, size: 10 }]) })]);
     assert.strictEqual(out[0].selections[0].back.length, 0);
   });
@@ -181,7 +181,7 @@ if (require.main === module) (async () => {
   // here as `Infinity`. It has anyway, in tests and in a future SDK. A bad price
   // flowing on corrupts ladder sorts and the book-percentage sums, so the level
   // is dropped at the boundary instead.
-  await check('a NaN or infinite price level is skipped, not rendered', () => {
+  await check('a NaN or infinite price level is skipped, not rendered', async () => {
     const out = groupRows([
       row({ odds: odds([lv(NaN), lv(2.4)], [lv(Infinity)]) }),
     ]);
@@ -191,13 +191,13 @@ if (require.main === module) (async () => {
     assert.strictEqual(s.lay.length, 0, "Betfair's infinite LAY level is gone");
   });
 
-  await check('a negative or sub-1 price level is skipped (boundary: price >= 1)', () => {
+  await check('a negative or sub-1 price level is skipped (boundary: price >= 1)', async () => {
     const out = groupRows([row({ odds: odds([lv(-2)], [lv(0.5)]) })]);
     assert.strictEqual(out[0].selections[0].back.length, 0, 'negative price skipped');
     assert.strictEqual(out[0].selections[0].lay.length, 0, 'sub-1 price skipped');
   });
 
-  await check('a negative or absent size is skipped; a null size is a real zero', () => {
+  await check('a negative or absent size is skipped; a null size is a real zero', async () => {
     const bad = groupRows([row({ odds: odds([lv(2.4, -5)], [lv(2.5, NaN)]) })]);
     assert.strictEqual(bad[0].selections[0].back.length, 0, 'negative size skipped');
     assert.strictEqual(bad[0].selections[0].lay.length, 0, 'NaN size skipped');
@@ -208,7 +208,7 @@ if (require.main === module) (async () => {
     assert.strictEqual(zero[0].selections[0].back[0].size_cents, 0, 'at zero cents');
   });
 
-  await check('a duplicated level is shown once, not as a repeated price cell', () => {
+  await check('a duplicated level is shown once, not as a repeated price cell', async () => {
     // Betfair can emit the same (price, size) twice across a resumption. The UI
     // has no way to render a duplicate cell, and a doubled level also doubles
     // its contribution to the book percentage.
@@ -220,7 +220,7 @@ if (require.main === module) (async () => {
     );
   });
 
-  await check('a runner whose only level is unusable still renders, with empty ladders', () => {
+  await check('a runner whose only level is unusable still renders, with empty ladders', async () => {
     const out = groupRows([
       row({ selection_id: 1, runner_name: 'Arsenal', odds: odds([lv(NaN)]) }),
       row({ selection_id: 2, runner_name: 'Chelsea', sort_priority: 2, odds: odds([lv(2.4)]) }),
@@ -230,7 +230,7 @@ if (require.main === module) (async () => {
     assert.strictEqual(out[0].selections.find((s) => String(s.selection_id) === '2').back.length, 1);
   });
 
-  await check('runners with no name still render (null mid-backfill)', () => {
+  await check('runners with no name still render (null mid-backfill)', async () => {
     const out = groupRows([row({ runner_name: null })]);
     assert.strictEqual(out[0].selections.length, 1);
     assert.strictEqual(out[0].selections[0].name, null);
@@ -245,21 +245,21 @@ if (require.main === module) (async () => {
   //
   // An offline suite cannot join Postgres to catch it, so this pins the column
   // list itself — which is the part that actually broke.
-  await check('the priced board query selects the ladder column, not just its metadata', () => {
+  await check('the priced board query selects the ladder column, not just its metadata', async () => {
     const sql = boardSql(2, false);
     assert.match(sql, /\bv\.odds\s*,/, 'v.odds is selected on feed 2');
     assert.match(sql, /\bv\.odds_captured_at\b/, 'and the book timestamp beside it');
     assert.match(sql, /v_feed2/, 'from the priced view');
   });
 
-  await check('the unpriced board query selects no price column at all', () => {
+  await check('the unpriced board query selects no price column at all', async () => {
     const sql = boardSql(1, false);
     assert.ok(!/\bv\.odds\b/.test(sql), 'feed 1 must not ask for a column that does not exist there');
     assert.ok(!/odds_captured_at/.test(sql));
     assert.match(sql, /v_feed1/, 'and it reads the unpriced view');
   });
 
-  await check('a board query with no limit clause cannot return one selection', () => {
+  await check('a board query with no limit clause cannot return one selection', async () => {
     // The single-market read once carried LIMIT 1. The view is one row per
     // SELECTION, so that returned one runner of a twenty-runner market and the
     // ladder rendered with a single line.
@@ -270,7 +270,7 @@ if (require.main === module) (async () => {
     assert.match(board, /LIMIT \$1/, 'the board read is');
   });
 
-  await check('the board cap counts markets, not selection rows', () => {
+  await check('the board cap counts markets, not selection rows', async () => {
     // Same class of error as the LIMIT above: a plain LIMIT on the outer select
     // caps rows, and a Correct Score market is 31 rows, so "limit 5" returned
     // one market. The market list is chosen in a CTE first.
@@ -280,23 +280,23 @@ if (require.main === module) (async () => {
     assert.match(sql, /JOIN chosen c ON c\.market_id = v\.market_id/);
   });
 
-  await check('a board query starts with WITH, not FROM', () => {
+  await check('a board query starts with WITH, not FROM', async () => {
     // Postgres reports a misplaced WITH as "syntax error at or near WITH",
     // which says nothing about the cause.
     const sql = boardSql(2, false).trim();
     assert.match(sql, /^WITH chosen AS \(/, 'the CTE leads the statement');
   });
 
-  await check('ageSeconds measures seconds since publish', () => {
+  await check('ageSeconds measures seconds since publish', async () => {
     assert.strictEqual(ageSeconds(iso(0)), 0);
     assert.strictEqual(ageSeconds(iso(90_000)), 90);
   });
 
-  await check('ageSeconds is null when publish_time is missing', () => {
+  await check('ageSeconds is null when publish_time is missing', async () => {
     assert.strictEqual(ageSeconds(null), null);
   });
 
-  await check('market status is normalised to upper case', () => {
+  await check('market status is normalised to upper case', async () => {
     const out = groupRows([row({ market_status: 'CLOSED' })]);
     assert.strictEqual(out[0].status, 'CLOSED');
   });
@@ -305,7 +305,7 @@ if (require.main === module) (async () => {
   // Betfair returns runners unordered and the stream carries no sort_priority,
   // so the leading number in the name is the only usable key. A racing ladder
   // read out of order looks broken to anyone who knows the sport.
-  await check('runners sort by the number in their name, not arrival order', () => {
+  await check('runners sort by the number in their name, not arrival order', async () => {
     const out = groupRows([
       row({ selection_id: 1, runner_name: '2. Landing Gear' }),
       row({ selection_id: 2, runner_name: '8. Scrap' }),
@@ -319,7 +319,7 @@ if (require.main === module) (async () => {
     );
   });
 
-  await check('runners without a number keep a stable alphabetical order', () => {
+  await check('runners without a number keep a stable alphabetical order', async () => {
     const out = groupRows([
       row({ selection_id: 1, runner_name: 'Zebra' }),
       row({ selection_id: 2, runner_name: 'Apple' }),
@@ -327,7 +327,7 @@ if (require.main === module) (async () => {
     assert.deepStrictEqual(out[0].selections.map((s) => s.name), ['Apple', 'Zebra']);
   });
 
-  await check('numbered runners sort before unnumbered ones', () => {
+  await check('numbered runners sort before unnumbered ones', async () => {
     const out = groupRows([
       row({ selection_id: 1, runner_name: 'Aardvark' }),
       row({ selection_id: 2, runner_name: '7. Seventh' }),
@@ -335,7 +335,7 @@ if (require.main === module) (async () => {
     assert.deepStrictEqual(out[0].selections.map((s) => s.name), ['7. Seventh', 'Aardvark']);
   });
 
-  await check('ordering is per-market, not global', () => {
+  await check('ordering is per-market, not global', async () => {
     const out = groupRows([
       row({ market_id: '1.100', selection_id: 1, runner_name: '5. Five' }),
       row({ market_id: '1.200', selection_id: 2, runner_name: '1. One' }),
@@ -349,7 +349,7 @@ if (require.main === module) (async () => {
   // Catalogue names are bare for some races ("Piteraq", not "1. Piteraq") and
   // for every non-racing sport. Without sort_priority these sort alphabetically,
   // which puts "Away" before "Home" and reads as a broken ladder.
-  await check('sort_priority orders unnumbered runners', () => {
+  await check('sort_priority orders unnumbered runners', async () => {
     const out = groupRows([
       row({ selection_id: 3, runner_name: 'The Draw', sort_priority: 3 }),
       row({ selection_id: 1, runner_name: 'Home FC', sort_priority: 1 }),
@@ -362,12 +362,12 @@ if (require.main === module) (async () => {
     );
   });
 
-  await check('sort_priority is carried onto each selection', () => {
+  await check('sort_priority is carried onto each selection', async () => {
     const out = groupRows([row({ selection_id: 1, runner_name: 'Home FC', sort_priority: 7 })]);
     assert.strictEqual(out[0].selections[0].sort_priority, 7);
   });
 
-  await check('a numeric name prefix still wins when sort_priority is absent', () => {
+  await check('a numeric name prefix still wins when sort_priority is absent', async () => {
     // The stream path never has sort_priority, so the "1. Blue and Gold" prefix
     // remains the fallback signal for it.
     const out = groupRows([
@@ -381,7 +381,7 @@ if (require.main === module) (async () => {
   // An event the name backfill has not reached yet has no venue and no
   // competition. The tree must still render a clickable node: a bare "—" is a
   // stray, and using the event name would nest a meeting inside itself.
-  await check('a trackless event gets a real node name, never a dash', () => {
+  await check('a trackless event gets a real node name, never a dash', async () => {
     const { nestNav } = require('../lib/feed');
     const out = nestNav([
       {
@@ -400,7 +400,7 @@ if (require.main === module) (async () => {
     assert.ok(meeting.races.length === 1, 'the race is still reachable');
   });
 
-  await check('a trackless event is distinct from a named one', () => {
+  await check('a trackless event is distinct from a named one', async () => {
     const { nestNav } = require('../lib/feed');
     const out = nestNav([
       { sport: 'S', sport_id: '7', country: 'AU', competition: 'Rosehill',
@@ -451,7 +451,7 @@ if (require.main === module) (async () => {
     ].join('|');
   };
 
-  await check('horse racing nests exactly like greyhound racing', () => {
+  await check('horse racing nests exactly like greyhound racing', async () => {
     const { nestNav } = require('../lib/feed');
     const grey = nestNav([
       racingRow({}),
@@ -473,7 +473,7 @@ if (require.main === module) (async () => {
       'same nesting depth and same child counts for both racing sports');
   });
 
-  await check('every racing race carries the fields the ladder header needs', () => {
+  await check('every racing race carries the fields the ladder header needs', async () => {
     const { nestNav } = require('../lib/feed');
     const out = nestNav([
       racingRow({ sport: 'Horse Racing', sport_id: '7', competition: 'Eagle Farm' }),
@@ -486,7 +486,7 @@ if (require.main === module) (async () => {
     assert.ok(!isNaN(new Date(race.market_time).getTime()), 'market_time parses for the header clock');
   });
 
-  await check('a race belongs to exactly one meeting when ids collide', () => {
+  await check('a race belongs to exactly one meeting when ids collide', async () => {
     // Betfair reuses market ids across sports; keying meetings by event_id
     // alone would merge two meetings into one node.
     const { nestNav } = require('../lib/feed');
@@ -505,25 +505,25 @@ if (require.main === module) (async () => {
   // one a separate market a bettor can price.
   const { marketLabel } = require('../lib/feed');
 
-  await check('a multi-winner place market says how many', () => {
+  await check('a multi-winner place market says how many', async () => {
     assert.strictEqual(marketLabel('To Be Placed', 3), 'To Be Placed — any 3 to be placed');
     assert.strictEqual(marketLabel('To Be Placed', 2), 'To Be Placed — any 2 to be placed');
   });
 
-  await check('a single-winner market keeps its plain name', () => {
+  await check('a single-winner market keeps its plain name', async () => {
     // "R1 300m Mdn" is already unambiguous, so the label must not gain words.
     assert.strictEqual(marketLabel('R1 300m Mdn', 1), 'R1 300m Mdn');
     assert.strictEqual(marketLabel('Match Odds', 1), 'Match Odds');
   });
 
-  await check('an unknown winner count leaves the name alone', () => {
+  await check('an unknown winner count leaves the name alone', async () => {
     for (const v of [null, undefined, 0, NaN, 'x']) {
       assert.strictEqual(marketLabel('R2 484m Rest', v), 'R2 484m Rest',
         `winner count ${String(v)} must not invent a label`);
     }
   });
 
-  await check('two winners in a meeting with different counts stay distinct', () => {
+  await check('two winners in a meeting with different counts stay distinct', async () => {
     // The real failure this guards: two markets both named "To Be Placed"
     // rendering as indistinguishable leaves.
     const labels = new Set([marketLabel('To Be Placed', 2), marketLabel('To Be Placed', 3)]);
@@ -540,20 +540,20 @@ if (require.main === module) (async () => {
     lay: lay === null ? [] : [{ price: lay }],
   });
 
-  await check('book percentages sum 1/price across every runner', () => {
+  await check('book percentages sum 1/price across every runner', async () => {
     // A fair two-way book over 2 runners: both sides exactly 2.00 -> 100%.
     const p = bookPercentages([ladder(2, 2), ladder(2, 2)]);
     assert.strictEqual(p.back_pct, 100);
     assert.strictEqual(p.lay_pct, 100);
   });
 
-  await check('book percentages round to one decimal', () => {
+  await check('book percentages round to one decimal', async () => {
     // 1/3 + 1/3 = 66.666...% -> 66.7
     const p = bookPercentages([ladder(3, 3), ladder(3, 3)]);
     assert.strictEqual(p.back_pct, 66.7);
   });
 
-  await check('a one-sided market reports null, not a inflated figure', () => {
+  await check('a one-sided market reports null, not a inflated figure', async () => {
     // Ten runners at 1.02 with no lays: summing only the back side would read
     // ~980%, which looks like an absurd book. null is the honest answer.
     const runners = Array.from({ length: 10 }, () => ladder(1.02, null));
@@ -564,7 +564,7 @@ if (require.main === module) (async () => {
     assert.strictEqual(p.lay_runners, 0);
   });
 
-  await check('book percentages count the runners that do have a price', () => {
+  await check('book percentages count the runners that do have a price', async () => {
     // A partially two-sided market: no percentage, but the counts still report
     // what the feed actually carried.
     const p = bookPercentages([ladder(2, null), ladder(null, 2), ladder(4, 4)]);
@@ -573,7 +573,7 @@ if (require.main === module) (async () => {
     assert.strictEqual(p.back_pct, null, 'an incomplete book has no percentage');
   });
 
-  await check('an empty market has no percentage rather than NaN', () => {
+  await check('an empty market has no percentage rather than NaN', async () => {
     const p = bookPercentages([]);
     assert.strictEqual(p.back_pct, null);
     assert.strictEqual(p.lay_pct, null);

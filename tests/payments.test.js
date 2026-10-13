@@ -25,9 +25,9 @@ const { assertProvider, PENDING, CONFIRMED } = require('../lib/payments/provider
 const checks = [];
 const check = (name, fn) => { checks.push([name, fn]); };
 
-function fixture() {
+async function fixture() {
   const db = openStore(':memory:');
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-1234', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-1234', balance_cents: 100000 }));
   return { db, alice };
 }
 const bal = (db, id) => db.prepare('SELECT balance_cents b, frozen_cents f FROM users WHERE id=?').get(id);
@@ -40,7 +40,7 @@ function assertWallet(db, id, b, f, msg) {
 
 // P1: THE rule. Asking to deposit moves no money.
 check('P1 a deposit intent credits NOTHING', async () => {
-  const { db, alice } = fixture();
+  const { db, alice } = (await fixture());
   await pay.openDeposit(db, alice.id, 25000);
   assertWallet(db, alice.id, 100000, 0, 'balance untouched');
   const row = db.prepare("SELECT status FROM payment_intents WHERE kind='deposit'").get();
@@ -50,7 +50,7 @@ check('P1 a deposit intent credits NOTHING', async () => {
 
 // P2: credit happens on CONFIRMATION, and posts to gateway_clearing.
 check('P2 confirmation credits the player from gateway_clearing', async () => {
-  const { db, alice } = fixture();
+  const { db, alice } = (await fixture());
   const i = await pay.openDeposit(db, alice.id, 25000);
   const clearingBefore = acc.balanceOf(db, acc.accountId(db, 'gateway_clearing', null));
   const r = pay.confirmDeposit(db, i.intent_id);
@@ -64,7 +64,7 @@ check('P2 confirmation credits the player from gateway_clearing', async () => {
 // P3: confirming twice moves money ONCE. A retried webhook is the classic
 // double-credit, and the intent id is what makes it impossible.
 check('P3 confirmation is idempotent', async () => {
-  const { db, alice } = fixture();
+  const { db, alice } = (await fixture());
   const i = await pay.openDeposit(db, alice.id, 25000);
   pay.confirmDeposit(db, i.intent_id);
   const r2 = pay.confirmDeposit(db, i.intent_id);
@@ -76,7 +76,7 @@ check('P3 confirmation is idempotent', async () => {
 // P4: opening many intents and abandoning them funds the player ZERO times.
 // This is the attack that crediting-on-initiation exists to prevent.
 check('P4 abandoned intents fund nothing', async () => {
-  const { db, alice } = fixture();
+  const { db, alice } = (await fixture());
   for (let n = 0; n < 10; n++) await pay.openDeposit(db, alice.id, 25000);
   assertWallet(db, alice.id, 100000, 0, 'not one cent credited');
   assert.strictEqual(db.prepare("SELECT COUNT(*) c FROM payment_intents WHERE status='pending'").get().c, 10);
@@ -84,7 +84,7 @@ check('P4 abandoned intents fund nothing', async () => {
 
 // P5: a failed deposit moves nothing and cannot be revived into a credit.
 check('P5 a failed intent cannot later be confirmed', async () => {
-  const { db, alice } = fixture();
+  const { db, alice } = (await fixture());
   const i = await pay.openDeposit(db, alice.id, 25000);
   pay.failDeposit(db, i.intent_id, 'card declined');
   assert.throws(() => pay.confirmDeposit(db, i.intent_id), /is failed/);
@@ -94,7 +94,7 @@ check('P5 a failed intent cannot later be confirmed', async () => {
 // P6: a withdrawal holds funds immediately, so the same balance cannot be
 // withdrawn twice.
 check('P6 a withdrawal holds funds at once', async () => {
-  const { db, alice } = fixture();
+  const { db, alice } = (await fixture());
   const before = acc.balanceOf(db, acc.accountId(db, 'gateway_clearing', null));
   pay.openWithdrawal(db, alice.id, 40000, 'player request');
   assertWallet(db, alice.id, 60000, 0, 'debited immediately and not spendable again');
@@ -106,7 +106,7 @@ check('P6 a withdrawal holds funds at once', async () => {
 // P7: a withdrawal cannot exceed available funds — the over-draft is refused
 // at the boundary rather than leaving the venue owing money it does not have.
 check('P7 a withdrawal cannot overdraw', async () => {
-  const { db, alice } = fixture();
+  const { db, alice } = (await fixture());
   assert.throws(() => pay.openWithdrawal(db, alice.id, 500000, 'too much'), /exceeds available/);
   assertWallet(db, alice.id, 100000, 0, 'nothing moved');
   assert.throws(() => pay.openWithdrawal(db, alice.id, 0), /positive integer/);
@@ -114,7 +114,7 @@ check('P7 a withdrawal cannot overdraw', async () => {
 
 // P8: reconciliation reports the drift rather than silently tolerating it.
 check('P8 reconcile reports drift', async () => {
-  const { db, alice } = fixture();
+  const { db, alice } = (await fixture());
   pay.openWithdrawal(db, alice.id, 40000, 'player request');
   const rep = await pay.reconcile(db);
   assert.strictEqual(rep.provider, 'reference');
@@ -131,7 +131,7 @@ check('P8 reconcile reports drift', async () => {
 // P9: an incomplete provider is REFUSED AT BOOT. The whole value of an
 // interface is that a missing method is a startup crash, not a production
 // surprise on someone's money.
-check('P9 an incomplete provider is refused', () => {
+check('P9 an incomplete provider is refused', async () => {
   assert.throws(() => assertProvider({ name: 'broken', createDepositIntent() {} }), /missing confirmDeposit/);
   assert.throws(() => assertProvider({}), /needs a name/);
   assert.throws(() => assertProvider(null), /must be an object/);
@@ -141,7 +141,7 @@ check('P9 an incomplete provider is refused', () => {
 // P10: REAL payments refuse the reference provider. A mock that instantly
 // confirms any deposit must never sit behind a live payment button, and the
 // only safe moment to find that out is startup.
-check('P10 real payments refuse the reference provider', () => {
+check('P10 real payments refuse the reference provider', async () => {
   assert.throws(() => pay.select('reference', { realPayments: true }), /cannot be used when real payments/);
   assert.throws(() => pay.select('never-configured', { realPayments: true }), /no provider is configured/);
   // Paper money falls back to it happily.

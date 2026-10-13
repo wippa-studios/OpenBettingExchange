@@ -270,7 +270,7 @@ const check = async (name, fn) => {
     });
 
     // ── a 5xx must never leak internals to the client ───────────────────
-    await check('error handler hides 5xx detail but keeps 4xx messages', () => {
+    await check('error handler hides 5xx detail but keeps 4xx messages', async () => {
       const sent = {};
       const res = {
         status(code) { sent.code = code; return this; },
@@ -319,7 +319,7 @@ const check = async (name, fn) => {
     });
 
     // ── S6: the feed board limit clamps to [1, 500] (pure helper) ────────
-    await check('feed board limit clamps to [1, 500]', () => {
+    await check('feed board limit clamps to [1, 500]', async () => {
       assert.strictEqual(srv.clampFeedLimit('abc', 60), 60); // junk → default
       assert.strictEqual(srv.clampFeedLimit(undefined, 60), 60); // absent → default
       assert.strictEqual(srv.clampFeedLimit(0, 60), 1); // clamped up

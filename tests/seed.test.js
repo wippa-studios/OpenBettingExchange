@@ -18,16 +18,21 @@ const { seed, seedIfNeeded, rollForwardEvents } = require('../lib/seed');
 const A = require('../lib/auth');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 const count = (db, t) => db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
 
 // S1: first run seeds the catalogue and the demo accounts; second run is a
 // no-op (guarded by the 'seeded' settings key).
-check('S1 seed is idempotent', () => {
+check('S1 seed is idempotent', async () => {
   const db = openStore(':memory:');
-  assert.strictEqual(seedIfNeeded(db), true);
+  assert.strictEqual(await seedIfNeeded(db), true);
   const first = ['sports', 'competitions', 'events', 'markets', 'selections', 'users'].map((t) => count(db, t));
-  assert.strictEqual(seedIfNeeded(db), false);
+  assert.strictEqual(await seedIfNeeded(db), false);
   const second = ['sports', 'competitions', 'events', 'markets', 'selections', 'users'].map((t) => count(db, t));
   assert.deepStrictEqual(second, first);
   assert.ok(count(db, 'events') >= 8, 'at least 8 events');
@@ -36,28 +41,28 @@ check('S1 seed is idempotent', () => {
 });
 
 // S2: the demo accounts exist with the documented roles and balances.
-check('S2 demo accounts', () => {
+check('S2 demo accounts', async () => {
   const db = openStore(':memory:');
-  seed(db);
+  await seed(db);
   const admin = db.prepare("SELECT * FROM users WHERE username='admin'").get();
   const demo = db.prepare("SELECT * FROM users WHERE username='demo'").get();
   const bot = db.prepare("SELECT * FROM users WHERE username='MarketMakers'").get();
   assert.strictEqual(admin.is_admin, 1);
   assert.strictEqual(demo.is_admin, 0);
   assert.strictEqual(bot.is_bot, 1);
-  assert.ok(A.loginUser(db, { username: 'admin', password: 'admin123' }).token);
-  assert.ok(A.loginUser(db, { username: 'demo', password: 'demo123' }).token);
-  assert.throws(() => A.loginUser(db, { username: 'demo', password: 'wrong' }), (e) => e.status === 401);
+  assert.ok((await A.loginUser(db, { username: 'admin', password: 'admin123' })).token);
+  assert.ok((await A.loginUser(db, { username: 'demo', password: 'demo123' })).token);
+  await assert.rejects(A.loginUser(db, { username: 'demo', password: 'wrong' }), (e) => e.status === 401);
   // bots hold the deepest book
   assert.ok(bot.balance_cents > admin.balance_cents, 'bot bank is the largest');
 });
 
 // S3: every seeded selection carries a fair price inside the ladder, so the
 // bot can quote it (a fair-priceless runner gets no ladder by design).
-check('S3 seeded fair prices are ladder-valid', () => {
+check('S3 seeded fair prices are ladder-valid', async () => {
   const { validTick } = require('../lib/odds');
   const db = openStore(':memory:');
-  seed(db);
+  await seed(db);
   const rows = db.prepare('SELECT name, fair_price FROM selections').all();
   assert.ok(rows.length > 0);
   for (const r of rows) {
@@ -79,7 +84,7 @@ check('S3 seeded fair prices are ladder-valid', () => {
 // re-dating an operator's real fixture to keep a demo happy is a far worse
 // failure than a stale demo board, so an is_demo = 0 event must be untouched
 // even when it is long past due.
-check('S4 roll the DEMO book forward in time; leave operator fixtures alone', () => {
+check('S4 roll the DEMO book forward in time; leave operator fixtures alone', async () => {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('F','f')").run();
   const add = (name, starts, status, isDemo) =>
@@ -118,7 +123,7 @@ check('S4 roll the DEMO book forward in time; leave operator fixtures alone', ()
 // S5: ADMIN_PASSWORD / DEMO_PASSWORD (lib/config.js) override the seeded
 // credentials on first run — the operator's escape from the well-known demo
 // passwords (server.js warns at boot while the defaults are live).
-check('S5 seeded accounts honour ADMIN_PASSWORD/DEMO_PASSWORD from config', () => {
+check('S5 seeded accounts honour ADMIN_PASSWORD/DEMO_PASSWORD from config', async () => {
   const config = require('../lib/config');
   const savedAdmin = config.ADMIN_PASSWORD;
   const savedDemo = config.DEMO_PASSWORD;
@@ -126,10 +131,10 @@ check('S5 seeded accounts honour ADMIN_PASSWORD/DEMO_PASSWORD from config', () =
   config.DEMO_PASSWORD = 'demo-override-pw';
   try {
     const db = openStore(':memory:');
-    seed(db);
-    assert.ok(A.loginUser(db, { username: 'admin', password: 'admin-override-pw' }).token, 'admin override accepted');
-    assert.ok(A.loginUser(db, { username: 'demo', password: 'demo-override-pw' }).token, 'demo override accepted');
-    assert.throws(() => A.loginUser(db, { username: 'admin', password: 'admin123' }), (e) => e.status === 401,
+    await seed(db);
+    assert.ok((await A.loginUser(db, { username: 'admin', password: 'admin-override-pw' })).token, 'admin override accepted');
+    assert.ok((await A.loginUser(db, { username: 'demo', password: 'demo-override-pw' })).token, 'demo override accepted');
+    await assert.rejects(A.loginUser(db, { username: 'admin', password: 'admin123' }), (e) => e.status === 401,
       'the well-known default no longer works');
   } finally {
     config.ADMIN_PASSWORD = savedAdmin;
@@ -141,15 +146,14 @@ check('S5 seeded accounts honour ADMIN_PASSWORD/DEMO_PASSWORD from config', () =
 // username, same bank — and its password is the documented CONSTANT
 // placeholder, which can never log anything in (auth rejects is_bot accounts
 // outright, so the constant not being secret is fine).
-check('S6 the seeded bot is the shared bot, on a never-usable password', () => {
+check('S6 the seeded bot is the shared bot, on a never-usable password', async () => {
   const bots = require('../lib/bots');
   const db = openStore(':memory:');
-  seed(db);
+  await seed(db);
   const bot = db.prepare("SELECT * FROM users WHERE username = 'MarketMakers'").get();
   assert.strictEqual(bot.username, bots.BOT_USERNAME, 'the shared username');
   assert.strictEqual(bot.balance_cents, bots.BOT_BANK_CENTS, 'the shared bank');
-  assert.throws(
-    () => A.loginUser(db, { username: bots.BOT_USERNAME, password: bots.BOT_PASSWORD }),
+  await assert.rejects(A.loginUser(db, { username: bots.BOT_USERNAME, password: bots.BOT_PASSWORD }),
     (e) => e.status === 401,
     'the placeholder password never logs in'
   );
@@ -160,14 +164,31 @@ check('S6 the seeded bot is the shared bot, on a never-usable password', () => {
 // flag write). seedIfNeeded must heal the flag instead of re-seeding over
 // the catalogue — re-seeding died on sports.slug UNIQUE on every boot, which
 // is what bricked the demo this fix removes.
-check('S7 a catalogued-but-unflagged database heals instead of re-seeding', () => {
+check('S7 a catalogued-but-unflagged database heals instead of re-seeding', async () => {
   const db = openStore(':memory:');
-  seed(db);
+  await seed(db);
   db.prepare("DELETE FROM settings WHERE key = 'seeded'").run(); // simulate the old crash window
   const sportsBefore = count(db, 'sports');
-  assert.strictEqual(seedIfNeeded(db), false, 'recognised as already seeded');
+  assert.strictEqual(await seedIfNeeded(db), false, 'recognised as already seeded');
   assert.strictEqual(db.prepare("SELECT value FROM settings WHERE key='seeded'").get().value, '1', 'flag healed');
   assert.strictEqual(count(db, 'sports'), sportsBefore, 'the catalogue was untouched');
 });
 
-console.log(`\nseed.test.js: ${passed} checks passed`);
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  console.log(`\nseed.test.js: ${passed} checks passed`);
+})();

@@ -24,10 +24,15 @@ const M = require('../lib/match');
 const settle = require('../lib/settle');
 
 let passed = 0;
-const check = (name, fn) => { fn(); passed++; console.log('  ok', name); };
+// Checks here are async (lib/auth.js derives password hashes off the event
+// loop), so they are COLLECTED and drained in order at the bottom of this
+// file rather than run eagerly - an eager runner would report a passing
+// check whose promise later rejected.
+const checks = [];
+const check = (name, fn) => { checks.push([name, fn]); };
 
 let n = 0;
-function fixture() {
+async function fixture() {
   const db = openStore(':memory:');
   db.prepare("INSERT INTO sports (name, slug) VALUES ('Football', 'football')").run();
   const sport = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
@@ -41,8 +46,8 @@ function fixture() {
     db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 2.0)').run(mkt.id, nm);
     sels.push(db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, nm).id);
   }
-  const alice = A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 });
-  const bob = A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 });
+  const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 100000 }));
   return { db, alice, bob, marketId: mkt.id, s1: sels[0], s2: sels[1] };
 }
 
@@ -52,8 +57,8 @@ const venueBal = (db, kind) => acc.balanceOf(db, acc.accountId(db, kind, null));
 
 // D1: an opening balance is fully traceable to the external clearing account.
 // Money did not appear from nowhere — it came from outside the venue.
-check('D1 opening balance is sourced from gateway_clearing', () => {
-  const { db, alice } = fixture();
+check('D1 opening balance is sourced from gateway_clearing', async () => {
+  const { db, alice } = (await fixture());
   // Both fixture accounts are opened at 100000, so clearing is out by both.
   assert.strictEqual(venueBal(db, 'gateway_clearing'), -200000);
   assert.strictEqual(acc.userBalance(db, alice.id, 'player_funds'), 100000);
@@ -62,8 +67,8 @@ check('D1 opening balance is sourced from gateway_clearing', () => {
 
 // D2: THE headline invariant. Total debits equal total credits — through a
 // whole match and settlement, driven by the real engine.
-check('D2 global conservation survives a full match and settlement', () => {
-  const { db, alice, bob, marketId, s1 } = fixture();
+check('D2 global conservation survives a full match and settlement', async () => {
+  const { db, alice, bob, marketId, s1 } = (await fixture());
   M.placeOrder(db, bob, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 20000 });
   M.placeOrder(db, alice, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 20000 });
   assert.strictEqual(conserved(db), 0, 'after matching');
@@ -74,8 +79,8 @@ check('D2 global conservation survives a full match and settlement', () => {
 
 // D3: the cache is a cache, and the test says so. If these two ever drift,
 // every number on screen is a lie even though the ledger is right.
-check('D3 materialised balances always equal the postings', () => {
-  const { db, alice, bob, marketId, s1 } = fixture();
+check('D3 materialised balances always equal the postings', async () => {
+  const { db, alice, bob, marketId, s1 } = (await fixture());
   L.deposit(db, alice.id, 5000, 100000);
   L.escrow(db, alice.id, 1500, {});
   L.release(db, alice.id, 500, {});
@@ -89,8 +94,8 @@ check('D3 materialised balances always equal the postings', () => {
 
 // D4: ESCROW IS A REAL ACCOUNT, not a memo. Money a player has committed is
 // visible in a liability account, which is what segregation means.
-check('D4 escrow is a real per-user liability account', () => {
-  const { db, alice } = fixture();
+check('D4 escrow is a real per-user liability account', async () => {
+  const { db, alice } = (await fixture());
   assert.strictEqual(acc.userBalance(db, alice.id, 'player_escrow'), 0);
   L.escrow(db, alice.id, 4000, {});
   assert.strictEqual(acc.userBalance(db, alice.id, 'player_escrow'), 4000);
@@ -104,8 +109,8 @@ check('D4 escrow is a real per-user liability account', () => {
 
 // D5: operator revenue is a QUERY, not an inference. This is the thing
 // single-entry could never give you.
-check('D5 commission is queryable as revenue', () => {
-  const { db, alice, bob, marketId, s1 } = fixture();
+check('D5 commission is queryable as revenue', async () => {
+  const { db, alice, bob, marketId, s1 } = (await fixture());
   // Bob backs 20000 @ 2.0 and wins: his net winnings are 20000, commission
   // 2.5% = 500.
   M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 20000 });
@@ -122,8 +127,8 @@ check('D5 commission is queryable as revenue', () => {
 
 // D6: players' money is SEGREGATED and provably so. The venue's own float is
 // negative (it holds the pot) and the two together are zero.
-check('D6 fund segregation is a query, not a promise', () => {
-  const { db, alice, bob, marketId, s1 } = fixture();
+check('D6 fund segregation is a query, not a promise', async () => {
+  const { db, alice, bob, marketId, s1 } = (await fixture());
   M.placeOrder(db, bob, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 20000 });
   M.placeOrder(db, alice, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 20000 });
   const seg = acc.segregation(db);
@@ -136,8 +141,8 @@ check('D6 fund segregation is a query, not a promise', () => {
 
 // D7: an UNBALANCED posting set is refused at the only place postings are
 // written, so it cannot be committed anywhere in the codebase.
-check('D7 unbalanced postings are refused', () => {
-  const { db, alice } = fixture();
+check('D7 unbalanced postings are refused', async () => {
+  const { db, alice } = (await fixture());
   const txId = Number(db.prepare("INSERT INTO transactions (user_id,type,amount_cents,balance_after,frozen_after) VALUES (?,'deposit',1,1,0)").run(alice.id).lastInsertRowid);
   assert.throws(
     () => acc.post(db, {
@@ -154,8 +159,8 @@ check('D7 unbalanced postings are refused', () => {
 
 // D8: a negative amount is impossible — direction carries the sign. This
 // closes the "which side of the entry is negative?" ambiguity.
-check('D8 postings reject negative amounts and unknown directions', () => {
-  const { db, alice } = fixture();
+check('D8 postings reject negative amounts and unknown directions', async () => {
+  const { db, alice } = (await fixture());
   const txId = Number(db.prepare("INSERT INTO transactions (user_id,type,amount_cents,balance_after,frozen_after) VALUES (?,'deposit',1,1,0)").run(alice.id).lastInsertRowid);
   const funds = acc.accountId(db, 'player_funds', alice.id);
   const house = acc.accountId(db, 'house_float', null);
@@ -171,8 +176,8 @@ check('D8 postings reject negative amounts and unknown directions', () => {
 
 // D9: a player account with NO owner would be money belonging to nobody —
 // exactly the ambiguity segregation exists to remove. Refused both ways.
-check('D9 account kinds and owners cannot be mismatched', () => {
-  const { db, alice } = fixture();
+check('D9 account kinds and owners cannot be mismatched', async () => {
+  const { db, alice } = (await fixture());
   assert.throws(() => acc.accountId(db, 'player_funds', null), /requires a user/);
   assert.throws(() => acc.accountId(db, 'house_float', alice.id), /must not have a user/);
   assert.throws(() => acc.accountId(db, 'not_a_kind', null), /Unknown account kind/);
@@ -180,8 +185,8 @@ check('D9 account kinds and owners cannot be mismatched', () => {
 
 // D10: the DATABASE enforces the player/venue split, not just the service
 // layer. A direct INSERT cannot create an unowned player_funds row.
-check('D10 the schema itself refuses an unowned player account', () => {
-  const { db } = fixture();
+check('D10 the schema itself refuses an unowned player account', async () => {
+  const { db } = (await fixture());
   assert.throws(() => db.prepare("INSERT INTO accounts (kind, user_id) VALUES ('player_funds', NULL)").run(), /CHECK constraint failed/);
   assert.throws(() => db.prepare("INSERT INTO accounts (kind, user_id) VALUES ('house_float', 1)").run(), /CHECK constraint failed/);
   assert.throws(() => db.prepare("INSERT INTO accounts (kind, user_id) VALUES ('made_up', NULL)").run(), /CHECK constraint failed/);
@@ -189,8 +194,8 @@ check('D10 the schema itself refuses an unowned player account', () => {
 
 // D11: a VOID returns every cent and must leave the books whole. Void is the
 // path where a conservation bug would be hardest to spot and most expensive.
-check('D11 a void refunds fully and conserves', () => {
-  const { db, alice, bob, marketId, s1 } = fixture();
+check('D11 a void refunds fully and conserves', async () => {
+  const { db, alice, bob, marketId, s1 } = (await fixture());
   M.placeOrder(db, bob, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 20000 });
   M.placeOrder(db, alice, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 20000 });
   settle.settleMarket(db, marketId, { void: true });
@@ -204,11 +209,11 @@ check('D11 a void refunds fully and conserves', () => {
 
 // D12: the ESCROW INVARIANT, restated in double-entry terms. Across a
 // property sweep of prices and stakes, no sequence ever creates money.
-check('D12 escrow invariant holds across a price x stake sweep', () => {
+check('D12 escrow invariant holds across a price x stake sweep', async () => {
   let worst = 0;
   for (const price of [1.5, 2.0, 3.0, 5.0]) {
     for (const stake of [1000, 7777, 50000]) {
-      const { db, alice, bob, marketId, s1 } = fixture();
+      const { db, alice, bob, marketId, s1 } = (await fixture());
       M.placeOrder(db, bob, { selection_id: s1, side: 'back', price, stake_cents: stake });
       // The LAY side escrows (price-1)*stake, so at price 5 a 50000 lay needs
       // 200000 — more than the account holds. Cap it so the sweep is about
@@ -233,9 +238,9 @@ check('D12 escrow invariant holds across a price x stake sweep', () => {
 // D13: a bot — the house counterparty — participates in the same ledger and
 // may legitimately go negative there. The house is not a special case that
 // escapes double-entry.
-check('D13 the house counterparty posts like any other account', () => {
-  const { db, alice, marketId, s1 } = fixture();
-  const bot = A.registerUser(db, { username: 'MarketMakers', password: 'bot-account-password-never-usable', is_bot: 1, balance_cents: 10000000 });
+check('D13 the house counterparty posts like any other account', async () => {
+  const { db, alice, marketId, s1 } = (await fixture());
+  const bot = (await A.registerUser(db, { username: 'MarketMakers', password: 'bot-account-password-never-usable', is_bot: 1, balance_cents: 10000000 }));
   // The house LAYs s1 and the player BACKs it, then s1 wins — the backer wins,
   // so the house is on the losing side. (Whoever initiates is irrelevant.)
   M.placeOrder(db, bot, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 30000 });
@@ -248,8 +253,8 @@ check('D13 the house counterparty posts like any other account', () => {
 
 // D14: an operator adjustment is venue money, so it posts against house_float
 // rather than pretending to be a player payment.
-check('D14 operator adjustment posts against the house float', () => {
-  const { db, alice } = fixture();
+check('D14 operator adjustment posts against the house float', async () => {
+  const { db, alice } = (await fixture());
   const floatBefore = venueBal(db, 'house_float');
   const clearingBefore = venueBal(db, 'gateway_clearing');
   L.adjust(db, alice.id, 2500);
@@ -263,8 +268,8 @@ check('D14 operator adjustment posts against the house float', () => {
 // D15: zero-amount legs are dropped, not rejected. A settlement with no
 // commission is normal, and making callers pre-filter is how a future caller
 // forgets.
-check('D15 zero-value transfers post nothing but do not fail', () => {
-  const { db, alice } = fixture();
+check('D15 zero-value transfers post nothing but do not fail', async () => {
+  const { db, alice } = (await fixture());
   const n0 = db.prepare('SELECT COUNT(*) c FROM entries').get().c;
   const txId = Number(db.prepare("INSERT INTO transactions (user_id,type,amount_cents,balance_after,frozen_after) VALUES (?,'deposit',0,1,0)").run(alice.id).lastInsertRowid);
   const r = acc.postTransfer(db, {
@@ -277,5 +282,22 @@ check('D15 zero-value transfers post nothing but do not fail', () => {
   assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM entries').get().c, n0, 'no rows written');
 });
 
-console.log(`\nledger2.test.js: ${passed} checks passed`);
-if (passed < 15) { console.error('expected 15 checks'); process.exit(1); }
+(async () => {
+  // Drain the collected checks IN ORDER, awaiting each. A check that rejects
+  // is a failure of this suite, not of the next file: exiting here stops
+  // the rest of this suite running rather than letting a broken assertion
+  // print a green line for a body that never completed.
+  for (const [name, fn] of checks) {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(`  FAIL ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+    passed++;
+    console.log('  ok', name);
+  }
+  if (passed < 15) { console.error('expected 15 checks'); process.exit(1); }
+  console.log(`\nledger2.test.js: ${passed} checks passed`);
+})();
