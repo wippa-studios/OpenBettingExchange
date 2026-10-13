@@ -487,6 +487,72 @@ check('E26 selection_id validation + suspended selection 409', async () => {
   assert.throws(() => M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 }), (e) => e.status === 409);
 });
 
+// E27 (#56): a lay filled at MULTIPLE price points, leaving a remainder, then
+// cancelled — the combination the escrow contract's hardest case, and the one
+// nothing covered.
+//
+// E16 fills a taker lay at two price points (1.01 and 1.51) but ends FULLY
+// MATCHED, so there is no remainder escrow and no cancel. E17 cancels with a
+// remainder but fills at ONE price. Multi-price + remainder + cancel never ran,
+// and it is precisely where a stranded or minted cent would live.
+//
+// Bob lays 400 @ 1.51. The sweep takes the lowest eligible back first:
+//   150 @ 1.01  -> per-fill liability round(0.01 * 150) = 2
+//   150 @ 1.51  -> per-fill liability round(0.51 * 150) = 77
+//   remainder 100 @ 1.51 -> remainder escrow round(0.51 * 100) = 51
+// Placement froze round(0.51 * 400) = 204 in ONE rounding; the first fill's
+// target is 128 (remainder at 250) + 2 = 130, so 74 is released — which is
+// precisely the layer's loss from filling at 1.01 instead of 1.51 and
+// therefore correctly belongs to the other side of the book, not to him.
+// The second fill's delta is 128 - 77 - 51 = 0, so no further movement.
+check('E27 multi-price lay with a remainder: cancel releases exactly the tracked remainder, settle -> 0', async () => {
+  const { db, users } = (await fresh());
+  const { market_id, s1, s2 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.2]]);
+  M.placeOrder(db, users.carol, { selection_id: s1, side: 'back', price: 1.01, stake_cents: 150 }); // rests
+  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 1.51, stake_cents: 150 }); // rests
+
+  const b = M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 1.51, stake_cents: 400 });
+
+  // Two fills at two DIFFERENT prices, and a remainder — the shape E16/E17
+  // each had one half of.
+  assert.deepStrictEqual(matchesFor(db, market_id), [
+    { price: 1.01, stake: 150 }, // lowest eligible back first
+    { price: 1.51, stake: 150 },
+  ]);
+  assert.deepStrictEqual(orderOf(db, b.order.id), { matched: 300, status: 'open' });
+  assert.deepStrictEqual(txsOf(db, users.bob.id), [{ type: 'escrow', a: 204 }, { type: 'release', a: 74 }]);
+  assert.deepStrictEqual(balances(db, users.bob.id), { b: 100000, f: 130 }); // 2 + 77 + 51, exactly
+  assert.strictEqual(frozenCol(db, b.order.id), 51, 'the remainder escrow is tracked on the order');
+
+  // CANCEL. Exactly the tracked remainder is released, and the wallet is left
+  // holding exactly the sum of the per-fill rounded liabilities: one 2 from the
+  // 1.01 fill and one 77 from the 1.51 fill. A cent here is a cent that
+  // settlement can neither release (it would throw "releasing more than frozen")
+  // nor leave behind (it would never be returned).
+  M.cancelOrder(db, users.bob, b.order.id);
+  assert.deepStrictEqual(balances(db, users.bob.id), { b: 100000, f: 79 }); // 2 + 77 exactly
+  assert.strictEqual(frozenCol(db, b.order.id), 0, 'the order row is released');
+
+  // SETTLEMENT releases exactly those 79 and takes the account to zero. Both
+  // halves of that are forced: settleUser refuses to release more than is
+  // frozen, so a settlement of more than 79 would have thrown above; and the
+  // account reads 0 afterwards, so it released no fewer.
+  S.settleMarket(db, market_id, { winner_selection_id: s2 }); // the lay wins
+  assert.deepStrictEqual(balances(db, users.bob.id), { b: 100292, f: 0 }); // +300 winnings - 8 commission (ceil(7.5))
+  assert.strictEqual(
+    db.prepare('SELECT COALESCE(SUM(frozen_cents),0) f FROM orders WHERE user_id = ?').get(users.bob.id).f,
+    0,
+    'no order row still holds escrow'
+  );
+  // The layer's winnings are the two backers' stakes, less the venue's fee;
+  // each backer loses exactly her own stake. Nothing minted, nothing stranded.
+  assert.deepStrictEqual(balances(db, users.alice.id), { b: 99850, f: 0 });
+  assert.deepStrictEqual(balances(db, users.carol.id), { b: 99850, f: 0 });
+  const acc = require('../lib/accounts');
+  assert.strictEqual(acc.assertConserved(db), 0, 'books balance');
+  assert.deepStrictEqual(acc.assertUserAgrees(db), []);
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops

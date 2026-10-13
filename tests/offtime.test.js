@@ -129,9 +129,35 @@ check('O4 an order exactly AT the off time is refused (off is inclusive)', async
   // `nowMs >= off` means the instant of off is closed. Betting "up to and
   // including" the off would leave a zero-width window at the boundary and a
   // clock-skew argument about who got in first.
+  //
+  // THIS USED TO BE A DUPLICATE OF O2. The fixture was PAST, so flipping
+  // `nowMs >= off` to `nowMs > off` in lib/offtime.js — i.e. exactly the
+  // semantic the name claims to pin — left the check green. isOffReached takes
+  // an injectable clock for precisely this case, so the check now asks about
+  // the boundary instant itself rather than about a time comfortably past it.
   const v = (await venue());
-  const e = v.event(PAST);
-  assert.throws(() => v.back(e.selectionId), (err) => err.status === 409);
+  const e = v.event(FUTURE);
+  const off = offtime.offTimeMs(FUTURE);
+  assert.ok(off > 0, 'the fixture off time parses to an instant');
+
+  // One millisecond EARLIER is still open. Without this, "closed at the
+  // instant" would also be satisfied by a gate that is simply always shut.
+  assert.strictEqual(offtime.isOffReached(v.db, e.eventId, off - 1), false, 'still tradeable 1ms before off');
+  assert.doesNotThrow(() => offtime.assertOffNotReached(v.db, e.eventId, off - 1),
+    'and the order-path assertion agrees');
+
+  // EXACTLY at the off instant: closed. This is the whole claim.
+  assert.strictEqual(offtime.isOffReached(v.db, e.eventId, off), true, 'the instant of off is off');
+  assert.strictEqual(offtime.isOffReached(v.db, e.eventId, off + 1), true);
+
+  // And the assertion the ORDER path actually calls (lib/match.js validateOrder
+  // -> assertOffNotReachedBySelection) refuses at that same instant, so this is
+  // the real gate and not only the predicate behind it.
+  assert.throws(
+    () => offtime.assertOffNotReachedBySelection(v.db, e.selectionId, off),
+    (err) => err.status === 409 && /off/i.test(err.message),
+    'the order path refuses at exactly the off instant'
+  );
 });
 
 check('O5 POST-OFF CASH-OUT is refused — the control that is easy to forget', async () => {

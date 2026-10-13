@@ -435,6 +435,66 @@ check('C15 a fully cashed-out market drops out of the positions view', async () 
   );
 });
 
+// ── #56: the plan is recomputed INSIDE the execute transaction ─────────────
+//
+// lib/cashout.js: "The plan is recomputed INSIDE the transaction, for the same
+// reason the old market hedge was: the position can change between a quote and
+// an execute, and the player must never be paid a quote for a position they no
+// longer hold."
+//
+// C6 asserts res.value_cents === plan.value_cents against an UNCHANGED book,
+// which a recompute and a stale-quote implementation satisfy identically — it
+// distinguishes nothing. So: quote, move the fair price, execute. The payout
+// must follow the position that exists at execution, not the one that existed
+// when the quote was issued.
+check('C16 the executed payout follows the CURRENT position, not the quoted one', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
+  // Alice backs Alpha at 2.5 against a fair 2.0 -> profitable, worth +2500.
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
+  const quoted = cashout.cashoutQuote(db, alice, marketId);
+  assert.ok(quoted, 'a quote exists before anything moves');
+  assert.strictEqual(quoted.fair_value_cents, 2500);
+  assert.strictEqual(quoted.legs, 1);
+
+  // THE POSITION CHANGES, and nothing re-quotes: Bob lays Beta at 2.5 and
+  // Alice takes it, so she now holds TWO legs instead of one. With both runners
+  // at a fair 2.0 her payouts are +5000 either way -> fair 5000, quoted 4900.
+  //
+  // Deliberately NOT re-quoting after the change. A test that re-quotes and
+  // then executes proves nothing about staleness — and worse, a stale-quote
+  // implementation that cached the most recent cashoutQuote would sail through
+  // it. The freshness of the executed figure has to come from the position, not
+  // from a second call to the function under test.
+  M.placeOrder(db, bob, { selection_id: ids.Beta, side: 'lay', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, alice, { selection_id: ids.Beta, side: 'back', price: 2.5, stake_cents: 10000 });
+  assert.strictEqual(M.myMatchedBets(db, alice.id, marketId).length, 2, 'the position really did change');
+
+  // State the new position's value with the module's own exported helpers, so
+  // the premise is checked without going through cashoutQuote again.
+  const probs = cashout.fairProbsFor(db, marketId);
+  const newFair = cashout
+    .payoutsFor(M.myMatchedBets(db, alice.id, marketId), [ids.Alpha, ids.Beta])
+    .reduce((acc, p) => acc + probs.get(p.selection_id) * p.payout_cents, 0);
+  assert.strictEqual(newFair, 5000, 'the position is worth 5000 now, not 2500');
+
+  // THE ASSERTION. A stale-quote implementation pays the old 2450 and this is
+  // red; a recompute pays 4900 and it is green. C6, by contrast, asserts
+  // value equality against an UNCHANGED book, which both implementations
+  // satisfy — which is why it could not have caught the bug its own comment
+  // claims to prevent.
+  const res = cashout.cashoutMarket(db, alice, marketId);
+  assert.strictEqual(res.value_cents, 4900, 'the payout follows the NEW position');
+  assert.strictEqual(res.fair_value_cents, 5000, 'and the recorded fair value is the new one');
+  assert.strictEqual(res.legs, 2, 'the buyout covered both legs');
+  assert.notStrictEqual(res.value_cents, quoted.value_cents,
+    `so this check fails a stale-quote implementation (stale would pay ${quoted.value_cents})`);
+  assert.strictEqual(res.payout_cents, 4900, 'and that is what the player was actually paid');
+  assert.strictEqual(wallet(db, alice.id).b, 1000000 + 4900, 'the money moved at the revalued price');
+  assert.strictEqual(acc.assertConserved(db), 0, 'and the books still balance');
+  assert.deepStrictEqual(acc.assertUserAgrees(db), []);
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -451,6 +511,6 @@ check('C15 a fully cashed-out market drops out of the positions view', async () 
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 15) { console.error("expected 15 checks"); process.exit(1); }
+  if (passed < 16) { console.error("expected 16 checks"); process.exit(1); }
   console.log(`\ncashout2.test.js: ${passed} checks passed`);
 })();
