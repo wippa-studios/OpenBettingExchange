@@ -119,10 +119,25 @@ async function main() {
     }
   });
 
-  await check('A3 the list endpoint returns every tenant, also with no secrets', async () => {
+  await check('A3 the list endpoint reports the caller\'s OWN tenant only, and no secrets', async () => {
+    // It used to answer for EVERY tenant: each venue's configured flag, login
+    // mode and created/updated timestamps. Behind an `admin` role that carries
+    // no venue-wide meaning, that told one operator that every other venue in
+    // the database had feed credentials, whether, and when they were touched.
+    //
+    // A second tenant exists HERE, so "exactly one" is a real assertion rather
+    // than a tautology about a database that only has one venue in it. A13
+    // then checks what that second tenant holds is still not disclosed.
+    srv.db.prepare("INSERT INTO tenants (slug, name) VALUES ('listing-probe', 'Listing Probe')").run();
     const r = await j('GET', `${TENANT}/credentials`, { cookie: admin.cookie });
     assert.strictEqual(r.status, 200);
     assert.ok(Array.isArray(r.json.tenants) && r.json.tenants.length >= 1);
+    assert.strictEqual(r.json.tenants.length, 1, 'one tenant, and it is the caller\'s own');
+    assert.strictEqual(
+      r.json.tenants[0].tenant_id,
+      srv.db.prepare('SELECT id FROM tenants WHERE slug = ?').get('default').id,
+      'specifically the caller\'s'
+    );
     for (const secret of Object.values(GOOD)) assert.ok(!r.text.includes(secret));
   });
 
@@ -233,6 +248,69 @@ async function main() {
     }
     assert.ok(trail.includes('[sealed]'), 'and records that sealed values were set');
     assert.ok(rows.every((r) => r.actor_id), 'each entry names who did it');
+  });
+
+  // ── the tenant boundary, over HTTP ─────────────────────────────────────────
+
+  // A13 is the one that matters, and it is the shape of attack the issue
+  // describes: any admin could name any tenant and overwrite, delete, enumerate
+  // or stop that tenant's Betfair credentials and collector. No plaintext is
+  // reachable, so this is a write / DoS / cross-tenant-disclosure failure rather
+  // than credential exfiltration — a distinction worth keeping when triaging,
+  // and worth a test that says which one it is.
+  await check('A13 an admin cannot reach another tenant feed credentials', async () => {
+    // A second venue in the same database, with its own admin and its own
+    // stored credential. Both admins are `role='admin'` — the roles are
+    // identical, which is exactly why the boundary cannot come from the role.
+    const otherTenant = srv.db
+      .prepare("INSERT INTO tenants (slug, name) VALUES ('other-venue', 'Other Venue')")
+      .run();
+    const otherId = Number(otherTenant.lastInsertRowid);
+    const otherAdmin = await mk('otheradmin', 'admin');
+    srv.db.prepare('UPDATE users SET tenant_id = ? WHERE id = ?').run(otherId, otherAdmin.id);
+    const THEIR = { app_key: 'OTHERKEYnotreal1', username: 'other-venue-acct', password: 'other-venue-password' };
+    const stored = await j('PUT', `${TENANT}/credentials`, { cookie: otherAdmin.cookie, body: THEIR });
+    assert.strictEqual(stored.status, 200, stored.text.slice(0, 160));
+
+    // The default-tenant admin, naming the other tenant every way the old
+    // feedTenantId() read it: path, query and body.
+    const attempts = [
+      ['PUT', `${TENANT}/credentials/${otherId}`, GOOD, {}],
+      ['PUT', `${TENANT}/credentials?tenant_id=${otherId}`, GOOD, {}],
+      ['PUT', `${TENANT}/credentials`, { ...GOOD, tenant_id: otherId }, {}],
+      ['DELETE', `${TENANT}/credentials/${otherId}`, undefined, {}],
+      ['DELETE', `${TENANT}/credentials?tenant_id=${otherId}`, undefined, {}],
+      ['GET', `${TENANT}/credentials/${otherId}`, undefined, {}],
+    ];
+    for (const [method, path, body] of attempts) {
+      const r = await j(method, path, { cookie: admin.cookie, body });
+      assert.notStrictEqual(r.status, 200, `${method} ${path} answered 200 for another tenant: ${r.text.slice(0, 120)}`);
+      assert.ok(r.status === 403 || r.status === 404, `${method} ${path} -> ${r.status}, expected a refusal`);
+      for (const secret of Object.values(GOOD)) assert.ok(!r.text.includes(secret));
+    }
+
+    // The other venue's credential is untouched — still its own account, not
+    // the attacker's.
+    const theirs = srv.db.prepare('SELECT username FROM feed_credentials WHERE tenant_id = ?').get(otherId);
+    assert.ok(theirs, 'the other tenant still has a stored credential');
+    const env = require('../lib/feedcreds').collectorEnv(srv.db, otherId);
+    assert.strictEqual(env.BETFAIR_USERNAME, THEIR.username, "still THEIR account");
+    assert.notStrictEqual(env.BETFAIR_USERNAME, GOOD.username, "not the attacker's");
+
+    // And the list route does not disclose the other venue either. A3 already
+    // created one tenant and A13 a second, so this database now holds three
+    // and "exactly one" cannot pass by accident.
+    const list = await j('GET', `${TENANT}/credentials`, { cookie: admin.cookie });
+    assert.strictEqual(list.status, 200);
+    assert.strictEqual(srv.db.prepare('SELECT COUNT(*) c FROM tenants').get().c, 3, 'three venues exist in this database');
+    assert.strictEqual(list.json.tenants.length, 1, 'exactly one tenant — the caller\'s own');
+    assert.strictEqual(list.json.tenants[0].tenant_id, srv.db.prepare('SELECT id FROM tenants WHERE slug = ?').get('default').id);
+
+    // Finally: the boundary is a boundary, not a lockout. Each admin can still
+    // do everything to their OWN tenant.
+    const own = await j('GET', `${TENANT}/credentials/${otherId}`, { cookie: otherAdmin.cookie });
+    assert.strictEqual(own.status, 200, 'the other admin reaches their own tenant');
+    assert.strictEqual(own.json.configured, true);
   });
 
   server.close();

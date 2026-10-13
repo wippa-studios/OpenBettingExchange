@@ -259,6 +259,13 @@ environment variables — the exchange never writes a `.env`. See
 | `GET /api/admin/feed/runner/:id?` | admin | supervisor state, restarts, exit codes, scrubbed log tail |
 | `POST /api/admin/feed/runner/start` \| `/stop` | admin | start or stop the collector |
 
+Feed credentials are **scoped to the caller's own tenant**, enforced in
+`lib/feedcreds.js` against the actor rather than by the route: `:id` may only
+name that tenant (`403` otherwise, `404` for a tenant that does not exist), and
+there is no venue-wide feed inventory to read. Each sealed field is additionally
+bound to its tenant and field name as GCM associated data, so a row moved at the
+database level fails to decrypt rather than becoming another venue's credential.
+
 `SIGTERM`/`SIGINT` drain the venue: jobs stopped, collector stopped (SIGTERM,
 then SIGKILL after a grace period), listener closed, exit 0 — so a restart
 cannot leave an orphaned collector still spending Betfair market-data weight.
@@ -316,7 +323,7 @@ including why a staleness guard was built and then deleted.
 ## Development
 
 ```bash
-npm test            # 613 checks, 47 suites — unit + API integration, fully offline
+npm test            # 617 checks, 47 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 74 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code

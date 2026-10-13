@@ -875,21 +875,54 @@ app.get('/api/feed/health', aw(async (req, res) => {
 // property of the design rather than an omission — lib/feedcreds exposes no
 // function that serves plaintext to an HTTP caller.
 
-/** Which tenant the request is acting on. Defaults to the requester's own. */
+/**
+ * Which tenant a feed route is acting on: THE REQUESTER'S OWN, ALWAYS.
+ *
+ * This used to read `req.params.id`, then `req.body.tenant_id`, then
+ * `req.query.tenant_id`, falling back to the caller's own tenant only when none
+ * was supplied. requireAdmin checks `role === 'admin'` and nothing else, so ANY
+ * admin could name ANY tenant and overwrite, delete, enumerate or stop that
+ * tenant's Betfair credentials and collector. No plaintext secret is reachable
+ * (status() returns only `*_set` booleans), so this was a write / DoS /
+ * cross-tenant-disclosure boundary failure rather than credential exfiltration
+ * — a distinction worth keeping when triaging.
+ *
+ * A tenant named in the request is now REFUSED rather than obeyed or ignored.
+ * Obeyed is the bug. Ignored is nearly as bad: the operator asks about tenant
+ * 99999, gets 200 describing a different tenant, and cannot tell from the
+ * response which one was affected. Refusing is the only honest third option,
+ * and it cannot break a real caller, because a real caller names its OWN tenant
+ * — which resolves and matches.
+ *
+ * lib/feedcreds enforces the same rule at the source, which is where it
+ * belongs: an optional tenant scope is a scope someone will eventually forget
+ * to pass, and a forgotten scope on an admin route is a cross-tenant read. The
+ * runner routes have no actor of their own, so they are checked here.
+ */
 function feedTenantId(req) {
+  const own = TEN.ofUser(db, req.user.id)?.id ?? TEN.defaultTenant(db).id;
   const asked = req.params.id || req.body?.tenant_id || req.query.tenant_id;
-  return asked === undefined || asked === '' ? TEN.ofUser(db, req.user.id)?.id ?? TEN.defaultTenant(db).id : Number(asked);
+  if (asked === undefined || asked === '') return own;
+  const wanted = Number(asked);
+  if (!TEN.byId(db, wanted)) throw A.httpError(404, `No such tenant: ${asked}`);
+  if (wanted !== own) {
+    throw A.httpError(403, 'Feed credentials and supervision are scoped to your own tenant');
+  }
+  return own;
 }
 
 // Status: WHICH credentials exist, never their values.
 //
-// Two GET shapes, because an operator setting up a venue wants the LIST and one
-// troubleshooting wants the DETAIL. A separate `/credentials-all` path was the
-// first attempt and it is a trap: it reads as a sibling of `/credentials` but
-// sits at the same level as `/credentials/:id`, so any future refactor that
-// reorders these silently starts routing it as a tenant id called "-all".
+// ONE shape, for the caller's own tenant. This used to be a LIST of every
+// tenant's feed configuration — `configured`, `login_mode`, created/updated
+// timestamps for each venue in the database — behind an `admin` role that
+// carries no venue-wide meaning. That is the disclosure half of the issue: on a
+// per-tenant admin surface, a venue-wide inventory tells one operator that
+// other venues exist, when they are configured, and when they were last
+// touched. The list route stays (it is a documented endpoint) and answers about
+// the caller's own tenant only.
 app.get('/api/admin/feed/credentials', requireAdmin, limit('admin'), (req, res) => {
-  res.json({ tenants: FCREDS.statusAll(db) });
+  res.json({ tenants: [FCREDS.status(db, feedTenantId(req))] });
 });
 
 app.get('/api/admin/feed/credentials/:id', requireAdmin, limit('admin'), (req, res) => {

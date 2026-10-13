@@ -365,7 +365,21 @@ is written**. There is no plaintext fallback.
 | `GET /api/admin/feed/runner/:id?` | supervisor state, restarts, exit codes, scrubbed log tail |
 | `POST /api/admin/feed/runner/start` · `/stop` | start or stop the collector |
 
-`:id` defaults to the requester's own tenant.
+`:id` defaults to the requester's own tenant, and **may only name it**. A tenant
+the caller does not belong to is `403`; a tenant that does not exist is `404`.
+The rule is enforced inside `lib/feedcreds.js` against the actor, not by the
+route, so a caller that reaches the module directly gets the same answer — an
+optional tenant scope is a scope someone will eventually forget to pass.
+
+`GET /api/admin/feed/credentials` reports **the caller's own tenant only**. A
+venue-wide inventory behind an `admin` role — which carries no venue-wide
+meaning — told one operator that every other venue in the database had feed
+credentials, whether, and when they were last touched. `statusAll()` is gone.
+
+Each sealed field is bound to its tenant, its field name and a schema version as
+GCM associated data, so a row moved at the database level (a restore, a
+migration, a bug, or anyone holding the file) fails the auth tag rather than
+decrypting cleanly as another tenant's credential.
 
 A credential change only takes effect on the next launch, so `PUT` restarts a
 supervised collector. `kill('SIGTERM')` is asynchronous, so the restart cannot be
