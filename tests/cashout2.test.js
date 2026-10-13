@@ -312,6 +312,58 @@ check('C13 the LAY side cashes out and the BACK counterparty is preserved exactl
   assert.strictEqual(acc.assertConserved(db), 0, 'and the books still balance');
 });
 
+// ── #15: a SUSPENDED selection must decline the quote, not vanish from it ──
+//
+// The outcome universe was `WHERE status = 'open'` and the priceable set was
+// also open-only. A selection that was not open therefore appeared in NEITHER:
+// it produced no payout row, was never counted by the `unpriced` gate, and its
+// probability mass was silently renormalised onto the remaining runners. The
+// venue then quoted as though an outcome it cannot price did not exist.
+//
+// Reproduces the reviewer's numbers exactly: alice lays Gamma @1.5 (fair 2.0)
+// in a 3-runner market, then Gamma is suspended. The quote RISES, because the
+// outcome alice is exposed to is priced as impossible.
+check('C14 a suspended selection the player holds DECLINES the quote', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture([
+    ['Alpha', 2.0], ['Beta', 2.0], ['Gamma', 2.0],
+  ]));
+
+  // Alice LAYS Gamma (so she wins when Gamma loses) and backs Alpha.
+  M.placeOrder(db, alice, { selection_id: ids.Gamma, side: 'lay', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Gamma, side: 'back', price: 1.5, stake_cents: 10000 });
+
+  // Control: with every runner open, the quote is offered. Without this the
+  // check below would pass for the wrong reason (a venue that never quotes).
+  const open = cashout.cashoutQuote(db, alice, marketId);
+  assert.ok(open, 'with every runner open the position IS quotable');
+  const openFair = open.fair_value_cents;
+
+  // Now suspend the very runner Alice is exposed to.
+  db.prepare("UPDATE selections SET status = 'suspended' WHERE id = ?").run(ids.Gamma);
+
+  const suspended = cashout.cashoutQuote(db, alice, marketId);
+  // The reviewer's measured figures: fair 5000 -> quoted 4900 with Gamma open;
+  // 10000 -> 9800 with it suspended. Roughly DOUBLE, because the -5000
+  // outcome was treated as impossible.
+  if (suspended) {
+    assert.ok(
+      suspended.fair_value_cents > openFair * 1.5,
+      `a suspended runner must not be priced as impossible (open ${openFair} vs suspended ${suspended.fair_value_cents})`
+    );
+  }
+  assert.strictEqual(
+    suspended,
+    null,
+    `the venue declines rather than quoting without an outcome it cannot price (it quoted ${JSON.stringify(suspended)})`
+  );
+
+  // The suspended runner is exactly the "unpriced" case the gate was written
+  // for — restoring it makes the quote come back, so the decline is about the
+  // status and not about something else being broken.
+  db.prepare("UPDATE selections SET status = 'open' WHERE id = ?").run(ids.Gamma);
+  assert.ok(cashout.cashoutQuote(db, alice, marketId), 'and it is quoted again once restored');
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -328,6 +380,6 @@ check('C13 the LAY side cashes out and the BACK counterparty is preserved exactl
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 13) { console.error("expected 13 checks"); process.exit(1); }
+  if (passed < 14) { console.error("expected 14 checks"); process.exit(1); }
   console.log(`\ncashout2.test.js: ${passed} checks passed`);
 })();
