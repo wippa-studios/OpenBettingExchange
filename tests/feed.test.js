@@ -5,7 +5,7 @@
 // the behaviour that actually breaks a ladder UI — side ordering, the delta
 // carry-forward case, and stale detection.
 const assert = require('assert');
-const { groupRows, ageSeconds, boardSql } = require('../lib/feed');
+const { groupRows, ageSeconds, boardSql, healthSql } = require('../lib/feed');
 
 // Pull the registered /api/feed/nav handler off the Express stack so it can be
 // called without binding a port. Express 4 stores routes in app._router.stack.
@@ -257,6 +257,58 @@ if (require.main === module) (async () => {
     assert.ok(!/\bv\.odds\b/.test(sql), 'feed 1 must not ask for a column that does not exist there');
     assert.ok(!/odds_captured_at/.test(sql));
     assert.match(sql, /v_feed1/, 'and it reads the unpriced view');
+  });
+
+  // THE ASSERTION THAT COULD HAVE FAILED. The check above regexes the generated
+  // string for a forbidden column NAME and never parses it — which is why a
+  // dangling comma in the wrong place sailed through it, and why a feed-1
+  // deployment could not load a board at all while the suite was green.
+  //
+  // Feed 1 has no price block, so the column list is assembled with nothing
+  // appended after it. That is the one shape where a comma-suffixed base list
+  // leaves a `,` immediately before FROM — a Postgres SYNTAX error, not a
+  // semantic one, so no database and no assertion about columns could ever see
+  // it. This asserts TERMINATION of the select list instead: the character
+  // before FROM/WHERE/ORDER BY must be a column name, not a comma.
+  await check('the board column list is syntactically terminated on BOTH feeds', async () => {
+    for (const feed of [1, 2]) {
+      for (const single of [false, true]) {
+        const sql = boardSql(feed, single);
+        const label = `feed ${feed}${single ? ' single' : ' board'}`;
+        // A comma immediately before a clause keyword is the exact defect.
+        assert.ok(!/,\s*FROM\b/i.test(sql), `${label}: dangling comma before FROM`);
+        assert.ok(!/,\s*WHERE\b/i.test(sql), `${label}: dangling comma before WHERE`);
+        assert.ok(!/,\s*ORDER\s+BY\b/i.test(sql), `${label}: dangling comma before ORDER BY`);
+        assert.ok(!/,\s*JOIN\b/i.test(sql), `${label}: dangling comma before JOIN`);
+        // Belt and braces: split the outer select list on commas and require
+        // every segment to be a non-empty column expression. This catches a
+        // leading or doubled comma that no keyword rule above would match.
+        const outer = sql.slice(sql.lastIndexOf('SELECT ') + 'SELECT '.length);
+        const fromAt = outer.search(/\bFROM\b/i);
+        assert.ok(fromAt > 0, `${label}: the outer select has a FROM`);
+        const segments = outer.slice(0, fromAt).split(',').map((s) => s.trim());
+        assert.ok(segments.length > 0, `${label}: has columns`);
+        for (const seg of segments) {
+          assert.ok(seg.length > 0, `${label}: empty segment in the column list`);
+          assert.match(seg, /^[A-Za-z_][\w.]*$/, `${label}: "${seg}" is not a bare column reference`);
+        }
+      }
+    }
+  });
+
+  // The other half of #59: a feed-1 deployment was probed against v_feed2, so
+  // health could not detect its own board being dead. A health probe that
+  // cannot fail for half the supported configurations is not a probe.
+  await check('the health probe reads the CONFIGURED view, not a hardcoded one', async () => {
+    assert.match(healthSql(1), /FROM\s+v_feed1\b/, 'a feed-1 probe reads v_feed1');
+    assert.ok(!/v_feed2/.test(healthSql(1)), 'and never the priced view it cannot use');
+    assert.match(healthSql(2), /FROM\s+v_feed2\b/, 'a feed-2 probe reads v_feed2');
+    // v_feed1 has no odds columns at all — a property of the schema, not a
+    // filter — so the feed-1 probe must not name them or it cannot run.
+    assert.ok(!/\bodds\b/.test(healthSql(1)), 'the feed-1 probe names no odds column');
+    assert.ok(!/odds_captured_at/.test(healthSql(1)), 'and no book timestamp');
+    // Feed 2 still measures staleness, which is the only thing `ok` means there.
+    assert.match(healthSql(2), /max\(odds_captured_at\)/, 'feed 2 still measures the newest book');
   });
 
   await check('a board query with no limit clause cannot return one selection', async () => {
