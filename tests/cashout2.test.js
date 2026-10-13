@@ -495,6 +495,152 @@ check('C16 the executed payout follows the CURRENT position, not the quoted one'
   assert.deepStrictEqual(acc.assertUserAgrees(db), []);
 });
 
+// ── #21: BOTH counterparties of one match cash out, then the market settles ─
+//
+// Every other cash-out check buys ONE position off ONE player. None covers two
+// players of the same match cashing out, after which the replacement matches
+// chain: alice's buyout puts the house in her slot, and when bob then buys out
+// the leg that is now house-vs-him, the house ends up on BOTH sides of one
+// match. That chain is the most delicate bookkeeping in the module and the
+// failure mode is a double payment out of the house float, not a display
+// artefact — so it is asserted end to end rather than left to a reading.
+//
+// THE FIXTURE NEEDS BOTH PLAYERS TO BE QUOTABLE, which is not free. Alice and
+// bob face each other on Alpha, so their books are mirror images and in a
+// two-runner market exactly one of them is ever profitable — the other gets a
+// null from the pricing gate and there is nothing to cash out. Each therefore
+// needs a SECOND leg against a third party, and the extra legs are chosen so
+// both books come out ahead:
+//
+//   alice: back Alpha @2.5 (fair 2.0)  +2500,  lay Beta @1.5  +2500  = +5000
+//   bob:   lay Alpha @2.5              -2500,  back Beta @3.0  +5000  = +2500
+//
+// Alpha vs bob is the shared match; Beta carries the two extra legs.
+check('C17 BOTH counterparties cash out, and the chained settlement pays everyone exactly once', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
+  const A = require('../lib/auth');
+  const carol = (await A.registerUser(db, { username: 'carol', password: 'pw-carol-123', balance_cents: 1000000 }));
+  const dave = (await A.registerUser(db, { username: 'dave', password: 'pw-dave-123', balance_cents: 1000000 }));
+
+  // Alice vs Bob on Alpha — the match they will BOTH cash out of.
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
+  // Carol vs Alice on Beta at 1.5 (a profitable lay for alice).
+  M.placeOrder(db, carol, { selection_id: ids.Beta, side: 'back', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, alice, { selection_id: ids.Beta, side: 'lay', price: 1.5, stake_cents: 10000 });
+  // Dave vs Bob on Beta at 3.0 (a profitable back for bob).
+  M.placeOrder(db, dave, { selection_id: ids.Beta, side: 'lay', price: 3.0, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Beta, side: 'back', price: 3.0, stake_cents: 10000 });
+
+  // Both are quotable, at different values — so a crossed-over payout (the
+  // right total, the wrong player) cannot pass.
+  const quotedAlice = cashout.cashoutQuote(db, alice, marketId);
+  const quotedBob = cashout.cashoutQuote(db, bob, marketId);
+  assert.ok(quotedAlice && quotedBob, 'BOTH players are quoted');
+  assert.strictEqual(quotedAlice.value_cents, 4900);
+  assert.strictEqual(quotedBob.value_cents, 2450);
+  assert.strictEqual(quotedAlice.legs, 2);
+  assert.strictEqual(quotedBob.legs, 2);
+
+  const start = { alice: wallet(db, alice.id), bob: wallet(db, bob.id) };
+  // ALICE FIRST. This is the ordering that produces the chain: her buyout puts
+  // the house in the Alpha back slot opposite bob.
+  const paidAlice = cashout.cashoutMarket(db, alice, marketId);
+  assert.strictEqual(paidAlice.payout_cents, 4900);
+  assert.strictEqual(paidAlice.matches_closed, 2, 'both her legs are closed');
+
+  // …and NOW bob. His Alpha leg is no longer the one alice held — it is the
+  // house's — so his buyout replaces a match whose other side is already the
+  // house, and the new takeover match is house vs house.
+  const paidBob = cashout.cashoutMarket(db, bob, marketId);
+  assert.strictEqual(paidBob.payout_cents, 2450);
+  assert.strictEqual(paidBob.matches_closed, 2, 'both his legs are closed');
+
+  const bot = require('../lib/bots').ensureBot(db);
+  const afterBuyouts = { alice: wallet(db, alice.id), bob: wallet(db, bob.id) };
+  assert.strictEqual(afterBuyouts.alice.b, start.alice.b + 4900, 'alice paid, exactly once, at the quote');
+  assert.strictEqual(afterBuyouts.bob.b, start.bob.b + 2450, 'bob paid, exactly once, at the quote');
+  assert.strictEqual(afterBuyouts.alice.f, 0, 'and her collateral is released');
+  assert.strictEqual(afterBuyouts.bob.f, 0, 'and his');
+
+  // THE CHAIN IS REAL, and the assertion below is about it specifically: the
+  // superseded legs are flagged, and exactly one live match has the house on
+  // both sides — the shape lib/cashoutrisk.js has to net to zero rather than
+  // charge the venue the full liability on.
+  const live = db
+    .prepare(
+      `SELECT mt.id, mt.cashout, bo.user_id AS bu, lo.user_id AS lu
+         FROM matches mt JOIN orders bo ON bo.id = mt.back_order_id
+         JOIN orders lo ON lo.id = mt.lay_order_id
+        WHERE mt.market_id = ? ORDER BY mt.id`
+    )
+    .all(marketId);
+  const superseded = live.filter((m) => m.cashout === 1);
+  assert.strictEqual(superseded.length, 4, 'the four replaced legs are all flagged cashout=1');
+  const houseVsHouse = live.filter((m) => m.cashout === 0 && m.bu === bot.id && m.lu === bot.id);
+  assert.strictEqual(houseVsHouse.length, 1, 'and exactly one live match has the house on BOTH sides');
+
+  // SETTLEMENT.
+  const beforeSettle = { alice: wallet(db, alice.id), bob: wallet(db, bob.id), carol: wallet(db, carol.id), dave: wallet(db, dave.id) };
+  settle.settleMarket(db, marketId, { winner_selection_id: ids.Beta });
+  const afterSettle = { alice: wallet(db, alice.id), bob: wallet(db, bob.id), carol: wallet(db, carol.id), dave: wallet(db, dave.id) };
+
+  // (1) THE HOUSE'S ESCROW RETURNS TO EXACTLY ZERO. It escrowed 40000 across
+  // the four takeover legs; every one of them is now resolved.
+  assert.strictEqual(wallet(db, bot.id).f, 0, 'house frozen_cents is exactly 0 after settlement');
+
+  // (2) EACH PLAYER IS PAID EXACTLY ONCE. The superseded-leg skip is what
+  // guarantees this: a bought-off leg carries cashout=1, so settle.js never
+  // reaches it and neither player is settled a second time.
+  assert.deepStrictEqual(afterSettle.alice, beforeSettle.alice, 'settlement did NOT touch alice again');
+  assert.deepStrictEqual(afterSettle.bob, beforeSettle.bob, 'settlement did NOT touch bob again');
+  assert.strictEqual(afterSettle.alice.b, 1000000 + 4900, 'alice holds exactly one buyout');
+  assert.strictEqual(afterSettle.bob.b, 1000000 + 2450, 'bob holds exactly one buyout, and not alice\'s');
+  for (const [who, u] of [['alice', alice], ['bob', bob]]) {
+    const rows = db.prepare('SELECT credit_cents, commission_cents FROM settlements WHERE user_id = ?').all(u.id);
+    assert.strictEqual(rows.length, 1, `${who} has exactly one settlements row`);
+    assert.strictEqual(rows[0].commission_cents, 0, `${who} paid no commission`);
+  }
+
+  // (3) THE BOOKS.
+  assert.strictEqual(acc.assertConserved(db), 0, 'books balance');
+  assert.deepStrictEqual(acc.assertUserAgrees(db), []);
+  assert.strictEqual(afterSettle.carol.f, 0, "carol's collateral released");
+  assert.strictEqual(afterSettle.dave.f, 0, "dave's collateral released");
+
+  // (4) ZERO COMMISSION for either player. A bought-off position is not a won
+  // one: cashoutPosition settles them with commissionCents 0, and settlement
+  // never reaches them because their legs are flagged. This is the assertion
+  // most likely to go wrong if the cash-out path ever changes — charging a
+  // player a fee for selling a position would be a fee for losing.
+  const comm = db
+    .prepare("SELECT COUNT(*) c FROM transactions WHERE user_id IN (?, ?) AND type = 'commission'")
+    .get(alice.id, bob.id).c;
+  assert.strictEqual(comm, 0, 'not one commission transaction for either player');
+
+  // (5) THE DESK RECONCILES. The loss the operator is shown must be derivable
+  // from what settlement ACTUALLY paid the house — read from the settlements
+  // table, not from the desk's own bookkeeping, or this is a tautology.
+  const rows = db.prepare('SELECT paid_cents, proceeds_cents, loss_cents FROM cashout_quotes WHERE market_id = ?').all(marketId);
+  assert.strictEqual(rows.length, 2, 'one buyout row per player');
+  for (const r of rows) {
+    assert.strictEqual(r.loss_cents, r.paid_cents - r.proceeds_cents, 'loss == paid - proceeds, row by row');
+  }
+  const sumLoss = rows.reduce((a, r) => a + r.loss_cents, 0);
+  const sumPaid = rows.reduce((a, r) => a + r.paid_cents, 0);
+  const sumProceeds = rows.reduce((a, r) => a + r.proceeds_cents, 0);
+  const houseRealised = db.prepare('SELECT pnl_cents p FROM settlements WHERE user_id = ?').get(bot.id).p;
+  // Non-degenerate: the house's taken-over positions came back +15000, so this
+  // is not a figure that reconciles by cancelling against itself.
+  assert.strictEqual(sumProceeds, 15000, 'the desk proceeds equal what the takeover legs were worth');
+  assert.strictEqual(sumProceeds, houseRealised, '…which is exactly what settlement credited the house');
+  assert.strictEqual(
+    sumLoss,
+    sumPaid - houseRealised,
+    `sum(loss) == sum(payouts) - the venue's realised position result (${sumLoss} == ${sumPaid} - ${houseRealised})`
+  );
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -511,6 +657,6 @@ check('C16 the executed payout follows the CURRENT position, not the quoted one'
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 16) { console.error("expected 16 checks"); process.exit(1); }
+  if (passed < 17) { console.error("expected 17 checks"); process.exit(1); }
   console.log(`\ncashout2.test.js: ${passed} checks passed`);
 })();
