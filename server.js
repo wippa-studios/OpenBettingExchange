@@ -1148,13 +1148,36 @@ app.patch('/api/admin/users/:id', requireAdmin, limit('admin'), (req, res) => {
   // Status and role are applied in one request but as two audited actions:
   // they are separate decisions with separate reasons, and collapsing them
   // would lose which half the operator actually intended.
-  const applied = {};
-  if (status !== undefined) applied.status = ADM.setStatus(db, { actor: req.user, userId: id, status, reason });
-  if (role !== undefined) applied.role = ADM.setRole(db, { actor: req.user, userId: id, role, reason });
-  if (!Object.keys(applied).length) {
-    return res.status(400).json({ error: 'Provide status or role' });
+  //
+  // ONE REQUEST IS ONE UNIT OF WORK, though. lib/admin.js opens its own
+  // transaction() in each of setStatus and setRole, so calling them in
+  // sequence gave two commits: setRole could 400 AFTER setStatus had already
+  // committed a suspension, cancelled that account's resting orders and
+  // deleted its live sessions. The operator saw a 400, re-submitted, and met
+  // "Account is already suspended" — with orders cancelled and sessions gone
+  // as a side effect of a request that reported failure.
+  //
+  // lib/tx.js nesting is safe (a nested call becomes a SAVEPOINT), so
+  // wrapping the handler in one transaction() makes the pair all-or-nothing
+  // without touching lib/admin.js at all.
+  const { transaction } = require('./lib/tx');
+  try {
+    const applied = transaction(db, () => {
+      const out = {};
+      if (status !== undefined) out.status = ADM.setStatus(db, { actor: req.user, userId: id, status, reason });
+      if (role !== undefined) out.role = ADM.setRole(db, { actor: req.user, userId: id, role, reason });
+      if (!Object.keys(out).length) {
+        throw A.httpError(400, 'Provide status or role');
+      }
+      return out;
+    });
+    res.json({ ok: true, ...applied });
+  } catch (e) {
+    // Re-thrown rather than handled: the transaction has already ROLLED BACK,
+    // so the operator gets the real status — and neither the cancellation of
+    // the account's orders nor the deletion of its sessions survives.
+    throw e;
   }
-  res.json({ ok: true, ...applied });
 });
 
 app.post('/api/admin/users/:id/balance', requireAdmin, limit('admin'), (req, res) => {

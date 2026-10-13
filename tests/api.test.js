@@ -349,6 +349,64 @@ const check = async (name, fn) => {
       assert.strictEqual(forbidden.status, 403);
     });
 
+    // ── #23: PATCH /api/admin/users/:id is ONE unit of work ────────────────
+    //
+    // The route applied status and role in sequence, each through lib/admin.js
+    // which opens its OWN transaction(). So the role half could 400 AFTER the
+    // status half had committed: a suspension, that account's resting orders
+    // cancelled and its live sessions deleted, all behind a request that
+    // returned 400. The operator re-submits and meets "Account is already
+    // suspended" — orders cancelled and sessions gone as a side effect of a
+    // request that reported failure.
+    //
+    // The trigger is deliberately one half failing for a reason that has
+    // NOTHING to do with the other: an unrecognised role is rejected by
+    // lib/admin.js's own validation, before it even opens its transaction. The
+    // suspension must be rolled back with it.
+    await check('a refused role change rolls back the suspension in the same PATCH', async () => {
+      const desk = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+
+      // A second admin, who is the last one that could be demoted.
+      await j('POST', '/api/auth/register', { body: { username: 'lastadmin', password: 'secret1' } });
+      const made = await j('POST', '/api/auth/login', { body: { username: 'lastadmin', password: 'secret1' } });
+      const lastAdminId = made.json.user.id;
+      const promote = await j('PATCH', `/api/admin/users/${lastAdminId}`, {
+        body: { role: 'admin', reason: 'desk cover' },
+        cookie: desk,
+      });
+      assert.strictEqual(promote.status, 200, `promote the second admin (${JSON.stringify(promote.json || {})})`);
+
+      // Suspend and demote together. The demotion is refused: the role is not
+      // one lib/admin.js recognises.
+      const both = await j('PATCH', `/api/admin/users/${lastAdminId}`, {
+        body: { status: 'suspended', role: 'superuser', reason: 'combined change' },
+        cookie: desk,
+      });
+      assert.strictEqual(both.status, 400, 'the combined request is refused');
+
+      // …and NOTHING from it survives. The suspension must have rolled back
+      // with the rejected role change.
+      const after = srv.db.prepare('SELECT status, role FROM users WHERE id = ?').get(lastAdminId);
+      assert.strictEqual(after.status, 'active', 'the suspension was rolled back');
+      assert.strictEqual(after.role, 'admin', 'and the refused role change never landed');
+
+      // The session deleted by the suspension must still work too.
+      const stillIn = await j('GET', '/api/me', { cookie: cookieOf(made) });
+      assert.strictEqual(stillIn.status, 200, 'and the live session was not revoked');
+
+      // Re-suspending on its own still works — the rollback undid the failed
+      // request, not the capability.
+      const alone = await j('PATCH', `/api/admin/users/${lastAdminId}`, {
+        body: { status: 'suspended', reason: 'genuine suspension' },
+        cookie: desk,
+      });
+      assert.strictEqual(alone.status, 200, 'a suspension on its own still lands');
+      assert.strictEqual(
+        srv.db.prepare('SELECT status FROM users WHERE id = ?').get(lastAdminId).status,
+        'suspended'
+      );
+    });
+
     // ── S5: starts_at must be ISO-8601 (the admin form sends "2030-01-01 12:00")
     let sseEventId = null;
     let sseMarketId = null;
