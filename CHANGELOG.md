@@ -64,6 +64,20 @@ Found by an adversarial pass against the running system. Two were critical.
   not `form-action`, so the residual risk was phishing/UI redress inside the
   admin desk. Now escaped like every other cell.
 
+- **The financial self-check was permanently red once cash-out was used.** The
+  buyout subquery correlated `matches.market_id IN (SELECT id FROM
+  cashout_quotes …)` — `id` being the quote row's PRIMARY KEY, an unrelated id
+  space. Measured: a buyout taking over 41,648 cents of stake reported
+  `venue_took_over_cents: 0`, so `self_check_ok` flipped false on the first
+  cash-out and stayed false, on a ledger that is provably conserved. A control
+  that is always red is one operators learn to ignore. Now joined on `market_id`,
+  and the case that was never tested — a book that used cash-out — is.
+- **A self-excluded account could still fund itself.** `assertTradeable` ran on
+  `/api/orders` and `/api/markets/:id/cashout` but not on the faucet or
+  `/api/wallet/deposit-intent`, so an excluded account kept acquiring funds,
+  and the per-call faucet cap is trivially looped. Both funding paths now refuse.
+  **Withdrawal is deliberately still open** — refusing to let someone take their
+  own money out is a worse failure than the gap.
 - **Absent `BACKUP_DIR` surfaced as a generic 500.** "Internal error" for a
   missing configuration. Now 409 naming the setting to set, and a real backup
   failure reports why.

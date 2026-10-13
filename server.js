@@ -1056,6 +1056,16 @@ app.get('/api/settlements', requireAuth, (req, res) => {
 
 app.post('/api/wallet/deposit', requireAuth, limit('wallet'), (req, res) => {
   const amount = req.body ? req.body.amount_cents : undefined;
+  // Self-exclusion gates FUNDING as well as trading. It was enforced on
+  // /api/orders and /api/markets/:id/cashout but not here or on
+  // /api/wallet/deposit-intent, so an excluded account could still fund itself
+  // through the faucet — which in a real deployment is the PSP path — and the
+  // per-call FAUCET_MAX_CENTS cap is trivially looped.
+  //
+  // WITHDRAWAL IS DELIBERATELY NOT GATED. Refusing to let someone take their own
+  // money out is a far worse failure than the gap above, and self-exclusion is a
+  // promise about PLAY, not about custody.
+  LIMITS.assertTradeable(db, req.user);
   // The RG deposit limit is checked on BOTH deposit paths, so it cannot be
   // side-stepped by using the payment intent instead of the faucet.
   RG.assertDeposit(db, req.user.id, Number(amount));
@@ -1220,6 +1230,9 @@ app.put('/api/admin/risk/bots/:id', requireAdmin, limit('admin'), (req, res) => 
 // contract, and it is why these are two calls rather than one.
 app.post('/api/wallet/deposit-intent', requireAuth, limit('wallet'), (req, res, next) => {
   const amount = Number((req.body || {}).amount_cents);
+  // Same reasoning as the faucet above: the intent is a way to move real money
+  // in, so self-exclusion has to stop it here too, not only stop trading.
+  LIMITS.assertTradeable(db, req.user);
   RG.assertDeposit(db, req.user.id, amount);
   PAY.openDeposit(db, req.user.id, amount)
     .then((r) => res.json(r))

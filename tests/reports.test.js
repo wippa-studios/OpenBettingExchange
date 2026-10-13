@@ -159,6 +159,99 @@ check('R2 the self-check reports a failure rather than always passing', () => {
   assert.strictEqual(rep.self_check_ok, false, 'and the report says it is not ok');
 });
 
+// R2b: THE SELF-CHECK WITH A CASH-OUT. This is the case that was never tested,
+// and it is the case the bug lived in.
+//
+// The buyout subquery correlated `matches.market_id IN (SELECT id FROM
+// cashout_quotes ...)` — `id` being the QUOTE ROW's primary key, an unrelated
+// id space. So `venue_took_over_cents` was always 0 once any cash-out existed,
+// and `self_check_ok` flipped to FALSE permanently on a ledger that is provably
+// conserved. Measured before the fix: a buyout taking over 41,648 cents of stake
+// reported 0 taken over, and six consecutive buyouts left the operator's
+// financial summary red every time.
+//
+// A control that is always red is worse than no control: it is one operators
+// learn to ignore. So this asserts the self-check is GREEN on a book that used
+// cash-out — which it could not be before.
+check('R2b the self-check stays ok on a book that used cash-out', () => {
+  const b = book();
+  const m = b.market();
+  b.trade(m);
+
+  // A taken buyout: the venue takes over one side, and a cashout_quotes row
+  // records it. Written directly rather than driven through the cash-out engine,
+  // because this is a REPORTING test and the engine is covered in cashout2.
+  b.db.prepare('UPDATE matches SET cashout = 1 WHERE id = (SELECT MIN(id) FROM matches WHERE market_id = ?)').run(m.id);
+  const taken = b.db.prepare('SELECT COALESCE(SUM(stake_cents),0) s FROM matches WHERE market_id = ? AND cashout = 1').get(m.id).s;
+  assert.ok(taken > 0, 'the fixture really did mark a match as taken over');
+  // fair_value_cents and expires_at are NOT NULL in the schema; a partial insert
+  // fails with a bare "SQL logic error" that says nothing about which column.
+  //
+  // THE THROWAWAY QUOTE IS THE POINT, and it took two attempts to get right.
+  //
+  // Both tables AUTOINCREMENT from 1, so a naive fixture has the market id and
+  // the quote id BOTH equal to 1 — and the buggy predicate
+  // `market_id IN (SELECT id …)` then ACCIDENTALLY matches. The first version of
+  // this test passed with the bug deliberately reintroduced.
+  //
+  // A second throwaway fixed the id arithmetic but not the test: it carried a
+  // settled_at INSIDE the period, so the buggy subquery still returned {1,2} and
+  // 1 was still a member.
+  //
+  // The throwaway is therefore settled_at = NULL — excluded from the subquery
+  // entirely — so it burns id 1 while contributing nothing, the real quote gets
+  // id 2, and the market's id 1 is in neither result set. The assertions below
+  // then verify the fixture can actually tell the two predicates apart, so a
+  // future edit cannot silently restore the coincidence.
+  b.db
+    .prepare(
+      `INSERT INTO cashout_quotes
+         (market_id, user_id, fair_value_cents, paid_cents, status, expires_at, settled_at)
+       VALUES (?, 1, 0, 0, 'open', datetime('now','+1 hour'), NULL)`
+    )
+    .run(m.id);
+  b.db
+    .prepare(
+      `INSERT INTO cashout_quotes
+         (market_id, user_id, fair_value_cents, paid_cents, status, expires_at, settled_at)
+       VALUES (?, 1, 0, ?, 'taken', datetime('now','+1 hour'), datetime('now'))`
+    )
+    .run(m.id, taken);
+
+  // The fixture must DISCRIMINATE: correct predicate finds the stake, the buggy
+  // one finds nothing. If these are equal the rest of this test proves nothing.
+  const per = (col) =>
+    b.db
+      .prepare(
+        `SELECT COALESCE(SUM(mt.stake_cents), 0) s
+           FROM matches mt
+          WHERE mt.cashout = 1
+            AND mt.market_id IN (SELECT ${col} FROM cashout_quotes
+                                  WHERE settled_at IS NOT NULL)`
+      )
+      .get().s;
+  const viaMarket = per('market_id');
+  const viaQuoteRowId = per('id');
+  assert.strictEqual(viaMarket, taken, 'the correct predicate finds the taken-over stake');
+  assert.strictEqual(
+    viaQuoteRowId, 0,
+    `the fixture must make the wrong predicate find nothing, or it cannot detect the bug (it found ${viaQuoteRowId})`
+  );
+
+  b.settle(m, m.s1);
+  const rep = REP.summary(b.db, p());
+  assert.ok(rep.buyout_paid_cents > 0, 'a buyout was actually paid, so this is not a vacuous pass');
+  assert.strictEqual(
+    rep.venue_took_over_cents, taken,
+    `the stake the venue took over must be reported (got ${rep.venue_took_over_cents}, expected ${taken})`
+  );
+  assert.strictEqual(
+    rep.self_check_ok, true,
+    'the identity must hold on a book that used cash-out — this was permanently false'
+  );
+  assert.strictEqual(rep.expected_net_pnl, rep.settlements_net_pnl, 'and the two sides agree');
+});
+
 // ── The financial summary ───────────────────────────────────────────────────
 
 // R3: THE GGR DEFINITION IS STATED, and the arithmetic is checkable by hand.
