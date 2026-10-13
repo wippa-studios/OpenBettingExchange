@@ -172,18 +172,62 @@ check('C6 a mixed back/lay position across runners is now supported', async () =
 
 // C7: the house cannot cash itself out. The venue quoting to itself would be
 // a self-dealing loop.
+//
+// THIS TEST USED TO PASS WITHOUT TOUCHING THE GUARD.
+//
+// It laid the bot at 3.5 against a fair 2.0, which is UNDERWATER: payouts
+// -25000 / +10000, so priced = 0.5*(-25000) + 0.5*(10000) = -7500. lib/cashout.js
+// fires `if (!(priced > 0)) return null` BEFORE `if (me.is_bot) return null`, so
+// the null was produced by the pricing gate and the is_bot line was never
+// executed. Delete that line outright and this check stayed green.
+//
+// The second problem was the first assertion, `plan === null || plan.mode ===
+// 'buyout'`: every plan object carries mode 'buyout', so that expression is
+// true for EVERY possible return value. It was decoration.
+//
+// A test asserting a guard fired must exclude every OTHER reason for the same
+// outcome. Both exclusions are below.
 check('C7 the house account is not given a cash-out quote', async () => {
   const { db, users } = (await fresh());
-  const market_id = inTheMoney(db, users);
   const bots = require('../lib/bots');
   await bots.primeBotHash(); // ensureBot() is synchronous and cannot hash for itself
   const bot = bots.ensureBot(db);
-  // Give the house a position against a player.
-  M.placeOrder(db, bot, { selection_id: 1, side: 'lay', price: 3.5, stake_cents: 10000 });
-  M.placeOrder(db, users.dave, { selection_id: 1, side: 'back', price: 3.5, stake_cents: 10000 });
-  const plan = C.cashoutQuote(db, bot, market_id);
-  assert.ok(plan === null || plan.mode === 'buyout', 'house is refused or not quoted');
-  assert.strictEqual(plan, null, 'and in fact refused outright');
+  const { market_id, s1, s2 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.0]]);
+
+  // Alice backs Alpha at 2.5 against a fair 2.0: PROFITABLE (payouts +15000 /
+  // -10000 -> +2500). She is the control that the pricing gate is not simply
+  // closed for this market.
+  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.5, stake_cents: 10000 });
+
+  // The house LAYS Alpha at 1.5 against the same fair 2.0: also PROFITABLE
+  // (payouts -5000 / +10000 -> +2500). Note the direction — it is the mirror of
+  // Alice's trade and is profitable for exactly the opposite reason.
+  M.placeOrder(db, bot, { selection_id: s1, side: 'lay', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, users.dave, { selection_id: s1, side: 'back', price: 1.5, stake_cents: 10000 });
+
+  // EXCLUSION 1 — the human in the same market with a profitable position IS
+  // quoted. Without this the null below could be the venue declining everyone.
+  assert.ok(C.cashoutQuote(db, users.alice, market_id),
+    'a profitable player IS quoted, so the gate below is what refuses the house');
+
+  // EXCLUSION 2 — the HOUSE'S OWN position is worth money, so `priced <= 0`
+  // cannot be the branch that produced its null. Computed with the module's own
+  // exported helpers, so this states the fixture's premise rather than
+  // restating the assertion under test.
+  const houseBets = M.myMatchedBets(db, bot.id, market_id);
+  assert.strictEqual(houseBets.length, 1, 'the house really does hold a position here');
+  const probs = C.fairProbsFor(db, market_id);
+  const houseFair = C.payoutsFor(houseBets, [s1, s2])
+    .reduce((acc, p) => acc + probs.get(p.selection_id) * p.payout_cents, 0);
+  assert.ok(houseFair > 0, `the house's own position is worth ${houseFair}, so the pricing gate cannot fire`);
+
+  // Every other null path is now excluded: CASHOUT_ENABLED is on (C5), the
+  // market is open and unheld, the house holds a position, every selection is
+  // priced, and the quote clears MIN_STAKE_CENTS at fair 2500. `is_bot` is the
+  // only remaining reason for a null — remove it and this assertion is red.
+  assert.strictEqual(C.cashoutQuote(db, bot, market_id), null,
+    'the house is refused by the is_bot guard specifically');
 });
 
 (async () => {

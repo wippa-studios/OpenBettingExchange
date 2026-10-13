@@ -385,6 +385,96 @@ check('A18 a login does not stall other work on the event loop', async () => {
   assert.ok(worst < 20, `worst event-loop stall was ${worst}ms (scryptSync would be ~42ms)`);
 });
 
+// A19 (#29): a session id is a PREFIX, and the old query treated it as a LIKE
+// PATTERN. In SQLite `_` matches any single character and `%` any sequence, so
+// an endpoint whose entire job is "revoke ONE session" revoked EVERY session
+// the account had — and answered {revoked: true}, because changes > 0.
+//
+// The assertion that matters is the session COUNT afterwards, not the return
+// value: a test that only checks the reply is satisfied by both behaviours,
+// because the buggy one also reports success. Before this check nothing
+// covered it at all.
+check('A19 a wildcard or empty session id revokes nothing at all', async () => {
+  const db = fresh();
+  const me = (await A.registerUser(db, { username: 'myself', password: 'secret1' }));
+  const other = (await A.registerUser(db, { username: 'other', password: 'secret1' }));
+  const a = A.createSession(db, me.id);
+  A.createSession(db, me.id);
+  A.createSession(db, me.id);
+  const theirs = A.createSession(db, other.id);
+  const liveSessions = (id) => A.listSessions(db, id, null).length;
+  assert.strictEqual(liveSessions(me.id), 3, 'three sessions to protect');
+
+  // Each of these matched EVERY row under LIKE. Under the fix they match none.
+  for (const wildcard of ['_', '%', '_%', '', null, undefined, 0, false, '____________']) {
+    assert.throws(
+      () => A.revokeSession(db, me.id, wildcard),
+      (e) => e.status === 400 || e.status === 404,
+      `${JSON.stringify(wildcard)} is refused`
+    );
+    assert.strictEqual(liveSessions(me.id), 3, `${JSON.stringify(wildcard)} revoked NO session`);
+  }
+  assert.ok(A.sessionUser(db, a), 'and the real token still works');
+  assert.ok(A.sessionUser(db, theirs), "another account's session is untouched too");
+
+  // The control: a REAL id still revokes exactly one, and only that one.
+  const victim = A.listSessions(db, me.id, null).find((s) => s.id !== A.hashToken(a).slice(0, 12));
+  assert.strictEqual(A.revokeSession(db, me.id, victim.id).revoked, true);
+  assert.strictEqual(liveSessions(me.id), 2, 'exactly one, not all');
+  assert.strictEqual(liveSessions(other.id), 1, "the other account is untouched");
+});
+
+// A20 (#35): the password-type rule, enforced ONCE in verifyPassword instead
+// of four times at the boundaries.
+//
+// The rule had been written three times and missed twice on this one module.
+// changePassword checked newPassword and passed currentPassword straight into
+// verifyPassword, which did String(password) internally, so
+// {"currentPassword":["secret1"]} authenticated — and then revoked every other
+// session, so a successful type-confused change is also an account-takeover
+// primitive. loginUser, which is also not behind validateCredentials, issued a
+// full session token for {"password":["secret1"]}.
+//
+// The assertions that carry weight are the ones about the EFFECT: the stored
+// hash is byte-identical afterwards, and the caller's session is still live. A
+// test that only checked for a thrown error would be satisfied by a 401 from
+// the ordinary wrong-password path.
+check('A20 a non-string password is refused and never coerced', async () => {
+  const db = fresh();
+  const u = (await A.registerUser(db, { username: 'joel', password: 'secret1' }));
+  const mine = A.createSession(db, u.id);
+  const stored = db.prepare('SELECT pass_hash FROM users WHERE id=?').get(u.id).pass_hash;
+
+  // changePassword: a non-string current password is a 400 at the boundary,
+  // and it must not have done any of the work a successful call would.
+  for (const bad of [['secret1'], ['secret1', 'x'], 123, null, undefined, true, { toString: () => 'secret1' }]) {
+    await assert.rejects(
+      A.changePassword(db, { userId: u.id, currentPassword: bad, newPassword: 'secret2', keepToken: mine }),
+      (e) => e.status === 400,
+      `currentPassword ${JSON.stringify(bad)} is a 400, not a coerced authenticate`
+    );
+  }
+  assert.strictEqual(db.prepare('SELECT pass_hash FROM users WHERE id=?').get(u.id).pass_hash, stored,
+    'the password was never changed');
+  assert.ok(A.sessionUser(db, mine), 'and no session was revoked — that is the takeover primitive');
+
+  // loginUser: the same body authenticates nothing.
+  await assert.rejects(A.loginUser(db, { username: 'joel', password: ['secret1'] }), (e) => e.status === 401);
+  assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM sessions WHERE user_id=?').get(u.id).c, 1,
+    'no session token was minted by the array form');
+
+  // The primitive itself: no input shape coerces into a match.
+  for (const bad of [['secret1'], null, 123, true, { toString: () => 'secret1' }]) {
+    assert.strictEqual(await A.verifyPassword(bad, stored), false, `${JSON.stringify(bad)} does not verify`);
+  }
+  assert.strictEqual(await A.verifyPassword('secret1', stored), true, 'the real password still verifies');
+
+  // And the happy path is untouched.
+  const r = await A.changePassword(db, { userId: u.id, currentPassword: 'secret1', newPassword: 'secret2', keepToken: mine });
+  assert.strictEqual(r.sessionsRevoked, 0, 'the caller keeps their only session');
+  assert.ok((await A.loginUser(db, { username: 'joel', password: 'secret2' })).token);
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops

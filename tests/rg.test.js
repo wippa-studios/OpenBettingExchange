@@ -618,6 +618,86 @@ check('G17 an unrecognised stored end date keeps the exclusion in force', async 
   );
 });
 
+// ── #56: the two INCLUSIVE boundaries, at the instant itself ──────────────
+//
+// Both controls are `>=`, and G2 and G7 could not tell that from `>`:
+//
+//   lib/rg.js:155   if (r.mins >= minutes)          — only ever tested at 61
+//   lib/rg.js:259   AND at >= datetime('now','-1 day') — only ever tested at 23h/25h
+//
+// A pair of assertions bracketing the boundary by a whole unit is enough for
+// the session limit, whose resolution is a whole minute. It is NOT enough for
+// the deposit window, whose resolution is a whole SECOND — so there the row's
+// actual age is measured first and the inclusive result is only asserted once
+// the row is genuinely sitting on the boundary. Otherwise the test is either
+// vacuous or flaky, which is worse than either.
+check('G18 both RG windows include their boundary instant', async () => {
+  const prev = [config.RG_SESSION_MINUTES, config.RG_DEPOSIT_DAILY_CENTS];
+  config.RG_SESSION_MINUTES = 60;
+  config.RG_DEPOSIT_DAILY_CENTS = 100000;
+  try {
+    const f = (await fixture());
+    RG.startSession(f.db, f.alice.id);
+
+    // ── the session limit, at exactly 60 minutes ──
+    // 59 is still inside the limit; 60 has reached it. Under `>` the second
+    // half is the one that fails, and under `>=` both hold.
+    age(f, { session: 59 });
+    assert.doesNotThrow(() => RG.assertSession(f.db, f.alice.id), '59 minutes is still inside a 60-minute limit');
+    assert.strictEqual(RG.status(f.db, f.alice.id).session_reached, false);
+
+    age(f, { session: 60 });
+    assert.throws(
+      () => RG.assertSession(f.db, f.alice.id),
+      (e) => e.status === 403 && e.details.code === 'session_limit_reached' && e.details.played_minutes === 60,
+      'exactly 60 minutes HAS reached a 60-minute limit — the comparison is inclusive'
+    );
+
+    // ── the rolling 24h deposit window, at exactly 24 hours ──
+    ledger.deposit(f.db, f.alice.id, 60000, config.FAUCET_MAX_CENTS);
+    assert.strictEqual(RG.depositedInWindow(f.db, f.alice.id), 60000);
+
+    // Ageing with `datetime('now','-24 hours')` is only EXACTLY at the boundary
+    // if the write and the read land in the same wall-clock second — SQLite
+    // truncates `now` to the second, and the window's lower bound is recomputed
+    // on every query, so a second of drift puts the row just past it and the
+    // assertion becomes a coin flip. So measure the row's real age and only
+    // assert once it is exactly 86400 seconds: under those conditions a result
+    // of 60000 can only have come from `>=`, because `>` is false at equality.
+    let atBoundary = null;
+    for (let attempt = 0; attempt < 100 && atBoundary === null; attempt++) {
+      f.db
+        .prepare("UPDATE transactions SET at = datetime('now','-24 hours') WHERE user_id = ? AND type='deposit'")
+        .run(f.alice.id);
+      const ageSeconds = f.db
+        .prepare("SELECT CAST((julianday('now') - julianday(at)) * 86400 AS INTEGER) AS s FROM transactions WHERE user_id = ? AND type='deposit'")
+        .get(f.alice.id).s;
+      if (ageSeconds === 86400) atBoundary = RG.depositedInWindow(f.db, f.alice.id);
+    }
+    assert.notStrictEqual(atBoundary, null, 'could not land the row on the exact 24h boundary');
+    assert.strictEqual(atBoundary, 60000, 'a deposit EXACTLY 24h old is still counted — the window is inclusive');
+    assert.throws(
+      () => RG.assertDeposit(f.db, f.alice.id, 40001),
+      (e) => e.status === 403 && e.details.code === 'deposit_limit_reached',
+      'and it still occupies the cap'
+    );
+    assert.doesNotThrow(() => RG.assertDeposit(f.db, f.alice.id, 40000),
+      'exactly the remaining headroom still fits');
+
+    // One second further on, it is out. This is the other half of the same
+    // boundary, and it is what makes the assertion above a boundary rather
+    // than "the window never expires".
+    f.db
+      .prepare("UPDATE transactions SET at = datetime('now','-25 hours') WHERE user_id = ? AND type='deposit'")
+      .run(f.alice.id);
+    assert.strictEqual(RG.depositedInWindow(f.db, f.alice.id), 0, 'released just past it');
+
+    assert.strictEqual(acc.assertConserved(f.db), 0, 'books balance throughout');
+  } finally {
+    [config.RG_SESSION_MINUTES, config.RG_DEPOSIT_DAILY_CENTS] = prev;
+  }
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -634,6 +714,6 @@ check('G17 an unrecognised stored end date keeps the exclusion in force', async 
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 18) { console.error('expected 18 checks'); process.exit(1); }
+  if (passed < 19) { console.error("expected 19 checks"); process.exit(1); }
   console.log(`\nrg.test.js: ${passed} checks passed`);
 })();

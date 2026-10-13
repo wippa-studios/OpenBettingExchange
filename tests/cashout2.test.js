@@ -27,7 +27,6 @@ const M = require('./../lib/match');
 const settle = require('../lib/settle');
 const cashout = require('../lib/cashout');
 const acc = require('../lib/accounts');
-const config = require('./../lib/config');
 
 let passed = 0;
 // Checks here are async (lib/auth.js derives password hashes off the event
@@ -256,13 +255,45 @@ check('C11 a second cash-out of the same position is refused', async () => {
 });
 
 // C12: a player with no position gets no quote, and neither does the house.
+//
+// The house half of this check was literally `void config;` — a placeholder
+// where the assertion should have been, so "neither does the house" was a claim
+// the file made about itself and never tested. The same failure mode as C7 in
+// cashout.test.js: to assert that a guard fired, every OTHER reason for the same
+// outcome has to be excluded, or the assertion is satisfied by whichever branch
+// happens to run first.
 check('C12 no position, or the house, gets no quote', async () => {
   const { db, alice, bob, marketId, ids } = (await fixture());
+  // Alice backs Alpha at 2.5 against a fair 2.0 -> PROFITABLE (+15000 /
+  // -10000 -> +2500). She is the control.
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
   M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
   const carol = (await A.registerUser(db, { username: 'carol', password: 'pw-carol-123', balance_cents: 100000 }));
   assert.strictEqual(cashout.cashoutQuote(db, carol, marketId), null, 'no position');
-  void config;
+
+  // The house LAYS Alpha at 1.5 against the same fair 2.0 -> also PROFITABLE
+  // (-5000 / +10000 -> +2500). Its 1.5 lay does not sweep Alice's resting 2.5
+  // back (a lay takes backs at P <= Q), so the two positions coexist.
+  const bot = require('../lib/bots').ensureBot(db);
+  M.placeOrder(db, bot, { selection_id: ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, carol, { selection_id: ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
+
+  // EXCLUSION 1 — a profitable player in this market IS quoted.
+  assert.ok(cashout.cashoutQuote(db, alice, marketId),
+    'a profitable player IS quoted, so the refusal below is not a blanket decline');
+
+  // EXCLUSION 2 — the HOUSE'S OWN position is worth money, so the pricing gate
+  // (`if (!(priced > 0)) return null`, which runs BEFORE the is_bot gate)
+  // cannot be what refused it.
+  const houseBets = M.myMatchedBets(db, bot.id, marketId);
+  assert.strictEqual(houseBets.length, 1, 'the house really does hold a position here');
+  const probs = cashout.fairProbsFor(db, marketId);
+  const houseFair = cashout.payoutsFor(houseBets, [ids.Alpha, ids.Beta])
+    .reduce((acc, p) => acc + probs.get(p.selection_id) * p.payout_cents, 0);
+  assert.ok(houseFair > 0, `the house's own position is worth ${houseFair}, so the pricing gate cannot fire`);
+
+  assert.strictEqual(cashout.cashoutQuote(db, bot, marketId), null,
+    'the house is refused by the is_bot guard specifically');
 });
 
 // C13: THE LAY SIDE OF THE SAME FLOW. C8 cashes out the BACK player, and for
@@ -404,6 +435,212 @@ check('C15 a fully cashed-out market drops out of the positions view', async () 
   );
 });
 
+// ── #56: the plan is recomputed INSIDE the execute transaction ─────────────
+//
+// lib/cashout.js: "The plan is recomputed INSIDE the transaction, for the same
+// reason the old market hedge was: the position can change between a quote and
+// an execute, and the player must never be paid a quote for a position they no
+// longer hold."
+//
+// C6 asserts res.value_cents === plan.value_cents against an UNCHANGED book,
+// which a recompute and a stale-quote implementation satisfy identically — it
+// distinguishes nothing. So: quote, move the fair price, execute. The payout
+// must follow the position that exists at execution, not the one that existed
+// when the quote was issued.
+check('C16 the executed payout follows the CURRENT position, not the quoted one', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
+  // Alice backs Alpha at 2.5 against a fair 2.0 -> profitable, worth +2500.
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
+  const quoted = cashout.cashoutQuote(db, alice, marketId);
+  assert.ok(quoted, 'a quote exists before anything moves');
+  assert.strictEqual(quoted.fair_value_cents, 2500);
+  assert.strictEqual(quoted.legs, 1);
+
+  // THE POSITION CHANGES, and nothing re-quotes: Bob lays Beta at 2.5 and
+  // Alice takes it, so she now holds TWO legs instead of one. With both runners
+  // at a fair 2.0 her payouts are +5000 either way -> fair 5000, quoted 4900.
+  //
+  // Deliberately NOT re-quoting after the change. A test that re-quotes and
+  // then executes proves nothing about staleness — and worse, a stale-quote
+  // implementation that cached the most recent cashoutQuote would sail through
+  // it. The freshness of the executed figure has to come from the position, not
+  // from a second call to the function under test.
+  M.placeOrder(db, bob, { selection_id: ids.Beta, side: 'lay', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, alice, { selection_id: ids.Beta, side: 'back', price: 2.5, stake_cents: 10000 });
+  assert.strictEqual(M.myMatchedBets(db, alice.id, marketId).length, 2, 'the position really did change');
+
+  // State the new position's value with the module's own exported helpers, so
+  // the premise is checked without going through cashoutQuote again.
+  const probs = cashout.fairProbsFor(db, marketId);
+  const newFair = cashout
+    .payoutsFor(M.myMatchedBets(db, alice.id, marketId), [ids.Alpha, ids.Beta])
+    .reduce((acc, p) => acc + probs.get(p.selection_id) * p.payout_cents, 0);
+  assert.strictEqual(newFair, 5000, 'the position is worth 5000 now, not 2500');
+
+  // THE ASSERTION. A stale-quote implementation pays the old 2450 and this is
+  // red; a recompute pays 4900 and it is green. C6, by contrast, asserts
+  // value equality against an UNCHANGED book, which both implementations
+  // satisfy — which is why it could not have caught the bug its own comment
+  // claims to prevent.
+  const res = cashout.cashoutMarket(db, alice, marketId);
+  assert.strictEqual(res.value_cents, 4900, 'the payout follows the NEW position');
+  assert.strictEqual(res.fair_value_cents, 5000, 'and the recorded fair value is the new one');
+  assert.strictEqual(res.legs, 2, 'the buyout covered both legs');
+  assert.notStrictEqual(res.value_cents, quoted.value_cents,
+    `so this check fails a stale-quote implementation (stale would pay ${quoted.value_cents})`);
+  assert.strictEqual(res.payout_cents, 4900, 'and that is what the player was actually paid');
+  assert.strictEqual(wallet(db, alice.id).b, 1000000 + 4900, 'the money moved at the revalued price');
+  assert.strictEqual(acc.assertConserved(db), 0, 'and the books still balance');
+  assert.deepStrictEqual(acc.assertUserAgrees(db), []);
+});
+
+// ── #21: BOTH counterparties of one match cash out, then the market settles ─
+//
+// Every other cash-out check buys ONE position off ONE player. None covers two
+// players of the same match cashing out, after which the replacement matches
+// chain: alice's buyout puts the house in her slot, and when bob then buys out
+// the leg that is now house-vs-him, the house ends up on BOTH sides of one
+// match. That chain is the most delicate bookkeeping in the module and the
+// failure mode is a double payment out of the house float, not a display
+// artefact — so it is asserted end to end rather than left to a reading.
+//
+// THE FIXTURE NEEDS BOTH PLAYERS TO BE QUOTABLE, which is not free. Alice and
+// bob face each other on Alpha, so their books are mirror images and in a
+// two-runner market exactly one of them is ever profitable — the other gets a
+// null from the pricing gate and there is nothing to cash out. Each therefore
+// needs a SECOND leg against a third party, and the extra legs are chosen so
+// both books come out ahead:
+//
+//   alice: back Alpha @2.5 (fair 2.0)  +2500,  lay Beta @1.5  +2500  = +5000
+//   bob:   lay Alpha @2.5              -2500,  back Beta @3.0  +5000  = +2500
+//
+// Alpha vs bob is the shared match; Beta carries the two extra legs.
+check('C17 BOTH counterparties cash out, and the chained settlement pays everyone exactly once', async () => {
+  const { db, alice, bob, marketId, ids } = (await fixture());
+  const A = require('../lib/auth');
+  const carol = (await A.registerUser(db, { username: 'carol', password: 'pw-carol-123', balance_cents: 1000000 }));
+  const dave = (await A.registerUser(db, { username: 'dave', password: 'pw-dave-123', balance_cents: 1000000 }));
+
+  // Alice vs Bob on Alpha — the match they will BOTH cash out of.
+  M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
+  // Carol vs Alice on Beta at 1.5 (a profitable lay for alice).
+  M.placeOrder(db, carol, { selection_id: ids.Beta, side: 'back', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, alice, { selection_id: ids.Beta, side: 'lay', price: 1.5, stake_cents: 10000 });
+  // Dave vs Bob on Beta at 3.0 (a profitable back for bob).
+  M.placeOrder(db, dave, { selection_id: ids.Beta, side: 'lay', price: 3.0, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: ids.Beta, side: 'back', price: 3.0, stake_cents: 10000 });
+
+  // Both are quotable, at different values — so a crossed-over payout (the
+  // right total, the wrong player) cannot pass.
+  const quotedAlice = cashout.cashoutQuote(db, alice, marketId);
+  const quotedBob = cashout.cashoutQuote(db, bob, marketId);
+  assert.ok(quotedAlice && quotedBob, 'BOTH players are quoted');
+  assert.strictEqual(quotedAlice.value_cents, 4900);
+  assert.strictEqual(quotedBob.value_cents, 2450);
+  assert.strictEqual(quotedAlice.legs, 2);
+  assert.strictEqual(quotedBob.legs, 2);
+
+  const start = { alice: wallet(db, alice.id), bob: wallet(db, bob.id) };
+  // ALICE FIRST. This is the ordering that produces the chain: her buyout puts
+  // the house in the Alpha back slot opposite bob.
+  const paidAlice = cashout.cashoutMarket(db, alice, marketId);
+  assert.strictEqual(paidAlice.payout_cents, 4900);
+  assert.strictEqual(paidAlice.matches_closed, 2, 'both her legs are closed');
+
+  // …and NOW bob. His Alpha leg is no longer the one alice held — it is the
+  // house's — so his buyout replaces a match whose other side is already the
+  // house, and the new takeover match is house vs house.
+  const paidBob = cashout.cashoutMarket(db, bob, marketId);
+  assert.strictEqual(paidBob.payout_cents, 2450);
+  assert.strictEqual(paidBob.matches_closed, 2, 'both his legs are closed');
+
+  const bot = require('../lib/bots').ensureBot(db);
+  const afterBuyouts = { alice: wallet(db, alice.id), bob: wallet(db, bob.id) };
+  assert.strictEqual(afterBuyouts.alice.b, start.alice.b + 4900, 'alice paid, exactly once, at the quote');
+  assert.strictEqual(afterBuyouts.bob.b, start.bob.b + 2450, 'bob paid, exactly once, at the quote');
+  assert.strictEqual(afterBuyouts.alice.f, 0, 'and her collateral is released');
+  assert.strictEqual(afterBuyouts.bob.f, 0, 'and his');
+
+  // THE CHAIN IS REAL, and the assertion below is about it specifically: the
+  // superseded legs are flagged, and exactly one live match has the house on
+  // both sides — the shape lib/cashoutrisk.js has to net to zero rather than
+  // charge the venue the full liability on.
+  const live = db
+    .prepare(
+      `SELECT mt.id, mt.cashout, bo.user_id AS bu, lo.user_id AS lu
+         FROM matches mt JOIN orders bo ON bo.id = mt.back_order_id
+         JOIN orders lo ON lo.id = mt.lay_order_id
+        WHERE mt.market_id = ? ORDER BY mt.id`
+    )
+    .all(marketId);
+  const superseded = live.filter((m) => m.cashout === 1);
+  assert.strictEqual(superseded.length, 4, 'the four replaced legs are all flagged cashout=1');
+  const houseVsHouse = live.filter((m) => m.cashout === 0 && m.bu === bot.id && m.lu === bot.id);
+  assert.strictEqual(houseVsHouse.length, 1, 'and exactly one live match has the house on BOTH sides');
+
+  // SETTLEMENT.
+  const beforeSettle = { alice: wallet(db, alice.id), bob: wallet(db, bob.id), carol: wallet(db, carol.id), dave: wallet(db, dave.id) };
+  settle.settleMarket(db, marketId, { winner_selection_id: ids.Beta });
+  const afterSettle = { alice: wallet(db, alice.id), bob: wallet(db, bob.id), carol: wallet(db, carol.id), dave: wallet(db, dave.id) };
+
+  // (1) THE HOUSE'S ESCROW RETURNS TO EXACTLY ZERO. It escrowed 40000 across
+  // the four takeover legs; every one of them is now resolved.
+  assert.strictEqual(wallet(db, bot.id).f, 0, 'house frozen_cents is exactly 0 after settlement');
+
+  // (2) EACH PLAYER IS PAID EXACTLY ONCE. The superseded-leg skip is what
+  // guarantees this: a bought-off leg carries cashout=1, so settle.js never
+  // reaches it and neither player is settled a second time.
+  assert.deepStrictEqual(afterSettle.alice, beforeSettle.alice, 'settlement did NOT touch alice again');
+  assert.deepStrictEqual(afterSettle.bob, beforeSettle.bob, 'settlement did NOT touch bob again');
+  assert.strictEqual(afterSettle.alice.b, 1000000 + 4900, 'alice holds exactly one buyout');
+  assert.strictEqual(afterSettle.bob.b, 1000000 + 2450, 'bob holds exactly one buyout, and not alice\'s');
+  for (const [who, u] of [['alice', alice], ['bob', bob]]) {
+    const rows = db.prepare('SELECT credit_cents, commission_cents FROM settlements WHERE user_id = ?').all(u.id);
+    assert.strictEqual(rows.length, 1, `${who} has exactly one settlements row`);
+    assert.strictEqual(rows[0].commission_cents, 0, `${who} paid no commission`);
+  }
+
+  // (3) THE BOOKS.
+  assert.strictEqual(acc.assertConserved(db), 0, 'books balance');
+  assert.deepStrictEqual(acc.assertUserAgrees(db), []);
+  assert.strictEqual(afterSettle.carol.f, 0, "carol's collateral released");
+  assert.strictEqual(afterSettle.dave.f, 0, "dave's collateral released");
+
+  // (4) ZERO COMMISSION for either player. A bought-off position is not a won
+  // one: cashoutPosition settles them with commissionCents 0, and settlement
+  // never reaches them because their legs are flagged. This is the assertion
+  // most likely to go wrong if the cash-out path ever changes — charging a
+  // player a fee for selling a position would be a fee for losing.
+  const comm = db
+    .prepare("SELECT COUNT(*) c FROM transactions WHERE user_id IN (?, ?) AND type = 'commission'")
+    .get(alice.id, bob.id).c;
+  assert.strictEqual(comm, 0, 'not one commission transaction for either player');
+
+  // (5) THE DESK RECONCILES. The loss the operator is shown must be derivable
+  // from what settlement ACTUALLY paid the house — read from the settlements
+  // table, not from the desk's own bookkeeping, or this is a tautology.
+  const rows = db.prepare('SELECT paid_cents, proceeds_cents, loss_cents FROM cashout_quotes WHERE market_id = ?').all(marketId);
+  assert.strictEqual(rows.length, 2, 'one buyout row per player');
+  for (const r of rows) {
+    assert.strictEqual(r.loss_cents, r.paid_cents - r.proceeds_cents, 'loss == paid - proceeds, row by row');
+  }
+  const sumLoss = rows.reduce((a, r) => a + r.loss_cents, 0);
+  const sumPaid = rows.reduce((a, r) => a + r.paid_cents, 0);
+  const sumProceeds = rows.reduce((a, r) => a + r.proceeds_cents, 0);
+  const houseRealised = db.prepare('SELECT pnl_cents p FROM settlements WHERE user_id = ?').get(bot.id).p;
+  // Non-degenerate: the house's taken-over positions came back +15000, so this
+  // is not a figure that reconciles by cancelling against itself.
+  assert.strictEqual(sumProceeds, 15000, 'the desk proceeds equal what the takeover legs were worth');
+  assert.strictEqual(sumProceeds, houseRealised, '…which is exactly what settlement credited the house');
+  assert.strictEqual(
+    sumLoss,
+    sumPaid - houseRealised,
+    `sum(loss) == sum(payouts) - the venue's realised position result (${sumLoss} == ${sumPaid} - ${houseRealised})`
+  );
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -420,6 +657,6 @@ check('C15 a fully cashed-out market drops out of the positions view', async () 
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 15) { console.error("expected 15 checks"); process.exit(1); }
+  if (passed < 17) { console.error("expected 17 checks"); process.exit(1); }
   console.log(`\ncashout2.test.js: ${passed} checks passed`);
 })();

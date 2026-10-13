@@ -322,6 +322,34 @@ check('L16 invalid limit values are refused, not coerced', async () => {
   assert.strictEqual(L.effective(db, alice.id, MKT).max_open_stake_cents, null, 'nothing was written');
 });
 
+// L17: a non-string SCOPE is a rejected request, not a thrown TypeError.
+//
+// The route substitutes the default only for `undefined`
+// (`scope === undefined ? GLOBAL_SCOPE : scope`), so `5`, `null` and
+// `["global"]` all reach isValidScope straight from JSON. Without a type guard
+// `scope.startsWith(...)` is a TypeError carrying no `.status`, which the error
+// handler renders as a 500 — bad input answered with "the server is broken",
+// which is exactly what teaches an operator to ignore 5xx from this route.
+//
+// The tell is that capOf() already rejects a non-integer on every AXIS, so a
+// caller reading the module has no way to know the scope was the unvalidated
+// one.
+check('L17 a non-string limit scope is a 400, not a 500', async () => {
+  const { db, alice, marketId: MKT } = (await fixture());
+  for (const bad of [5, null, ['global'], true, { scope: 'global' }, 1.5]) {
+    assert.strictEqual(L.isValidScope(bad), false, `${JSON.stringify(bad)} is not a scope`);
+    assert.throws(
+      () => L.setLimits(db, { actor: alice, userId: alice.id, scope: bad, max_open_stake_cents: 1000 }),
+      (e) => e.status === 400,
+      `${JSON.stringify(bad)} is refused with a 400, not a TypeError`
+    );
+  }
+  // The guard did not narrow the vocabulary: both well-formed scopes still work.
+  assert.strictEqual(L.isValidScope('global'), true);
+  assert.strictEqual(L.isValidScope(L.marketScope(MKT)), true);
+  assert.strictEqual(L.effective(db, alice.id, MKT).max_open_stake_cents, null, 'nothing was written');
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -338,6 +366,6 @@ check('L16 invalid limit values are refused, not coerced', async () => {
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 17) { console.error("expected 17 checks"); process.exit(1); }
+  if (passed < 18) { console.error("expected 18 checks"); process.exit(1); }
   console.log(`\nlimits.test.js: ${passed} checks passed`);
 })();
