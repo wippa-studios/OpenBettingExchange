@@ -389,10 +389,115 @@ const run = async () => {
     assert.deepStrictEqual(RF.parseOutcomes([{ market_id: 5, status: 'completed', winners: [1] }]), {
       5: { status: 'completed', winners: [1] },
     });
-    // Unusable keys are dropped rather than becoming market 0.
-    assert.deepStrictEqual(RF.parseOutcomes({ outcomes: { abc: { status: 'completed' } } }), {});
+    // An unusable key alongside a usable one is DROPPED, never coerced to
+    // market 0. (On its own it now raises — see T17.)
+    assert.deepStrictEqual(
+      RF.parseOutcomes({ outcomes: { abc: { status: 'completed' }, 5: { status: 'completed' } } }),
+      { 5: { status: 'completed' } }
+    );
     assert.throws(() => RF.parseOutcomes('nope'), (e) => e.reason === 'unreadable_response');
     assert.throws(() => RF.parseOutcomes(null), (e) => e.reason === 'unreadable_response');
+  });
+
+  // T17: A WRONG-SHAPE RESPONSE IS NOT A SUCCESSFUL EMPTY POLL.
+  //
+  // The asymmetry this pins was backwards from the module's own header, which
+  // says "a response the venue cannot read must not be read as 'no outcomes'":
+  // an UNREADABLE body raised, while a perfectly READABLE body of an
+  // unexpected shape was silently skipped entry by entry and collapsed to {}.
+  // The caller then advanced last_ok_at, incremented ok_polls and cleared
+  // consecutive_failures — so a provider that changed its wrapper key left the
+  // venue permanently green, polling on a timer, settling nothing, with the
+  // health endpoint agreeing it was fine and the alarm line never once printed.
+  //
+  // The shape that matters most is the one the VENUE ITSELF SENDS:
+  // `requestBody` posts {markets: [...]}, so any provider that echoes the
+  // request shape back — plausible, common, and the easiest integration bug in
+  // the world to write — was read as "no outcomes, all healthy".
+  await check('T17 a wrong-shape response is a FAILURE, not a quiet success', async () => {
+    const shapes = [
+      ['a different wrapper key', { results: [{ market_id: 5, status: 'completed' }] }],
+      // The venue's own request shape, echoed back.
+      ['the request shape echoed back', { markets: [{ id: 5, name: 'Match Odds' }] }],
+      ['array entries with no market id', [{ market: 1, status: 'completed' }]],
+      ['a string-keyed map', { race: { status: 'completed', winners: [1] } }],
+    ];
+    for (const [what, payload] of shapes) {
+      assert.throws(
+        () => RF.parseOutcomes(payload),
+        (e) => e.name === 'FeedError' && e.reason === 'unrecognised_shape',
+        `${what} must not parse as "no outcomes"`
+      );
+    }
+    // And through the transport, end to end: the poll must FAIL and be counted,
+    // because "the feed is working and has nothing to say" and "we cannot read
+    // the feed at all" are indistinguishable from every number an operator has.
+    RF.resetState();
+    const f = (await fixture());
+    backed(f);
+    const fetcher = RF.createFetcher({
+      url: 'https://results.example/v1/outcomes',
+      fetchImpl: stub(() => jsonReply({ markets: [{ id: f.marketId, name: 'Match Odds' }] }), []),
+    });
+    const r = await RF.pollNow(f.db, { fetcher });
+    assert.strictEqual(r.applied, 0, 'nothing was settled from a response we could not read');
+    assert.strictEqual(r.error, null, 'and it still did not throw into the runner');
+    assert.strictEqual(r.feed.status, 'failing', 'the module now says so');
+    assert.strictEqual(r.feed.last_error.reason, 'unrecognised_shape');
+    assert.strictEqual(r.feed.consecutive_failures, 1, 'and counts it as a failure');
+    assert.strictEqual(r.feed.ok_polls, 0, 'a shape change is NOT an ok poll');
+    assert.strictEqual(r.feed.last_ok_at, null, 'last_ok_at does not advance on a shape change');
+    // Dropped entries are visible too, so the half of this that does not throw
+    // is still countable.
+    assert.strictEqual(r.feed.dropped_entries, 1, 'and the dropped entry is counted');
+    // Nothing settled, and the books are untouched.
+    assert.strictEqual(f.db.prepare('SELECT status s FROM markets WHERE id=?').get(f.marketId).s, 'open');
+    assert.strictEqual(acc.assertConserved(f.db), 0);
+  });
+
+  // T18: a payload that MOSTLY parses still applies what it can, and reports
+  // what it dropped. One malformed entry from an otherwise working provider is
+  // not the same event as a contract that has moved underneath us, and neither
+  // is a reason to refuse the entries we did understand.
+  await check('T18 a partial parse applies what it can and counts the rest', async () => {
+    RF.resetState();
+    const f = (await fixture());
+    backed(f);
+    const stats = {};
+    const out = RF.parseOutcomes(
+      { outcomes: { [f.marketId]: { status: 'completed', winners: [f.s1] }, rubbish: { status: 'completed' } } },
+      stats
+    );
+    assert.deepStrictEqual(Object.keys(out), [String(f.marketId)], 'the usable entry survives');
+    assert.strictEqual(stats.dropped, 1, 'and the unusable one is counted, not silently lost');
+
+    const fetcher = RF.createFetcher({
+      url: 'https://results.example/v1/outcomes',
+      fetchImpl: stub(
+        () => jsonReply({ outcomes: { [f.marketId]: { status: 'completed', winners: [f.s1] }, junk: { status: 'x' } } }),
+        []
+      ),
+    });
+    const r = await RF.pollNow(f.db, { fetcher });
+    assert.strictEqual(r.applied, 1, 'the good entry settled the market');
+    assert.strictEqual(r.feed.status, 'ok', 'a provider that got one entry wrong is not an outage');
+    assert.strictEqual(r.feed.last_dropped, 1, 'but the drop is on the record');
+    assert.strictEqual(r.feed.dropped_entries, 1);
+    assert.strictEqual(f.db.prepare('SELECT status s FROM markets WHERE id=?').get(f.marketId).s, 'settled');
+    assert.strictEqual(acc.assertConserved(f.db), 0);
+
+    // And a healthy poll with nothing to drop leaves the counter at zero, so a
+    // non-zero number always means something.
+    RF.resetState();
+    const g = (await fixture());
+    backed(g);
+    const clean = RF.createFetcher({
+      url: 'https://results.example/v1/outcomes',
+      fetchImpl: stub(() => jsonReply({ outcomes: { [g.marketId]: { status: 'completed', winners: [g.s1] } } }), []),
+    });
+    await RF.pollNow(g.db, { fetcher: clean });
+    assert.strictEqual(RF.health().dropped_entries, 0, 'nothing dropped on a clean poll');
+    assert.strictEqual(RF.health().last_dropped, 0);
   });
 
   // T13: the secret is sent as a bearer token, and a feed with no secret does
@@ -481,7 +586,7 @@ const run = async () => {
   });
 
   console.log(`\nresultsfeed.test.js: ${passed} checks passed`);
-  if (passed < 17) { console.error('expected 17 checks'); process.exit(1); }
+  if (passed < 19) { console.error('expected 19 checks'); process.exit(1); }
 };
 
 run().catch((e) => { console.error(e); process.exit(1); });
