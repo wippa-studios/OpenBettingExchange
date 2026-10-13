@@ -367,6 +367,28 @@ is written**. There is no plaintext fallback.
 
 `:id` defaults to the requester's own tenant.
 
+A credential change only takes effect on the next launch, so `PUT` restarts a
+supervised collector. `kill('SIGTERM')` is asynchronous, so the restart cannot be
+`stop()` then `start()` — the old child is still terminating when the second call
+runs, and the pair silently left the feed **stopped**. The response says which
+state you are in:
+
+| Field | Meaning |
+| --- | --- |
+| `collector_restarted` | a new collector is already running |
+| `collector_restart_pending` | the old process is terminating; the launch follows on its exit |
+
+`GET /api/admin/feed/runner` reports `running` from whether a **process** exists,
+not from whether a handle does — a failed spawn leaves `pid: null` and
+`running: false` rather than claiming a collector that never existed. While a
+restart is in flight, `supervisor` is `"restarting"` and `restart_pending` is
+`true`.
+
+On `SIGTERM`/`SIGINT` the server stops the scheduled jobs, stops the collector
+(SIGTERM, escalating to SIGKILL after a grace period), closes the listener and
+exits 0. Without that path the collector outlived every restart — still holding
+its Betfair session and still spending market-data weight.
+
 `GET /api/admin/feed/credentials/1` → `200`
 
 ```jsonc

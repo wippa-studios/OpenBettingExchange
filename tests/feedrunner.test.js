@@ -270,6 +270,197 @@ await check('R9 a collector that dies is restarted, and the crash is recorded', 
   }
 });
 
+// ── the two lifecycle failures that share one root cause ──────────────────────
+// `state.child` was used as a statement about whether a collector was RUNNING.
+// It is a statement about whether a HANDLE exists, and those come apart in two
+// places: a spawn that failed (no process, handle kept forever) and a stop that
+// has not finished yet (process dying, handle still held). Both made the
+// operator's view of the feed wrong in opposite directions.
+
+// R10: A MISSING BINARY DOES NOT WEDGE THE RUNNER. The module's own message
+// calls ENOENT "the most common cause by far" — a typo in FEED_COLLECTOR_CMD, a
+// missing venv, a PATH difference between the operator's shell and the service
+// user — and it is the one failure that used to leave the venue permanently,
+// silently broken while reporting green.
+//
+// Node emits 'error' and 'close' but NOT 'exit' when the spawn itself fails, so
+// the only code that cleared `state.child` never ran. The supervisor kept a
+// ChildProcess for a process that did not exist: health() said running with
+// pid undefined, supervisor 'running', every later start() answered
+// already_running, and stop() killed nothing while health() still said running.
+await check('R10 a missing collector binary leaves the runner usable', async () => {
+  const missing = path.join(os.tmpdir(), `no-such-collector-${process.pid}.sh`);
+  fs.rmSync(missing, { force: true });
+  const savedCmd = config.FEED_COLLECTOR_CMD;
+  config.FEED_COLLECTOR_CMD = missing;
+  try {
+    const r = FRUN.start(tenant.id);
+    assert.strictEqual(r.started, true, r.reason);
+    assert.strictEqual(r.pid, undefined, 'a failed spawn has no pid — synchronously, before any event fires');
+
+    const h0 = FRUN.health(tenant.id);
+    assert.strictEqual(h0.running, false, 'health does not report a collector that never existed');
+    assert.strictEqual(h0.pid, null, 'and reports a null pid, never undefined');
+    assert.notStrictEqual(h0.supervisor, 'running', 'supervisor is not "running"');
+
+    // The wedge: every later start() used to answer already_running and do
+    // nothing, forever.
+    const again = FRUN.start(tenant.id);
+    assert.notStrictEqual(again.already_running, true, 'a second start is not refused as "already running"');
+
+    // The operator's message arrives on the async 'error' event.
+    await until(() => FRUN.health(tenant.id).last_start_error, 'the launch failure to be reported');
+    assert.match(String(FRUN.health(tenant.id).last_start_error), /not installed or not on PATH|ENOENT|spawn/);
+
+    // And stop() must not leave it claiming to be running either.
+    FRUN.stop(tenant.id);
+    assert.strictEqual(FRUN.health(tenant.id).running, false, 'still not running after stop()');
+    // No respawn storm: the absence of an 'exit' event is DESIRABLE, so assert
+    // the failure was not scheduled into a retry loop.
+    const before = FRUN.health(tenant.id).consecutive_failures;
+    await new Promise((res) => setTimeout(res, 600));
+    assert.strictEqual(FRUN.health(tenant.id).consecutive_failures, before, 'a missing binary is not retried in a loop');
+  } finally {
+    FRUN.stopAll();
+    config.FEED_COLLECTOR_CMD = savedCmd;
+  }
+});
+
+// R11: THE CREDENTIAL-ROTATION PATH COMES BACK. This is the exact two-call
+// sequence the PUT /api/admin/feed/credentials route used to make.
+//
+// kill('SIGTERM') is asynchronous, so `state.child` was still set on the next
+// line: start() hit the already_running guard and spawned nothing, and then the
+// old child's exit handler saw stopping===true and returned early instead of
+// rescheduling. Saving rotated Betfair credentials — routine, expected
+// maintenance — permanently stopped the venue's odds feed, with no error, no log
+// line, and a response asserting collector_restarted: true.
+await check('R11 a credential rotation restarts the collector instead of stopping it', async () => {
+  const savedCmd = config.FEED_COLLECTOR_CMD;
+  config.FEED_COLLECTOR_CMD = FAKE;
+  try {
+    FC.setCredentials(db, { actor: admin, tenantId: tenant.id, ...GOOD });
+    FRUN.stop(tenant.id);
+    await until(() => !FRUN.health(tenant.id).running, 'the old collector to be gone');
+    FRUN.start(tenant.id);
+    await until(() => FRUN.health(tenant.id).running, 'a collector to be running');
+    const firstPid = FRUN.health(tenant.id).pid;
+    assert.ok(firstPid > 0, 'a real process is running');
+
+    // The restart. A live child is still terminating when this returns, so the
+    // response must say "pending" rather than claim a restart that has not
+    // happened yet.
+    const r = FRUN.restart(tenant.id, { actor: admin });
+    assert.strictEqual(r.pending, true, 'the launch is pending the old process exiting');
+    assert.strictEqual(r.restarted, false, 'and is NOT reported as already done');
+
+    // Wait for the pending restart to RESOLVE into a different pid — not merely
+    // for `running`, which is still true while the old process drains. That
+    // distinction is the whole bug: the old route waited on nothing at all and
+    // reported success.
+    await until(
+      () => {
+        const h = FRUN.health(tenant.id);
+        return h.running && !h.restart_pending && h.pid !== firstPid ? h : null;
+      },
+      'the collector to come back as a NEW process'
+    );
+    const after = FRUN.health(tenant.id);
+    assert.ok(after.pid && after.pid !== firstPid, 'a NEW process is running, not the old one');
+    assert.strictEqual(after.supervisor, 'running');
+    assert.strictEqual(after.restart_pending, false, 'and nothing is pending');
+
+    // The old process is really gone, not merely unreported.
+    let alive = true;
+    try {
+      process.kill(firstPid, 0);
+    } catch (e) {
+      alive = false;
+    }
+    assert.strictEqual(alive, false, 'the replaced collector is really gone');
+  } finally {
+    FRUN.stop(tenant.id);
+    await FRUN.stopAll();
+    config.FEED_COLLECTOR_CMD = savedCmd;
+  }
+});
+
+// R12: RESTART WITH NOTHING RUNNING IS A PLAIN START. The rotation path when
+// no collector is supervised must not report a pending restart that never
+// resolves, and must not invent a process.
+await check('R12 restarting a stopped runner starts it immediately', async () => {
+  const savedCmd = config.FEED_COLLECTOR_CMD;
+  config.FEED_COLLECTOR_CMD = FAKE;
+  try {
+    FRUN.stop(tenant.id);
+    await until(() => !FRUN.health(tenant.id).running, 'the runner to be stopped');
+    const r = FRUN.restart(tenant.id, { actor: admin });
+    assert.strictEqual(r.pending, false, 'nothing was terminating, so nothing is pending');
+    assert.strictEqual(r.restarted, true, 'and the launch happened synchronously');
+    await until(() => FRUN.health(tenant.id).running, 'the collector to be running');
+  } finally {
+    FRUN.stop(tenant.id);
+    await FRUN.stopAll();
+    config.FEED_COLLECTOR_CMD = savedCmd;
+  }
+});
+
+// R13: SHUTDOWN ACTUALLY STOPS THE COLLECTOR, AND ESCALATES. stopAll existed
+// and had ZERO callers: the server registered no SIGTERM/SIGINT handler, so the
+// default action killed the process, `server.on('close')` never fired, and the
+// old `betfeed collect` survived every restart — still holding a Betfair
+// session, still spending market-data weight, and competing with the new
+// collector for the same account. The new process reported supervisor: 'idle'
+// while a zombie ran on.
+//
+// stopAll is unit-tested against a live child here; the WIRING is asserted by
+// tests/shutdown.test.js, which sends a real signal to a real process. Both,
+// because the function being tested is precisely what hid the missing caller.
+await check('R13 stopAll() stops every collector and escalates to SIGKILL', async () => {
+  const savedCmd = config.FEED_COLLECTOR_CMD;
+  config.FEED_COLLECTOR_CMD = FAKE;
+  try {
+    FC.setCredentials(db, { actor: admin, tenantId: tenant.id, ...GOOD });
+    FRUN.start(tenant.id);
+    await until(() => FRUN.health(tenant.id).running, 'a collector to be running');
+    const pid = FRUN.health(tenant.id).pid;
+    assert.ok(pid > 0);
+
+    const r = await FRUN.stopAll();
+    assert.strictEqual(r.stopped, 1, 'it reported stopping one process');
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch (e) {
+      alive = false;
+    }
+    assert.strictEqual(alive, false, 'and the collector is really gone');
+
+    // Escalation: a collector that IGNORES SIGTERM must not hang the shutdown.
+    // `trap '' TERM` in a shell script is exactly that — a third-party Python
+    // collector that never installed a handler behaves the same way.
+    const stubborn = path.join(os.tmpdir(), `stubborn-collector-${process.pid}.sh`);
+    fs.writeFileSync(stubborn, '#!/bin/bash\ntrap "" TERM\nwhile true; do sleep 0.2; done\n', { mode: 0o755 });
+    config.FEED_COLLECTOR_CMD = stubborn;
+    FRUN.start(tenant.id);
+    await until(() => FRUN.health(tenant.id).running, 'the stubborn collector to be running');
+    const stubbornPid = FRUN.health(tenant.id).pid;
+    const esc = await FRUN.stopAll({ killAfterMs: 300 });
+    assert.strictEqual(esc.escalated, 1, 'a SIGTERM-ignoring child is SIGKILLed');
+    let stubbornAlive = true;
+    try {
+      process.kill(stubbornPid, 0);
+    } catch {
+      stubbornAlive = false;
+    }
+    assert.strictEqual(stubbornAlive, false, 'and is gone afterwards');
+    fs.rmSync(stubborn, { force: true });
+  } finally {
+    await FRUN.stopAll();
+    config.FEED_COLLECTOR_CMD = savedCmd;
+  }
+});
+
 // ── teardown ─────────────────────────────────────────────────────────────────
 
 FRUN.stopAll();
@@ -277,6 +468,10 @@ db.close();
 fs.rmSync(FAKE, { force: true });
 
 console.log(`\nfeedrunner.test.js: ${passed} checks passed`);
+if (failures.length) {
+  console.error(`failed: ${failures.join(', ')}`);
+  process.exitCode = 1;
+}
 if (failures.length) {
   console.error(`failed: ${failures.join(', ')}`);
   process.exitCode = 1;

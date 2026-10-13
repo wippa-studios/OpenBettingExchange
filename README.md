@@ -259,6 +259,10 @@ environment variables — the exchange never writes a `.env`. See
 | `GET /api/admin/feed/runner/:id?` | admin | supervisor state, restarts, exit codes, scrubbed log tail |
 | `POST /api/admin/feed/runner/start` \| `/stop` | admin | start or stop the collector |
 
+`SIGTERM`/`SIGINT` drain the venue: jobs stopped, collector stopped (SIGTERM,
+then SIGKILL after a grace period), listener closed, exit 0 — so a restart
+cannot leave an orphaned collector still spending Betfair market-data weight.
+
 | `FEED_STALE_SECONDS` | `300` | frame age beyond which the board reports stale |
 | `FEED_MARKET_LIMIT` | `60` | markets returned to the board |
 | `BOT_ENABLED` / `DRIFT_ENABLED` | `true` | demo liquidity and price drift (ignored when the feed is on) |
@@ -312,7 +316,7 @@ including why a staleness guard was built and then deleted.
 ## Development
 
 ```bash
-npm test            # 608 checks, 46 suites — unit + API integration, fully offline
+npm test            # 613 checks, 47 suites — unit + API integration, fully offline
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 74 checks — real Chromium via Playwright (board + admin desk)
 npm run docs:check  # fail if the documentation contradicts the code

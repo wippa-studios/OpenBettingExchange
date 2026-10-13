@@ -913,13 +913,28 @@ app.put('/api/admin/feed/credentials/:id?', requireAdmin, limit('admin'), (req, 
   // supervised collector rather than leaving it running on the old one — the
   // single most confusing possible outcome otherwise ("I saved it and nothing
   // changed"). Never restarted without supervision.
-  let restarted = false;
+  //
+  // FRUN.restart(), NOT stop() followed by start(). kill('SIGTERM') is
+  // ASYNCHRONOUS, so the old sequence found `state.child` still set one line
+  // later, bailed at the already_running guard, and spawned nothing — and then
+  // the old child's exit saw stopping===true and returned instead of
+  // rescheduling. Net effect: saving rotated credentials PERMANENTLY STOPPED
+  // the venue's odds feed, with no error, no log line, and a response claiming
+  // a successful restart. See lib/feedrunner.js restart().
+  //
+  // The response now says which of the two things happened. `collector_
+  // restarted` is true only when a new child is already up;
+  // `collector_restart_pending` is true when the old process is still
+  // terminating and the launch follows on its exit.
+  let collector = { restarted: false, pending: false };
   if (FRUN.health(result.tenant_id).running) {
-    FRUN.stop(result.tenant_id);
-    FRUN.start(result.tenant_id);
-    restarted = true;
+    collector = FRUN.restart(result.tenant_id, { actor: req.user });
   }
-  res.json({ ...result, collector_restarted: restarted });
+  res.json({
+    ...result,
+    collector_restarted: !!collector.restarted,
+    collector_restart_pending: !!collector.pending,
+  });
 });
 
 app.delete('/api/admin/feed/credentials/:id?', requireAdmin, limit('admin'), (req, res) => {
@@ -2237,6 +2252,69 @@ async function main() {
   // A hung SSE connection must not keep the process alive on shutdown.
   server.on('close', closeStreams);
   server.on('close', () => { FEED.close().catch(() => {}); });
+
+  installShutdown(server);
+}
+
+/**
+ * ── SHUTDOWN ──────────────────────────────────────────────────────────────────
+ *
+ * THERE WAS NO SHUTDOWN PATH. The only `process.on` registrations were
+ * unhandledRejection and uncaughtException, so a SIGTERM from systemd, docker or
+ * a supervisor took the DEFAULT action and terminated the process immediately:
+ * `server.close()` was never called, so the `server.on('close')` handlers
+ * (closeStreams, FEED.close) never ran, and — the part that matters —
+ * FRUN.stopAll() was never called, because it had no callers at all.
+ *
+ * The collector is a child process with no parent-death signal. So every
+ * deploy, every crash and every Ctrl-C left the previous `betfeed collect`
+ * running: still holding a Betfair session, still spending market-data weight,
+ * still writing into the feed PostgreSQL, and now competing with the new
+ * collector for the same account. The new process started with an empty
+ * in-memory `runners` map, so it reported `supervisor: 'idle'` and `stop()`
+ * answered "the collector was not running" — the operator was told nothing was
+ * running while a zombie was. Two collectors on one Betfair account is the
+ * fastest route to being rate-limited or banned.
+ *
+ * The order matters. Timers first, so no new work is queued; then the
+ * collector, because it is the thing that outlives us; then the listener, so
+ * in-flight requests finish. And the whole thing has a hard deadline: a
+ * shutdown handler that hangs forever is worse than none, because it turns
+ * SIGTERM into a hang for whatever supervises the service — so if the drain
+ * does not finish we exit anyway rather than sit there.
+ */
+function installShutdown(server) {
+  let shuttingDown = false;
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    process.on(sig, () => {
+      // A second Ctrl-C must not begin a second shutdown.
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.log(`[shutdown] ${sig} — stopping jobs and the feed collector`);
+      for (const t of jobTimers) {
+        try { t.stop(); } catch { /* a job that is not a timer */ }
+      }
+      // stopAll() escalates to SIGKILL itself; this is the OUTER bound, so
+      // nothing here may hold the process open indefinitely.
+      const deadline = setTimeout(() => {
+        console.error('[shutdown] drain did not finish in time; exiting anyway');
+        process.exit(1);
+      }, 10_000);
+      FRUN.stopAll()
+        .then((r) => {
+          console.log(`[shutdown] collector stopped (${r.stopped} process(es), ${r.escalated} SIGKILLed)`);
+        })
+        .catch(() => {})
+        .then(() => {
+          clearTimeout(deadline);
+          server.close(() => process.exit(0));
+          // server.close() waits for keep-alive connections to drain. It is not
+          // allowed to be the reason a service restart hangs.
+          const hard = setTimeout(() => process.exit(0), 3_000);
+          if (hard.unref) hard.unref();
+        });
+    });
+  }
 }
 
 // main() is async (it awaits the seed bootstrap and the first-run lock's key
