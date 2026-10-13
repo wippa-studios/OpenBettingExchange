@@ -424,6 +424,57 @@ check('A19 a wildcard or empty session id revokes nothing at all', async () => {
   assert.strictEqual(liveSessions(other.id), 1, "the other account is untouched");
 });
 
+// A20 (#35): the password-type rule, enforced ONCE in verifyPassword instead
+// of four times at the boundaries.
+//
+// The rule had been written three times and missed twice on this one module.
+// changePassword checked newPassword and passed currentPassword straight into
+// verifyPassword, which did String(password) internally, so
+// {"currentPassword":["secret1"]} authenticated — and then revoked every other
+// session, so a successful type-confused change is also an account-takeover
+// primitive. loginUser, which is also not behind validateCredentials, issued a
+// full session token for {"password":["secret1"]}.
+//
+// The assertions that carry weight are the ones about the EFFECT: the stored
+// hash is byte-identical afterwards, and the caller's session is still live. A
+// test that only checked for a thrown error would be satisfied by a 401 from
+// the ordinary wrong-password path.
+check('A20 a non-string password is refused and never coerced', async () => {
+  const db = fresh();
+  const u = (await A.registerUser(db, { username: 'joel', password: 'secret1' }));
+  const mine = A.createSession(db, u.id);
+  const stored = db.prepare('SELECT pass_hash FROM users WHERE id=?').get(u.id).pass_hash;
+
+  // changePassword: a non-string current password is a 400 at the boundary,
+  // and it must not have done any of the work a successful call would.
+  for (const bad of [['secret1'], ['secret1', 'x'], 123, null, undefined, true, { toString: () => 'secret1' }]) {
+    await assert.rejects(
+      A.changePassword(db, { userId: u.id, currentPassword: bad, newPassword: 'secret2', keepToken: mine }),
+      (e) => e.status === 400,
+      `currentPassword ${JSON.stringify(bad)} is a 400, not a coerced authenticate`
+    );
+  }
+  assert.strictEqual(db.prepare('SELECT pass_hash FROM users WHERE id=?').get(u.id).pass_hash, stored,
+    'the password was never changed');
+  assert.ok(A.sessionUser(db, mine), 'and no session was revoked — that is the takeover primitive');
+
+  // loginUser: the same body authenticates nothing.
+  await assert.rejects(A.loginUser(db, { username: 'joel', password: ['secret1'] }), (e) => e.status === 401);
+  assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM sessions WHERE user_id=?').get(u.id).c, 1,
+    'no session token was minted by the array form');
+
+  // The primitive itself: no input shape coerces into a match.
+  for (const bad of [['secret1'], null, 123, true, { toString: () => 'secret1' }]) {
+    assert.strictEqual(await A.verifyPassword(bad, stored), false, `${JSON.stringify(bad)} does not verify`);
+  }
+  assert.strictEqual(await A.verifyPassword('secret1', stored), true, 'the real password still verifies');
+
+  // And the happy path is untouched.
+  const r = await A.changePassword(db, { userId: u.id, currentPassword: 'secret1', newPassword: 'secret2', keepToken: mine });
+  assert.strictEqual(r.sessionsRevoked, 0, 'the caller keeps their only session');
+  assert.ok((await A.loginUser(db, { username: 'joel', password: 'secret2' })).token);
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
