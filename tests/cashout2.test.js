@@ -27,7 +27,6 @@ const M = require('./../lib/match');
 const settle = require('../lib/settle');
 const cashout = require('../lib/cashout');
 const acc = require('../lib/accounts');
-const config = require('./../lib/config');
 
 let passed = 0;
 // Checks here are async (lib/auth.js derives password hashes off the event
@@ -256,13 +255,45 @@ check('C11 a second cash-out of the same position is refused', async () => {
 });
 
 // C12: a player with no position gets no quote, and neither does the house.
+//
+// The house half of this check was literally `void config;` — a placeholder
+// where the assertion should have been, so "neither does the house" was a claim
+// the file made about itself and never tested. The same failure mode as C7 in
+// cashout.test.js: to assert that a guard fired, every OTHER reason for the same
+// outcome has to be excluded, or the assertion is satisfied by whichever branch
+// happens to run first.
 check('C12 no position, or the house, gets no quote', async () => {
   const { db, alice, bob, marketId, ids } = (await fixture());
+  // Alice backs Alpha at 2.5 against a fair 2.0 -> PROFITABLE (+15000 /
+  // -10000 -> +2500). She is the control.
   M.placeOrder(db, alice, { selection_id: ids.Alpha, side: 'back', price: 2.5, stake_cents: 10000 });
   M.placeOrder(db, bob, { selection_id: ids.Alpha, side: 'lay', price: 2.5, stake_cents: 10000 });
   const carol = (await A.registerUser(db, { username: 'carol', password: 'pw-carol-123', balance_cents: 100000 }));
   assert.strictEqual(cashout.cashoutQuote(db, carol, marketId), null, 'no position');
-  void config;
+
+  // The house LAYS Alpha at 1.5 against the same fair 2.0 -> also PROFITABLE
+  // (-5000 / +10000 -> +2500). Its 1.5 lay does not sweep Alice's resting 2.5
+  // back (a lay takes backs at P <= Q), so the two positions coexist.
+  const bot = require('../lib/bots').ensureBot(db);
+  M.placeOrder(db, bot, { selection_id: ids.Alpha, side: 'lay', price: 1.5, stake_cents: 10000 });
+  M.placeOrder(db, carol, { selection_id: ids.Alpha, side: 'back', price: 1.5, stake_cents: 10000 });
+
+  // EXCLUSION 1 — a profitable player in this market IS quoted.
+  assert.ok(cashout.cashoutQuote(db, alice, marketId),
+    'a profitable player IS quoted, so the refusal below is not a blanket decline');
+
+  // EXCLUSION 2 — the HOUSE'S OWN position is worth money, so the pricing gate
+  // (`if (!(priced > 0)) return null`, which runs BEFORE the is_bot gate)
+  // cannot be what refused it.
+  const houseBets = M.myMatchedBets(db, bot.id, marketId);
+  assert.strictEqual(houseBets.length, 1, 'the house really does hold a position here');
+  const probs = cashout.fairProbsFor(db, marketId);
+  const houseFair = cashout.payoutsFor(houseBets, [ids.Alpha, ids.Beta])
+    .reduce((acc, p) => acc + probs.get(p.selection_id) * p.payout_cents, 0);
+  assert.ok(houseFair > 0, `the house's own position is worth ${houseFair}, so the pricing gate cannot fire`);
+
+  assert.strictEqual(cashout.cashoutQuote(db, bot, marketId), null,
+    'the house is refused by the is_bot guard specifically');
 });
 
 // C13: THE LAY SIDE OF THE SAME FLOW. C8 cashes out the BACK player, and for
