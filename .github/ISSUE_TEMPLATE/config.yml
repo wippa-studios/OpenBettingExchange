@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  # The issue-template config used to live at .github/config.yml — GitHub's
+  # legacy location, which it no longer reads. It was silently doing nothing:
+  # blank issues were possible and the contact links never rendered.
+  - name: Security vulnerability
+    url: https://github.com/wippa-studios/OpenBettingExchange/security/advisories/new
+    about: Report privately. Never open a public issue about a credential or a money bug.
+  - name: Question or idea
+    url: https://github.com/wippa-studios/OpenBettingExchange/discussions
+    about: Ask questions and propose features in Discussions.
