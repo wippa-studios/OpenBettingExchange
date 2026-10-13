@@ -48,7 +48,8 @@ const clean = (db) => {
 async function fixture() {
   const db = openStore(':memory:');
   const alice = (await A.registerUser(db, { username: 'alice', password: 'pw-alice-123', balance_cents: 100000 }));
-  return { db, alice };
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-123', balance_cents: 0 }));
+  return { db, alice, bob };
 }
 
 // ── F1: the critical one. Any player could mint unlimited money by
@@ -107,6 +108,47 @@ check('A3 (F1) a compromised webhook is bounded by the daily cumulative cap', as
     assert.strictEqual(bal(db, alice.id).b, 160000, 'first confirm passes');
     assert.throws(() => pay.confirmDeposit(db, b.intent_id), /daily cumulative cap/);
     assert.strictEqual(bal(db, alice.id).b, 160000, 'the second does not credit');
+  } finally {
+    config.DEPOSIT_DAILY_MAX_CENTS = prev;
+  }
+  clean(db);
+});
+
+// A3b: the daily cap is PER USER. The sum that enforces it had no user_id
+// predicate while row.user_id sat in scope, so DEPOSIT_DAILY_MAX_CENTS —
+// documented as "cumulative per user per day" — was a venue-wide total. Two
+// players each depositing half the cap exhausted it between them, and the
+// second was refused over money that was never theirs. The cap named after a
+// per-user limit was the one thing bounding a single compromised account, and
+// it was shared.
+//
+// With the venue-wide bug in place, alice's 60000 + bob's 60000 hits the
+// 100000 ceiling and bob is refused. With the predicate in place both land.
+check('A3b the daily cumulative cap is scoped PER USER, not venue-wide', async () => {
+  const { db, alice, bob } = (await fixture());
+  const prev = config.DEPOSIT_DAILY_MAX_CENTS;
+  config.DEPOSIT_DAILY_MAX_CENTS = 100000; // $1,000 a day each
+  try {
+    const aliceIntent = await pay.openDeposit(db, alice.id, 60000);
+    const bobIntent = await pay.openDeposit(db, bob.id, 60000);
+    pay.confirmDeposit(db, aliceIntent.intent_id);
+    pay.confirmDeposit(db, bobIntent.intent_id);
+
+    assert.strictEqual(bal(db, alice.id).b, 160000, "alice credited, and only alice's own deposits count");
+    assert.strictEqual(
+      bal(db, bob.id).b,
+      60000,
+      "bob is credited too — alice's $600 is not bob's problem"
+    );
+
+    // …and the per-user cap is still real: bob's own second deposit refuses.
+    const bobSecond = await pay.openDeposit(db, bob.id, 60000);
+    assert.throws(() => pay.confirmDeposit(db, bobSecond.intent_id), /daily cumulative cap/);
+    assert.strictEqual(bal(db, bob.id).b, 60000, 'and credits nothing');
+    // …while alice, having deposited less in total, can still deposit.
+    const aliceSecond = await pay.openDeposit(db, alice.id, 40000);
+    pay.confirmDeposit(db, aliceSecond.intent_id);
+    assert.strictEqual(bal(db, alice.id).b, 200000, "alice's own cap tracks her own money");
   } finally {
     config.DEPOSIT_DAILY_MAX_CENTS = prev;
   }
@@ -401,6 +443,6 @@ check('A13 (F8) the faucet is per-deposit, and that is documented and deliberate
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 13) { console.error('expected 13 checks'); process.exit(1); }
+  if (passed < 14) { console.error('expected 14 checks'); process.exit(1); }
   console.log(`\naudit.test.js: ${passed} checks passed`);
 })();
