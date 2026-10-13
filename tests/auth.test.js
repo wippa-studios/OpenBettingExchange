@@ -385,6 +385,45 @@ check('A18 a login does not stall other work on the event loop', async () => {
   assert.ok(worst < 20, `worst event-loop stall was ${worst}ms (scryptSync would be ~42ms)`);
 });
 
+// A19 (#29): a session id is a PREFIX, and the old query treated it as a LIKE
+// PATTERN. In SQLite `_` matches any single character and `%` any sequence, so
+// an endpoint whose entire job is "revoke ONE session" revoked EVERY session
+// the account had — and answered {revoked: true}, because changes > 0.
+//
+// The assertion that matters is the session COUNT afterwards, not the return
+// value: a test that only checks the reply is satisfied by both behaviours,
+// because the buggy one also reports success. Before this check nothing
+// covered it at all.
+check('A19 a wildcard or empty session id revokes nothing at all', async () => {
+  const db = fresh();
+  const me = (await A.registerUser(db, { username: 'myself', password: 'secret1' }));
+  const other = (await A.registerUser(db, { username: 'other', password: 'secret1' }));
+  const a = A.createSession(db, me.id);
+  A.createSession(db, me.id);
+  A.createSession(db, me.id);
+  const theirs = A.createSession(db, other.id);
+  const liveSessions = (id) => A.listSessions(db, id, null).length;
+  assert.strictEqual(liveSessions(me.id), 3, 'three sessions to protect');
+
+  // Each of these matched EVERY row under LIKE. Under the fix they match none.
+  for (const wildcard of ['_', '%', '_%', '', null, undefined, 0, false, '____________']) {
+    assert.throws(
+      () => A.revokeSession(db, me.id, wildcard),
+      (e) => e.status === 400 || e.status === 404,
+      `${JSON.stringify(wildcard)} is refused`
+    );
+    assert.strictEqual(liveSessions(me.id), 3, `${JSON.stringify(wildcard)} revoked NO session`);
+  }
+  assert.ok(A.sessionUser(db, a), 'and the real token still works');
+  assert.ok(A.sessionUser(db, theirs), "another account's session is untouched too");
+
+  // The control: a REAL id still revokes exactly one, and only that one.
+  const victim = A.listSessions(db, me.id, null).find((s) => s.id !== A.hashToken(a).slice(0, 12));
+  assert.strictEqual(A.revokeSession(db, me.id, victim.id).revoked, true);
+  assert.strictEqual(liveSessions(me.id), 2, 'exactly one, not all');
+  assert.strictEqual(liveSessions(other.id), 1, "the other account is untouched");
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
