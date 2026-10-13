@@ -11,6 +11,7 @@
     "test:ui": "node tests/ui_test.mjs",
     "shots": "node scripts/shoot.mjs",
     "docs:check": "node scripts/check-docs.mjs",
+    "check:secrets": "node scripts/check-no-secrets.mjs",
     "load": "node scripts/load-test.mjs"
   },
   "engines": {

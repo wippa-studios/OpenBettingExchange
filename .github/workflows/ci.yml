@@ -100,6 +100,18 @@ jobs:
             exit 1
           fi
 
+      # The step above checks for key FILES. The actual incident was a credential
+      # VALUE pasted into an ordinary .js test fixture as "obviously fake sample
+      # data" — a live Betfair app key and username, committed and pushed to a
+      # PUBLIC repository. A filename check cannot see that; a value check can.
+      #
+      # Honest limitation, stated so nobody over-trusts it: CI has no .env, so
+      # here it verifies the script runs and finds nothing. Its teeth are on the
+      # operator's machine (`npm run check:secrets`). Covering history and CI
+      # properly wants a real scanner (gitleaks/trufflehog) over full history.
+      - name: No credential value from .env is committed
+        run: node scripts/check-no-secrets.mjs
+
       - name: No stray large files
         run: |
           # node_modules, a database, or a screenshot dump would bloat history
