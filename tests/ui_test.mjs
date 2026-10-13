@@ -106,12 +106,19 @@ let signedIn = false;
 // wrong-password login is an expected rejection, not a defect.
 let expectAuth401 = false;
 const EXPECTED_PREAUTH_401 = /401 \(Unauthorized\)/;
+// Set while the first-run-lock scenario runs. A locked account is refused by
+// everything outside SETUP_ALLOWLIST — including the board the app re-renders
+// behind the password panel — so Chromium logs those 403s. That is the lock
+// WORKING, exactly as the signed-out 401 above is the whoami probe working.
+let expectLock403 = false;
+const EXPECTED_LOCK_403 = /403 \(Forbidden\)/;
 page.on('pageerror', (e) => pageErrors.push(String(e)));
 page.on('console', (msg) => {
   if (msg.type() !== 'error') return;
   const text = 'console.error: ' + msg.text();
   if (!signedIn && EXPECTED_PREAUTH_401.test(msg.text())) return;
   if (expectAuth401 && EXPECTED_PREAUTH_401.test(msg.text())) return;
+  if (expectLock403 && EXPECTED_LOCK_403.test(msg.text())) return;
   pageErrors.push(text);
 });
 
@@ -620,6 +627,71 @@ try {
   await page.waitForTimeout(600);
   const setupShown = await page.locator('#accountModal.show').count();
   check('a configured password does not trigger the setup lock', setupShown === 0, `(${setupShown} modal(s))`);
+
+  // ── #44: the LOCKED sign-in actually forces setup ───────────────────────
+  //
+  // The check above only ever proved the NEGATIVE — that an unlocked account
+  // does not open the panel. It passed with maybeForceSetup() throwing a
+  // ReferenceError, because the throw was swallowed by submitAuth's own catch
+  // and the panel stayed closed either way. So the bug shipped with a green
+  // test beside it.
+  //
+  // This drives the POSITIVE: the server is made to flag demo as locked (the
+  // same column server.js's boot sweep writes), then demo signs in and the UI
+  // must open the panel and say what is wrong.
+  await scenario('a locked account is routed to the password panel on sign-in', async () => {
+    // Sign OUT before flipping the flag. Flipping it under a live session
+    // leaves that session polling endpoints it is no longer allowed to reach,
+    // and the resulting 403 is this test manufacturing its own console error.
+    await page.click('#authBtn');
+    await page.waitForFunction(() => document.getElementById('authBtn').textContent === 'Sign in', null, { timeout: 10000 });
+
+    // The server is made to flag demo as locked — the same column server.js's
+    // boot sweep writes — so this is the real lock, not a mocked flag.
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(path.join(TMP, 'ui.db'));
+    db.prepare('UPDATE users SET must_change_password = 1 WHERE username = ?').run('demo');
+    db.close();
+
+    await page.click('#authBtn');
+    await page.waitForSelector('#authModal.show', { timeout: 5000 });
+    await page.fill('#authUser', 'demo');
+    await page.fill('#authPass', 'ui-demo-password');
+    expectLock403 = true;
+    await page.click('#authGo');
+
+    // The panel must open on its own. Nothing here clicks anything to get it.
+    await page.waitForSelector('#accountModal.show', { timeout: 10000 });
+    check('a locked sign-in opens the account panel by itself', true);
+
+    const toastText = (await page.locator('#toast').textContent()) || '';
+    check(
+      'the lock is stated, not left to be discovered on a 403',
+      /change your password/i.test(toastText),
+      `("${toastText.trim()}")`
+    );
+
+    // And the panel must be USABLE: the routes it needs are all on the
+    // server's SETUP_ALLOWLIST, so the session list must load rather than 403.
+    await page.waitForFunction(
+      () => /this device/.test(document.getElementById('sessionList').textContent || ''),
+      null,
+      { timeout: 10000 }
+    );
+    check('the locked account can still see its own sessions', true);
+
+    // Clear the lock through the panel, so the run ends the way it started.
+    await page.fill('#pwCurrent', 'ui-demo-password');
+    await page.fill('#pwNew', 'ui-demo-password-2');
+    await page.click('#pwGo');
+    await page.waitForFunction(
+      () => /Password changed/.test(document.getElementById('pwNote').textContent || ''),
+      null,
+      { timeout: 10000 }
+    );
+    check('the panel actually unlocks the account', true);
+    expectLock403 = false;
+  });
 
   check('no uncaught page errors during the whole run', pageErrors.length === 0, pageErrors.join(' | '));
 } catch (e) {

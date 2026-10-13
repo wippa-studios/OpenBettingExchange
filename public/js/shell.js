@@ -56,6 +56,38 @@
   }
   const closeAuth = () => OB.closeOverlay(OB.$('authModal'));
 
+  /**
+   * Act on `must_change_password` immediately after a successful sign-in.
+   *
+   * This function was CALLED at the end of submitAuth and DEFINED nowhere in the
+   * repository. The login itself had already succeeded and the header had
+   * already been rendered by the time the bare identifier was resolved, so the
+   * ReferenceError was raised at the last statement of the try block — and the
+   * catch turned it into `OB.toast('maybeForceSetup is not defined', 'err')`,
+   * replacing the "Welcome back" that had just been shown. Every single sign-in
+   * therefore ended on an error toast about an internal bug, and the lock this
+   * line was written to surface was never surfaced at all.
+   *
+   * The behaviour is the one the call site's comment describes and the one
+   * lib/auth.js's sanitizeUser promises the client when it exposes
+   * must_change_password: "the UI can route the account straight to the
+   * password panel instead of letting them discover the lock by clicking".
+   *
+   * So: open the account panel — which is where the change-password form lives,
+   * and every route it needs (GET /api/me, POST /api/auth/change-password,
+   * GET /api/auth/sessions) is on the server's SETUP_ALLOWLIST, so a locked
+   * account can actually use it — and say plainly what is wrong.
+   *
+   * Toasting the lock REPLACES the "Welcome back" it follows, deliberately. A
+   * cosmetic greeting and a hard block deserve different weight, and the block
+   * is the one the operator must act on before anything else will work.
+   */
+  function maybeForceSetup(user) {
+    if (!user || !user.must_change_password) return;
+    OB.toast('Change your password before using the exchange', 'err');
+    openAccount();
+  }
+
   async function submitAuth() {
     const identifier = OB.$('authUser').value.trim();
     const password = OB.$('authPass').value;
