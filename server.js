@@ -96,17 +96,43 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Origin guard FIRST, before any body parsing: mutating requests need no
-// Origin (curl/local tooling) or a loopback/same-host origin (JIT/bet-agent
-// pattern). Running it before express.json() means a foreign origin gets 403
-// even when the body is malformed. ──────────────────────────────────────────
+// ── Origin guard FIRST, before any body parsing ───────────────────────────────
+//
+// The rule is SIMPLE, and it was previously two rules that were each wrong:
+//
+//   no Origin            => allowed. A browser ALWAYS sends Origin on a
+//                          cross-origin mutating request, so its absence means
+//                          this is not a browser: curl, a local agent, a script.
+//   Origin present       => it MUST equal the authority the request addressed.
+//
+// The old check compared `u.hostname` against a loopback set and nothing else:
+//
+//   - It ignored the PORT, so `http://127.0.0.1:9999` was accepted. Browsers
+//     exclude ports from the site calculation, so a page served by ANY local
+//     server on a different port is SAME-SITE, `SameSite` does not protect it,
+//     and that page could drive the exchange with the operator's session. The
+//     guard was written to stop precisely that and did not.
+//   - It REJECTED legitimate IPv6 clients: `new URL('http://[::1]:7777')` has
+//     hostname `[::1]` WITH the brackets, which never equals the `'::1'` it was
+//     compared against. So the venue on ::1 refused its own client.
+//
+// Matching the full authority (`host:port`) against the `Host` header closes the
+// first and fixes the second. Behind a reverse proxy that rewrites Host this
+// would need the forwarded host instead — but the venue binds loopback only, so
+// direct access is the norm, and a wrong comparison fails CLOSED (403), which is
+// the direction to fail in.
+//
+// Running it before express.json() means a foreign origin gets 403 even when
+// the body is malformed.
 app.use((req, res, next) => {
   if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
   const origin = req.headers.origin;
   if (!origin) return next();
   try {
     const u = new URL(origin);
-    if (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '::1') return next();
+    // `u.host` is authority WITH the port, brackets preserved. Compare the whole
+    // thing against the authority the client addressed.
+    if (u.host && req.headers.host && u.host === req.headers.host) return next();
   } catch {}
   return res.status(403).json({ error: 'Forbidden origin' });
 });

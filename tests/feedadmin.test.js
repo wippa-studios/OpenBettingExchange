@@ -43,7 +43,7 @@ const check = async (name, fn) => {
   }
 };
 
-const GOOD = { app_key: 'eldno0TOrTIbJozT', username: 'JSIrwin', password: 'Skullman2540' };
+const GOOD = { app_key: 'TESTKEYnotreal12', username: 'test.bettfair-demo', password: 'not-a-real-password' };
 const TENANT = '/api/admin/feed';
 
 async function main() {

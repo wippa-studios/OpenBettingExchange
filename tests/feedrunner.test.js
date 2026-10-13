@@ -64,7 +64,7 @@ async function check(name, fn) {
   }
 }
 
-const GOOD = { appKey: 'eldno0TOrTIbJozT', username: 'JSIrwin', password: 'Skullman2540' };
+const GOOD = { appKey: 'TESTKEYnotreal12', username: 'test.bettfair-demo', password: 'not-a-real-password' };
 
 const db = openStore(':memory:');
 FRUN.setDb(db);

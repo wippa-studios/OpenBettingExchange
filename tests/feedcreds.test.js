@@ -35,7 +35,7 @@ function check(name, fn) {
   }
 }
 
-const GOOD = { appKey: 'eldno0TOrTIbJozT', username: 'JSIrwin', password: 'Skullman2540' };
+const GOOD = { appKey: 'TESTKEYnotreal12', username: 'test.bettfair-demo', password: 'not-a-real-password' };
 
 function venue() {
   const db = openStore(':memory:');
@@ -133,7 +133,7 @@ check('K7 status() reveals WHICH fields exist and never their values', () => {
   assert.strictEqual(st.username_set, true);
   assert.strictEqual(st.password_set, true);
 
-  for (const secret of [GOOD.appKey, GOOD.username, GOOD.password, 'eldno0', 'Skullman', 'JSIrwin']) {
+  for (const secret of [GOOD.appKey, GOOD.username, GOOD.password, 'TESTKEYno', 'not-a-real', 'bettfair-demo']) {
     assert.ok(!serialised.includes(secret), `status() leaked ${JSON.stringify(secret)}`);
   }
   // Not even a prefix of the app key: it is half of a credential pair.
