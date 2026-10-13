@@ -202,6 +202,58 @@ check('I10 a replay after settlement still returns the original order', async ()
   assert.strictEqual(acc.assertConserved(db), 0);
 });
 
+// #53: the predicate placeOrder() uses to recognise a lost idempotency race.
+//
+// It tested for the INDEX NAME `idx_orders_client_id`, and SQLite never puts
+// an index name in a UNIQUE error — it puts the COLUMN LIST. Verified against
+// the driver on this very schema: errcode 2067,
+// "UNIQUE constraint failed: orders.user_id, orders.client_order_id".
+// So the predicate was false for every error it could ever see, and the
+// race-recovery branch above was unreachable: the loser of two concurrent
+// retries got a 500 instead of the order it had already placed.
+//
+// THE ERROR HERE IS CAUGHT FROM A REAL DUPLICATE INSERT, never hand-built.
+// A fixture is written to match whatever the implementation looks for, so it
+// passes against a predicate that can never return true — which is the whole
+// bug. SQLite is the only thing that can say what it actually emits.
+check('I7 the client-order-id conflict predicate recognises a REAL duplicate', async () => {
+  const { db, alice, s1 } = (await fixture());
+  M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000, client_order_id: 'race-key' });
+
+  let caught = null;
+  try {
+    // The same (user_id, client_order_id) pair, inserted raw — so the INSERT
+    // reaches the UNIQUE index rather than being short-circuited by
+    // placeOrder's own prior-order read.
+    db.prepare(
+      `INSERT INTO orders (user_id, market_id, selection_id, side, price, stake_cents, status, client_order_id)
+       VALUES (?, 1, ?, 'back', 2.0, 5000, 'open', 'race-key')`
+    ).run(alice.id, s1);
+  } catch (e) {
+    caught = e;
+  }
+  assert.ok(caught, 'the duplicate really was refused by the index');
+  // Pin what the driver says, so this test fails LOUDLY if SQLite changes its
+  // wording rather than quietly becoming a tautology.
+  assert.match(caught.message, /UNIQUE constraint failed/, caught.message);
+  assert.strictEqual(M.isClientOrderIdConflict(caught), true, `driver said: ${caught.message}`);
+});
+
+// …and it must still be precise. An unrelated UNIQUE violation is not an
+// idempotent replay, and swallowing one would hide a real 500.
+check('I8 the predicate does not swallow an unrelated unique violation', async () => {
+  let caught = null;
+  try {
+    const db = openStore(':memory:');
+    await A.registerUser(db, { username: 'twin', password: 'secret1' });
+    await A.registerUser(db, { username: 'twin', password: 'secret1' });
+  } catch (e) {
+    caught = e;
+  }
+  assert.ok(caught, 'the duplicate username really was refused');
+  assert.strictEqual(M.isClientOrderIdConflict(caught), false, `driver said: ${caught.message}`);
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -218,6 +270,6 @@ check('I10 a replay after settlement still returns the original order', async ()
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 10) { console.error('expected 10 checks'); process.exit(1); }
+  if (passed < 12) { console.error('expected 12 checks'); process.exit(1); }
   console.log(`\nidempotency.test.js: ${passed} checks passed`);
 })();
