@@ -1245,12 +1245,23 @@ app.get('/api/admin/risk', requireAdmin, limit('admin'), (req, res) => {
   res.json({ kill_switch: RISK.killSwitch(db), bots: RISK.desk(db, bots.riskDefaults()) });
 });
 
+// BOTH of these prompt for a reason in the UI, and both now keep it.
+//
+// The kill-switch route used to read only `on`, and the withdraw route used to
+// discard the request body entirely — so a justification was collected in the
+// browser, sent over the wire, and thrown away by the server, while the prompt
+// told the operator it was "recorded in the audit log". The kill switch is the
+// most consequential write the venue offers (every bot stops quoting on the
+// next pass) and the withdraw is a venue-wide liquidity event; neither left a
+// recorded reason, and lib/bots.js had no audit call at all.
 app.put('/api/admin/risk/kill-switch', requireAdmin, limit('admin'), (req, res) => {
-  res.json(RISK.setKillSwitch(db, { actor: req.user, on: !!(req.body || {}).on }));
+  const b = req.body || {};
+  res.json(RISK.setKillSwitch(db, { actor: req.user, on: !!b.on, reason: b.reason }));
 });
 
 app.post('/api/admin/risk/withdraw', requireAdmin, limit('admin'), (req, res) => {
-  res.json(bots.withdrawAll(db));
+  const { reason } = req.body || {};
+  res.json(bots.withdrawAll(db, { actor: req.user, reason }));
 });
 
 // No `wrap` indirection: it was invoked exactly once, immediately, and existed

@@ -154,7 +154,7 @@ check('R8 desk kill switch stops all quoting', async () => {
   bots.quoteMarket(db, marketId);
   assert.ok(db.prepare("SELECT COUNT(*) c FROM orders WHERE user_id=? AND status='open'").get(bot.id).c > 0);
 
-  risk.setKillSwitch(db, { actor: adm, on: true });
+  risk.setKillSwitch(db, { actor: adm, on: true, reason: 'testing the desk kill switch' });
   assert.strictEqual(risk.killSwitch(db), true);
   bots.quoteMarket(db, marketId);
   assert.strictEqual(db.prepare("SELECT COUNT(*) c FROM orders WHERE user_id=? AND status='open'").get(bot.id).c, 0,
@@ -170,7 +170,7 @@ check('R9 kill switch alone does not cancel resting quotes', async () => {
   bots.quoteMarket(db, marketId);
   const resting = db.prepare("SELECT COUNT(*) c FROM orders WHERE user_id=? AND status='open'").get(bot.id).c;
   assert.ok(resting > 0);
-  risk.setKillSwitch(db, { actor: adm, on: true });
+  risk.setKillSwitch(db, { actor: adm, on: true, reason: 'testing the desk kill switch' });
   const still = db.prepare("SELECT COUNT(*) c FROM orders WHERE user_id=? AND status='open'").get(bot.id).c;
   assert.strictEqual(still, resting, 'resting quotes untouched by the kill switch');
 });
@@ -178,10 +178,11 @@ check('R9 kill switch alone does not cancel resting quotes', async () => {
 // R10: withdraw is the explicit, separate withdrawal of liquidity.
 check('R10 withdraw cancels resting quotes and releases escrow', async () => {
   const { db, bot, marketId } = (await fixture());
+  const adm = (await A.registerUser(db, { username: 'ops', password: 'pw-ops-123' }));
   bots.quoteMarket(db, marketId);
   const before = db.prepare("SELECT COUNT(*) c, COALESCE(SUM(frozen_cents),0) f FROM orders WHERE user_id=? AND status='open'").get(bot.id);
   assert.ok(before.c > 0 && before.f > 0);
-  const r = bots.withdrawAll(db);
+  const r = bots.withdrawAll(db, { actor: adm, reason: 'testing a venue-wide liquidity withdrawal' });
   assert.strictEqual(r.cancelled_orders, before.c);
   assert.strictEqual(r.released_cents, before.f);
   const after = db.prepare("SELECT COUNT(*) c FROM orders WHERE user_id=? AND status='open'").get(bot.id).c;
@@ -244,7 +245,7 @@ check('R14 risk configuration and kill switch are audited', async () => {
   const adm = (await A.registerUser(db, { username: 'ops', password: 'pw-ops-123' }));
   risk.ensureRiskRow(db, bot.id, DEFAULTS);
   risk.configure(db, { actor: adm, botId: bot.id, max_liability_cents: 250000, max_daily_loss_cents: 125000, quote_skew: 0.75 });
-  risk.setKillSwitch(db, { actor: adm, on: true });
+  risk.setKillSwitch(db, { actor: adm, on: true, reason: 'testing the desk kill switch' });
   const A2 = require('../lib/audit');
   const acts = A2.list(db, { limit: 50 }).map((r) => r.action);
   assert.ok(acts.includes('risk.configured'));
@@ -286,6 +287,80 @@ check('R17 desk view reports every bot with its exposure', async () => {
   assert.strictEqual(typeof desk[0].pressure, 'number');
 });
 
+// R18: THE PROMPT'S PROMISE IS KEPT. `askReason` in public/admin-risk.js tells
+// the operator "Reason (recorded in the audit log)". For the kill switch that
+// was a false statement: the client captured the reason and sent only `{on}`,
+// the route read only `on`, and lib/risk.js wrote a hard-coded null into the
+// audit row. For the withdraw it was worse — the reason WAS sent, the route
+// discarded the body, and `grep -c audit lib/bots.js` returned 0, so a
+// venue-wide liquidity withdrawal left no audit row at all.
+//
+// These are the two controls where the gap is invisible from either end, which
+// is why it survived: the UI collects, the server drops, nothing errors.
+check('R18 both desk controls record the operator reason they prompt for', async () => {
+  const A2 = require('../lib/audit');
+  const { db, bot, marketId } = (await fixture());
+  const adm = (await A.registerUser(db, { username: 'ops', password: 'pw-ops-123' }));
+
+  // (b) FIRST, while there is still liquidity. This one wrote NO row before, at
+  // all — for the venue-wide withdrawal the operator was prompted to justify.
+  bots.quoteMarket(db, marketId);
+  const before = db.prepare("SELECT COUNT(*) c FROM orders WHERE user_id=? AND status='open'").get(bot.id).c;
+  assert.ok(before > 0, 'there was liquidity to withdraw');
+  const r = bots.withdrawAll(db, { actor: adm, reason: 'venue-wide withdrawal before the exchange reopens' });
+  assert.strictEqual(r.cancelled_orders, before);
+  const w = A2.list(db, { limit: 50 }).find((x) => x.target === 'desk:risk/quotes');
+  assert.ok(w, 'the withdrawal wrote an audit row');
+  assert.strictEqual(w.reason, 'venue-wide withdrawal before the exchange reopens', 'carrying the reason verbatim');
+  assert.strictEqual(w.actor_id, adm.id);
+  // And the two numbers an operator reviewing the desk later actually wants:
+  // who pulled the quotes, and what did it free.
+  assert.strictEqual(w.after.cancelled_orders, before, 'the count of quotes pulled');
+  assert.ok(w.after.released_cents > 0, 'and the escrow it released');
+  assert.strictEqual(w.before.resting_bot_quotes, before, 'from the resting set');
+
+  // (a) the kill switch: reason captured by the prompt, sent by neither end,
+  // and written to the audit row as a hard-coded null.
+  risk.setKillSwitch(db, { actor: adm, on: true, reason: 'betfair feed returned nothing for an hour' });
+  const kill = A2.list(db, { limit: 50 }).find((x) => x.target === 'desk:risk');
+  assert.ok(kill, 'the kill switch wrote an audit row');
+  assert.strictEqual(kill.reason, 'betfair feed returned nothing for an hour', 'carrying the reason verbatim');
+  assert.strictEqual(kill.actor_id, adm.id, 'and who did it');
+});
+
+// R19: neither control may be driven without a written reason. Every comparable
+// desk action enforces this (reasonOr400 in lib/admin.js, a >=5-character
+// reason in lib/results.js and lib/jobs.js); these two were the exceptions
+// precisely because the UI already collected one, so nothing looked missing.
+check('R19 neither desk control can be driven without a reason', async () => {
+  const { db, bot, marketId } = (await fixture());
+  const adm = (await A.registerUser(db, { username: 'ops', password: 'pw-ops-123' }));
+  for (const reason of [undefined, null, '', '   ', 'ok']) {
+    assert.throws(
+      () => risk.setKillSwitch(db, { actor: adm, on: true, reason }),
+      (e) => e.status === 400 && /reason/.test(e.message),
+      `kill switch refused ${JSON.stringify(reason)}`
+    );
+    assert.throws(
+      () => bots.withdrawAll(db, { actor: adm, reason }),
+      (e) => e.status === 400 && /reason/.test(e.message),
+      `withdraw refused ${JSON.stringify(reason)}`
+    );
+  }
+  // A refusal must leave the venue alone: no switch pulled, no quote cancelled.
+  assert.strictEqual(risk.killSwitch(db), false, 'the kill switch was never pulled');
+  bots.quoteMarket(db, marketId);
+  const resting = db.prepare("SELECT COUNT(*) c FROM orders WHERE user_id=? AND status='open'").get(bot.id).c;
+  for (const reason of [undefined, '', 'x']) {
+    assert.throws(() => bots.withdrawAll(db, { actor: adm, reason }), (e) => e.status === 400);
+  }
+  assert.strictEqual(
+    db.prepare("SELECT COUNT(*) c FROM orders WHERE user_id=? AND status='open'").get(bot.id).c,
+    resting,
+    'and no quote was cancelled by a refused withdrawal'
+  );
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -302,6 +377,6 @@ check('R17 desk view reports every bot with its exposure', async () => {
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 17) { console.error('expected 17 checks'); process.exit(1); }
+  if (passed < 19) { console.error('expected 19 checks'); process.exit(1); }
   console.log(`\nrisk.test.js: ${passed} checks passed`);
 })();

@@ -33,10 +33,27 @@
     return `<span class="${cents > 0 ? 'win' : cents < 0 ? 'loss' : 'muted'}">${fmt(cents)}</span>`;
   }
 
+  // The prompt says the reason is recorded, so it must actually reach the
+  // server. The kill-switch handler used to capture it and send only `{ on }`,
+  // and the server wrote a hard-coded null into the audit row — the operator was
+  // told their justification was kept and it was thrown away.
+  //
+  // The length floor is enforced HERE as well as on the server: the server's is
+  // the control, but a raw 400 from `window.prompt` is a worse experience than
+  // being told the minimum before submitting.
+  const MIN_REASON = 5;
   function askReason(what) {
-    const reason = window.prompt(`${what}\n\nReason (recorded in the audit log):`);
-    if (reason === null) return null;
-    return reason.trim() ? reason.trim() : null;
+    for (;;) {
+      const reason = window.prompt(`${what}\n\nReason (recorded in the audit log):`);
+      if (reason === null) return null;
+      const trimmed = reason.trim();
+      if (!trimmed) return null;
+      if (trimmed.length < MIN_REASON) {
+        toast(`A reason of at least ${MIN_REASON} characters is required`);
+        continue;
+      }
+      return trimmed;
+    }
   }
 
   // ── Risk desk ─────────────────────────────────────────────────────────────
@@ -106,7 +123,7 @@
       const reason = askReason(`You are ${why}`);
       if (!reason) return;
       try {
-        await api('PUT', '/api/admin/risk/kill-switch', { on });
+        await api('PUT', '/api/admin/risk/kill-switch', { on, reason });
         toast(`Kill switch ${on ? 'released' : 'pulled'}`);
         renderRiskView(body);
       } catch (e) { toast(e.message); }
