@@ -180,6 +180,26 @@ What a feed-1 board actually contains:
 | `in_play`, `bet_delay` | `false` / `null` — both columns are selected only on feed 2 |
 | ordering | `market_start_time`, then market id, sort priority, selection id |
 
+**The board's order is the query's, on both feeds.** `fetchBoard` used to end
+with a start-time sort, which silently re-keyed the order the SQL had chosen —
+and the comment above `boardSql` argues at length that feed 2 must lead with the
+freshest books, because start-time ordering puts the *already-finished* markets
+first and those are exactly the ones the odds job stopped polling. The sort made
+that reasoning dead text and left `ORDER BY v.odds_captured_at DESC` relevant
+only to which markets survived the CTE `LIMIT`. It is gone; `shape()` groups
+rows and decorates them, in the order the statement returned them.
+
+`?limit=` with a blank, a zero or a negative now falls back to
+`FEED_MARKET_LIMIT` instead of clamping to one market. `Number('') === 0` is
+finite, so the old `!Number.isFinite(n)` guard let the most likely junk a URL
+produces through to `Math.max(1, 0)` — a one-market board, no error, no warning.
+The 500 ceiling still applies.
+
+Every market carries `sport_id`, read from `v.event_type_id` — the column
+`NAV_SQL` already aliased correctly. The board field used to read
+`row.sport_type_id`, which no view has, so it was `undefined` on every response
+while its name promised otherwise.
+
 `/api/feed/health` on feed 1 answers from `v_feed1`, with the price aggregates as
 **typed nulls** rather than unknown columns — the probe can run, and can still
 fail:
@@ -479,6 +499,13 @@ wrong is a good way to get the account rate-limited or locked. The backoff reset
 only when a child has stayed up longer than `FEED_RUNNER_MIN_UPTIME_SECONDS`, so
 a crash-loop that survives ten seconds each time does not reset it to 5 s and
 retry forever.
+
+The **first** restart used to wait 10 s. The exit path recorded the failure and
+*then* asked how long to wait, so the count it read on the first crash was 1 and
+the ladder started one rung above where it claims to. `BACKOFF_START_MS` was a
+value the code could not produce. The wait is now computed before the failure is
+counted, so 5 s is reachable; the log line still names the crash it is reporting,
+which is why it reads "retrying in 5s (failure 1)".
 
 ### Shutdown drains the collector
 
