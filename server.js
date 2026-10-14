@@ -621,11 +621,41 @@ function rlTooManyAttempts(res, key) {
 // ten times and a burst of successful reads are different problems with
 // different remedies, and one counter serving both would let traffic of
 // either kind clear the other's budget.
+//
+// COVERAGE, NOT JUST EXISTENCE. This bucket existed and was correctly
+// enforced, and it was on ONE of the player read routes. Every route added
+// after it inherited nothing: the limiter is an argument at the registration
+// site, so a route without that argument is not throttled at all, and nothing
+// failed when that happened. The cheap catalogue reads are now on it for the
+// same reason as the expensive ones — an unauthenticated caller reaching
+// /api/events gets a full board, with a book query per market, per request.
+//
+// EXEMPTIONS ARE DELIBERATE AND FEW:
+//   /api/stream       a long-held connection, not a request; it has its own cap
+//                     (MAX_SSE_CLIENTS) and is counted once per connect.
+//   /api/branding     one row, no query worth bounding, and it is what a
+//                     locked account's page load reads.
+//   /healthz /readyz /metrics   supervisor probes. A rate-limited readiness
+//                     probe is a venue that gets itself killed.
+//   /api/feed/*       the odds-feed board, which is a different data source in
+//                     a different mode; it answers 409 before doing any work
+//                     when FEED_ENABLED is off, and its cost is a Postgres
+//                     round trip the feed bucket does not govern.
 const VOLUME_BUCKETS = {
   // Trading is the money path. Generous per user — a scalper legitimately
   // fires many orders — but bounded, because unbounded order placement is a
   // self-DoS on the single-threaded engine.
   // Limits come from config so an operator can tune them; 0 disables a bucket.
+  //
+  // auth is keyed on the SOURCE, like the failure counters above, and bounds
+  // the two routes that pay a key derivation on every request. Registration was
+  // the one that had nothing at all: the per-address register counter counts
+  // FAILURES, so a flood of SUCCESSFUL registrations never tripped it, and each
+  // success cost a full scrypt — so unauthenticated registration was the
+  // cheapest CPU flood available. Login is bounded for the same reason: the
+  // username counter is cleared by every success, so 200 valid sign-ins in a
+  // minute from one address spent 200 derivations and recorded no failures.
+  auth: { limit: config.RATE_LIMIT_AUTH, windowMs: 60_000 },
   trade: { limit: config.RATE_LIMIT_TRADE, windowMs: 60_000 },
   cashout: { limit: config.RATE_LIMIT_CASHOUT, windowMs: 60_000 },
   admin: { limit: config.RATE_LIMIT_ADMIN, windowMs: 60_000 },
@@ -672,7 +702,7 @@ if (volumeSweeper.unref) volumeSweeper.unref();
 
 /** Rate-limit middleware factory: 429 with Retry-After once the budget is spent. */
 function limit(bucket) {
-  return (req, res, next) => {
+  const middleware = (req, res, next) => {
     const retryAfter = volumeExceeded(req, bucket);
     if (retryAfter > 0) {
       res.setHeader('Retry-After', String(retryAfter));
@@ -680,6 +710,13 @@ function limit(bucket) {
     }
     next();
   };
+  // The middleware is STAMPED with its bucket so the wiring can be asserted
+  // from the live router rather than by scraping the source for the string
+  // `limit(`. Coverage is the whole point of this control — the bug was a route
+  // registered without the argument, which no test could see — so the bucket a
+  // route was given has to be readable from the route itself.
+  middleware.volumeBucket = bucket;
+  return middleware;
 }
 
 function resetVolumeLimits() {
@@ -691,7 +728,7 @@ function resetVolumeLimits() {
 // await a handler, so every error must be caught INSIDE and re-thrown onto the
 // error handler explicitly — an async handler's rejection is an unhandled
 // promise rejection, not a 500.
-app.post('/api/auth/register', async (req, res, next) => {
+app.post('/api/auth/register', limit('auth'), async (req, res, next) => {
   const { username, password, email } = req.body || {};
   // Registration abuse is account-farming or identity enumeration from one
   // machine, so the counter keys on the caller's IP.
@@ -714,7 +751,7 @@ app.post('/api/auth/register', async (req, res, next) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res, next) => {
+app.post('/api/auth/login', limit('auth'), async (req, res, next) => {
   // Case-normalized on purpose: 'Admin', 'ADMIN' and 'admin' share one
   // counter, so case variants cannot farm fresh guessing windows.
   const key = 'login:' + String((req.body || {}).username || '').trim().toLowerCase();
@@ -768,6 +805,7 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
+<<<<<<< HEAD
 app.get('/api/me', requireAuth, (req, res) => {
   // `tenant_status` is here because reads REMAIN AVAILABLE on a suspended
   // tenant (#32), and a player who is allowed to look at the book but refused
@@ -782,6 +820,10 @@ app.get('/api/me', requireAuth, (req, res) => {
       tenant_status: tenant ? tenant.status : null,
     },
   });
+=======
+app.get('/api/me', requireAuth, limit('read'), (req, res) => {
+  res.json({ user: { ...req.user, available_cents: req.user.balance_cents - req.user.frozen_cents } });
+>>>>>>> 16a175a (fix(#6): the volume limiter existed and was on 1 of the player reads; registration had none)
 });
 
 // ── Account self-service ───────────────────────────────────────────────────
@@ -811,7 +853,7 @@ app.post('/api/auth/change-password', requireAuth, async (req, res, next) => {
   }
 });
 
-app.get('/api/auth/sessions', requireAuth, (req, res) => {
+app.get('/api/auth/sessions', requireAuth, limit('read'), (req, res) => {
   res.json({ sessions: A.listSessions(db, req.user.id, req.token) });
 });
 
@@ -890,7 +932,7 @@ app.use('/api', (req, res, next) => {
   firstRunLockResponse(req, res);
 });
 
-app.get('/api/sports', (req, res) => {
+app.get('/api/sports', limit('read'), (req, res) => {
   const sports = db
     .prepare(
       `SELECT s.id, s.name, s.slug,
@@ -1183,7 +1225,7 @@ app.post('/api/admin/feed/runner/stop', requireAdmin, limit('admin'), (req, res)
   res.json(FRUN.stop(feedTenantId(req)));
 });
 
-app.get('/api/events', (req, res) => {
+app.get('/api/events', limit('read'), (req, res) => {
   const sportSlug = req.query.sport;
   let rows;
   if (sportSlug) {
@@ -1234,7 +1276,7 @@ app.get('/api/events', (req, res) => {
   res.json({ events });
 });
 
-app.get('/api/markets/:id/book', (req, res) => {
+app.get('/api/markets/:id/book', limit('read'), (req, res) => {
   const m = db.prepare('SELECT * FROM markets WHERE id = ?').get(intId(req.params.id));
   if (!m) return res.status(404).json({ error: 'Market not found' });
   res.json({ market: m, book: M.bookFor(db, m.id, 5) });
@@ -1242,7 +1284,7 @@ app.get('/api/markets/:id/book', (req, res) => {
 
 // Price formats for the trading desk: the same pure functions the engine uses,
 // so the UI never has to re-implement (or drift from) the conversion maths.
-app.get('/api/format/:price', (req, res) => {
+app.get('/api/format/:price', limit('read'), (req, res) => {
   const raw = Number(req.params.price);
   if (!Number.isFinite(raw)) return res.status(400).json({ error: 'Price must be a number' });
   // THE RANGE IS CHECKED BEFORE THE SNAP, which is what makes the documented 400
@@ -1290,7 +1332,7 @@ app.post('/api/orders', requireAuth, limit('trade'), (req, res) => {
   res.status(result.idempotent_replay ? 200 : 201).json(result);
 });
 
-app.get('/api/orders', requireAuth, (req, res) => {
+app.get('/api/orders', requireAuth, limit('read'), (req, res) => {
   res.json({ orders: M.openOrdersFor(db, req.user.id) });
 });
 
@@ -1302,7 +1344,7 @@ app.post('/api/orders/:id/cancel', requireAuth, limit('trade'), (req, res) => {
   res.json({ order });
 });
 
-app.get('/api/positions', requireAuth, (req, res) => {
+app.get('/api/positions', requireAuth, limit('read'), (req, res) => {
   const positions = M.positionsFor(db, req.user.id).map((p) => ({
     ...p,
     cashout: CASH.cashoutQuote(db, req.user, p.market_id),
@@ -1320,11 +1362,11 @@ app.post('/api/markets/:id/cashout', requireAuth, limit('cashout'), (req, res) =
 });
 
 // ── Wallet ─────────────────────────────────────────────────────────────────
-app.get('/api/wallet', requireAuth, (req, res) => {
+app.get('/api/wallet', requireAuth, limit('read'), (req, res) => {
   res.json(L.walletView(db, req.user.id));
 });
 
-app.get('/api/settlements', requireAuth, (req, res) => {
+app.get('/api/settlements', requireAuth, limit('read'), (req, res) => {
   res.json({ settlements: SET.settledFor(db, req.user.id) });
 });
 
@@ -2086,7 +2128,7 @@ const backupRetentionFrom = (raw) => {
   return Math.min(BACKUP_RETENTION_MAX, Math.max(BACKUP_RETENTION_MIN, Math.trunc(n)));
 };
 
-app.post('/api/admin/backup', requireAdmin, opsGuard, (req, res) => {
+app.post('/api/admin/backup', requireAdmin, opsGuard, limit('admin'), (req, res) => {
   if (!config.BACKUP_DIR) {
     return res.status(400).json({
       error: 'No backup directory configured — set BACKUP_DIR and restart',

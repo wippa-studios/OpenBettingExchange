@@ -277,7 +277,7 @@ Configuration is read from `.env` (see [`.env.example`](.env.example)). Every
 value is validated at boot; an invalid value **aborts startup** rather than
 failing later.
 
-> **Note:** `.env.example` now documents all 58 of the keys the server reads.
+> **Note:** `.env.example` now documents all 59 of the keys the server reads.
 > `lib/config.js`'s `DEFAULTS`. Undocumented keys are listed in the tables below.
 > Closing that gap — and adding the same CI guard the feed collector has — is
 > tracked as a known issue.
