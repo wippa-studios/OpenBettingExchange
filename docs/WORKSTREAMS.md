@@ -7,6 +7,22 @@ The split follows the existing module boundaries, with two deliberate moves:
 `server.js` becomes a composition root, and the domain gets a hard interface
 between it and everything that talks to it.
 
+> **Status note.** This document was written as a *plan*, against a codebase
+> where the frontend was one `public/app.js`. That file has since been deleted
+> and replaced by seven modules under `public/js/`, so task (a) in section 1 is
+> done. Several other items have shipped too — the per-section "Work" lists are
+> annotated where the state has moved. Treat the diagrams as the intended shape
+> and the task lists as the live state.
+
+## Contents
+
+- [The three parts](#the-three-parts)
+- [1. Front end](#1-front-end)
+- [2. Engine](#2-engine)
+- [3. Back end](#3-back-end)
+- [Cross-cutting](#cross-cutting)
+- [Quick reference](#quick-reference)
+
 ---
 
 ## The three parts
@@ -26,7 +42,7 @@ between it and everything that talks to it.
 └──────────────────────────┬──────────────────────────────────────┘
                            │ narrow domain interface
 ┌──────────────────────────▼──────────────────────────────────────┐
-│ 2. ENGINE — lib/{match,ledger,settle,cashout,odds,tx,bots,drift} │
+│ 2. ENGINE — lib/{match,ledger,settle,cashout,odds,tx,accounts}    │
 │    matching · escrow · settlement · cash-out · pricing · risk    │
 │    no HTTP, no SQL, no rendering, no payment                     │
 └─────────────────────────────────────────────────────────────────┘
@@ -42,9 +58,16 @@ willingness to take dependencies.
 
 ## 1. Front end
 
-**Today:** `public/app.js` (1,768 lines, one IIFE, ~40 top-level functions),
-`admin.js` (329), `ladder.js` (118), `index.html` (86), `style.css` (725).
-Zero build step, classic scripts, self-hosted Inter fonts.
+**Today:** the single `public/app.js` this document was written against is
+**gone** — it has been split into seven modules under `public/js/` (`core`,
+`shell`, `nav`, `board`, `slip`, `views`, `boot`, 2,118 lines total) plus
+`admin.js` (503), `admin-risk.js` (438) and `ladder.js` (118).
+`index.html` is 141 lines and `style.css` 780. Zero build step, classic
+scripts, self-hosted Inter fonts.
+
+Task (a) below is therefore **done**; the rest of this section describes work
+that is still open. `server.js` is 2,367 lines across 87 routes, which is the
+composition-root work item (c) in section 3.
 
 ### Work
 
@@ -111,10 +134,14 @@ isolation, and the UI suite covering slip arithmetic and refusal states.
 
 ## 2. Engine
 
-**Today:** `lib/match.js` (452), `lib/settle.js` (174), `lib/ledger.js` (158),
-`lib/cashout.js` (114), `lib/odds.js`, `lib/tx.js`, `lib/bots.js`,
-`lib/drift.js`. Strictly one-way: `match → ledger → tx`, with
-`settle`/`cashout → match`. No HTTP, no rendering.
+**Today:** `lib/match.js` (788), `lib/settle.js` (458), `lib/results.js` (340),
+`lib/ledger.js` (356), `lib/cashout.js` (296), `lib/cashoutrisk.js` (267),
+`lib/accounts.js` (247), `lib/bots.js` (282), `lib/voidrules.js` (209),
+`lib/odds.js` (199), `lib/tx.js` (87), `lib/drift.js` (49). Strictly one-way:
+`match → ledger → tx`, with `settle`/`cashout → match`. No HTTP, no rendering.
+
+Tasks (a), (b) and (c) below — idempotency, per-user limits and market-maker
+risk — all shipped in Phases 1 and 2.
 
 This is the crown jewel and it's already correct on the hard parts. The work
 here is **additive**, not corrective.
@@ -187,11 +214,17 @@ convention enforced by something other than a code comment.
 
 ## 3. Back end
 
-**Today:** `server.js` (880 lines — origin guard, sessions, SSE broadcaster,
-rate limiter, ~35 routes, static, error handler), `lib/auth.js` (scrypt +
-opaque tokens), `lib/config.js` (validated at boot, aborts on bad value),
-`lib/feed.js` (23KB, Postgres recorder client), `lib/store.js` (13 tables,
-pragmas, idempotent migration).
+**Today:** `server.js` (**2,367 lines, 87 routes** — origin guard, sessions,
+SSE broadcaster, rate limiter, static, error handler), `lib/store.js` (1,073
+lines, **25 tables**, pragmas, idempotent migration), `lib/feed.js` (778, the
+Postgres feed client), `lib/auth.js` (639, scrypt + opaque tokens),
+`lib/config.js` (389, validated at boot, aborts on a bad value),
+`lib/payments/` (319 in the provider-facing index), `lib/tenants.js` (243).
+
+Task (c) below — the double-entry ledger — shipped in Phase 3. Task (a), carving
+`server.js` into a composition root, has grown **more** pressing rather than
+less: at 2,367 lines it is now the largest file in either repository by a wide
+margin.
 
 ### Work
 

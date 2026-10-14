@@ -7,6 +7,33 @@ rules and the data, and can read every line that moves money.
 This document is the map from the current codebase to that. It is written
 against the code as it stands, not an aspiration.
 
+> **Note on reading this document.** Phases 1–4 and the bulk of section 6 are
+> **history**, kept because the reasoning behind each control is the part worth
+> keeping — several of these were "done" controls that existed only in their
+> reporting, and the record of *how that was found* is more useful than the fact.
+> Section 6's **Outstanding** subsection is the live list; everything else in
+> section 6 is completed work.
+
+## Contents
+
+- [1. Where we actually are](#1-where-we-actually-are)
+- [2. Corrections to the risk picture](#2-corrections-to-the-risk-picture)
+- [3. Phase plan](#3-phase-plan)
+  - [Phase 0 — Make it actually open source](#phase-0--make-it-actually-open-source)
+  - [Phase 1 — Abuse controls](#phase-1--abuse-controls-shipped)
+  - [Phase 2 — Market-maker risk](#phase-2--market-maker-risk-shipped)
+  - [Phase 3 — Money](#phase-3--money-double-entry-ledger-and-real-payments-partially-shipped)
+  - [Phase 4 — Tenancy](#phase-4--tenancy-shipped)
+  - [Phase 5 — Feed, market lifecycle, scale](#phase-5--feed-market-lifecycle-scale)
+  - [Phase 6 — Operator surface and the business](#phase-6--operator-surface-and-the-business)
+- [4. Sequencing and dependencies](#4-sequencing-and-dependencies)
+- [5. What would kill this](#5-what-would-kill-this)
+- [6. Immediate next actions](#6-immediate-next-actions)
+  - [Recently completed](#recently-completed)
+  - [Completed since the first plan](#completed-since-the-first-plan)
+  - [Outstanding](#outstanding)
+  - [The verification gap — DISCHARGED](#the-verification-gap--discharged)
+
 ---
 
 ## 1. Where we actually are
@@ -475,7 +502,42 @@ Reassessed after Phases 1–4, the follow-on work, and the first outside
 review of the money path. The suite is now **625 checks across 47 suites**,
 plus a live smoke script and a 78-check browser suite, all green.
 
-### Recently completed since the first plan
+### Recently completed
+
+The two fix batches driven by the outside review, which closed 23 filed issues
+across the engine, the feed stack and the collector. Recorded here because the
+**pattern** is the durable part, not any individual fix:
+
+- **Dead controls that reported success while doing nothing.** `pendingMarkets()`
+  had an unsatisfiable predicate — it required a market `open` on an event
+  `completed`, and the only writer of `completed` fires once every market is
+  already settled — so the automated results poll asked about an empty set
+  forever, advanced `last_ok_at`, and reported `ok`. The feed-1 board SQL had a
+  dangling comma before `FROM`, a hard Postgres syntax error, so an entire
+  supported configuration could not load a board. `maybeForceSetup` was called on
+  every login and defined nowhere.
+- **A function that could never return true.** `isClientOrderIdConflict` tested
+  for an index name that SQLite does not put in a UNIQUE violation message, so
+  the idempotency race-recovery catch was unreachable — idempotency held
+  single-threaded and failed in exactly the concurrent case its comment claimed
+  to cover.
+- **A control that failed open.** Self-exclusion validated `until` with
+  `Date.parse` (which accepts `"15 Jan 2030"`), stored it mangled, then compared
+  **lexicographically** against `'YYYY-MM-DD HH:MM:SS'` — so a plausible date
+  string sorted before the current timestamp and the exclusion read as lapsed the
+  instant it was made. It now fails closed on any value it cannot parse.
+- **Tests that could not fail.** Several, in this repo's own suite, not just in
+  the code: a rollback test that asserted "no half-written state" against an
+  empty table; a test *named* "counts NET settlement, not gross" whose every row
+  had `commission_cents = 0`; an async suite that never awaited, so failures
+  printed `ok` and the rejection crashed the process afterwards; a UI smoke test
+  whose wait was vacuously true and which listened for no page errors.
+
+### Completed since the first plan
+
+The items below are **done**. They are kept here rather than deleted because
+each records a control that existed only in its reporting before it was made
+real, and the record of how that was found is the useful part.
 
 - Order idempotency (`client_order_id`) — the smallest high-value item, now
   the largest single behavioural change in the engine and the one whose
@@ -492,8 +554,35 @@ plus a live smoke script and a 78-check browser suite, all green.
 - The `orders.frozen_cents` convention is now enforced mechanically by
   `tests/guard.test.js`, verified by deliberately introducing a violating
   `UPDATE`.
+- Collector supervision is now a managed lifecycle: `alive()` rather than "a
+  child handle exists", a real restart rather than two sequential calls, and a
+  `SIGTERM`/`SIGINT` drain so a restart cannot orphan a collector still spending
+  Betfair market-data weight. Feed credentials are scoped to the actor inside
+  `lib/feedcreds.js` and bound to tenant and field as GCM additional
+  authenticated data, so a row moved in the database fails to decrypt rather than
+  becoming another tenant's credential.
 
-### Still outstanding
+### Outstanding
+
+1. **One real PSP adapter.** The interface and reference provider ship; the
+   concrete integration does not. This is the only item on this list that blocks
+   the operator thesis.
+2. **KYC and age verification.** Deliberately absent: an identity control with
+   an external verification provider, not a limit. `lib/tenants.js` carries
+   jurisdiction data, but nothing verifies anybody against it.
+3. **Complete `.env.example`.** 15 of the 50 keys in `lib/config.js`'s `DEFAULTS`
+   are documented, and the exchange has no CI guard keeping it honest — the
+   collector repo has one, and it would catch the drift.
+4. **The escrow top-up path in `lib/match.js`.** A 1-cent rounding top-up when a
+   resting layer has no available balance can abort the taker's entire
+   placement, including a stranger's, and reports the taker as insufficient.
+   The divergence is common rather than rare (353,793 reachable cases in a
+   bounded sweep), and the fix needs a behavioural decision: skip that layer
+   mid-sweep, or fail the fill. Not attempted, deliberately.
+5. **Every open issue in the tracker.** 51 remain, most of them documented
+   defects rather than missing features.
+
+### Detailed record of the completed items
 
 1. ~~Cash-out is an uncapped venue risk.~~ ✅ Fixed — `lib/cashoutrisk.js`,
    then **rewritten** after the outside review found the first version was a
@@ -521,7 +610,8 @@ plus a live smoke script and a 78-check browser suite, all green.
    liquidity — the exact condition in-play delay exists to prevent.
    Regression-tested both directions in `tests/inplay2.test.js` (12 checks).
 3. **One real PSP adapter.** The interface and reference provider ship; the
-   concrete integration does not.
+   concrete integration does not. The only item here that blocks the operator
+   thesis — see [Outstanding](#outstanding).
 4. ~~Trading-side split of the results feed.~~ ✅ `lib/resultsfeed.js` — the
    consumer in `lib/results.js` existed the whole time and had NO transport, and
    the scheduled poll had never been wired at all, so
