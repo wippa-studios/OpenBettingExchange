@@ -9,10 +9,34 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Default-deny. Pinning an action to a SHA stops it being swapped; this stops
+# the pinned action doing anything it does not need to. Every job here only
+# reads the repository. The gitleaks job is the one exception and says so
+# explicitly below, because it needs to write a PR comment.
+permissions:
+  contents: read
+
 # A superseded run is wasted compute on a queue nobody is watching.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+# ── Action pinning ─────────────────────────────────────────────────────────
+# Every `uses:` below is pinned to a full commit SHA, not a tag. A tag is a
+# mutable pointer: `actions/checkout@v4` resolves to whatever v4 points at when
+# the job runs, so a retagged or compromised action revision executes with this
+# workflow's permissions. The SHA is the only immutable reference.
+#
+# The comment on each pin names the version it corresponds to. Without it the
+# next person sees an opaque hash, cannot tell what they are pinned to, and has
+# no reason not to "tidy" it back to a tag. `.github/dependabot.yml` has a
+# github-actions ecosystem configured precisely so these pins get upgraded by a
+# bot that rewrites both the SHA and the version comment.
+#
+# These were bumped off @v4 at the same time, and that was not cosmetic:
+# actions/checkout v4 and actions/setup-node v4 are node20 actions, and GitHub
+# removed Node 20 from hosted runners on 2026-09-16. Pinning a dead runtime to a
+# SHA would have been pinning something that cannot run. v7 is node24 for both.
 
 jobs:
   test:
@@ -26,9 +50,9 @@ jobs:
         # it BEFORE an operator finds out.
         node: ['22.13', '24']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -48,8 +72,8 @@ jobs:
     name: Browser (Playwright)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
           cache: npm
@@ -65,8 +89,8 @@ jobs:
     name: Repository guards
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
           cache: npm
@@ -119,7 +143,17 @@ jobs:
       # here it verifies the script runs and finds nothing. Its teeth are on the
       # operator's machine (`npm run check:secrets`). Covering history and CI
       # properly wants a real scanner (gitleaks/trufflehog) over full history.
-      - name: No credential value from .env is committed
+      - name: Secret scanner runs (value check needs a local .env)
+        # Renamed from "No credential value from .env is committed", which named
+        # a check this step cannot perform. scripts/check-no-secrets.mjs compares
+        # against values in a .env file, and CI has no .env, so it finds nothing
+        # and exits 0 unconditionally. Deleting the script outright would leave
+        # this step green. The new name says what actually happens. The real
+        # coverage for this project is the gitleaks job below, which reads every
+        # commit rather than the working tree.
+        #
+        # The teeth are still real on an operator's machine: `npm run
+        # check:secrets` in a checkout that has a .env.
         run: node scripts/check-no-secrets.mjs
 
       - name: No stray large files
@@ -149,6 +183,16 @@ jobs:
         # or finds .env.example gutted.
         run: node scripts/check-env-example.mjs
 
+      - name: CI actions are pinned to SHAs, not tags
+        # The pins at the top of this file are the control; this is what keeps
+        # them. A tag is mutable — the revision that runs is whatever upstream
+        # points at when the job starts — and a pin is easy to "tidy" back to a
+        # tag. It also requires the version comment beside each SHA, because a
+        # bare 40-character hash tells the next reader nothing and gives them no
+        # reason not to change it. Dependabot's github-actions ecosystem is
+        # configured to update both together. #10.
+        run: node scripts/check-action-pins.mjs
+
   # A capacity smoke, not a benchmark: it asserts the system survives concurrent
   # writes with the books still balanced, which is a correctness property and
   # belongs in CI. Absolute rps is machine-dependent and is NOT asserted —
@@ -157,20 +201,54 @@ jobs:
     name: Load smoke (concurrent writes, books balanced)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
           cache: npm
       - run: npm ci
       - run: node scripts/load-test.mjs --orders 600 --concurrency 25
 
+  # The control whose absence already cost this project once. Commit 9eac3a4 put
+  # a live Betfair app key, username and password into three test fixtures in a
+  # PUBLIC repository. Commit 173a68b removed them — with an ordinary follow-up
+  # commit, not a history rewrite — so they are still readable with `git log -p`
+  # today. The guard that existed at the time matched key FILES by extension, and
+  # a credential VALUE inside a tracked .js is not a file, so nothing fired.
+  # scripts/check-no-secrets.mjs came afterwards and is honest that it cannot
+  # see this. gitleaks reads every commit, which is the only thing that does.
+  #
+  # EXPECTED TO BE RED. It reports the 9eac3a4 credential above, and that
+  # finding is correct. .gitleaks.toml allowlists only the four synthetic
+  # fixture literals the test suites authenticate with; widening it to silence
+  # the real one would mean committing the leaked value to the working tree,
+  # which is the exact failure this scanner exists to prevent. See the long note
+  # at the bottom of .gitleaks.toml.
+  secrets:
+    name: Secret scan (gitleaks, full history)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # gitleaks-action posts the finding as a review comment on the PR.
+      pull-requests: write
+    steps:
+      # fetch-depth: 0 is what makes this a HISTORY scan. The default checkout is
+      # a shallow single commit, which would make the scanner report nothing and
+      # look like it had passed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   security:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
       - run: npm audit --audit-level=high
