@@ -368,6 +368,59 @@ const check = async (name, fn) => {
       assert.strictEqual(forbidden.status, 403);
     });
 
+    // #30. The settle audit row recorded the LITERAL 'open' as the "before"
+    // state, whatever the market actually was. Settling an open market makes
+    // the lie invisible, so this check settles a SUSPENDED one: settleTx refuses
+    // only `settled` and `held`, so a suspended market settles normally, and
+    // the recorded prior state is then provably not 'open'.
+    //
+    // The audit row is the record an operator, an auditor or a regulator reads
+    // to answer "what state was this market in when you settled it", on the
+    // single most money-moving action the venue offers.
+    await check('the settle audit row records the market\'s ACTUAL prior status', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+
+      // Build a dedicated market so the check does not disturb the ones other
+      // checks in this suite settled.
+      const sport = (await j('GET', '/api/sports')).json.sports.find((s) => s.slug === 'football');
+      const ev = await j('POST', '/api/admin/events', {
+        body: { sport_id: sport.id, name: 'audit-prior-state event', starts_at: '2031-01-01T00:00:00Z' },
+        cookie: admin,
+      });
+      assert.strictEqual(ev.status, 201, `event created (${JSON.stringify(ev.json)})`);
+      const comp = await j('GET', `/api/admin/competitions?sport_id=${sport.id}`, { cookie: admin });
+      const compId = (comp.json.competitions[0] || {}).id;
+      const mkt = await j('POST', '/api/admin/markets', {
+        body: { event_id: ev.json.event.id, name: 'audit-prior-state market' },
+        cookie: admin,
+      });
+      assert.strictEqual(mkt.status, 201, `market created (${JSON.stringify(mkt.json)})`);
+      const mid = mkt.json.market.id;
+      const sel = await j('POST', '/api/admin/selections', {
+        body: { market_id: mid, name: 'Runner A' },
+        cookie: admin,
+      });
+      assert.strictEqual(sel.status, 201);
+
+      // Put it in a state that is NOT 'open'.
+      const susp = await j('PATCH', `/api/admin/markets/${mid}`, { body: { status: 'suspended', reason: 'audit probe' }, cookie: admin });
+      assert.strictEqual(susp.status, 200, 'market suspended');
+      assert.strictEqual(susp.json.market.status, 'suspended', 'really suspended before the settle');
+
+      const settled = await j('POST', `/api/admin/markets/${mid}/settle`, { body: { winner_selection_id: sel.json.selection.id }, cookie: admin });
+      assert.strictEqual(settled.status, 200, `settled (${JSON.stringify(settled.json)})`);
+
+      const audit = await j('GET', `/api/admin/audit?limit=100`, { cookie: admin });
+      const row = audit.json.entries.find((r) => r.target === `market:${mid}` && r.action === 'market.settled');
+      assert.ok(row, 'a market.settled audit row exists for this market');
+      assert.ok(row.before, 'the row carries a "before" state at all');
+      assert.strictEqual(
+        row.before.status,
+        'suspended',
+        `the recorded prior status must be what the market WAS (suspended), not the literal 'open' (got ${JSON.stringify(row.before)})`
+      );
+    });
+
     // ── #25: the risk-cap route must not call every fault a 400 ──────────────
     //
     // The route caught everything and stamped `e.status = 400` on whatever

@@ -2141,7 +2141,15 @@ app.post('/api/admin/markets/:id/settle', requireAdmin, limit('admin'), (req, re
     db, req.user,
     AUDIT.ACTIONS.MARKET_SETTLED,
     `market:${mid}`,
-    { status: 'open' },
+    // The status this market WAS, taken from the row the settlement
+    // transaction itself read (`settleMarket` returns it). It used to be the
+    // string literal 'open', so every settlement audit row asserted a prior
+    // state that was simply asserted rather than observed — and a suspended
+    // market (which settles normally; only `settled` and `held` are refused)
+    // was recorded as having been open. This is the `before` an operator,
+    // auditor or regulator reads on the most money-moving action the venue
+    // offers, so it must be a record and not a fabrication.
+    { status: result.previous_status ?? null },
     { void: !!body.void, winner_selection_id: body.winner_selection_id ?? null, users_settled: result.per_user.length },
     body.reason || null
   );
