@@ -136,6 +136,19 @@ jobs:
         # are the specific failure this prevents.
         run: node scripts/check-docs.mjs
 
+      - name: .env.example documents every key the code reads
+        # .env.example covered 15 of the 58 keys the server actually reads, and
+        # nothing was checking. Several of the missing ones fail CLOSED —
+        # FEED_CREDENTIALS_KEY unset means the venue refuses to store a
+        # credential, OPS_TOKEN unset means /metrics 404s — so an operator finds
+        # out by being surprised rather than by reading documentation. #5.
+        #
+        # The surface is extracted from lib/config.js and server.js rather than
+        # listed here, so adding a knob makes this fail until it is documented,
+        # and the check refuses to report success if it cannot parse its source
+        # or finds .env.example gutted.
+        run: node scripts/check-env-example.mjs
+
   # A capacity smoke, not a benchmark: it asserts the system survives concurrent
   # writes with the books still balanced, which is a correctness property and
   # belongs in CI. Absolute rps is machine-dependent and is NOT asserted —
