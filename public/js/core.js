@@ -167,7 +167,13 @@
 
   async function refreshMe() {
     try {
-      state.user = (await api('GET', '/api/me')).user;
+      const r = await api('GET', '/api/me');
+      state.user = r.user;
+      // The server's stake window, when it publishes one, replaces the client's
+      // documented defaults (issue #47) so the slip can never hold a stake the
+      // engine will refuse — nor refuse one it would accept. A build that does
+      // not publish it simply leaves slip.js's defaults alone.
+      if (OB.setStakeBounds) OB.setStakeBounds(r.stake_bounds);
     } catch {
       state.user = null;
     }

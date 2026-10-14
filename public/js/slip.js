@@ -18,6 +18,80 @@
   // /^\d+$/ became /^\d+OB.$/. scripts/split-app.mjs does the rewriting and
   // is the reference for what must NOT be touched.
 
+  // ── the engine's stake window ───────────────────────────────────────────
+  // The engine refuses anything outside [MIN_STAKE_CENTS, MAX_STAKE_CENTS]
+  // (lib/config.js, enforced in lib/match.js validateOrder; EXCHANGE_RULES
+  // §"Placing an order" step 2 makes that the contract). The slip used to check
+  // only `cents > 0`, so it happily built "Place $0.50" and "Place $2,000.00" —
+  // both of which can only fail, with a 400, after the user presses Place.
+  //
+  // THESE ARE THE SERVER'S DEFAULTS AND THE ONLY COPY ON THE CLIENT. The
+  // server publishes its live window on /api/me as `stake_bounds` and
+  // refreshMe() hands it to setStakeBounds(), which replaces them — so a venue
+  // that configures a different MIN/MAX_STAKE_CENTS gets a slip that agrees
+  // with it rather than a second constant that drifts.
+  OB.state.stakeBounds = { min_cents: 100, max_cents: 100000 };
+
+  function stakeBounds() {
+    return OB.state.stakeBounds || { min_cents: 100, max_cents: 100000 };
+  }
+
+  /**
+   * Adopt the server's window. An unusable one is IGNORED rather than
+   * half-applied: a bounds object missing an endpoint must never silently widen
+   * or close what the slip will accept. Returns whether anything changed.
+   */
+  function setStakeBounds(bounds) {
+    const min = Number(bounds && bounds.min_cents);
+    const max = Number(bounds && bounds.max_cents);
+    if (!Number.isInteger(min) || !Number.isInteger(max) || min <= 0 || max < min) return false;
+    const prev = OB.state.stakeBounds;
+    if (prev && prev.min_cents === min && prev.max_cents === max) return false;
+    OB.state.stakeBounds = { min_cents: min, max_cents: max };
+    // A window that MOVED can invalidate a row that was already typed, so the
+    // whole slip is re-checked rather than only the rows that happen to be on
+    // screen. Re-validating from stake_raw where there is one keeps the message
+    // talking about the figure the user actually entered.
+    for (const it of OB.state.slip) {
+      it.stake_error = stakeError(it.stake_raw != null ? parseStakeCents(it.stake_raw) : it.stake_cents);
+    }
+    OB.renderSlip();
+    return true;
+  }
+
+  /** Typed stake -> whole cents, or null when it is not an amount at all. */
+  function parseStakeCents(raw) {
+    const s = typeof raw === 'string' ? raw.trim() : raw;
+    if (s === '' || s == null) return null;
+    const dollars = parseFloat(s);
+    if (!Number.isFinite(dollars)) return null;
+    return Math.round(dollars * 100);
+  }
+
+  /**
+   * null when the stake is placeable, or the reason it is not.
+   *
+   * The REASON is what the row shows. There is deliberately no fallback value:
+   * substituting a stake the user never typed is the same failure mode as
+   * silently clamping a price, and it leaves the input and the Place button
+   * disagreeing about what is about to be sent.
+   */
+  function stakeError(cents) {
+    const b = stakeBounds();
+    if (cents === null) return 'Enter a stake, in dollars';
+    if (cents < b.min_cents) return `Minimum stake is ${OB.fmt(b.min_cents)}`;
+    if (cents > b.max_cents) return `Maximum stake is ${OB.fmt(b.max_cents)}`;
+    return null;
+  }
+
+  // What the stake box shows. A rejected amount keeps the TEXT the user typed:
+  // rewriting it to the last good value would leave the error message talking
+  // about a number that is no longer on screen.
+  function stakeInputValue(it) {
+    if (it.stake_error && it.stake_raw != null) return String(it.stake_raw);
+    return (it.stake_cents / 100).toFixed(2);
+  }
+
   // ── bet slip ─────────────────────────────────────────────────────────────
   function addToSlip(item) {
     // FEED GATE (removable — see bindLadder): defense in depth. The ladder
@@ -57,6 +131,8 @@
   function slipRowHtml(it) {
     // Integer price-cents, one rounding — the same maths the engine uses (S3).
     const exposure = OB.Ladder.exposureCents(it.price, it.stake_cents);
+    const b = stakeBounds();
+    const err = it.stake_error;
     const detail =
       it.side === 'back'
         ? `<span class="muted">Profit</span> ${OB.fmt(exposure)} · <span class="muted">Return</span> ${OB.fmt(it.stake_cents + exposure)}`
@@ -78,7 +154,7 @@
           <div class="slipgrid">
             <div>
               <label>Stake</label>
-              <input class="stake" data-stake type="number" min="1" step="0.01" value="${(it.stake_cents / 100).toFixed(2)}" />
+              <input class="stake" data-stake type="number" min="${(b.min_cents / 100).toFixed(2)}" max="${(b.max_cents / 100).toFixed(2)}" step="0.01" value="${OB.esc(stakeInputValue(it))}" />
             </div>
             <div>
               <label>Price</label>
@@ -90,7 +166,10 @@
             </div>
           </div>
           <div class="prev tn">${detail}</div>
-          <button type="button" class="btn primary place" data-place>Place ${OB.fmt(it.stake_cents)}</button>`;
+          ${err ? `<div class="stakeerr">${OB.esc(err)}</div>` : ''}
+          <button type="button" class="btn primary place" data-place${err ? ' disabled' : ''}>${
+            err ? 'Place —' : `Place ${OB.fmt(it.stake_cents)}`
+          }</button>`;
   }
 
   // Update ONE row's derived values in place — never restructure the row.
@@ -116,9 +195,30 @@
     const prev = row.querySelector('.prev');
     if (prev) prev.textContent = slipDetailText(it);
     const place = row.querySelector('[data-place]');
-    if (place) place.textContent = `Place ${OB.fmt(it.stake_cents)}`;
+    if (place) {
+      place.disabled = !!it.stake_error;
+      place.textContent = it.stake_error ? 'Place —' : `Place ${OB.fmt(it.stake_cents)}`;
+    }
+    // A rejected amount stays in the box; normalising it here would leave the
+    // message referring to a figure that is no longer on screen.
     const stakeInput = row.querySelector('[data-stake]');
-    if (stakeInput && document.activeElement !== stakeInput) stakeInput.value = (it.stake_cents / 100).toFixed(2);
+    if (stakeInput && document.activeElement !== stakeInput && !it.stake_error) {
+      stakeInput.value = (it.stake_cents / 100).toFixed(2);
+    }
+    // The message is created and removed rather than rewritten, because
+    // setHtml-style innerHTML on the ROW would detach the focused input.
+    let err = row.querySelector('.stakeerr');
+    if (it.stake_error) {
+      if (!err) {
+        err = document.createElement('div');
+        err.className = 'stakeerr';
+        if (place) row.insertBefore(err, place);
+        else row.appendChild(err);
+      }
+      err.textContent = it.stake_error;
+    } else if (err) {
+      err.remove();
+    }
   }
 
   // Slip events are DELEGATED from #slipBody (bound once in boot), keyed off
@@ -153,8 +253,15 @@
       const it = OB.state.slip[i];
       if (!it) return;
       if (e.target.matches('[data-stake]')) {
-        const cents = Math.round(parseFloat(e.target.value) * 100);
-        it.stake_cents = Number.isFinite(cents) && cents > 0 ? cents : 1000;
+        // Validate against the ENGINE's window, and never substitute a value the
+        // user did not type: a rejected amount keeps the last good stake in
+        // state, the typed text stays in the box, and the row says why.
+        const raw = e.target.value;
+        const cents = parseStakeCents(raw);
+        const err = stakeError(cents);
+        it.stake_raw = raw;
+        it.stake_error = err;
+        if (!err) it.stake_cents = cents;
         updateSlipRow(i);
         return;
       }
@@ -190,6 +297,14 @@
   async function placeOne(i, btn) {
     const it = OB.state.slip[i];
     if (!it) return;
+    // Defence in depth for the row's disabled Place button: a caller holding a
+    // stale reference must not send a stake the engine will refuse. This is UX,
+    // not a control — lib/match.js is the control.
+    if (it.stake_error) {
+      OB.toast(it.stake_error, 'err');
+      updateSlipRow(i);
+      return;
+    }
     btn.disabled = true;
     btn.textContent = 'Placing…';
     try {
@@ -218,5 +333,5 @@
   }
 
 
-  Object.assign(OB, { addToSlip, bindSlip, placeOne, renderSlip, slipDetailText, slipRowHtml, updateSlipRow });
+  Object.assign(OB, { addToSlip, bindSlip, parseStakeCents, placeOne, renderSlip, setStakeBounds, slipDetailText, slipRowHtml, stakeBounds, stakeError, stakeInputValue, updateSlipRow });
 })();
