@@ -37,7 +37,7 @@ endpoint.
 | Session | `401 Authentication required` with no valid, unexpired session |
 | Admin | `401` without a session; `403 Admin only` for a signed-in non-admin. `role` is authoritative, with `is_admin` accepted as a legacy mirror |
 | Ops token | `/metrics` and `POST /api/admin/backup` are additionally gated on `OPS_TOKEN` (`x-ops-token` header or `Authorization: Bearer`). Unset token ⇒ `404 Not found`; wrong token ⇒ `401 Unauthorized`. `/healthz` and `/readyz` are always public |
-| Payments webhook | HMAC-SHA256 over the **raw** body in `x-obx-signature`, compared in constant time. Without `PAYMENTS_WEBHOOK_SECRET` the route is `404` |
+| Payments webhook | HMAC-SHA256 over `"<x-obx-timestamp>." + rawBody`, hex in `x-obx-signature`, compared in constant time. `x-obx-timestamp` is **required** and **part of the MAC**, and a request outside a 300 s window is refused — see the webhook signing note below. Without `PAYMENTS_WEBHOOK_SECRET` the route is `404` |
 
 **The first-run lock.** An account still on a seeded demo password (`admin` /
 `admin123`, `demo` / `demo123`) can sign in but is refused `403` on every route
@@ -310,7 +310,32 @@ pay them twice.
 | `POST /api/wallet/deposit` | `{ amount_cents }` | `200 { balance_cents, frozen_cents }` (play-money faucet, capped by `FAUCET_MAX_CENTS`) | `400` not a positive integer or over the cap; `403` self-excluded / suspended / over the RG deposit limit |
 | `POST /api/wallet/deposit-intent` | `{ amount_cents }` | `200 { intent_id, external_id, status, client_secret }` — **credits nothing** | `400` not positive, or over `DEPOSIT_MAX_CENTS`; `403` self-excluded or over the RG deposit limit |
 | `POST /api/wallet/withdraw` | `{ amount_cents, reason? }`. `amount_cents` must be a JSON **integer** — a quoted `"100"`, `true` or `[100]` is refused, not coerced | `200 { status: "pending", amount_cents }` — funds debited and held in `gateway_clearing` at once | `400` not a positive integer, over available balance, or a bot account. **Not gated by self-exclusion** |
-| `POST /api/payments/webhook` | `{ provider, external_id, amount_cents }` + `x-obx-signature` | `200` confirms the matching pending deposit intent | `404` no `PAYMENTS_WEBHOOK_SECRET` or no matching pending intent; `401 Bad signature`; `400` provider mismatch or amount disagreeing with the recorded intent; `429` abuse counter |
+| `POST /api/payments/webhook` | `{ provider, external_id, amount_cents }` + `x-obx-timestamp` + `x-obx-signature` | `200` confirms the matching deposit intent. A **redelivery** of an already-confirmed intent is `200 { already_confirmed: true }`, not a `404` — at-least-once delivery is the normal case, not an error | `404` no `PAYMENTS_WEBHOOK_SECRET`, or an external id no deposit intent has; `401 Bad signature`; `400` missing/malformed `x-obx-timestamp`, outside the 300 s replay window, provider mismatch, or amount disagreeing with the recorded intent; `429` abuse counter |
+
+**Webhook signing and the replay window.** The signature is
+`hex(HMAC-SHA256(PAYMENTS_WEBHOOK_SECRET, "<timestamp>." + rawBody))`, where
+`<timestamp>` is `x-obx-timestamp` in unix seconds, compared in constant time
+against `x-obx-signature`.
+
+The timestamp is **required** and is **inside the MAC**, and both matter. It was
+neither before: the MAC covered the raw body alone, so a captured valid request
+was replayable indefinitely, and the only thing preventing a second credit was
+that the intent was no longer pending — a *state*-based defence, which stops
+re-delivery of one intent but not a captured request replayed later.
+
+Making the timestamp optional would have been worse than leaving it out: a
+caller can bypass an optional control by omitting it, so a captured body-only
+request could be replayed forever with a fresh timestamp beside it. A signature
+over the body alone is therefore refused, not accepted for compatibility.
+Requests older or newer than **300 seconds** are rejected with `400`; five
+minutes is generous for clock skew between provider and venue and comfortably
+covers a retry cycle.
+
+Note the ordering: the timestamp's *shape* is checked first (a malformed one is
+a `400` protocol error), then the signature (`401`), then the *window* (`400`).
+The window is evaluated only after the request has authenticated, so the
+timestamp it reads is one the provider actually signed rather than one the caller
+asserted.
 
 There is deliberately **no player-callable confirm route.** A deposit is credited
 only by the provider-authenticated webhook or by the admin desk below, and both

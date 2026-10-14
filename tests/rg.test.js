@@ -513,7 +513,7 @@ check('G14 the deposit limit is enforced at credit, not at intent creation', asy
     let refused = 0;
     for (const intent of intents) {
       try {
-        PAY.confirmDeposit(f.db, intent.id, { settled: true });
+        PAY.confirmDeposit(f.db, intent.id);
         credited++;
       } catch (e) {
         if (e.status === 403 && e.details && e.details.code === 'deposit_limit_reached') refused++;

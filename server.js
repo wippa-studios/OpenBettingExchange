@@ -1476,16 +1476,42 @@ app.post('/api/wallet/deposit-intent', requireAuth, limit('wallet'), (req, res, 
 
 // ── Payments webhook ───────────────────────────────────────────────────────
 // The ONLY automated deposit-confirmation path, and it authenticates the
-// CALLER, not the session: an HMAC over the raw body with a shared secret,
-// compared in constant time. Without the secret the route 404s rather than
-// accepting unsigned events — the safe default, since this is the path that
-// creates money.
+// CALLER, not the session: an HMAC with a shared secret, compared in constant
+// time. Without the secret the route 404s rather than accepting unsigned events
+// — the safe default, since this is the path that creates money.
+//
+// THE SIGNATURE COVERS A DELIVERY TIMESTAMP AS WELL AS THE BODY. It used to
+// cover the raw body alone, which meant a captured valid request was replayable
+// FOREVER. The only thing stopping a second credit was that the intent was no
+// longer PENDING — a STATE-based defence, not a replay defence. Those are not
+// the same: state-based idempotency stops re-delivery of one intent, and nothing
+// stopped a captured request being replayed later against a still-pending one.
+// Binding the timestamp into the MAC bounds the window by time as well.
+//
+// The timestamp is REQUIRED, not optional. An optional one would be a control the
+// caller could bypass by omitting the header, which is worse than no control
+// because it would read as one. Five minutes is generous for clock skew between
+// the provider and the venue, and comfortably covers a retry cycle.
+//
+// Wire format: `x-obx-timestamp` is unix seconds; `x-obx-signature` is
+// `hex(HMAC-SHA256(secret, "<timestamp>." + rawBody))`. Documented in
+// docs/API.md.
 const crypto = require('crypto');
+const WEBHOOK_REPLAY_WINDOW_SECONDS = 300;
 app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
   if (!config.PAYMENTS_WEBHOOK_SECRET) return res.status(404).json({ error: 'Not found' });
+
+  // Shape first: the timestamp is an input to the MAC, so a malformed one is a
+  // protocol error and is reported as one rather than as a bad signature.
+  const ts = String(req.headers['x-obx-timestamp'] || '');
+  if (!/^\d{1,15}$/.test(ts)) {
+    return res.status(400).json({ error: 'x-obx-timestamp is required and must be unix seconds' });
+  }
+
   const sig = String(req.headers['x-obx-signature'] || '');
   const expected = crypto
     .createHmac('sha256', config.PAYMENTS_WEBHOOK_SECRET)
+    .update(`${ts}.`)
     .update(req.rawBody || Buffer.alloc(0))
     .digest('hex');
   const a = Buffer.from(sig);
@@ -1495,6 +1521,19 @@ app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
     return res.status(401).json({ error: 'Bad signature' });
   }
+
+  // Authenticated, so the freshness of THIS request is a fact about the signed
+  // payload rather than anything the caller could have asserted on its own.
+  // Checked after the signature deliberately: an unsigned caller learns nothing
+  // about the window, and a replay of a genuinely captured request is caught
+  // here with its signature still valid.
+  const age = Math.abs(Math.floor(Date.now() / 1000) - Number(ts));
+  if (age > WEBHOOK_REPLAY_WINDOW_SECONDS) {
+    return res.status(400).json({
+      error: `Webhook timestamp is outside the ${WEBHOOK_REPLAY_WINDOW_SECONDS}s replay window`,
+    });
+  }
+
   const body = req.body || {};
   try {
     const r = PAY.confirmByExternalId(db, {
@@ -1504,9 +1543,11 @@ app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
     });
     res.json(r);
   } catch (e) {
-    // A webhook the provider RETRIES must not credit twice, and one that
-    // references an unknown or already-confirmed intent is the normal result
-    // of at-least-once delivery — answer it, do not crash the process.
+    // A webhook the provider RETRIES must not credit twice. One referencing an
+    // already-confirmed intent is the NORMAL result of at-least-once delivery,
+    // and lib/payments now answers it 200 {already_confirmed: true} rather than
+    // 404 — so this branch is for genuinely unknown ids, which is a real fault.
+    // Either way: answer it, do not crash the process.
     if (e && e.status) return res.status(e.status).json({ error: e.message, details: e.details || null });
     throw e;
   }

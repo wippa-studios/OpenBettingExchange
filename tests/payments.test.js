@@ -73,6 +73,40 @@ check('P3 confirmation is idempotent', async () => {
   assert.strictEqual(acc.assertConserved(db), 0);
 });
 
+// P3b: the same idempotence by EXTERNAL id, which is what the webhook actually
+// calls. The lookup used to carry `AND status = 'PENDING'`, so a provider's
+// routine redelivery of an already-confirmed intent fell through to a 404 —
+// indistinguishable from an unknown id, and a 4xx is exactly what providers
+// retry on and alert on. Removing the filter is what made the already-written
+// `already_confirmed` branch reachable from here at all.
+//
+// Asserting `already_confirmed` rather than merely "does not throw" is the
+// point: a refund, a failure or an unknown id would all throw, and a throw is
+// not the behaviour being pinned.
+check('P3b a redelivery by external id answers already_confirmed, not 404', async () => {
+  const { db, alice } = (await fixture());
+  const i = await pay.openDeposit(db, alice.id, 25000);
+  const first = pay.confirmByExternalId(db, { provider: 'reference', externalId: i.external_id, amountCents: 25000 });
+  assert.strictEqual(first.status, 'confirmed');
+  assert.ok(!first.already_confirmed, 'the first delivery is a real confirmation');
+  assertWallet(db, alice.id, 125000, 0, 'funded once');
+
+  const again = pay.confirmByExternalId(db, { provider: 'reference', externalId: i.external_id, amountCents: 25000 });
+  assert.strictEqual(again.already_confirmed, true, 'a redelivery is reported, not refused');
+  assert.strictEqual(again.status, 'confirmed');
+  assert.strictEqual(again.intent_id, i.intent_id, 'and names the same intent');
+  assertWallet(db, alice.id, 125000, 0, 'the redelivery credited NOTHING');
+
+  // The control: a genuinely unknown id is still a 404, so the assertion above
+  // is not just "the function stopped throwing".
+  assert.throws(
+    () => pay.confirmByExternalId(db, { provider: 'reference', externalId: 'ref_nope', amountCents: 25000 }),
+    (e) => e.status === 404 && /No deposit intent/.test(e.message),
+    'an unknown external id is still a 404'
+  );
+  assert.strictEqual(acc.assertConserved(db), 0);
+});
+
 // P4: opening many intents and abandoning them funds the player ZERO times.
 // This is the attack that crediting-on-initiation exists to prevent.
 check('P4 abandoned intents fund nothing', async () => {
