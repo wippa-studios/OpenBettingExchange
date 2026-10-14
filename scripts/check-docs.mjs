@@ -136,7 +136,12 @@ if (checks) {
 // This is the one that matters most. The v1 hedge formula was provably
 // value-destroying; a doc that still teaches it sends a contributor to
 // implement the wrong thing.
-for (const rel of ['README.md', 'docs/EXCHANGE_RULES.md', 'docs/ARCHITECTURE.md']) {
+// docs/API.md was NOT in this list, which is how it kept describing the removed
+// hedge (`"hedge_price"`, a `hedge_order` response and a `409` for a
+// multi-runner position) long after the engine moved to a venue buyout. The
+// regex is cheap and the file is the one most likely to be read by someone
+// integrating against this API, so it belongs here.
+for (const rel of ['README.md', 'docs/API.md', 'docs/EXCHANGE_RULES.md', 'docs/ARCHITECTURE.md']) {
   if (!exists(rel)) continue;
   const src = read(rel);
   note(
