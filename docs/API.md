@@ -84,6 +84,37 @@ the product rather than the trading, and a locked operator saw a JSON `403` in
 the address bar with no way to conclude anything except that the server was
 broken.
 
+### Username identity
+
+A username is **case-insensitive**. `admin`, `Admin` and `ADMIN` are one account:
+registration refuses the second and later spellings with `409`, and login accepts
+any of them. The guarantee is a `UNIQUE INDEX` on `users (username COLLATE
+NOCASE)` in the database itself, not a service-layer check — so it cannot be
+bypassed by any writer that is not `lib/auth.js`.
+
+The stored **spelling** is preserved. `username` is displayed in the UI, in the
+admin desk and in audit targets, so identity is case-folded and display is not.
+
+Two paths that are not the login path — the boot sweep that flags seeded demo
+accounts and the one that warns about them — match the same way, so a seeded
+account spelled `ADMIN` is still locked and still warned about.
+
+The reason this is a rule and not a preference: the credential-abuse counters
+have always keyed on the **folded** name (so case variants cannot farm separate
+guessing windows), while the registry was case-**sensitive**. That combination is
+an unauthenticated denial of service against a name the README publishes —
+register `ADMIN`, spend ten wrong passwords on it, and the documented `admin`
+account is locked out of its own venue without the attacker ever touching it.
+
+`COLLATE NOCASE` folds ASCII only, and that is sufficient because the charset
+restriction above admits only `[A-Za-z0-9_-]`. Under a Unicode username policy
+this decision would have to be revisited: `İ` and `i` are two identities to
+`NOCASE`.
+
+A database that **already** holds two accounts differing only by case refuses to
+boot, naming them. Merging them is not automatic because each carries its own
+balance, orders and settlements; rename one of each and start again.
+
 ### Error codes
 
 | Status | Meaning as the code actually uses it |
@@ -155,8 +186,13 @@ a status that elsewhere in this API means "slow down, retry", yet it carries no
 
 | Route | Request | Success | Errors |
 | --- | --- | --- | --- |
+<<<<<<< HEAD
 | `POST /api/auth/register` | `{ username, password, email? }` | `201 { user }` + session cookie. `username` 3–32 chars `[A-Za-z0-9_-]`; `password` 6–128 chars; `email` lowercased and unique | `400` invalid username, non-string or wrong-length password, malformed email; `409` username or email taken; `429` abuse counter |
 | `POST /api/auth/login` | `{ username \| email \| identifier, password }` | `200 { user, rg }` + session cookie. Starts the responsible-gambling session clock | `401` unknown user, wrong password or bot account (one message, constant-time); `403 Account is suspended`; `403` jurisdiction; `403` suspended tenant; `429` abuse counter |
+=======
+| `POST /api/auth/register` | `{ username, password, email? }` | `201 { user }` + session cookie. `username` 3–32 chars `[A-Za-z0-9_-]`, matched **case-insensitively** (see [Username identity](#username-identity)); `password` 6–128 chars; `email` lowercased and unique | `400` invalid username, non-string or wrong-length password, malformed email; `409` username or email taken; `429` abuse counter |
+| `POST /api/auth/login` | `{ username \| email \| identifier, password }` | `200 { user, rg }` + session cookie. `username` is matched case-insensitively. Starts the responsible-gambling session clock | `401` unknown user, wrong password or bot account (one message, constant-time); `403 Account is suspended`; `403` jurisdiction; `429` abuse counter |
+>>>>>>> 61d793f (fix(#8): username uniqueness was case-sensitive while the lockout was not)
 | `POST /api/auth/logout` | — | `200 { ok: true }`, cookie cleared. It stamps activity on the responsible-gambling state **for the token presented** (not every session) | — |
 
 Logout does **not** clear the session clock. `lib/rg.js`'s `endSession` only

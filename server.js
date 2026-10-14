@@ -877,8 +877,19 @@ app.post('/api/auth/register', limit('auth'), async (req, res, next) => {
 });
 
 app.post('/api/auth/login', limit('auth'), async (req, res, next) => {
-  // Case-normalized on purpose: 'Admin', 'ADMIN' and 'admin' share one
-  // counter, so case variants cannot farm fresh guessing windows.
+  // Case-normalized on purpose, and it now AGREES with the rest of the system
+  // rather than disagreeing with it. It used to be the odd one out: usernames
+  // were case-sensitive in the registry (so `admin` and `ADMIN` were two
+  // accounts) while this key folded case (so they were one bucket) — and that
+  // pairing is an unauthenticated denial of service, because an attacker
+  // registers `ADMIN`, spends ten wrong passwords on it, and locks the
+  // documented `admin` account out of its own venue.
+  //
+  // A username is now case-insensitive IDENTITY, enforced by a unique index on
+  // users(username COLLATE NOCASE) and matched that way at registration and at
+  // login, so there is no second account to hide behind and the folded key is
+  // simply the name. It is still the right key to use: `AdMiN` and `admin`
+  // cannot farm separate guessing windows for the one person they are.
   const key = 'login:' + String((req.body || {}).username || '').trim().toLowerCase();
   // AND a per-SOURCE counter. The username key alone was trivially bypassed by
   // an attacker who simply used a fresh username per request. That counter
@@ -1030,7 +1041,13 @@ async function enforceFirstRunLock() {
   let flagged = 0;
   for (const name of ['admin', 'demo']) {
     if (!(await isDefaultCredential(name))) continue;
-    const r = db.prepare('UPDATE users SET must_change_password = 1 WHERE username = ? AND must_change_password = 0').run(name);
+    // COLLATE NOCASE, like every other identity lookup in the codebase. A
+    // seeded account whose stored spelling is 'ADMIN' is still the seeded
+    // account — the first-run lock has to reach it, and an exact match would
+    // have flagged nothing.
+    const r = db
+      .prepare('UPDATE users SET must_change_password = 1 WHERE username = ? COLLATE NOCASE AND must_change_password = 0')
+      .run(name);
     flagged += r.changes;
   }
   return flagged;
@@ -2646,7 +2663,9 @@ async function warnDefaultCredentials() {
  */
 async function isDefaultCredential(username) {
   const DEFAULTS = { admin: 'admin123', demo: 'demo123' };
-  const row = db.prepare('SELECT pass_hash FROM users WHERE username = ?').get(username);
+  // COLLATE NOCASE: a seeded account spelled 'ADMIN' is the same identity and
+  // must be recognised as one.
+  const row = db.prepare('SELECT pass_hash FROM users WHERE username = ? COLLATE NOCASE').get(username);
   return !!row && (await A.verifyPassword(DEFAULTS[username], row.pass_hash));
 }
 
