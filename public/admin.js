@@ -64,7 +64,12 @@
     return trimmed ? trimmed : null;
   }
 
+  // Every desk view renders into #adminBody, so they all share ONE sequence
+  // token: rapid tab clicks used to leave the users table painted over the audit
+  // table the operator had just selected, because whichever response landed last
+  // won regardless of which request was made last.
   async function renderUsersView(q) {
+    const seq = OB.beginLoad('adminBody');
     const body = document.getElementById('adminBody');
     const params = new URLSearchParams();
     if (q) params.set('q', q);
@@ -73,9 +78,12 @@
     try {
       data = await api('GET', '/api/admin/users?' + params.toString());
     } catch (e) {
-      body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+      if (OB.isCurrent('adminBody', seq) && document.getElementById('adminBody') === body) {
+        body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+      }
       return;
     }
+    if (!OB.isCurrent('adminBody', seq) || document.getElementById('adminBody') !== body) return;
 
     body.innerHTML = `
       <div class="row adm-gap">
@@ -160,6 +168,7 @@
 
   // ── audit trail ───────────────────────────────────────────────────────────
   async function renderAuditView(target) {
+    const seq = OB.beginLoad('adminBody');
     const body = document.getElementById('adminBody');
     body.innerHTML = '<div class="empty">Loading…</div>';
     let entries;
@@ -168,9 +177,12 @@
       if (target) params.set('target', target);
       entries = (await api('GET', '/api/admin/audit?' + params.toString())).entries;
     } catch (e) {
-      body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+      if (OB.isCurrent('adminBody', seq) && document.getElementById('adminBody') === body) {
+        body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+      }
       return;
     }
+    if (!OB.isCurrent('adminBody', seq) || document.getElementById('adminBody') !== body) return;
     if (!entries.length) {
       body.innerHTML = '<div class="empty">No audit entries yet</div>';
       return;
@@ -212,11 +224,13 @@
 
   // ── markets + settlement ────────────────────────────────────────────────
   async function renderMarketsView() {
+    const seq = OB.beginLoad('adminBody');
     const page = document.getElementById('pageAdmin') || document.querySelector('#adminBody')?.parentElement;
     const body = document.getElementById('adminBody');
     body.innerHTML = '<div class="empty">Loading…</div>';
     try {
       const { markets } = await api('GET', '/api/admin/stats');
+      if (!OB.isCurrent('adminBody', seq) || document.getElementById('adminBody') !== body) return;
       if (!markets.length) {
         body.innerHTML = '<div class="empty">No markets</div>';
         return;
@@ -263,7 +277,9 @@
         b.onclick = () => settleDialog(b.dataset.settle);
       });
     } catch (e) {
-      body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+      if (OB.isCurrent('adminBody', seq) && document.getElementById('adminBody') === body) {
+        body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+      }
     }
   }
 
@@ -352,11 +368,13 @@
 
   // ── create form ─────────────────────────────────────────────────────────
   async function renderCreateView() {
+    const seq = OB.beginLoad('adminBody');
     const body = document.getElementById('adminBody');
     body.innerHTML = '<div class="empty">Loading…</div>';
     try {
       const sports = (await api('GET', '/api/sports')).sports;
       const events = (await api('GET', '/api/events')).events;
+      if (!OB.isCurrent('adminBody', seq) || document.getElementById('adminBody') !== body) return;
       const sportOpts = sports.map((s) => `<option value="${attr(s.id)}">${esc(s.name)}</option>`).join('');
       const eventOpts = events.map((e) => `<option value="${attr(e.id)}">${esc(e.name)}</option>`).join('');
       const marketOpts = events
@@ -428,17 +446,22 @@
       // competition dropdown follows the chosen sport
       const evtForm = body.querySelector('form[data-f="event"]');
       const compSel = evtForm.querySelector('[name="competition_id"]');
+      // Its own mount point: picking two sports in quick succession must not let
+      // the slower first response fill the dropdown for the second.
+      let compSeq = 0;
       evtForm.querySelector('[name="sport_id"]').onchange = async (e) => {
         const sid = e.target.value;
+        const seq = ++compSeq;
         if (!sid) {
           compSel.innerHTML = '<option value="">—</option>';
           return;
         }
         try {
           const { competitions } = await api('GET', `/api/admin/competitions?sport_id=${encodeURIComponent(sid)}`);
+          if (seq !== compSeq || !compSel.isConnected) return;
           compSel.innerHTML = '<option value="">—</option>' + competitions.map((c) => `<option value="${attr(c.id)}">${esc(c.name)}</option>`).join('');
         } catch {
-          compSel.innerHTML = '<option value="">—</option>';
+          if (seq === compSeq && compSel.isConnected) compSel.innerHTML = '<option value="">—</option>';
         }
       };
 
@@ -495,7 +518,9 @@
         };
       });
     } catch (e) {
-      body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+      if (OB.isCurrent('adminBody', seq) && document.getElementById('adminBody') === body) {
+        body.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+      }
     }
   }
 

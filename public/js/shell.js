@@ -131,15 +131,21 @@
   // on a password change: the two together cover both "someone else has my
   // password" and "someone else has my cookie".
   async function renderSessions() {
+    // Reached from openAccount() and again after every revoke or password
+    // change, so two of these are routinely in flight together; the panel is one
+    // mount point and takes one token.
+    const seq = OB.beginLoad('sessionList');
     const box = OB.$('sessionList');
+    if (!box) return; // the panel was closed mid-flight
     box.textContent = 'Loading…';
     let list;
     try {
       list = (await OB.api('GET', '/api/auth/sessions')).sessions;
     } catch (e) {
-      box.textContent = e.message;
+      if (OB.isCurrent('sessionList', seq) && OB.$('sessionList') === box) box.textContent = e.message;
       return;
     }
+    if (!OB.isCurrent('sessionList', seq) || OB.$('sessionList') !== box) return;
     if (!list.length) {
       box.textContent = 'No active sessions.';
       return;

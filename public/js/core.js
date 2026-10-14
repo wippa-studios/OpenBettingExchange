@@ -21,6 +21,12 @@
 
   const state = {
     user: null,
+    // Per-mount request tokens (#49). This lives ON `state` — not on a separate
+    // `OB.state` — because `state` IS `OB.state`: the export at the bottom of
+    // this file does `Object.assign(OB, { … state … })`, so anything created on
+    // a different object is overwritten the moment core.js finishes loading, and
+    // `beginLoad` then reads `reqSeq` off an object that has none.
+    reqSeq: {},
     page: 'markets',
     sport: null,          // active sport slug (null = all)
     sports: [],
@@ -83,6 +89,34 @@
     const n = OB.$(id);
     return n && n.isConnected ? n : null;
   };
+
+  // ── sequence guards (last-arrival-wins is not a render policy) ───────────
+  // An async loader must not paint a response that a NEWER load has already
+  // superseded. Re-checking that the mount still exists only detects PAGE
+  // navigation — switching a tab re-creates the same mount, so a slow in-flight
+  // load passes the existence check and overwrites the newer tab's content while
+  // the newer tab is highlighted. Every trigger is routine: two tab clicks, an
+  // SSE burst, two balance events, two refreshMe calls.
+  //
+  // One token PER MOUNT POINT, never per loader: several loaders render into the
+  // same container (#betsBody is written by loadOpenOrders, loadPositions AND
+  // loadSettled), so a per-loader token would still let a stale loadPositions
+  // overwrite a fresh loadOpenOrders — the precise bug the guard exists to stop.
+  //
+  // The state lives here, in core.js, because that is the only module loaded
+  // before every other one, and the two calls are resolved through OB at the call
+  // site like every other cross-module name.
+  // `reqSeq` is initialised on `state` above, and `state` is what `OB.state` is —
+  // see the note on the declaration. Nothing is created here: doing so created a
+  // SECOND object that the export below immediately replaced, which surfaced as
+  // "cannot read properties of undefined (reading 'me')" the first time any
+  // loader ran, and as five unrelated errors in between.
+  function beginLoad(mount) {
+    const seq = (state.reqSeq[mount] || 0) + 1;
+    state.reqSeq[mount] = seq;
+    return seq;
+  }
+  const isCurrent = (mount, seq) => state.reqSeq[mount] === seq;
 
   const fmt = (cents) => '$' + ((Number(cents) || 0) / 100).toFixed(2);
   const signed = (cents) => (cents >= 0 ? '+' : '−') + fmt(Math.abs(cents));
@@ -165,10 +199,22 @@
     }
   }
 
+  // The header balance and the session identity are a MOUNT POINT of their own:
+  // two SSE `balance` events in quick succession fire two of these, and the
+  // slower one must not roll the balance back or resurrect a stale identity.
   async function refreshMe() {
+    const seq = beginLoad('me');
     try {
-      state.user = (await api('GET', '/api/me')).user;
+      const r = await api('GET', '/api/me');
+      if (!isCurrent('me', seq)) return; // a newer refreshMe owns the header
+      state.user = r.user;
+      // The server's stake window, when it publishes one, replaces the client's
+      // documented defaults (issue #47) so the slip can never hold a stake the
+      // engine will refuse — nor refuse one it would accept. A build that does
+      // not publish it simply leaves slip.js's defaults alone.
+      if (OB.setStakeBounds) OB.setStakeBounds(r.stake_bounds);
     } catch {
+      if (!isCurrent('me', seq)) return;
       state.user = null;
     }
     renderHeader();
@@ -249,5 +295,5 @@
   // Derived from the file's own definitions rather than hand-listed, because
   // a hand-written list is how a name goes missing and surfaces as an
   // undefined reference buried in a view three files away.
-  Object.assign(OB, { $, FOCUSABLE, Ladder, TREE_LEVELS, api, attr, closeOverlay, el, esc, fmt, logout, num, openOverlay, overlayStack, price2, qa, refreshMe, renderHeader, setHtml, signed, state, toast, trapTab });
+  Object.assign(OB, { $, FOCUSABLE, Ladder, TREE_LEVELS, api, attr, beginLoad, closeOverlay, el, esc, fmt, isCurrent, logout, num, openOverlay, overlayStack, price2, qa, refreshMe, renderHeader, setHtml, signed, state, toast, trapTab });
 })();

@@ -597,6 +597,9 @@ button.chip:hover { border-color: var(--accent); color: var(--text); }
   border-color: var(--accent);
 }
 #slip .prev { font-variant-numeric: tabular-nums; margin: 8px 0; color: var(--muted); font-size: 12px; }
+/* A stake the engine will refuse: the row says so instead of substituting a
+   value the user never typed, and Place stays disabled until it is fixed. */
+#slip .stakeerr { color: var(--red); font-size: 12px; margin: 0 0 8px; }
 #slip .stepper { display: flex; gap: 4px; align-items: center; }
 #slip .stepper input { text-align: center; }
 #slip .stepper button { width: 28px; padding: 4px 0; flex: none; }
