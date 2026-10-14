@@ -455,6 +455,113 @@ const clients = new Set();
 // held socket and a periodic write, so this is a real memory ceiling, not free.
 const MAX_SSE_CLIENTS = Number(config.MAX_SSE_CLIENTS || 2000);
 
+// ── WHY THERE IS MORE THAN ONE CAP ──────────────────────────────────────────
+//
+// A single global cap is not a capacity control, it is a lottery. Every stream
+// in `clients` costs the venue exactly the same — a socket, a descriptor, a
+// write buffer, a slot in every broadcast fan-out — and every stream in it
+// returns the same, which is NOTHING to an unauthenticated caller: /api/stream
+// requires no session, and an anonymous stream receives only public `book`
+// frames. So one script could open all 2000 of them, and the cost to the
+// attacker was 2000 open TCP connections while the cost to the venue was its
+// live UX for every player who then got a 503 on the live-update channel.
+//
+// Three rules, and each one closes a different hole:
+//
+//   1. PER SOURCE, on ANONYMOUS streams. The described attack is one script,
+//      so the bound has to be on the source. It counts ANONYMOUS streams
+//      only, and that is deliberate: if it counted every stream from the
+//      address, a flood from a player's own NAT would lock that player out —
+//      which is the same unfairness, pointed the other way. An authenticated
+//      caller is bounded by rule 2 instead.
+//
+//   2. PER USER, on streams latched to an account. Without this the "per-user"
+//      half of the problem does not exist at all: one account, many tabs, is
+//      the same account as far as fairness is concerned, and 2000 tabs is a
+//      legitimate-looking way to take the whole pool.
+//
+//   3. A RESERVATION. Rules 1 and 2 bound one source and one account; neither
+//      bounds a flood spread across sources. So anonymous streams may occupy
+//      at most ANON_POOL_SHARE of the pool, and the rest is kept for
+//      authenticated players whatever else is happening. This is the property
+//      that makes "a player is never starved by anonymous traffic" true rather
+//      than merely likely.
+//
+// The session requirement the issue also suggests is NOT applied, and that is a
+// judgement rather than an omission: requiring one would mean a signed-out
+// viewer loses live prices on a venue whose front page IS the board, in
+// exchange for bounding a problem rules 1–3 already bound. The anonymous stream
+// is documented behaviour and it stays.
+const MAX_SSE_CLIENTS_PER_SOURCE = Number(config.MAX_SSE_CLIENTS_PER_SOURCE || 20);
+const MAX_SSE_CLIENTS_PER_USER = Number(config.MAX_SSE_CLIENTS_PER_USER || 8);
+// The share of the pool anonymous viewers may occupy. Four fifths is generous
+// to anonymous traffic and still leaves a fifth of the pool — 400 streams at
+// the default cap — for signed-in players under any flood shape.
+const ANON_POOL_SHARE = 0.8;
+// Ceil, not floor: a reservation that rounds DOWN to zero would leave no room
+// for authenticated players at all, which is the opposite of what it is for.
+const ANON_POOL_CAP = Math.max(1, Math.ceil(MAX_SSE_CLIENTS * ANON_POOL_SHARE));
+
+/**
+ * Whether a stream may be opened, as a PURE function of the pool's contents.
+ *
+ * `state` is a list of `{ remote, userId }` and is passed in rather than read
+ * from the module so the policy is assertable without opening 2000 sockets —
+ * which is the only reason the third rule above can be tested at all: every
+ * real connection from an offline test shares one loopback address, so a
+ * multi-source flood is not reproducible over HTTP. The route passes the live
+ * `clients` set; the tests pass a list they built.
+ *
+ * Returns null to admit, or the refusal the route should answer. 503 for a
+ * CAPACITY refusal (the venue is full) and 429 for a CALLER refusal (this
+ * caller is over its share) — a client that is over its own limit can fix that
+ * by closing a stream, and saying so with Retry-After is the useful answer.
+ *
+ * O(n) in the pool per connect. That is deliberate: a second map of per-source
+ * counters would be a second source of truth about who is connected, which is
+ * exactly the kind of bookkeeping that drifts. Connects are rare and the pool
+ * is bounded, so the scan is cheaper than the bookkeeping.
+ */
+function streamAdmission(state, who, limits) {
+  if (state.length >= limits.global) {
+    return { status: 503, error: 'Too many concurrent streams' };
+  }
+  // Counted before any refusal, so every caller learns the same thing about
+  // their own share of the pool.
+  let anonFromSource = 0;
+  let mine = 0;
+  for (const c of state) {
+    if (c.userId === null && c.remote === who.remote) anonFromSource++;
+    if (who.userId !== null && c.userId === who.userId) mine++;
+  }
+  if (who.userId === null) {
+    if (limits.perSource > 0 && anonFromSource >= limits.perSource) {
+      return {
+        status: 429,
+        error: 'Too many concurrent streams from this address',
+        retryAfter: 60,
+      };
+    }
+    // The reservation counts EVERY anonymous stream, not just this source's:
+    // it is a claim on the pool, and a rule that only applied per address
+    // would be defeated by spreading the flood across addresses — which is
+    // the one shape rules 1 and 2 cannot see.
+    let anonTotal = 0;
+    for (const c of state) if (c.userId === null) anonTotal++;
+    if (anonTotal >= limits.anonCap) {
+      return {
+        status: 503,
+        error: 'Live stream capacity is reserved for signed-in players; try again shortly',
+      };
+    }
+    return null;
+  }
+  if (limits.perUser > 0 && mine >= limits.perUser) {
+    return { status: 429, error: 'Too many concurrent streams for this account', retryAfter: 60 };
+  }
+  return null;
+}
+
 app.get('/api/stream', (req, res) => {
   // The first-run lock, explicitly. This route uses OPTIONAL auth — a signed-out
   // viewer gets an anonymous stream — so it never passes through requireAuth,
@@ -464,7 +571,21 @@ app.get('/api/stream', (req, res) => {
   // cannot matter, and this one route keeps an explicit call because optional
   // auth is genuinely a different case, not an oversight.
   if (req.user && firstRunLockResponse(req, res)) return;
-  if (clients.size >= MAX_SSE_CLIENTS) return res.status(503).json({ error: 'Too many concurrent streams' });
+  const remote = req.socket.remoteAddress || 'unknown';
+  const refusal = streamAdmission(
+    [...clients],
+    { remote, userId: req.user ? req.user.id : null },
+    {
+      global: MAX_SSE_CLIENTS,
+      perSource: MAX_SSE_CLIENTS_PER_SOURCE,
+      perUser: MAX_SSE_CLIENTS_PER_USER,
+      anonCap: ANON_POOL_CAP,
+    }
+  );
+  if (refusal) {
+    if (refusal.retryAfter) res.setHeader('Retry-After', String(refusal.retryAfter));
+    return res.status(refusal.status).json({ error: refusal.error });
+  }
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -478,7 +599,11 @@ app.get('/api/stream', (req, res) => {
   // Deliberate: per-frame re-auth would cost a DB hit per broadcast, and
   // the loopback demo accepts the stale stream. The browser tears it down on
   // its own logout/reload anyway.
-  const client = { res, userId: req.user ? req.user.id : null };
+  //
+  // `remote` is recorded because the admission rules above count by source:
+  // without it on the client there would be no way to answer "how many streams
+  // does this address already hold" without keeping a second map in step.
+  const client = { res, userId: req.user ? req.user.id : null, remote };
   clients.add(client);
   req.on('close', () => clients.delete(client));
 });
@@ -2697,4 +2822,4 @@ if (require.main === module) {
 // `ready` is exported so anything that requires this module can await the
 // seed before assuming the catalogue exists. tests/api.test.js, feed.test.js,
 // feed_nav.test.js and feedadmin.test.js all listen on `app` themselves.
-module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, feedBootStatus, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, ready, OPS };
+module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, feedBootStatus, streamAdmission, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, ready, OPS };

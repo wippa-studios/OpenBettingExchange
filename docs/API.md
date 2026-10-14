@@ -169,7 +169,7 @@ session limit — the clock resets only after a real idle gap
 | `GET /api/markets/:id/book` | — | `200 { market, book }` at 5 levels | `400` non-integer id; `404` unknown market |
 | `GET /api/format/:price` | — | `200 { decimal, american, fractional, implied_prob }`. An off-tick price **inside** the ladder is snapped, so the desk can show a trader what the engine would make of a hand-typed `2.75` | `400 Price must be a number`; `400 Price is outside the 1.01-1000 ladder` |
 | `GET /api/branding` | — | `200 { tenant, name, logo, terms_url, palette }` — the caller's tenant, or the default when signed out | — |
-| `GET /api/stream` | — | `200 text/event-stream`; see the event table below | `503 Too many concurrent streams` at `MAX_SSE_CLIENTS`; `403` first-run lock |
+| `GET /api/stream` | — | `200 text/event-stream`; see the event table below | `403` first-run lock. Capacity: `503 Too many concurrent streams` at `MAX_SSE_CLIENTS`, `503` once anonymous streams hold their reserved share (a fifth of the pool), `429` for a caller over `MAX_SSE_CLIENTS_PER_SOURCE` (anonymous streams from one address) or `MAX_SSE_CLIENTS_PER_USER` (one account) |
 
 `user` is always `lib/auth.js`'s `sanitizeUser` shape:
 `{ id, username, email, role, is_admin, is_bot, status, must_change_password,
