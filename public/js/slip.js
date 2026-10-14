@@ -221,6 +221,23 @@
     }
   }
 
+  // Remove a row BY IDENTITY, never by position.
+  //
+  // `OB.state.slip` is a mutable array the user can change for the whole
+  // duration of any in-flight request: the × button, a re-add, a tick, a
+  // cancel. An index captured before an `await` and spliced after it therefore
+  // points at whatever row moved into that slot meanwhile — so pressing Place on
+  // row 0 and then removing row 0 while the POST was in flight deleted row 1
+  // instead, silently discarding a bet the user never placed and never cancelled.
+  // Every removal in this file goes through here, so the rule has one home.
+  function removeFromSlip(it) {
+    const at = OB.state.slip.indexOf(it);
+    if (at < 0) return false;
+    OB.state.slip.splice(at, 1);
+    renderSlip();
+    return true;
+  }
+
   // Slip events are DELEGATED from #slipBody (bound once in boot), keyed off
   // each row's data-row — so re-rendering the slip never rebinds anything,
   // and there is no per-row handler to go stale. (W1)
@@ -233,8 +250,7 @@
       const it = OB.state.slip[i];
       if (!it) return;
       if (e.target.closest('[data-rm]')) {
-        OB.state.slip.splice(i, 1);
-        renderSlip();
+        removeFromSlip(it);
         return;
       }
       const tick = e.target.closest('[data-tick]');
@@ -295,6 +311,8 @@
   }
 
   async function placeOne(i, btn) {
+    // `i` names the row on SCREEN; `it` is the bet. Only `it` may outlive this
+    // function's await — see removeFromSlip for why a position cannot.
     const it = OB.state.slip[i];
     if (!it) return;
     // Defence in depth for the row's disabled Place button: a caller holding a
@@ -319,8 +337,9 @@
       if (matched > 0 && resting === 0) OB.toast(`Matched ${OB.fmt(matched)} @ ${OB.price2(r.fills[0].price)}`);
       else if (matched > 0) OB.toast(`Matched ${OB.fmt(matched)} · ${OB.fmt(resting)} resting @ ${OB.price2(r.order.price)}`);
       else OB.toast(`Resting ${OB.fmt(r.order.stake_cents)} @ ${OB.price2(r.order.price)}`);
-      OB.state.slip.splice(i, 1);
-      renderSlip();
+      // By identity, not by position: the user may have removed, re-added or
+      // re-ordered rows while this POST was in flight.
+      removeFromSlip(it);
       OB.refreshMe();
       // Feed-aware board refresh — loadEvents() is the seeded loader and
       // updated nothing in feed mode. (W4)
@@ -333,5 +352,5 @@
   }
 
 
-  Object.assign(OB, { addToSlip, bindSlip, parseStakeCents, placeOne, renderSlip, setStakeBounds, slipDetailText, slipRowHtml, stakeBounds, stakeError, stakeInputValue, updateSlipRow });
+  Object.assign(OB, { addToSlip, bindSlip, parseStakeCents, placeOne, removeFromSlip, renderSlip, setStakeBounds, slipDetailText, slipRowHtml, stakeBounds, stakeError, stakeInputValue, updateSlipRow });
 })();
