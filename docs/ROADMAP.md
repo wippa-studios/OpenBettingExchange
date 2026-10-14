@@ -48,7 +48,7 @@ An inventory, so the plan is grounded rather than generic.
 | Escrow ledger | `lib/ledger.js` | integer cents, single rounding point, available vs frozen, refusal to over-commit |
 | Transaction discipline | `lib/tx.js` | savepoint nesting, cross-connection nesting refused loudly |
 | Settlement | `lib/settle.js` | pot distribution, void refunds, commission on net winnings, auto-cancel, double-settle blocked |
-| Cash-out | `lib/cashout.js` | green-up close, hedge scaled `1/n`, own-liquidity correctly excluded |
+| Cash-out | `lib/cashout.js` | venue buyout at `Σ pᵢ·Payoutᵢ` less a margin; held when the venue cannot price it fairly; risk-bounded by `lib/cashoutrisk.js` |
 | Tick ladder | `lib/odds.js` | Betfair increments, American/fractional/implied, overround |
 | Odds feed client | `lib/feed.js` | board/nav contract from a Postgres recorder, staleness reporting |
 | Test suite | `tests/` | 47 suites, hand-computed money rules, smoke + Playwright |
