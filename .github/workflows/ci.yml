@@ -100,6 +100,16 @@ jobs:
             exit 1
           fi
 
+      - name: .gitignore still refuses the credential files
+        # The step above is a backstop: it fails AFTER a file is staged and only
+        # matches by extension, so it cannot see .netrc or pgpass (bare
+        # name==password files with no extension at all). This one asks git
+        # itself whether the rules still exclude the paths — and, in the same
+        # run, whether they still leave .env.example and ordinary source
+        # committable. That second half is what keeps it from being satisfied by
+        # an over-broad rule. See #12.
+        run: node scripts/check-gitignore.mjs
+
       # The step above checks for key FILES. The actual incident was a credential
       # VALUE pasted into an ordinary .js test fixture as "obviously fake sample
       # data" — a live Betfair app key and username, committed and pushed to a

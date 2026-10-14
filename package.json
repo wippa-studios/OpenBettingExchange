@@ -12,6 +12,7 @@
     "shots": "node scripts/shoot.mjs",
     "docs:check": "node scripts/check-docs.mjs",
     "check:secrets": "node scripts/check-no-secrets.mjs",
+    "check:ignore": "node scripts/check-gitignore.mjs",
     "load": "node scripts/load-test.mjs"
   },
   "engines": {
