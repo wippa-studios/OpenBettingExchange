@@ -175,6 +175,47 @@ check('R9 kill switch alone does not cancel resting quotes', async () => {
   assert.strictEqual(still, resting, 'resting quotes untouched by the kill switch');
 });
 
+// R9b: the kill switch is the venue's most consequential write — every bot
+// stops quoting on the next pass — and it must not land without a record of who
+// did it (#27). The audit call sat OUTSIDE the transaction this function
+// already had.
+//
+// The mechanism is not the one usually assumed. `audit.record` does not throw: it
+// catches its own failure, warns and returns FALSE. So merely moving the call
+// inside the transaction would have changed nothing — nothing would be thrown,
+// so nothing would roll back. The fix has to treat a failed audit write as a
+// failed mutation.
+//
+// The failure is produced by dropping `audit_log`, so the INSERT fails the way a
+// full disk or a locked database would. Asserting the switch is STILL OFF is
+// the whole point: "it threw" alone would also be satisfied by a switch that
+// moved and then failed loudly.
+check('R9b a kill switch that cannot be audited does not land', async () => {
+  const { db } = (await fixture());
+  const adm = (await A.registerUser(db, { username: 'ops', password: 'pw-ops-123' }));
+  assert.strictEqual(risk.killSwitch(db), false, 'absent means not pulled');
+
+  db.exec('DROP TABLE audit_log');
+  assert.throws(
+    () => risk.setKillSwitch(db, { actor: adm, on: true, reason: 'testing a failed audit write' }),
+    (e) => e.status >= 500,
+    'the operator is told the switch did not move'
+  );
+  assert.strictEqual(risk.killSwitch(db), false, 'and the switch is STILL OFF — nothing is unrecorded');
+  db.close();
+
+  // The control, on a fresh venue with a working audit log: the same call
+  // succeeds and IS recorded. Without it this check would also be satisfied by
+  // a setKillSwitch that simply always threw.
+  const ok = (await fixture());
+  const okAdm = (await A.registerUser(ok.db, { username: 'ops', password: 'pw-ops-123' }));
+  assert.strictEqual(risk.setKillSwitch(ok.db, { actor: okAdm, on: true, reason: 'testing a working audit write' }).kill_switch, true);
+  assert.strictEqual(risk.killSwitch(ok.db), true, 'the switch moved when it could be recorded');
+  const rows = ok.db.prepare("SELECT COUNT(*) c FROM audit_log WHERE action = 'risk.kill_switch'").get().c;
+  assert.strictEqual(rows, 1, 'and exactly one audit row names it');
+  ok.db.close();
+});
+
 // R10: withdraw is the explicit, separate withdrawal of liquidity.
 check('R10 withdraw cancels resting quotes and releases escrow', async () => {
   const { db, bot, marketId } = (await fixture());
@@ -377,6 +418,6 @@ check('R19 neither desk control can be driven without a reason', async () => {
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 19) { console.error('expected 19 checks'); process.exit(1); }
+  if (passed < 20) { console.error("expected 20 checks"); process.exit(1); }
   console.log(`\nrisk.test.js: ${passed} checks passed`);
 })();

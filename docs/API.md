@@ -505,7 +505,7 @@ exits 0.
 | Route | Request | Success | Errors |
 | --- | --- | --- | --- |
 | `GET /api/admin/tenants` | — | `200 { tenants }` — all rows; `brand` and `jurisdictions` are stored as JSON **strings** | `401`/`403` |
-| `PUT /api/admin/tenants/:id` | `{ name?, status?, commission_bps?, brand?, jurisdictions? }`. `status` is `active`/`suspended`; `commission_bps` an integer in `[0, 2000]`; `brand` and `jurisdictions` are **objects**, stored JSON-encoded. An absent key leaves that column untouched | `200` the tenant row | `400` unknown status or out-of-range `commission_bps`; `404 No such tenant` |
+| `PUT /api/admin/tenants/:id` | `{ name?, status?, commission_bps?, brand?, jurisdictions? }`. `status` is `active`/`suspended`; `commission_bps` an integer in `[0, 2000]`; `brand` and `jurisdictions` are **objects**, stored JSON-encoded. An absent key leaves that column untouched | `200` the tenant row. The `UPDATE` and its `tenant.configured` audit row are one transaction, and the change is **refused outright** if the audit write fails — a commission rate or a tenant status that cannot be recorded does not stand | `400` unknown status or out-of-range `commission_bps`; `404 No such tenant`; `500` the audit log could not be written |
 
 A `NULL` `tenant_id` on a user means the default tenant. Jurisdiction is enforced
 at **session mint**, not at bet placement, and only from a proxy-overwritten
@@ -579,7 +579,7 @@ because an order that vanished for no stated reason is a support incident.
 | Route | Request | Success | Errors |
 | --- | --- | --- | --- |
 | `GET /api/admin/risk` | — | `200 { kill_switch, bots }`; each bot carries `liability_cents`, `daily_pnl_cents`, `pressure` (0–1), `quoting_allowed` and `reason` | `401`/`403` |
-| `PUT /api/admin/risk/kill-switch` | `{ on, reason }` — **reason required**, 5–500 chars | `200 { kill_switch }`, audited | `400` missing, under 5 or over 500 chars |
+| `PUT /api/admin/risk/kill-switch` | `{ on, reason }` — **reason required**, 5–500 chars | `200 { kill_switch }`. The setting write and its `risk.kill_switch` audit row are one transaction, and the switch is **not pulled** if the audit write fails — the most consequential write the venue offers must not land with no record of who did it | `400` missing, under 5 or over 500 chars; `500` the audit log could not be written |
 | `POST /api/admin/risk/withdraw` | `{ reason }` — same requirement | `200 { cancelled_orders, released_cents }`, audited | `400` on the reason |
 | `PUT /api/admin/risk/bots/:id` | `{ max_liability_cents?, max_daily_loss_cents?, quote_skew?, enabled? }` — caps are **positive integers**, `quote_skew` is `0`–`1` | `200` the updated `risk_bots` row, audited | `400` a non-positive cap, `quote_skew must be between 0 and 1`, or a non-bot account; `404 No such bot` |
 | `GET /api/admin/risk/cashout` | — | `200 { outstanding_cents, outlay_today_cents, realised_loss_today_cents, open_buyouts, taken_today, max_outstanding_cents, max_daily_outlay_cents, outstanding_headroom_cents, daily_outlay_headroom_cents, quoting_allowed }` | `401`/`403` |

@@ -258,6 +258,46 @@ check('T19 an allowlist with no trusted source fails closed', async () => {
   assert.throws(() => A.createSession(db, alice.id, { country: null }), (e) => e.status === 403 && e.details.code === 'no-jurisdiction-supplied');
 });
 
+// T20: a tenant's commission rate and status are, in the module's own words,
+// "commercial and legal facts" — so a change that cannot be recorded must not
+// stand. #27.
+//
+// THE MECHANISM IS NOT THE ONE THE ISSUE DESCRIBED. It assumed
+// `audit.record` throws. It does not: it catches its own errors, logs a warning
+// and RETURNS FALSE. So simply wrapping the UPDATE and the audit call in one
+// transaction would have been decorative — nothing would roll back, because
+// nothing is thrown. The transaction only closes the hole if a failed audit
+// write is treated as a failed mutation, which is what `assertAudited` below
+// makes explicit.
+//
+// The audit failure is produced by dropping `audit_log`, which makes the INSERT
+// fail the way a full disk or a locked database would.
+check('T20 a tenant change that cannot be audited does not stand', async () => {
+  const { db, alice } = (await fixture());
+  const tid = T.defaultTenant(db).id;
+  const ops = { actor: alice, tenantId: tid };
+  const before = T.byId(db, tid).commission_bps;
+
+  db.exec('DROP TABLE audit_log');
+  assert.throws(
+    () => T.configure(db, { ...ops, commission_bps: 999 }),
+    (e) => e.status >= 500,
+    'the operator is told the change did not happen'
+  );
+  assert.strictEqual(
+    T.byId(db, tid).commission_bps,
+    before,
+    'and the commission rate is UNCHANGED — the mutation rolled back with its audit row'
+  );
+
+  // The status half of the same call: a suspended tenant is an availability
+  // fact, so it must roll back on the same terms.
+  const statusBefore = T.byId(db, tid).status;
+  assert.throws(() => T.configure(db, { ...ops, status: 'suspended' }), (e) => e.status >= 500);
+  assert.strictEqual(T.byId(db, tid).status, statusBefore, 'the status is unchanged too');
+  db.close();
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -274,6 +314,6 @@ check('T19 an allowlist with no trusted source fails closed', async () => {
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 19) { console.error('expected 19 checks'); process.exit(1); }
+  if (passed < 20) { console.error("expected 20 checks"); process.exit(1); }
   console.log(`\ntenants.test.js: ${passed} checks passed`);
 })();

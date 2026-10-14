@@ -1275,6 +1275,10 @@ function slugify(name) {
 // Every route here is audited inside lib/admin.js, in the same transaction as
 // the mutation it describes — so an audit row can never exist for a change
 // that was rolled back.
+//
+// The desk's other audited mutators, in lib/tenants.js (commission rate, tenant
+// status) and lib/risk.js (the kill switch), are now held to the same rule.
+// They were the two exceptions, and the comment above did not mark them (#27).
 
 app.get('/api/admin/users', requireAdmin, limit('admin'), (req, res) => {
   res.json(

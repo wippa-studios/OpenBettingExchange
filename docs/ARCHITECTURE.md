@@ -24,7 +24,7 @@ browser   public/    index.html, style.css, classic scripts — no build step
              admin.js, admin-risk.js, ladder.js
    │      fetch() + EventSource          same-origin, httpOnly cookie session
    ▼
-server    server.js  2,556 lines, 87 routes
+server    server.js  2,560 lines, 87 routes
              1. baseline security headers
              2. origin guard — BEFORE any body parsing
              3. express.json({ limit: 256kb })
@@ -184,7 +184,7 @@ Deliberately narrow, and asserted by tests rather than assumed:
 
 ## Testing strategy
 
-640 checks across 48 suites, plus a browser suite and a live smoke script.
+642 checks across 48 suites, plus a browser suite and a live smoke script.
 
 | Layer | Where | What it proves |
 | --- | --- | --- |
