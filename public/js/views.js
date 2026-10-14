@@ -48,10 +48,18 @@
     else loadSettled();
   }
 
+  // All three loaders below render into #betsBody and therefore share ONE
+  // sequence token: they are alternatives writing the same mount, so a stale
+  // loadPositions must not be allowed to overwrite a fresh loadOpenOrders.
   async function loadOpenOrders() {
+    const seq = OB.beginLoad('betsBody');
     if (!OB.el('betsBody')) return; // navigated away mid-flight
     try {
       const { orders } = await OB.api('GET', '/api/orders');
+      // The existence check below only detects PAGE navigation; switching tabs
+      // re-creates #betsBody, so a slow load passes it and overwrites the newer
+      // tab. The token is what actually orders the renders.
+      if (!OB.isCurrent('betsBody', seq)) return;
       const body = OB.el('betsBody');
       if (!body) return; // tab changed while the request was in flight
       if (!orders.length) {
@@ -89,14 +97,16 @@
         };
       });
     } catch (e) {
-      OB.setHtml(OB.el('betsBody'), `<div class="empty">${OB.esc(e.message)}</div>`);
+      if (OB.isCurrent('betsBody', seq)) OB.setHtml(OB.el('betsBody'), `<div class="empty">${OB.esc(e.message)}</div>`);
     }
   }
 
   async function loadPositions() {
+    const seq = OB.beginLoad('betsBody');
     if (!OB.el('betsBody')) return; // navigated away mid-flight
     try {
       const { positions } = await OB.api('GET', '/api/positions');
+      if (!OB.isCurrent('betsBody', seq)) return;
       const body = OB.el('betsBody');
       if (!body) return; // tab changed while the request was in flight
       if (!positions.length) {
@@ -161,14 +171,16 @@
         };
       });
     } catch (e) {
-      OB.setHtml(OB.el('betsBody'), `<div class="empty">${OB.esc(e.message)}</div>`);
+      if (OB.isCurrent('betsBody', seq)) OB.setHtml(OB.el('betsBody'), `<div class="empty">${OB.esc(e.message)}</div>`);
     }
   }
 
   async function loadSettled() {
+    const seq = OB.beginLoad('betsBody');
     if (!OB.el('betsBody')) return; // navigated away mid-flight
     try {
       const { settlements } = await OB.api('GET', '/api/settlements');
+      if (!OB.isCurrent('betsBody', seq)) return;
       const body = OB.el('betsBody');
       if (!body) return; // tab changed while the request was in flight
       if (!settlements.length) {
@@ -191,7 +203,7 @@
           .join('') +
         '</tbody></table>');
     } catch (e) {
-      OB.setHtml(OB.el('betsBody'), `<div class="empty">${OB.esc(e.message)}</div>`);
+      if (OB.isCurrent('betsBody', seq)) OB.setHtml(OB.el('betsBody'), `<div class="empty">${OB.esc(e.message)}</div>`);
     }
   }
 
@@ -240,10 +252,15 @@
     loadWallet();
   }
 
+  // One token for the WHOLE wallet render: the three balance figures and the
+  // transaction table are a single snapshot, and half of one is a wrong answer.
+  // Two SSE `balance` events fire two of these, so the race is routine.
   async function loadWallet() {
+    const seq = OB.beginLoad('wTx');
     if (!OB.el('wTx')) return; // navigated away mid-flight
     try {
       const w = await OB.api('GET', '/api/wallet');
+      if (!OB.isCurrent('wTx', seq)) return;
       const balEl = OB.el('wBal');
       if (!balEl || !OB.el('wTx')) return; // left the wallet page mid-flight
       balEl.textContent = OB.fmt(w.balance_cents);
@@ -273,7 +290,7 @@
           .join('') +
         '</tbody></table>');
     } catch (e) {
-      OB.setHtml(OB.el('wTx'), `<div class="empty">${OB.esc(e.message)}</div>`);
+      if (OB.isCurrent('wTx', seq)) OB.setHtml(OB.el('wTx'), `<div class="empty">${OB.esc(e.message)}</div>`);
     }
   }
 
