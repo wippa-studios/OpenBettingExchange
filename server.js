@@ -359,8 +359,28 @@ function firstRunLockResponse(req, res) {
     details: {
       code: 'password_change_required',
       username: req.user.username,
-      // Named so a fresh demo deployment shows the operator what to change.
-      seeded_password: req.user.username === 'admin' ? 'admin123' : 'demo123',
+      // THE FIXTURE THIS REPLACED: `seeded_password: username === 'admin' ?
+      // 'admin123' : 'demo123'`. A password value in an API response, which is
+      // the one thing this codebase does not otherwise do — lib/feedcreds has
+      // an explicit property that no function there returns a credential, and
+      // this line was the counterexample sitting in the same repository.
+      //
+      // It was not only a disclosure, it was a FALSE one. It answered from a
+      // literal rather than from the stored hash, so an operator who seeded
+      // ADMIN_PASSWORD (which lib/config.js has always supported) was told
+      // `admin123`, which does not open their account. And it answered
+      // `demo123` for EVERY other username, so any account that ended up
+      // flagged was handed the demo pattern on the strength of a ternary —
+      // a password oracle whose only claim to knowledge was "not named admin".
+      //
+      // The value was never needed to recover, which is what makes removing it
+      // cost nothing: this response is only reachable by a caller who has
+      // ALREADY proved knowledge of the password it discloses. You cannot be
+      // locked out of here without having signed in, and `POST
+      // /api/auth/change-password` verifies that same password. So what the
+      // client needs is the FLAG — which it already has, from
+      // `user.must_change_password` on the login response — and a reason, which
+      // is what this now says.
     },
   });
   return true;
@@ -2447,6 +2467,15 @@ async function warnDefaultCredentials() {
  * an operator who sets ADMIN_PASSWORD in .env gets a real account and this
  * returns false immediately, whereas comparing config would keep flagging an
  * account that is already safe and train the operator to ignore the warning.
+ *
+ * THE LITERAL IS DELIBERATELY NOT lib/seed.js's `config.ADMIN_PASSWORD ||
+ * 'admin123'`. It looks like the same value and it is not: this asks "does this
+ * account still accept the PUBLISHED demo password", which is the only question
+ * the warning and the lock are asking. Sourcing it from the seed would make this
+ * verify the OPERATOR's chosen password — which the seed used — so every
+ * properly-configured deployment would flag and lock its own admin for using a
+ * password nobody else knows. Verified here: the account really is unsafe, not
+ * merely un-defaulted.
  */
 async function isDefaultCredential(username) {
   const DEFAULTS = { admin: 'admin123', demo: 'demo123' };

@@ -47,8 +47,11 @@ outside a five-route allowlist — `GET /api/me`, `POST /api/auth/change-passwor
 segment matches exactly one non-empty path segment, so `/api/auth/sessions/abc`
 is allowlisted while `/api/auth/sessions/a/b` is not, and the HTTP method is part
 of the match. The refusal carries
-`details.code = "password_change_required"`, `details.username` and
-`details.seeded_password`, so a fresh deployment can be unlocked from the UI.
+`details.code = "password_change_required"` and `details.username`, and nothing
+else: no password, seeded or otherwise. It does not need one — the refusal is
+only reachable by a caller who has already signed in with the very password it
+would otherwise disclose, and the client acts on `user.must_change_password`
+from the login response before it ever sees a `403`.
 The check lives inside `requireAuth`/`requireAdmin`, so a route's position in
 the file cannot exempt it.
 
