@@ -601,6 +601,7 @@ POST /api/admin/results/poll      one cycle, on demand
 | `last_error` | `{ reason, detail, at }`; `reason` is what tells an operator where to look |
 | `polls` · `ok_polls` · `signals_received` | totals |
 | `dropped_entries` · `last_dropped` | see above |
+| `pending_last_poll` · `pending_peak` | how many markets the last poll asked about, and the high-water mark since boot. The backlog, not the transport — see [The poll set is bounded, not truncated](#the-poll-set-is-bounded-not-truncated) |
 | `stale` | configured, and the venue has been waiting too long for an answer: the last success is older than `staleAfterMs`, **or there has never been one** |
 
 A feed that has been configured and has **never once answered** reports `stale`,
@@ -620,6 +621,52 @@ Reasons an operator will see: `unreadable_response`, `invalid_json`,
 an unreadable body is a transport problem, a body read perfectly well but not
 interpreted is an integration whose contract moved underneath you, and that is
 the one to page someone about.
+
+### The poll set is bounded, not truncated
+
+A results service that has to page through the venue's entire market catalogue
+in one request is a service that will time out. `pendingMarkets` therefore has
+**no `LIMIT`**, and that is deliberate rather than an oversight.
+
+It became a live query when #39 replaced its unsatisfiable predicate (which
+required `events.status = 'completed'` — a state production cannot reach, since
+`settle.js` only writes it once every market on the event is already settled)
+with off time. Before that the set was always empty, so its size never mattered.
+Now it does: on a long-running venue whose results feed has quietly stopped
+working, every market that goes off stays in the set forever.
+
+A `LIMIT` fixes that by **dropping markets silently**. A market outside the limit
+is never asked about, never settled and never reported — the exact failure this
+whole path exists to prevent, introduced by the fix for "the list grows". The
+ordering does not save it: putting the longest-waiting markets last strands
+precisely those, which are the ones holding a player's money, and putting them
+first strands whatever is behind them the moment the backlog exceeds the cap.
+The list is not a queue an operator is draining; it is everything the venue
+still owes money on.
+
+So the bound is on the **wire** instead:
+
+| | |
+| --- | --- |
+| `pendingMarkets` | returns everything eligible. No cap, ever |
+| `createFetcher({ batchSize })` | the set is posted in batches, default **250** markets per request |
+| `pending_last_poll` / `pending_peak` | published in `health()`, so a backlog that only grows is visible rather than inferred |
+| the log | a **new high** in the backlog is announced once, when it happens |
+
+Every pending market is asked about on every poll, across as many requests as it
+takes. Nothing is dropped and nothing is deferred.
+
+A failed batch **stops** the poll and keeps the outcomes from the batches that
+already answered. Stopping avoids hammering a provider that has just failed a
+request; keeping them is because those outcomes are real results for real
+markets, and discarding them because a later batch timed out strands money the
+venue is already holding answers for. The health entry is identical to a
+single-request failure either way.
+
+The high-water trigger is a new high rather than a threshold, so a venue with a
+permanently large backlog says so once instead of every cycle and the line keeps
+its meaning; a queue that is merely large but not growing stays silent, because
+it is not getting worse.
 
 The feed is reported in `/readyz` and deliberately **not** gated on it: a dead
 results feed means outcomes arrive late and a human settles, not that the book
@@ -716,13 +763,15 @@ discovered by reading a green dashboard.
 | Gap | Where | What actually happens |
 | --- | --- | --- |
 | The nav tree reads feed 2 on feed 1 | `NAV_SQL`, `lib/feed.js` | `NAV_SQL` interpolates `feedView(2)` at module load while `boardSql` and `healthSql` take the configured feed, and `fetchNav()` takes no argument. With `FEED_NUMBER=1` the navigation tree describes `v_feed2` while the board and market routes read `v_feed1`. |
-| The results poll set is uncapped | `pendingMarkets`, `lib/results.js` | Every open, non-held, off market is polled and POSTed, every cycle. A venue whose results feed is quietly broken accumulates off-but-unsettled markets and the request body grows without bound. |
+| The results poll set is uncapped | `pendingMarkets`, `lib/results.js` | Every open, non-held, off market is asked about, every cycle. There is deliberately **no `LIMIT`** — see [The poll set is bounded, not truncated](#the-poll-set-is-bounded-not-truncated). The bound is on the request body, and the backlog is published as `pending_last_poll` / `pending_peak`. |
 | The delay probe asks for a column that does not exist | `delayProbe`, `lib/feed.js` | It selects `feed_run.payload`; the collector's `feed_run` has no such column, so the query raises, the fallback is `is_delay: true`, and `app_key_delay` is always `true` with `data_age_seconds` always `null`. The response now publishes `app_key_delay_source`, so an operator can tell an assumed flag from a read one — but the flag itself still carries no information until the collector writes it somewhere a query can reach. |
 
 On the second: the predicate was previously unreachable. It also required
 `events.status = 'completed'`, which cannot co-exist with an open market, so the
 set was empty by construction and the absence of a cap had nothing to act on.
-Removing the dead clause is what made the list real.
+Removing the dead clause is what made the list real. It is still uncapped, on
+purpose — see
+[The poll set is bounded, not truncated](#the-poll-set-is-bounded-not-truncated).
 
 ---
 
