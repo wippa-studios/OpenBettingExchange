@@ -450,6 +450,45 @@ const check = async (name, fn) => {
       );
     });
 
+    // #61, at the route. `releaseHold` no longer coerces, but the ROUTE also did:
+    // `Number(winner_selection_id)`, so `true` became selection 1 on the wire
+    // before the engine could ever see the boolean. Driven over HTTP because the
+    // route is a separate coercion site from the module's.
+    await check('the hold-release route passes a malformed winner id through, uncoerced', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      // Build and HOLD a dedicated market, so the refusal can be observed on a
+      // market that is genuinely held rather than on a 404.
+      const sport = (await j('GET', '/api/sports')).json.sports.find((s) => s.slug === 'football');
+      const ev = await j('POST', '/api/admin/events', {
+        body: { sport_id: sport.id, name: 'release-probe event', starts_at: '2031-01-01T00:00:00Z' },
+        cookie: admin,
+      });
+      const mkt = await j('POST', '/api/admin/markets', { body: { event_id: ev.json.event.id, name: 'release-probe market' }, cookie: admin });
+      const mid = mkt.json.market.id;
+      const selA = await j('POST', '/api/admin/selections', { body: { market_id: mid, name: 'Runner B' }, cookie: admin });
+      const selB = await j('POST', '/api/admin/selections', { body: { market_id: mid, name: 'Runner C' }, cookie: admin });
+      srv.db.prepare('UPDATE markets SET settlement_hold = 1, hold_reason = ? WHERE id = ?').run('disputed', mid);
+
+      for (const [label, body] of [
+        ['a boolean winner', { decision: 'settle', winner_selection_id: true, reason: 'adjudicating the dispute' }],
+        ['a quoted winner', { decision: 'settle', winner_selection_id: String(selA.json.selection.id), reason: 'adjudicating the dispute' }],
+        // The QUOTED id here is the one that matters. `Number("35")` is 35, so
+        // with the coercion this is a perfectly valid two-runner dead heat
+        // naming two selections of THIS market — and it settles. Using `true`
+        // instead would coerce to selection 1, which belongs to a different
+        // market, so settleMarket would refuse it for being foreign and the
+        // check would pass with the coercion still in place.
+        ['a dead_heat holding a quoted id', { decision: 'settle', dead_heat: [String(selA.json.selection.id), selB.json.selection.id], reason: 'adjudicating the dispute' }],
+        ['a dead_heat that is not an array', { decision: 'settle', dead_heat: `${selA.json.selection.id},${selB.json.selection.id}`, reason: 'adjudicating the dispute' }],
+      ]) {
+        const r = await j('POST', `/api/admin/results/held/${mid}/release`, { body, cookie: admin });
+        assert.strictEqual(r.status, 400, `${label} is refused (got ${r.status} ${JSON.stringify(r.json)})`);
+        const row = srv.db.prepare('SELECT status, settlement_hold FROM markets WHERE id = ?').get(mid);
+        assert.strictEqual(row.status, 'open', `${label}: the market is still open`);
+        assert.strictEqual(row.settlement_hold, 1, `${label}: and still held`);
+      }
+    });
+
     // ── #25: the risk-cap route must not call every fault a 400 ──────────────
     //
     // The route caught everything and stamped `e.status = 400` on whatever

@@ -184,7 +184,7 @@ Deliberately narrow, and asserted by tests rather than assumed:
 
 ## Testing strategy
 
-632 checks across 47 suites, plus a browser suite and a live smoke script.
+634 checks across 47 suites, plus a browser suite and a live smoke script.
 
 | Layer | Where | What it proves |
 | --- | --- | --- |

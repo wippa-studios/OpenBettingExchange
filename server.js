@@ -1763,7 +1763,12 @@ app.post('/api/admin/results/held/:id/release', requireAdmin, limit('admin'), (r
       actor: req.user,
       marketId: intId(req.params.id),
       decision,
-      winnerSelectionId: winner_selection_id === undefined ? null : Number(winner_selection_id),
+      // UNCHANGED, and `Number()` is gone from here too. This route carried the
+      // same coercion the joint-favourite list was meant to be free of:
+      // `Number(true)` is 1 and `Number("2")` is 2, so a hand-rolled `curl` with
+      // a quoted id settled on it as though the operator had chosen it. lib/
+      // settle.js refuses both, which is the whole point of that strictness.
+      winnerSelectionId: winner_selection_id === undefined ? null : winner_selection_id,
       // A held DEAD HEAT is exactly the case a hold exists for, and this route
       // could only express a single winner — so releasing one paid a whole stake
       // to one runner and charged a joint winner's backer his whole stake. The
