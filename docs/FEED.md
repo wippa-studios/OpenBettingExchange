@@ -180,6 +180,26 @@ What a feed-1 board actually contains:
 | `in_play`, `bet_delay` | `false` / `null` — both columns are selected only on feed 2 |
 | ordering | `market_start_time`, then market id, sort priority, selection id |
 
+**The board's order is the query's, on both feeds.** `fetchBoard` used to end
+with a start-time sort, which silently re-keyed the order the SQL had chosen —
+and the comment above `boardSql` argues at length that feed 2 must lead with the
+freshest books, because start-time ordering puts the *already-finished* markets
+first and those are exactly the ones the odds job stopped polling. The sort made
+that reasoning dead text and left `ORDER BY v.odds_captured_at DESC` relevant
+only to which markets survived the CTE `LIMIT`. It is gone; `shape()` groups
+rows and decorates them, in the order the statement returned them.
+
+`?limit=` with a blank, a zero or a negative now falls back to
+`FEED_MARKET_LIMIT` instead of clamping to one market. `Number('') === 0` is
+finite, so the old `!Number.isFinite(n)` guard let the most likely junk a URL
+produces through to `Math.max(1, 0)` — a one-market board, no error, no warning.
+The 500 ceiling still applies.
+
+Every market carries `sport_id`, read from `v.event_type_id` — the column
+`NAV_SQL` already aliased correctly. The board field used to read
+`row.sport_type_id`, which no view has, so it was `undefined` on every response
+while its name promised otherwise.
+
 `/api/feed/health` on feed 1 answers from `v_feed1`, with the price aggregates as
 **typed nulls** rather than unknown columns — the probe can run, and can still
 fail:
@@ -196,6 +216,7 @@ fail:
   "oldest_odds_age_seconds": null,
   "data_age_seconds": null,
   "app_key_delay": true,
+  "app_key_delay_source": "assumed",   // the probe could not read it; see below
   "delay_note": "…"
 }
 ```
@@ -480,6 +501,13 @@ only when a child has stayed up longer than `FEED_RUNNER_MIN_UPTIME_SECONDS`, so
 a crash-loop that survives ten seconds each time does not reset it to 5 s and
 retry forever.
 
+The **first** restart used to wait 10 s. The exit path recorded the failure and
+*then* asked how long to wait, so the count it read on the first crash was 1 and
+the ladder started one rung above where it claims to. `BACKOFF_START_MS` was a
+value the code could not produce. The wait is now computed before the failure is
+counted, so 5 s is reachable; the log line still names the crash it is reporting,
+which is why it reads "retrying in 5s (failure 1)".
+
 ### Shutdown drains the collector
 
 `SIGTERM` and `SIGINT` are handled. In order: every job timer is stopped, then
@@ -601,7 +629,19 @@ POST /api/admin/results/poll      one cycle, on demand
 | `last_error` | `{ reason, detail, at }`; `reason` is what tells an operator where to look |
 | `polls` · `ok_polls` · `signals_received` | totals |
 | `dropped_entries` · `last_dropped` | see above |
-| `stale` | configured, and the last success is older than `staleAfterMs` |
+| `pending_last_poll` · `pending_peak` | how many markets the last poll asked about, and the high-water mark since boot. The backlog, not the transport — see [The poll set is bounded, not truncated](#the-poll-set-is-bounded-not-truncated) |
+| `stale` | configured, and the venue has been waiting too long for an answer: the last success is older than `staleAfterMs`, **or there has never been one** |
+
+A feed that has been configured and has **never once answered** reports `stale`,
+not `ok`. `stale_after_ms` is the poll interval and the test is "has the venue
+been waiting too long for an answer", which from boot is already true. It used
+to require a previous success to have an age to measure, so a configured feed
+read `ok` until its first good poll and — if the poll job never ran at all —
+read `ok` forever: the one state in which the alarm was structurally incapable
+of firing. The four states above are unchanged; only the rule for reaching
+`stale` moved. (`stale_after_ms` defaults to 0, which turns staleness off
+entirely; `/readyz` calls `health()` with no arguments, and the feed is
+reported there rather than gating on it.)
 
 Reasons an operator will see: `unreadable_response`, `invalid_json`,
 `unrecognised_shape`, `response_too_large`, `timeout`, `unreachable`,
@@ -609,6 +649,52 @@ Reasons an operator will see: `unreadable_response`, `invalid_json`,
 an unreadable body is a transport problem, a body read perfectly well but not
 interpreted is an integration whose contract moved underneath you, and that is
 the one to page someone about.
+
+### The poll set is bounded, not truncated
+
+A results service that has to page through the venue's entire market catalogue
+in one request is a service that will time out. `pendingMarkets` therefore has
+**no `LIMIT`**, and that is deliberate rather than an oversight.
+
+It became a live query when #39 replaced its unsatisfiable predicate (which
+required `events.status = 'completed'` — a state production cannot reach, since
+`settle.js` only writes it once every market on the event is already settled)
+with off time. Before that the set was always empty, so its size never mattered.
+Now it does: on a long-running venue whose results feed has quietly stopped
+working, every market that goes off stays in the set forever.
+
+A `LIMIT` fixes that by **dropping markets silently**. A market outside the limit
+is never asked about, never settled and never reported — the exact failure this
+whole path exists to prevent, introduced by the fix for "the list grows". The
+ordering does not save it: putting the longest-waiting markets last strands
+precisely those, which are the ones holding a player's money, and putting them
+first strands whatever is behind them the moment the backlog exceeds the cap.
+The list is not a queue an operator is draining; it is everything the venue
+still owes money on.
+
+So the bound is on the **wire** instead:
+
+| | |
+| --- | --- |
+| `pendingMarkets` | returns everything eligible. No cap, ever |
+| `createFetcher({ batchSize })` | the set is posted in batches, default **250** markets per request |
+| `pending_last_poll` / `pending_peak` | published in `health()`, so a backlog that only grows is visible rather than inferred |
+| the log | a **new high** in the backlog is announced once, when it happens |
+
+Every pending market is asked about on every poll, across as many requests as it
+takes. Nothing is dropped and nothing is deferred.
+
+A failed batch **stops** the poll and keeps the outcomes from the batches that
+already answered. Stopping avoids hammering a provider that has just failed a
+request; keeping them is because those outcomes are real results for real
+markets, and discarding them because a later batch timed out strands money the
+venue is already holding answers for. The health entry is identical to a
+single-request failure either way.
+
+The high-water trigger is a new high rather than a threshold, so a venue with a
+permanently large backlog says so once instead of every cycle and the line keeps
+its meaning; a queue that is merely large but not growing stays silent, because
+it is not getting worse.
 
 The feed is reported in `/readyz` and deliberately **not** gated on it: a dead
 results feed means outcomes arrive late and a human settles, not that the book
@@ -660,15 +746,40 @@ it reports it through its own command and MCP tool, not through a column this
 query can reach.
 
 The fallback direction is the safe one: a null age rather than a fabricated one.
-But the flag carries no information in that state, and nothing in the response
-says so — the probe's internal `source` (`collector` or `assumed`) is not
-published. `delay_note` will tell a Delay-key operator that prices are ~5 minutes
-behind whatever the key actually is. See [Known gaps](#known-gaps).
+The flag carries no information in that state, so the response now publishes
+**`app_key_delay_source`** — `collector` if the probe actually read it,
+`assumed` if it fell back — and `delay_note` says so in words. `delay_note`
+will still tell a Delay-key operator that prices are ~5 minutes behind whatever
+the key actually is. See [Known gaps](#known-gaps).
 
-When the probe does read `app_key_delay: false`, `data_age_seconds` is computed
-from `max(odds_captured_at)` — the collector's poll time, the same quantity as
-`odds_age_seconds` — **not** from Betfair's `publish_time`, which the health
-probe does not select.
+### `data_age_seconds` is Betfair's clock, not ours
+
+`data_age_seconds` used to be `max(odds_captured_at)` — **our** poll timestamp —
+which made it numerically identical to `odds_age_seconds`, while `delay_note`
+told the operator in prose that it was measured from Betfair's `publish_time`.
+It was not, and it never could be: `healthSql` did not select `publish_time` at
+all.
+
+That contradicted this document's own argument, which is that a number measuring
+when *we* polled "is a number that will be misread as freshness by anyone who
+glances at it — so it is never called `data_age`". The name was kept and the
+meaning was not. It was also inconsistent in the honest direction: a Delay key
+published a null *with* an explanation of why, while a live key published a
+number with an explanation that was false — and a null cannot be misread, a
+number will be.
+
+The probe now aggregates `max(v.publish_time)` and `data_age_seconds` reads
+from it. Three branches, and `delay_note` describes the one that actually ran:
+
+| Branch | `data_age_seconds` | `delay_note` |
+| --- | --- | --- |
+| Delay key | `null` | Betfair withholds `publish_time`, so it cannot be measured |
+| Live key, books stamped | Betfair's age | measured from Betfair `publish_time`, not from our poll time |
+| Live key, no `publish_time` recorded | `null` | live key, but nothing to measure yet |
+
+The third is not hypothetical. `max()` over nulls is null, so a live key before
+the collector has ever captured a `publish_time` lands there, and the old note
+would have promised a measurement it had not made.
 
 ---
 
@@ -679,13 +790,15 @@ discovered by reading a green dashboard.
 
 | Gap | Where | What actually happens |
 | --- | --- | --- |
-| The results poll set is uncapped | `pendingMarkets`, `lib/results.js` | Every open, non-held, off market is polled and POSTed, every cycle. A venue whose results feed is quietly broken accumulates off-but-unsettled markets and the request body grows without bound. |
-| The delay probe asks for a column that does not exist | `delayProbe`, `lib/feed.js` | It selects `feed_run.payload`; the collector's `feed_run` has no such column, so the query raises, the fallback is `is_delay: true`, and `app_key_delay` is always `true` with `data_age_seconds` always `null`. The response does not publish the probe's `source`, so nothing tells an operator the flag was assumed. |
+| The results poll set is uncapped | `pendingMarkets`, `lib/results.js` | Every open, non-held, off market is asked about, every cycle. There is deliberately **no `LIMIT`** — see [The poll set is bounded, not truncated](#the-poll-set-is-bounded-not-truncated). The bound is on the request body, and the backlog is published as `pending_last_poll` / `pending_peak`. |
+| The delay probe asks for a column that does not exist | `delayProbe`, `lib/feed.js` | It selects `feed_run.payload`; the collector's `feed_run` has no such column, so the query raises, the fallback is `is_delay: true`, and `app_key_delay` is always `true` with `data_age_seconds` always `null`. The response now publishes `app_key_delay_source`, so an operator can tell an assumed flag from a read one — but the flag itself still carries no information until the collector writes it somewhere a query can reach. |
 
 On the second: the predicate was previously unreachable. It also required
 `events.status = 'completed'`, which cannot co-exist with an open market, so the
 set was empty by construction and the absence of a cap had nothing to act on.
-Removing the dead clause is what made the list real.
+Removing the dead clause is what made the list real. It is still uncapped, on
+purpose — see
+[The poll set is bounded, not truncated](#the-poll-set-is-bounded-not-truncated).
 
 ---
 
@@ -750,7 +863,7 @@ the boundary** rather than carried into the UI, where it would render as
 | Every board request returns `503` | the feed database is unreachable, or the view does not exist. The real message is in the server log |
 | Feed 1 board renders but every market is `stale` | correct — feed 1 has no prices, so there is no poll age to be fresh |
 | `markets_with_odds: 0` on feed 2 | the collector's price block is empty. `markets` counts `DISTINCT market_id`, not rows, so the two numbers are not comparable to a row count — but `markets` high and `markets_with_odds` zero means the view is publishing no prices |
-| `app_key_delay: true`, `data_age_seconds: null` | expected on a Delay key; also what you get when the probe cannot read `feed_run.payload`. See [Known gaps](#known-gaps) |
+| `app_key_delay: true`, `data_age_seconds: null` | expected on a Delay key; also what you get when the probe cannot read `feed_run.payload` — check `app_key_delay_source`. See [Known gaps](#known-gaps) |
 | `DSC-0018` in the collector log | `VENUE` or `EVENT_RUNNER_DESCRIPTION` added to the collector's `CATALOGUE_PROJECTION`. Live-key-only; `betfeed validate` fails on it |
 | `ANGX-0001` / `TOO_MUCH_DATA` | `CATALOGUE_MAX_RESULTS` > 200 (its default) or `BOOK_CHUNK_SIZE` > 40 (its default) on a Delay key |
 | `CERT_AUTH_REQUIRED` | the collector configured `login_mode=certs`, which POSTs to Betfair's *certificate* endpoint — use `password`. The exchange's own credential store always writes `password`, so this can only come from a collector you run yourself |
