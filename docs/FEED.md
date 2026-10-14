@@ -600,7 +600,18 @@ POST /api/admin/results/poll      one cycle, on demand
 | `last_error` | `{ reason, detail, at }`; `reason` is what tells an operator where to look |
 | `polls` · `ok_polls` · `signals_received` | totals |
 | `dropped_entries` · `last_dropped` | see above |
-| `stale` | configured, and the last success is older than `staleAfterMs` |
+| `stale` | configured, and the venue has been waiting too long for an answer: the last success is older than `staleAfterMs`, **or there has never been one** |
+
+A feed that has been configured and has **never once answered** reports `stale`,
+not `ok`. `stale_after_ms` is the poll interval and the test is "has the venue
+been waiting too long for an answer", which from boot is already true. It used
+to require a previous success to have an age to measure, so a configured feed
+read `ok` until its first good poll and — if the poll job never ran at all —
+read `ok` forever: the one state in which the alarm was structurally incapable
+of firing. The four states above are unchanged; only the rule for reaching
+`stale` moved. (`stale_after_ms` defaults to 0, which turns staleness off
+entirely; `/readyz` calls `health()` with no arguments, and the feed is
+reported there rather than gating on it.)
 
 Reasons an operator will see: `unreadable_response`, `invalid_json`,
 `unrecognised_shape`, `response_too_large`, `timeout`, `unreachable`,
