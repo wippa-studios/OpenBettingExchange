@@ -22,7 +22,7 @@
 // tests/feed.test.js) and, via a stubbed fetchNav seam below, the
 // enabled+healthy ROUTE contract — 200 {enabled:true, sports:[...]} carrying
 // exactly the tree the real fetchNav produces. What remains uncovered is the
-// NAV_SQL that feeds nestNav against a live recorder, which cannot run
+// navSql that feeds nestNav against a live recorder, which cannot run
 // offline by construction.
 process.env.DB_PATH = ':memory:';
 process.env.DRIFT_ENABLED = 'false';

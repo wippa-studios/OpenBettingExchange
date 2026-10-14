@@ -5,7 +5,8 @@
 // the behaviour that actually breaks a ladder UI — side ordering, the delta
 // carry-forward case, and stale detection.
 const assert = require('assert');
-const { groupRows, ageSeconds, boardSql, healthSql } = require('../lib/feed');
+const { groupRows, ageSeconds, boardSql, healthSql, navSql, feedView } = require('../lib/feed');
+const NAV_SRC = require('fs').readFileSync(require('path').join(__dirname, '..', 'lib', 'feed.js'), 'utf8');
 
 // Pull the registered /api/feed/nav handler off the Express stack so it can be
 // called without binding a port. Express 4 stores routes in app._router.stack.
@@ -309,6 +310,49 @@ if (require.main === module) (async () => {
     assert.ok(!/odds_captured_at/.test(healthSql(1)), 'and no book timestamp');
     // Feed 2 still measures staleness, which is the only thing `ok` means there.
     assert.match(healthSql(2), /max\(odds_captured_at\)/, 'feed 2 still measures the newest book');
+  });
+
+  // #69: the same class one function away, and the reason this second check
+  // exists at all. NAV_SQL was a module constant interpolating `feedView(2)`,
+  // so a FEED_NUMBER=1 deployment built its whole navigation rail from the
+  // priced view it never reads. It degraded quietly rather than erroring — which
+  // is why #59 fixed the health probe and missed this one.
+  await check('the nav query reads the CONFIGURED view, not a hardcoded one', async () => {
+    assert.match(navSql(1), /FROM\s+v_feed1\b/, 'a feed-1 nav reads v_feed1');
+    assert.ok(!/v_feed2/.test(navSql(1)), 'and never the priced view');
+    assert.match(navSql(2), /FROM\s+v_feed2\b/, 'a feed-2 nav reads v_feed2');
+    // The shape must be otherwise untouched, or the guard below would be
+    // satisfiable by a query that returns nothing at all.
+    for (const sql of [navSql(1), navSql(2)]) {
+      assert.match(sql, /AS sport_slug|WHERE v\.market_status IN/, 'the query still selects and filters');
+      assert.ok(!/\$\{/.test(sql), 'and interpolates nothing at runtime');
+    }
+  });
+
+  // A third hardcoding site cannot appear. Two were found once already and one
+  // survived the fix for the other, which is the whole argument for checking
+  // the SOURCE rather than only the behaviour: a new query could hardcode the
+  // view and no test above would notice until a feed-1 operator reported a rail
+  // built from the wrong fixtures.
+  await check('no query in lib/feed.js hardcodes a feed number', async () => {
+    // Comments are stripped, so the note above the view accessor — which
+    // necessarily discusses the two numbers — is not read as a hardcoded call.
+    const code = NAV_SRC.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    const hardcoded = [...code.matchAll(/feedView\(\s*\d\s*\)/g)].map((m) => m[0]);
+    assert.deepStrictEqual(hardcoded, [], `feedView() called with a literal feed number: ${hardcoded.join(', ')}`);
+  });
+
+  // ...and with no argument it reads the CONFIGURED view, which is what
+  // fetchNav() actually calls. Without this the two assertions above would only
+  // show that the function CAN take an argument, not that the live path uses the
+  // configuration.
+  await check('navSql with no argument follows FEED_NUMBER', async () => {
+    const config = require('../lib/config');
+    const configured = feedView(); // the same defaulting fetchNav relies on
+    assert.strictEqual(configured, feedView(config.FEED_NUMBER), 'the default resolves to the configured feed');
+    assert.match(navSql(), new RegExp(`FROM\\s+${configured}\\b`), `navSql() reads ${configured}`);
+    assert.strictEqual(feedView(1), 'v_feed1');
+    assert.strictEqual(feedView(2), 'v_feed2');
   });
 
   await check('a board query with no limit clause cannot return one selection', async () => {
