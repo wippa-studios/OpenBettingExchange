@@ -270,14 +270,40 @@ const check = async (name, fn) => {
       assert.strictEqual(short.json.fractional, '2/5');
     });
 
-    await check('GET /api/format snaps to the ladder and rejects junk', async () => {
+    // #37. The route snapped FIRST and validated the snapped value, which made the
+    // 400 branch dead by construction: snapToTick clamps to [1.01, 1000] and
+    // always returns a tick, so `GET /api/format/5000` answered 200 {decimal:
+    // 1000}. A caller checking a price was told a DIFFERENT price was fine.
+    //
+    // The off-tick case stays 200 on purpose: the desk's fair-price helper shows
+    // a trader what the engine would make of a hand-typed near-miss, and
+    // POST /api/orders documents the same clamp. Only a number that is not a
+    // price at all is refused.
+    await check('GET /api/format refuses a price outside the ladder instead of clamping', async () => {
+      // Off-tick but IN range: still snapped. The desk depends on this.
       const snap = await j('GET', '/api/format/2.75'); // 2.75 is not a tick
-      assert.strictEqual(snap.status, 200);
+      assert.strictEqual(snap.status, 200, 'an off-tick price inside the ladder is still snapped');
       assert.ok([2.74, 2.76].includes(snap.json.decimal), `snapped to ${snap.json.decimal}`);
-      assert.strictEqual((await j('GET', '/api/format/abc')).status, 400);
-      const clamped = await j('GET', '/api/format/0.5');
-      assert.strictEqual(clamped.status, 200);
-      assert.strictEqual(clamped.json.decimal, 1.01); // clamped UP to the ladder floor — assert the body, not just 200
+
+      assert.strictEqual((await j('GET', '/api/format/abc')).status, 400, 'non-numeric is refused');
+
+      // Out of range in every direction. Before the fix each answered 200 with a
+      // confident clamp — 5000 -> 1000, 0.5 -> 1.01.
+      for (const bad of ['5000', '1000.01', '-5', '0.5', '0']) {
+        const r = await j('GET', `/api/format/${bad}`);
+        assert.strictEqual(r.status, 400, `${bad} is outside the ladder and must be refused (got ${r.status})`);
+        assert.strictEqual(r.json.error, 'Price is outside the 1.01-1000 ladder', `and says why (${bad})`);
+        // The decisive assertion: a clamp would answer 200, so a body carrying
+        // a DIFFERENT price than the one asked for must not exist at all.
+        assert.strictEqual(r.json.decimal, undefined, `${bad} must not come back as some other price`);
+      }
+
+      // Both ends of the ladder itself are IN range, and must still answer.
+      for (const good of ['1.01', '1000']) {
+        const r = await j('GET', `/api/format/${good}`);
+        assert.strictEqual(r.status, 200, `${good} is on the ladder and must answer (got ${r.status})`);
+        assert.strictEqual(r.json.decimal, Number(good), `${good} is returned unchanged`);
+      }
     });
 
     // ── admin stats carry the per-market overround ──────────────────────

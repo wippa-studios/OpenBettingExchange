@@ -160,6 +160,43 @@ check('T11 snapToTick throws on non-finite input', async () => {
   }
 });
 
+// T12: inLadderRange asks "is this number a price at all", which is strictly
+// weaker than validTick's "is this exactly a tick".
+//
+// The distinction is the whole point of #37 and it is easy to collapse by
+// accident, so both directions are asserted: an off-tick price INSIDE the range
+// is accepted (the desk's fair-price helper must still be able to snap a
+// hand-typed 2.75), and a price outside it is refused (it is not a near-miss, it
+// is not a price). The two ends of the ladder are inside by definition.
+check('T12 inLadderRange separates "off-tick" from "not a price"', async () => {
+  // Every valid tick is in range — validTick implies inLadderRange.
+  for (const band of O.LADDER) {
+    for (let c = band.lo; c <= band.hi; c += band.step) {
+      assert.strictEqual(O.inLadderRange(c / 100), true, `tick ${c / 100} is in range`);
+    }
+  }
+  // Off-tick but inside: accepted by inLadderRange, rejected by validTick.
+  // This is the assertion that keeps the two from being the same function.
+  // Every value here is unambiguous under priceToCents' rounding; 1.005 is NOT
+  // used because 1.005 * 100 is 100.49999… and rounds DOWN to 1.00, which is
+  // below the floor — a float artefact, not a ladder fact.
+  for (const offTick of [1.99, 2.01, 2.74, 2.75, 3.02, 3.04, 10.2, 100.5]) {
+    assert.strictEqual(O.inLadderRange(offTick), true, `${offTick} is inside the ladder`);
+  }
+  for (const offTick of [2.01, 2.75, 3.02, 3.04, 10.2, 100.5]) {
+    assert.strictEqual(O.validTick(offTick), false, `${offTick} is genuinely off-tick`);
+  }
+  // Outside: refused by BOTH, which is what lets the route rely on it.
+  for (const out of [0, 0.5, 1, 1.005, -5, 1000.01, 5000, 99999]) {
+    assert.strictEqual(O.inLadderRange(out), false, `${out} is outside the ladder`);
+  }
+  // The exported decimal bounds agree with the cents constants they came from.
+  assert.strictEqual(O.MIN_PRICE, 1.01);
+  assert.strictEqual(O.MAX_PRICE, 1000);
+  assert.strictEqual(O.inLadderRange(O.MIN_PRICE), true, 'the floor is in range');
+  assert.strictEqual(O.inLadderRange(O.MAX_PRICE), true, 'the ceiling is in range');
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops

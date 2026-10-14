@@ -142,7 +142,7 @@ session limit — the clock resets only after a real idle gap
 | `GET /api/sports` | — | `200 { sports: [{ id, name, slug, event_count }] }`; `event_count` covers `upcoming` and `live` events | — |
 | `GET /api/events` | `?sport=<slug>` | `200 { events }`, 3-level book per runner | `404 Unknown sport` |
 | `GET /api/markets/:id/book` | — | `200 { market, book }` at 5 levels | `400` non-integer id; `404` unknown market |
-| `GET /api/format/:price` | — | `200 { decimal, american, fractional, implied_prob }` | `400 Price must be a number` |
+| `GET /api/format/:price` | — | `200 { decimal, american, fractional, implied_prob }`. An off-tick price **inside** the ladder is snapped, so the desk can show a trader what the engine would make of a hand-typed `2.75` | `400 Price must be a number`; `400 Price is outside the 1.01-1000 ladder` |
 | `GET /api/branding` | — | `200 { tenant, name, logo, terms_url, palette }` — the caller's tenant, or the default when signed out | — |
 | `GET /api/stream` | — | `200 text/event-stream`; see the event table below | `503 Too many concurrent streams` at `MAX_SSE_CLIENTS`; `403` first-run lock |
 
@@ -187,14 +187,21 @@ cannot reach another account's row.
 `back` is what a backer can bet into; `lay` is what a layer can bet into. `ltp`
 is `null` until the runner trades.
 
-### `GET /api/format/:price` clamps rather than rejects
+### `GET /api/format/:price` refuses a price outside the ladder, and snaps one that is merely off-tick
 
-The price is snapped with `ODDS.snapToTick`, which **clamps to `[1.01, 1000]`**
-and rounds to the nearest tick, so `0.5`, `-1` and `99999` all answer `200` with
-`1.01`, `1.01` and `1000`. The `400 Price is outside the 1.01-1000 ladder` branch
-on the next line is therefore **unreachable** — a snapped price is always a valid
-tick. Issue #37 is open. The only `400` this route can return is a non-numeric
-price.
+The **range** is checked before the snap, with `ODDS.inLadderRange`. It used to
+be checked after, against the snapped value — and `snapToTick` clamps to
+`[1.01, 1000]` and always returns a tick, so that branch was dead code and
+`5000`, `99999` and `-5` all answered `200` with `1000`, `1000` and `1.01`. For a
+route whose job is to answer "is this a price", returning a confident different
+price is the worst kind of wrong answer, so it is now `400`.
+
+A price **inside** the ladder that is merely off-tick — `2.75` — is still
+snapped, and that is deliberate. It is the fair-price helper the trading desk
+types into, and it exists to show what the engine would make of a near-miss. The
+trading path makes the same promise: `POST /api/orders` corrects an off-ladder
+price rather than rejecting it, and [`EXCHANGE_RULES.md`](EXCHANGE_RULES.md)
+documents that.
 
 ### `GET /api/stream`
 
@@ -237,10 +244,12 @@ Selection not found` — which is also what a **feed** selection id gets, before
 any collateral is taken; `409` for market not open, selection not open, event
 completed, market suspended, or the event off.
 
-`validateOrder` also carries a `400 Price out of range` branch. Like the one on
-`GET /api/format/:price`, it is **unreachable**: `snapToTick` clamps to
-`[1.01, 1000]` first, and `lib/match.js` labels it a redundant backstop kept so
-a future ladder change fails at the API edge.
+`validateOrder` also carries a `400 Price out of range` branch. It is a
+**redundant backstop**: `snapToTick` clamps to `[1.01, 1000]` first, and
+`lib/match.js` labels it as kept so a future ladder change fails at the API edge.
+It is left in place on purpose — the clamp is what this route wants (a near-miss
+price still trades), so unlike `GET /api/format/:price`, which refuses rather
+than clamps, this one cannot make that branch the primary check.
 
 `order.status` is `open` (has a remainder), `fully_matched` or `cancelled`.
 `fills` is `[{ price, stake_cents }]` at the **resting** order's price. An order

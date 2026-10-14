@@ -1151,8 +1151,25 @@ app.get('/api/markets/:id/book', (req, res) => {
 app.get('/api/format/:price', (req, res) => {
   const raw = Number(req.params.price);
   if (!Number.isFinite(raw)) return res.status(400).json({ error: 'Price must be a number' });
+  // THE RANGE IS CHECKED BEFORE THE SNAP, which is what makes the documented 400
+  // reachable at all.
+  //
+  // It used to be checked after, against the snapped value — and
+  // `snapToTick` CLAMPS to [1.01, 1000] and then returns a tick, by
+  // construction. So `validTick(snapped)` is always true and that branch was
+  // dead code: `GET /api/format/5000` answered `200 {decimal: 1000}` and
+  // `GET /api/format/-5` answered `200 {decimal: 1.01}`. A caller checking a
+  // price was told a *different* price was fine, which for a validation
+  // endpoint is the worst kind of wrong answer.
+  //
+  // Range only, NOT tick. An off-tick price inside the range — 2.75 — is still
+  // snapped, because that is what the desk's fair-price helper is for: a trader
+  // types a near-miss and is shown what the engine would make of it (the desk
+  // renders "snaps to 2.76"). docs/EXCHANGE_RULES.md makes the same promise for
+  // the trading path, where `POST /api/orders` documents the clamp. What is
+  // refused here is a number that is not a price at all.
+  if (!ODDS.inLadderRange(raw)) return res.status(400).json({ error: 'Price is outside the 1.01-1000 ladder' });
   const p = ODDS.snapToTick(raw);
-  if (!ODDS.validTick(p)) return res.status(400).json({ error: 'Price is outside the 1.01-1000 ladder' });
   res.json({
     decimal: p,
     american: ODDS.toAmerican(p),
