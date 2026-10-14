@@ -282,7 +282,7 @@ pay them twice.
 | `GET /api/settlements` | — | `200 { settlements }` | `401` |
 | `POST /api/wallet/deposit` | `{ amount_cents }` | `200 { balance_cents, frozen_cents }` (play-money faucet, capped by `FAUCET_MAX_CENTS`) | `400` not a positive integer or over the cap; `403` self-excluded / suspended / over the RG deposit limit |
 | `POST /api/wallet/deposit-intent` | `{ amount_cents }` | `200 { intent_id, external_id, status, client_secret }` — **credits nothing** | `400` not positive, or over `DEPOSIT_MAX_CENTS`; `403` self-excluded or over the RG deposit limit |
-| `POST /api/wallet/withdraw` | `{ amount_cents, reason? }` | `200 { status: "pending", amount_cents }` — funds debited and held in `gateway_clearing` at once | `400` not positive, over available balance, or a bot account. **Not gated by self-exclusion** |
+| `POST /api/wallet/withdraw` | `{ amount_cents, reason? }`. `amount_cents` must be a JSON **integer** — a quoted `"100"`, `true` or `[100]` is refused, not coerced | `200 { status: "pending", amount_cents }` — funds debited and held in `gateway_clearing` at once | `400` not a positive integer, over available balance, or a bot account. **Not gated by self-exclusion** |
 | `POST /api/payments/webhook` | `{ provider, external_id, amount_cents }` + `x-obx-signature` | `200` confirms the matching pending deposit intent | `404` no `PAYMENTS_WEBHOOK_SECRET` or no matching pending intent; `401 Bad signature`; `400` provider mismatch or amount disagreeing with the recorded intent; `429` abuse counter |
 
 There is deliberately **no player-callable confirm route.** A deposit is credited

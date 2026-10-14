@@ -734,6 +734,49 @@ const check = async (name, fn) => {
       assert.ok(r.status === 404 || r.status === 401, `unsigned/unconfigured webhook is refused, got ${r.status}`);
     });
 
+    // #9. `POST /api/wallet/withdraw` called `Number(amount_cents)` before
+    // handing the value to lib/payments, so `"100"`, `true` and `[100]` were all
+    // coerced into a valid cent amount and DEBITED. Every other money edge in
+    // the codebase refuses them at the boundary.
+    //
+    // The balance is made large FIRST, deliberately. A player with 50c would
+    // get `400 Withdrawal exceeds available balance` for every one of these
+    // values, coercion or not — and a test that only asserted "400" would then
+    // pass with the bug present. Asserting the refusal happens *with money
+    // available to take* is what makes it a real test: before the fix these
+    // three debit real cents and answer 200; after, they are refused and the
+    // balance is untouched.
+    await check('W0 withdraw refuses non-integer cents at the route, with funds available', async () => {
+      const reg = await j('POST', '/api/auth/register', { body: { username: 'wendy', password: 'secret1' } });
+      const cookie = cookieOf(reg);
+      await j('POST', '/api/wallet/deposit', { body: { amount_cents: 50000 }, cookie });
+      const start = (await j('GET', '/api/wallet', { cookie })).json.balance_cents;
+      assert.strictEqual(start, 50000, 'the account really does have funds to withdraw');
+
+      for (const [label, amount] of [['a string', '100'], ['a boolean', true], ['an array', [100]]]) {
+        const r = await j('POST', '/api/wallet/withdraw', { body: { amount_cents: amount, reason: 'boundary test' }, cookie });
+        assert.strictEqual(r.status, 400, `${label} amount_cents is refused (got ${r.status} ${JSON.stringify(r.json)})`);
+        // Assert the message too: a 400 from an unrelated check (say, the
+        // balance cap) would satisfy the status assertion alone and hide a
+        // coercion that still went through.
+        assert.match(
+          r.json.error,
+          /positive integer/i,
+          `${label} is refused as a non-integer, not for some other reason (got ${JSON.stringify(r.json.error)})`
+        );
+      }
+
+      // The point of the whole check: not one cent left the account.
+      const after = (await j('GET', '/api/wallet', { cookie })).json.balance_cents;
+      assert.strictEqual(after, start, 'no coerced value debited anything');
+
+      // And the control: a REAL integer still works, so the check is not just
+      // "withdraw always 400s".
+      const ok = await j('POST', '/api/wallet/withdraw', { body: { amount_cents: 100, reason: 'boundary test' }, cookie });
+      assert.strictEqual(ok.status, 200, 'an integer withdrawal still opens an intent');
+      assert.strictEqual((await j('GET', '/api/wallet', { cookie })).json.balance_cents, start - 100);
+    });
+
     // ── Every operator/control route is CALLED at least once ──────────────
     // `const MATCH = M;` went missing to a shell-quoting failure and NOTHING
     // failed: the delay-release job and its admin route were dead, because no

@@ -1464,7 +1464,22 @@ app.post('/api/admin/payments/intents/:id/fail', requireAdmin, limit('admin'), (
 
 app.post('/api/wallet/withdraw', requireAuth, limit('wallet'), (req, res) => {
   const { amount_cents, reason } = req.body || {};
-  res.json(PAY.openWithdrawal(db, req.user.id, Number(amount_cents), reason));
+  // UNCOERCED, and the reason is the shape of every other money route here.
+  //
+  // This route called `Number(amount_cents)`, which made it the ONLY money edge
+  // in the codebase that accepted a non-integer: `"100"`, `true` and `[100]` all
+  // became a valid cent amount and were DEBITED, each with a proper intent row.
+  // Nothing was minted — the coerced amount is exactly what was withdrawn — so
+  // this was never a money-printing bug. It was a boundary defect, and boundaries
+  // are load-bearing in this codebase: the rest of the money path rejects these
+  // types at the edge, which is what stops a future refactor from reaching the
+  // ledger believing a half-cent or a boolean is a quantity.
+  //
+  // lib/payments' `openWithdrawal` ALREADY has the correct check — its first
+  // line refuses anything that is not a positive integer. The coercion here was
+  // defeating an existing validator, so the fix is to pass the value through
+  // untouched and let that validator do its job, not to add a second one.
+  res.json(PAY.openWithdrawal(db, req.user.id, amount_cents, reason));
 });
 
 app.get('/api/admin/reconciliation', requireAdmin, limit('admin'), (req, res, next) => {
