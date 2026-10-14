@@ -197,7 +197,7 @@ layered on `match`.
 | `lib/auth` | scrypt password hashing, opaque session tokens |
 | `lib/feed`, `lib/feedcreds`, `lib/feedrunner` | Odds feed reader, encrypted credentials, collector supervisor |
 | `lib/bots`, `lib/drift` | Market-maker ladders and fair-price drift |
-| `lib/store`, `lib/seed` | Schema (25 tables) and fixtures |
+| `lib/store`, `lib/seed` | Schema (26 tables) and fixtures |
 
 The frontend (`public/js/`) is split into seven modules (`core`, `shell`, `nav`,
 `board`, `slip`, `views`, `boot`) under the `window.OB` namespace.

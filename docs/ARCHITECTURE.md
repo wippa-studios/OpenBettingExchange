@@ -36,7 +36,7 @@ server    server.js  2,560 lines, 87 routes
 engine    lib/       31 modules + lib/payments/ — see the table below
    │
    ▼
-storage   data/openbettingexchange.db   SQLite (WAL), 25 tables, created on first run
+storage   data/openbettingexchange.db   SQLite (WAL), 26 tables, created on first run
 ```
 
 There is no ORM, no migration framework and no service layer beyond `lib/`. The
@@ -116,7 +116,7 @@ that once made the automated results poll settle nothing while reporting success
 
 ## Why these choices
 
-- **No ORM, no migrations.** The schema is 25 tables of plain SQL with `CHECK`
+- **No ORM, no migrations.** The schema is 26 tables of plain SQL with `CHECK`
   constraints on the money columns. A contributor can read the whole data model
   in one file, and the database itself refuses an invalid cent. `docs:check`
   verifies the table count against the code, so the figure above cannot rot.
@@ -188,6 +188,18 @@ Deliberately narrow, and asserted by tests rather than assumed:
   an `HttpOnly; SameSite=Lax` cookie. Passwords are scrypt compared with
   `timingSafeEqual`, a missing user still pays the KDF cost, and a non-string
   password is refused rather than coerced.
+- **Credential-abuse counters live in SQLite, not in the process.** They were a
+  module-level `Map`, so a restart handed a locked-out attacker a fresh ten
+  guesses on every account — the effective rate was ten guesses per restart
+  cycle rather than ten per escalating window. A restart now **preserves** the
+  lock and the failure count: a user locked out by their own typos already gets
+  one on the clock (30 s, doubling to at most 15 min), so preserving costs them a
+  wait they would have sat through anyway, while clearing costs an account ten
+  more guesses every time the process cycles. Rows are swept by age — the TTL is
+  the longest possible window, so a swept row is one the limiter would have
+  treated as unlocked anyway, and the escalation survives for anyone still
+  trying. `tests/login-lock-restart.test.js` pins the choice across a real
+  process boundary, because a test inside one process cannot see it.
 - **Error discipline.** 4xx messages are ours and safe; anything 5xx is logged
   and replaced with `Internal error` before it reaches a client.
 - **No secrets in the repo.** The demo credentials are deliberate and documented;

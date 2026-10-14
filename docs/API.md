@@ -84,6 +84,24 @@ the product rather than the trading, and a locked operator saw a JSON `403` in
 the address bar with no way to conclude anything except that the server was
 broken.
 
+### Credential-abuse state
+
+The login and registration failure counters are rows in `login_attempts`, not
+process memory. **A restart preserves them**: the lockout and the failure count
+both carry over, so the doubling window continues where it left off and a
+restarted venue does not hand a locked-out attacker a fresh allowance of ten
+guesses. That is a decision, not an accident — the alternative (clear on
+restart) shortens the wait for whoever is guessing at an account and for nobody
+else.
+
+The escape route is unchanged and needs no database edit: the window expires on
+its own, and a successful sign-in **deletes** the row. Rows are swept in the
+background by age, never because a lock expired — `fails` is meant to keep
+counting after a window lapses, because that is what doubles the next one.
+
+The keys are the source-level identifiers the counters have always used:
+`login:<username>`, `login-ip:<address>`, `register:<address>`.
+
 ### Username identity
 
 A username is **case-insensitive**. `admin`, `Admin` and `ADMIN` are one account:
@@ -136,7 +154,7 @@ fault cannot leak detail through it.
 | Source | Body | `Retry-After` |
 | --- | --- | --- |
 | Request-volume limiter (`limit('trade'\|'cashout'\|'admin'\|'wallet'\|'read')`, 60-second sliding window keyed on user or IP) | `{ "error": "Too many requests", "retry_after_seconds": N }` | set |
-| Credential-abuse counters on register/login (10 consecutive failures per username, escalating 30 s → 15 min; 30 per source IP, flat 60 s) | `{ "error": "Too many failed attempts; try again later" }` | set |
+| Credential-abuse counters on register/login (10 consecutive failures per username, escalating 30 s → 15 min; 30 per source IP, flat 60 s). **Stored in SQLite, so they survive a restart** — see [Credential-abuse state](#credential-abuse-state) | `{ "error": "Too many failed attempts; try again later" }` | set |
 | **Abuse limits** (`lib/limits.js`) — market liability and stake caps | `{ "error": "…", "details": { "code": "market_liability_exceeded" \| "stake_limit_exceeded", … } }` | **absent** |
 
 The last row is the divergence worth naming: an abuse-limit refusal uses `429`,

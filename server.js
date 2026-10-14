@@ -63,6 +63,9 @@ const RESULTS = require('./lib/results');
 const VOIDRULES = require('./lib/voidrules');
 const OPS = require('./lib/ops');
 const INPLAY = require('./lib/inplay');
+// The credential-abuse counters do their read-modify-write inside a transaction,
+// so two processes sharing the database cannot lose a strike between them.
+const { transaction } = require('./lib/tx');
 const CASHOUTRISK = require('./lib/cashoutrisk');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
@@ -662,26 +665,62 @@ function broadcast(event, data, userId = null) {
 }
 
 // ── Auth ───────────────────────────────────────────────────────────────────
-// Brute-force guard for the two credential routes (W3). In-memory, no deps.
-// Counters are per key — the case-normalized username for login, the remote
-// IP for register — and count CONSECUTIVE FAILURES only: any success clears
-// the key, so a legitimate user who occasionally mistypes a password is
-// never locked out and successes can never accumulate toward a lock.
+// Brute-force guard for the two credential routes (W3). In SQLite, not a Map.
+// Counters are per key - the case-normalized username for login, the remote IP
+// for login-by-source and for register - and count CONSECUTIVE FAILURES only:
+// any success clears the key, so a legitimate user who occasionally mistypes a
+// password is never locked out and successes can never accumulate toward a lock.
 //
 // At RL_MAX_FAILURES consecutive misses the key is locked for RL_LOCK_BASE_MS,
 // doubling with each further failure and capped at RL_LOCK_MAX_MS. While
 // locked, every attempt answers 429 WITHOUT touching scrypt, so a locked
-// account is cheap to defend and expensive to keep guessing at. The map is
-// process-local (a restart clears it) — right for a single-node loopback
-// demo; a multi-node deployment would need a shared store instead.
+// account is cheap to defend and expensive to keep guessing at.
+//
+// WHY THIS IS A TABLE AND NOT A MAP
+// It was a module-level Map, with a comment that knew its own cost: "the map is
+// process-local (a restart clears it)". A restart handed every locked-out
+// attacker a fresh allowance of ten guesses on every account, indefinitely - so
+// the effective rate was ten guesses per RESTART CYCLE rather than ten per
+// escalating window. A control whose state lives in the process it is meant to
+// survive is not a control, and process managers restart on crash, which is
+// exactly when brute-force protection matters most.
+//
+// THE DECISION, stated: a restart now PRESERVES the lock, and the failure count
+// with it, so the escalation continues where it left off.
+//
+// The case for clearing is real - a user locked out by their own typos gets a
+// fresh start instead of waiting out a window. But they already get one: the
+// lock expires on its own, in 30 seconds rising to at most fifteen minutes. A
+// restart shortens that wait for whoever is guessing at the account and for
+// nobody else. The costs are not symmetric. Preserving costs a legitimate user
+// a wait they would have had to sit through anyway; clearing costs an account
+// ten more guesses every time the process cycles, which is the entire reason
+// the threshold exists. So it preserves.
+//
+// THE SWEEP IS A TIMER, not a read. The obvious design - sweep stale rows when
+// a key is read - puts a DELETE on the path of every login, which is the one
+// request class that already pays a key derivation. A boot pass plus an unref'd
+// minute timer costs the same and never sits inside a request.
+//
+// ROWS ARE SWEPT BY AGE, NEVER BECAUSE THEY EXPIRED: `fails` is meant to keep
+// counting after a window lapses, because that is what doubles the next one. The
+// TTL is the LONGEST LOCK WINDOW, so a row the sweep deletes is one the limiter
+// would have treated as unlocked anyway - and the escalation survives for every
+// attacker still trying, which is the only attacker it exists for.
 const RL_MAX_FAILURES = 10; // consecutive failures before lockout
 const RL_LOCK_BASE_MS = 30 * 1000; // first lockout window
 const RL_LOCK_MAX_MS = 15 * 60 * 1000; // cap: further doubling outlives interest
-const rlAttempts = new Map(); // key → { fails, lockedUntil }
 
-function rlLocked(key) {
-  const a = rlAttempts.get(key);
-  return !!a && a.lockedUntil > Date.now();
+// Read, write and clear are the whole interface, and there is deliberately no
+// in-memory cache in front of them: a cache would be a second source of truth
+// about whether an account is locked, which is the bug this move exists to fix.
+function rlRead(db, key) {
+  return db.prepare('SELECT fails, locked_until FROM login_attempts WHERE key = ?').get(key) || null;
+}
+
+function rlLocked(db, key) {
+  const a = rlRead(db, key);
+  return !!a && a.locked_until > Date.now();
 }
 
 // A per-SOURCE key is a different kind of control from a per-USERNAME key and
@@ -700,38 +739,64 @@ function rlLocked(key) {
 const RL_IP_MAX_FAILURES = 30;
 const RL_IP_LOCK_MS = 60 * 1000;
 
-function rlRecordFailure(key) {
+// The read-modify-write is inside a transaction so a SECOND process sharing the
+// database cannot interleave: without it two processes recording a failure for
+// one key could both read fails=9 and both write 10, losing a strike. SQLite is
+// single-writer, so BEGIN IMMEDIATE is what serialises them, and the same
+// property is what lets this table serve the multi-node case the in-memory Map
+// could not have.
+function rlRecordFailure(db, key) {
   const perIp = key.startsWith('login-ip:');
   const maxFails = perIp ? RL_IP_MAX_FAILURES : RL_MAX_FAILURES;
-  const a = rlAttempts.get(key) || { fails: 0, lockedUntil: 0 };
-  a.fails += 1;
-  if (a.fails >= maxFails) {
-    a.lockedUntil = perIp
-      ? Date.now() + RL_IP_LOCK_MS
-      : Date.now() + Math.min(RL_LOCK_BASE_MS * 2 ** (a.fails - RL_MAX_FAILURES), RL_LOCK_MAX_MS);
+  const now = Date.now();
+  transaction(db, () => {
+    const a = rlRead(db, key) || { fails: 0, locked_until: 0 };
+    const fails = a.fails + 1;
+    const locked_until = fails >= maxFails
+      ? (perIp
+        ? now + RL_IP_LOCK_MS
+        : now + Math.min(RL_LOCK_BASE_MS * 2 ** (fails - RL_MAX_FAILURES), RL_LOCK_MAX_MS))
+      : a.locked_until;
+    db.prepare(
+      `INSERT INTO login_attempts (key, fails, locked_until, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET fails = excluded.fails, locked_until = excluded.locked_until,
+                                     updated_at = excluded.updated_at`
+    ).run(key, fails, locked_until, now);
+  });
+}
+
+function rlRecordSuccess(db, key) {
+  db.prepare('DELETE FROM login_attempts WHERE key = ?').run(key);
+}
+
+function rlRetryAfterSeconds(db, key) {
+  const a = rlRead(db, key);
+  return a ? Math.max(1, Math.ceil((a.locked_until - Date.now()) / 1000)) : 0;
+}
+
+// Boot pass, then a minute timer. Both unref'd, so neither keeps a test run or
+// a shutting-down process alive on its own.
+function sweepLoginAttempts() {
+  try {
+    db.prepare('DELETE FROM login_attempts WHERE updated_at <= ?').run(Date.now() - RL_LOCK_MAX_MS);
+  } catch {
+    /* DB closed during shutdown - nothing left to sweep */
   }
-  rlAttempts.set(key, a);
 }
+sweepLoginAttempts();
+const loginAttemptSweeper = setInterval(sweepLoginAttempts, 60_000);
+if (loginAttemptSweeper.unref) loginAttemptSweeper.unref();
 
-function rlRecordSuccess(key) {
-  rlAttempts.delete(key);
-}
-
-function rlRetryAfterSeconds(key) {
-  const a = rlAttempts.get(key);
-  return a ? Math.max(1, Math.ceil((a.lockedUntil - Date.now()) / 1000)) : 0;
-}
-
-// Test seam: clears the in-memory counters so a suite can isolate the
-// limiter. Exported for tests ONLY — no production path calls this.
+// Test seam: clears the counters so a suite can isolate the limiter. Exported
+// for tests ONLY - no production path calls this.
 function resetLoginLimiter() {
-  rlAttempts.clear();
+  db.prepare('DELETE FROM login_attempts').run();
 }
 
 function rlTooManyAttempts(res, key) {
   return res
     .status(429)
-    .setHeader('Retry-After', String(rlRetryAfterSeconds(key)))
+    .setHeader('Retry-After', String(rlRetryAfterSeconds(db, key)))
     .json({ error: 'Too many failed attempts; try again later' });
 }
 
@@ -742,10 +807,10 @@ function rlTooManyAttempts(res, key) {
 // cash-out, walking the admin catalogue — never trips a failure counter.
 //
 // So a second, independent limiter counts requests in a sliding window.
-// Deliberately SEPARATE from rlAttempts rather than merged: a login failing
-// ten times and a burst of successful reads are different problems with
-// different remedies, and one counter serving both would let traffic of
-// either kind clear the other's budget.
+// Deliberately SEPARATE from the failure counters rather than merged: a login
+// failing ten times and a burst of successful reads are different problems with
+// different remedies, and one counter serving both would let traffic of either
+// kind clear the other's budget.
 //
 // COVERAGE, NOT JUST EXISTENCE. This bucket existed and was correctly
 // enforced, and it was on ONE of the player read routes. Every route added
@@ -858,10 +923,10 @@ app.post('/api/auth/register', limit('auth'), async (req, res, next) => {
   // Registration abuse is account-farming or identity enumeration from one
   // machine, so the counter keys on the caller's IP.
   const key = 'register:' + (req.socket.remoteAddress || 'unknown');
-  if (rlLocked(key)) return rlTooManyAttempts(res, key);
+  if (rlLocked(db, key)) return rlTooManyAttempts(res, key);
   try {
     const user = await A.registerUser(db, { username, password, email });
-    rlRecordSuccess(key);
+    rlRecordSuccess(db, key);
     // Jurisdiction gate at session mint, not at bet placement. The country is
     // read ONLY from a proxy-overwritten header, and only when the operator has
     // asserted that is true — see lib/tenants.js trustedCountry().
@@ -871,7 +936,7 @@ app.post('/api/auth/register', limit('auth'), async (req, res, next) => {
   } catch (e) {
     // A refused registration (validation, duplicate username) is a failed
     // attempt; anything else (a server fault) is not.
-    if (e && (e.status === 400 || e.status === 409)) rlRecordFailure(key);
+    if (e && (e.status === 400 || e.status === 409)) rlRecordFailure(db, key);
     next(e);
   }
 });
@@ -905,12 +970,12 @@ app.post('/api/auth/login', limit('auth'), async (req, res, next) => {
   // concurrent guesses still occupy four pool slots. It is no longer the only
   // thing standing between the venue and that, though.
   const ipKey = 'login-ip:' + (req.socket.remoteAddress || 'unknown');
-  if (rlLocked(ipKey)) return rlTooManyAttempts(res, ipKey);
-  if (rlLocked(key)) return rlTooManyAttempts(res, key);
+  if (rlLocked(db, ipKey)) return rlTooManyAttempts(res, ipKey);
+  if (rlLocked(db, key)) return rlTooManyAttempts(res, key);
   try {
     const { user, token } = await A.loginUser(db, { ...(req.body || {}), country: TEN.trustedCountry(req) });
-    rlRecordSuccess(key); // a success proves the real user — clear the slate
-    rlRecordSuccess(ipKey);
+    rlRecordSuccess(db, key); // a success proves the real user — clear the slate
+    rlRecordSuccess(db, ipKey);
     // Sign-in starts the RG session clock, and does NOT restart a session
     // already running: a player who refreshes the page must not get a fresh
     // session limit, which is the easiest way to defeat one.
@@ -919,8 +984,8 @@ app.post('/api/auth/login', limit('auth'), async (req, res, next) => {
     res.json({ user, rg });
   } catch (e) {
     if (e && e.status === 401) {
-      rlRecordFailure(key); // only auth misses count
-      rlRecordFailure(ipKey); // …and they count against the source too
+      rlRecordFailure(db, key); // only auth misses count
+      rlRecordFailure(db, ipKey); // …and they count against the source too
     }
     // Async handler: hand the error to Express explicitly. A throw here would
     // reject the handler's promise and Express 4 would never see it.
@@ -941,13 +1006,16 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
-<<<<<<< HEAD
-app.get('/api/me', requireAuth, (req, res) => {
+app.get('/api/me', requireAuth, limit('read'), (req, res) => {
   // `tenant_status` is here because reads REMAIN AVAILABLE on a suspended
   // tenant (#32), and a player who is allowed to look at the book but refused
   // at the bet slip deserves to be told why without having to place an order to
   // find out. It is the only surface that reports it; the refusals carry it in
   // `details.code`.
+  //
+  // Both changes land on one line, which is why this was a real conflict and not
+  // an automatic merge: #32 added the field, #6 added the rate-limit bucket, and
+  // dropping either side silently reinstates the other's bug.
   const tenant = TEN.ofUser(db, req.user.id);
   res.json({
     user: {
@@ -956,10 +1024,6 @@ app.get('/api/me', requireAuth, (req, res) => {
       tenant_status: tenant ? tenant.status : null,
     },
   });
-=======
-app.get('/api/me', requireAuth, limit('read'), (req, res) => {
-  res.json({ user: { ...req.user, available_cents: req.user.balance_cents - req.user.frozen_cents } });
->>>>>>> 16a175a (fix(#6): the volume limiter existed and was on 1 of the player reads; registration had none)
 });
 
 // ── Account self-service ───────────────────────────────────────────────────
