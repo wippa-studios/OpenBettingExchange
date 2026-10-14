@@ -906,6 +906,68 @@ function clampFeedLimit(raw, fallback) {
   return Math.min(500, Math.max(1, Math.floor(n)));
 }
 
+/**
+ * The one line an operator reads about the odds feed at BOOT, as a PURE
+ * function of what FEED.health() returned.
+ *
+ * Extracted (like clampFeedLimit) because the bug it replaces cannot be reached
+ * from the suite at all: the line was built inside a `.then()` on a live Postgres
+ * probe, so it only ever appeared by booting a server with FEED_ENABLED=true
+ * against a real database. Two independent reads were wrong —
+ *
+ *   h.age_seconds   health() returns `odds_age_seconds`. Both were `undefined`,
+ *                   so the ternary ALWAYS took the "unknown" branch, on a feed
+ *                   the server had just queried successfully.
+ *   h.stale         health() returns no such field, so "(STALE)" was dead text.
+ *
+ * — and the branch that mattered most never ran at all. `healthPayload` sets
+ * `ok: !!newest && age < FEED_STALE_SECONDS` and sets NO `error` field, so a
+ * STALE feed arrived as `{ok:false}` with `h.error === undefined` and the line
+ * printed `[feed] unreachable: undefined`: the one condition the line exists to
+ * report, reported as an unreachable feed with no reason attached.
+ *
+ * So staleness is derived HERE, from the two things health() actually returns —
+ * its `ok` verdict, which IS the staleness computation, and the frame age
+ * against the threshold the caller was configured with. Every field read below
+ * is a field health() returns; `tests/feedboot-line.test.js` pins that by
+ * feeding this function the REAL healthPayload rather than a hand-written
+ * fixture, so if the payload changes shape this file fails rather than quietly
+ * testing a shape that no longer occurs.
+ */
+function feedBootStatus(h, staleSeconds) {
+  if (!h || typeof h !== 'object') {
+    return { level: 'error', message: 'health check returned no payload' };
+  }
+  // health() returns `{ok:false, error}` ONLY when the probe itself threw;
+  // healthPayload sets `ok` and never sets `error`. So the PRESENCE of `error`
+  // is the discriminator between "could not ask" and "asked, and the answer is
+  // bad" — which is the distinction the old `if (h.ok)` threw away.
+  if (h.error) return { level: 'error', message: `unreachable: ${h.error}` };
+  // Feed 1 has no odds columns at all, so there is no frame to age and nothing
+  // that can go stale. "newest frame unknown" there is a warning about a number
+  // this deployment was never going to publish.
+  if (h.priced === false) {
+    return {
+      level: 'log',
+      message: `odds feed connected — feed ${h.feed}: ${h.markets || 0} fixtures, no prices on this feed`,
+    };
+  }
+  const age = typeof h.odds_age_seconds === 'number' ? h.odds_age_seconds : null;
+  // Compared exactly as healthPayload compares it, against the SAME configured
+  // threshold — a boot line that used its own copy of the limit could disagree
+  // with /api/feed/health about whether the feed is stale, which is the class of
+  // bug this function exists to end.
+  const stale = h.ok === false || (age !== null && age > staleSeconds);
+  // `ok === false` with no age at all means the collector has never captured an
+  // odds frame. "no odds frame recorded yet" says that; "unknown" claims a
+  // measurement was taken and could not be reported.
+  const frame = age === null ? 'no odds frame recorded yet' : `newest frame ${age}s old`;
+  return {
+    level: stale ? 'warn' : 'log',
+    message: `odds feed connected — ${h.markets || 0} markets, ${frame}${stale ? ' (STALE)' : ''}`,
+  };
+}
+
 // One market's ladder, by id. This is what the page prices when you pick a race
 // from the tree.
 //
@@ -1084,7 +1146,7 @@ app.delete('/api/admin/feed/credentials/:id?', requireAdmin, limit('admin'), (re
 
 // Supervision. The readiness reason comes back verbatim rather than as a bool,
 // because "the runner will not start" is useless to an operator who is not told
-// which of five conditions is missing.
+// which of four conditions is missing.
 app.get('/api/admin/feed/runner/:id?', requireAdmin, limit('admin'), (req, res) => {
   res.json(FRUN.health(feedTenantId(req)));
 });
@@ -2472,15 +2534,10 @@ async function main() {
   if (config.FEED_ENABLED) {
     FEED.health()
       .then((h) => {
-        if (h.ok) {
-          console.log(
-            `[feed] odds feed connected — ${h.markets} markets, newest frame ${
-              h.age_seconds == null ? 'unknown' : `${h.age_seconds}s old`
-            }${h.stale ? ' (STALE)' : ''}`
-          );
-        } else {
-          console.error(`[feed] unreachable: ${h.error}`);
-        }
+        const line = feedBootStatus(h, config.FEED_STALE_SECONDS);
+        if (line.level === 'error') console.error(`[feed] ${line.message}`);
+        else if (line.level === 'warn') console.warn(`[feed] ${line.message}`);
+        else console.log(`[feed] ${line.message}`);
       })
       .catch((e) => console.error('[feed] health check failed:', e.message));
   }
@@ -2569,4 +2626,4 @@ if (require.main === module) {
 // `ready` is exported so anything that requires this module can await the
 // seed before assuming the catalogue exists. tests/api.test.js, feed.test.js,
 // feed_nav.test.js and feedadmin.test.js all listen on `app` themselves.
-module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, ready, OPS };
+module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, feedBootStatus, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, ready, OPS };
