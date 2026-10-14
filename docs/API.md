@@ -43,7 +43,10 @@ endpoint.
 `admin123`, `demo` / `demo123`) can sign in but is refused `403` on every route
 outside a five-route allowlist — `GET /api/me`, `POST /api/auth/change-password`,
 `POST /api/auth/logout`, `GET /api/auth/sessions`,
-`DELETE /api/auth/sessions/:id`. The refusal carries
+`DELETE /api/auth/sessions/:id`. Each entry is a route **pattern**: a `:id`
+segment matches exactly one non-empty path segment, so `/api/auth/sessions/abc`
+is allowlisted while `/api/auth/sessions/a/b` is not, and the HTTP method is part
+of the match. The refusal carries
 `details.code = "password_change_required"`, `details.username` and
 `details.seeded_password`, so a fresh deployment can be unlocked from the UI.
 The check lives inside `requireAuth`/`requireAdmin`, so a route's position in

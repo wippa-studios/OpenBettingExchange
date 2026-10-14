@@ -15,6 +15,9 @@ process.env.BOT_ENABLED = 'false';
 
 const assert = require('assert');
 const srv = require('../server');
+// Only for `verifyPassword`, so the first-run-lock checks below can sign in with
+// whichever password the seeded demo account currently holds.
+const A = require('../lib/auth');
 
 let passed = 0;
 const check = async (name, fn) => {
@@ -995,6 +998,62 @@ const check = async (name, fn) => {
         assert.strictEqual(cp.status, 200, `the lock is escapable (${JSON.stringify(cp.json)})`);
       } finally {
         // Leave the account usable for any later check, and unflag it.
+        srv.db.prepare('UPDATE users SET must_change_password = 0 WHERE username = ?').run('demo');
+      }
+    });
+
+    // #34. `SETUP_ALLOWLIST` held `DELETE /api/auth/sessions/:id` — a route
+    // PATTERN — while `isSetupRoute` compared the literal `${method} ${path}`
+    // against it. `req.path` is the concrete path, so that entry could never
+    // match and was dead by construction.
+    //
+    // This walks EVERY allowlisted route against a locked session, which is what
+    // the issue names as the missing test: one entry in the wrong form and this
+    // fails, rather than the next person adding a fifth.
+    await check('every first-run-lock allowlisted route is reachable while locked', async () => {
+      // The previous check changed this account's password, so sign in with the
+      // one it now has rather than the seed value.
+      const demoPw = srv.db
+        .prepare("SELECT pass_hash FROM users WHERE username = 'demo'")
+        .get().pass_hash;
+      const which = (await A.verifyPassword('demo-after-unlock', demoPw)) ? 'demo-after-unlock' : 'demo123';
+      srv.db.prepare('UPDATE users SET must_change_password = 1 WHERE username = ?').run('demo');
+      // A second session for the SAME account, so revoking one does not sign the
+      // caller out of the session it is calling from.
+      const locked = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'demo', password: which } }));
+      const other = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'demo', password: which } }));
+      try {
+        // Control: the lock is engaged. Without it every "reachable" assertion
+        // below would be vacuous.
+        assert.strictEqual((await j('GET', '/api/wallet', { cookie: locked })).status, 403, 'the lock is engaged');
+
+        // The five allowlisted entries, each exercised for real.
+        assert.strictEqual((await j('GET', '/api/me', { cookie: locked })).status, 200, 'GET /api/me');
+        assert.strictEqual((await j('GET', '/api/auth/sessions', { cookie: locked })).status, 200, 'GET /api/auth/sessions');
+
+        // The one that could never match. Revoke the OTHER session, so the
+        // caller survives and the assertion is about reachability, not self-logout.
+        const listed = await j('GET', '/api/auth/sessions', { cookie: locked });
+        const ids = listed.json.sessions.map((s) => s.id);
+        assert.ok(ids.length >= 2, `two sessions exist to choose between (${JSON.stringify(ids)})`);
+        const current = (await j('GET', '/api/auth/sessions', { cookie: locked })).json.sessions.find((s) => s.current).id;
+        const victim = ids.find((id) => id !== current);
+        assert.ok(victim, 'a non-current session id to revoke');
+        const del = await j('DELETE', `/api/auth/sessions/${victim}`, { cookie: locked });
+        assert.strictEqual(
+          del.status,
+          200,
+          `DELETE /api/auth/sessions/:id must be reachable while locked (got ${del.status} ${JSON.stringify(del.json)})`
+        );
+
+        // logout last: it ends the session, so anything after it would 401.
+        assert.strictEqual((await j('POST', '/api/auth/logout', { cookie: other })).status, 200, 'POST /api/auth/logout');
+
+        // And the pattern must stay a pattern: a two-segment path is not a
+        // session id, so it must NOT become allowlisted by the prefix.
+        const deeper = await fetch(`${base}/api/auth/sessions/a/b`, { method: 'DELETE', headers: { cookie: locked } });
+        assert.strictEqual(deeper.status, 403, 'a path the pattern does not describe stays locked');
+      } finally {
         srv.db.prepare('UPDATE users SET must_change_password = 0 WHERE username = ?').run('demo');
       }
     });

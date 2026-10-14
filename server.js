@@ -277,21 +277,61 @@ app.use((req, res, next) => {
 // desk, which is the account that matters most. An admin left on admin123 who
 // can read the ledger and move other people's money is the worst state this
 // project can be deployed in.
-const SETUP_ALLOWLIST = new Set([
-  'GET /api/me',
-  'POST /api/auth/change-password',
-  'POST /api/auth/logout',
-  'GET /api/auth/sessions',
-  'DELETE /api/auth/sessions/:id',
-]);
+// Each entry is a route PATTERN: a segment beginning with `:` matches exactly
+// one non-empty segment. Writing them as patterns rather than literals is what
+// lets a parameterised route be expressible at all — see isSetupRoute below.
+const SETUP_ALLOWLIST = [
+  ['GET', '/api/me'],
+  ['POST', '/api/auth/change-password'],
+  ['POST', '/api/auth/logout'],
+  ['GET', '/api/auth/sessions'],
+  ['DELETE', '/api/auth/sessions/:id'],
+];
 
-// isSetupRoute: the exact key the allowlist is written in, from the request.
-// `req.path` is used rather than `req.originalUrl` so a query string does not
-// turn an allowlisted route into a locked one — `GET /api/me?x=1` must behave
-// identically to `GET /api/me`, and originalUrl would compare 'GET /api/me?x=1'
-// against 'GET /api/me' and miss.
+// Compile one entry to a matcher. The pattern is anchored at both ends and each
+// segment is compared individually, so `/api/auth/sessions/:id` matches
+// `/api/auth/sessions/abc` and NOT `/api/auth/sessions/a/b`, and no allowlisted
+// prefix can grow to cover a route nobody approved.
+function compileAllowlistEntry([method, pattern]) {
+  const re = new RegExp(
+    `^${pattern
+      .split('/')
+      // The leading empty segment of an absolute path splits to '' and is kept.
+      .map((seg) => (seg.startsWith(':') ? '[^/]+' : seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+      .join('/')}$`
+  );
+  return { method, re };
+}
+
+const SETUP_ALLOWLIST_COMPILED = SETUP_ALLOWLIST.map(compileAllowlistEntry);
+
+// isSetupRoute: does the request match an allowlisted route PATTERN?
+//
+// It compared the literal string `${req.method} ${req.path}` against the Set
+// before. Four of the five entries happened to be literal already, so the set
+// lookup worked and nobody noticed that `DELETE /api/auth/sessions/:id` could
+// never match: `req.path` is `/api/auth/sessions/abc` for every real request,
+// and comparing that against the string `/api/auth/sessions/:id` misses. The
+// entry was dead BY CONSTRUCTION, not by an accident of data — a locked account
+// was refused `GET /api/auth/sessions` (200) but `DELETE` of one of them (403),
+// which is the exact trap this lock is supposed to avoid being.
+//
+// Two properties are deliberately preserved from that comparison:
+//
+//   - `req.path`, not `req.originalUrl`, so a query string cannot turn an
+//     allowlisted route into a locked one: `GET /api/me?x=1` must behave
+//     identically to `GET /api/me`. (Verified: req.path excludes the query.)
+//   - the METHOD is part of the match, not just the path, so allowing a GET
+//     never implies allowing a POST to the same path.
+//
+// Matching a pattern rather than dropping the entry is the right direction: the
+// list's own comment says session management is part of the minimum needed to
+// reach the fix, and a player who believes a device is stolen should be able to
+// sign it out. Narrowing the lock is a product decision; making the mechanism
+// match what it already claims is not.
 function isSetupRoute(req) {
-  return SETUP_ALLOWLIST.has(`${req.method} ${req.path}`);
+  const path = req.path;
+  return SETUP_ALLOWLIST_COMPILED.some((e) => e.method === req.method && e.re.test(path));
 }
 
 function firstRunLockResponse(req, res) {
