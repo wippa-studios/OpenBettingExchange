@@ -957,6 +957,48 @@ const check = async (name, fn) => {
       assert.ok(/per-intent cap/.test(r.json.error));
     });
 
+    // ── #33 + #34: the first-run lock must be escapable through the UI ──────
+    //
+    // A locked account must be able to load the page that fixes the lock, and
+    // must be able to reach every route on the setup allowlist. Both of these
+    // go wrong in the direction of an unusable deployment, which is what the
+    // lock's own comment calls a trap rather than a control.
+    await check('a locked account can load the frontend it must use to unlock', async () => {
+      // Flag exactly one account, and restore it afterwards, so the rest of
+      // this suite's seeded admin is untouched.
+      srv.db.prepare('UPDATE users SET must_change_password = 1 WHERE username = ?').run('demo');
+      const locked = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'demo', password: 'demo123' } }));
+      try {
+        // The control first: prove the lock IS engaged for this session. Without
+        // it, the static assertions below would pass vacuously — an unlocked
+        // account also gets 200 for these paths, which is exactly the trap of a
+        // test that cannot fail.
+        const refused = await j('GET', '/api/wallet', { cookie: locked });
+        assert.strictEqual(refused.status, 403, 'the lock really is engaged for this session');
+        assert.match(refused.json.error, /Change your password/i);
+
+        for (const [path, type] of [['/', /text\/html/], ['/style.css', /text\/css/], ['/ladder.js', /javascript/]]) {
+          const res = await fetch(`${base}${path}`, { headers: { cookie: locked } });
+          assert.strictEqual(res.status, 200, `a locked account must still load ${path} (got ${res.status})`);
+          const ct = res.headers.get('content-type') || '';
+          assert.match(ct, type, `${path} is served as itself, not as the lock's JSON error`);
+        }
+
+        // And the whole point: the account can still reach the fix, then load
+        // the UI again. Asserting only the static assets would pass even if the
+        // change-password route were itself behind the lock — which is the
+        // failure this codebase has already had once (server.js, firstRunLockResponse).
+        const cp = await j('POST', '/api/auth/change-password', {
+          body: { currentPassword: 'demo123', newPassword: 'demo-after-unlock' },
+          cookie: locked,
+        });
+        assert.strictEqual(cp.status, 200, `the lock is escapable (${JSON.stringify(cp.json)})`);
+      } finally {
+        // Leave the account usable for any later check, and unflag it.
+        srv.db.prepare('UPDATE users SET must_change_password = 0 WHERE username = ?').run('demo');
+      }
+    });
+
     console.log(`\napi.test.js: ${passed} checks passed`);
   } finally {
     server.close();

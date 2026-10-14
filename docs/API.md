@@ -49,6 +49,13 @@ outside a five-route allowlist — `GET /api/me`, `POST /api/auth/change-passwor
 The check lives inside `requireAuth`/`requireAdmin`, so a route's position in
 the file cannot exempt it.
 
+The lock covers **`/api` only**. Static assets (`/`, `/style.css`, `/ladder.js`,
+`/js/*`) are served normally to a locked account, because the only route out of
+the lock is the UI that renders the change-password panel — a global lock blocked
+the product rather than the trading, and a locked operator saw a JSON `403` in
+the address bar with no way to conclude anything except that the server was
+broken.
+
 ### Error codes
 
 | Status | Meaning as the code actually uses it |

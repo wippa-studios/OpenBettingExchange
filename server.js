@@ -797,7 +797,21 @@ async function enforceFirstRunLock() {
   return flagged;
 }
 
-app.use((req, res, next) => {
+// The second enforcement point described above: it catches a route that reads
+// req.user WITHOUT requireAuth, which is what /api/branding is.
+//
+// IT IS SCOPED TO /api, AND THAT SCOPE IS THE FIX FOR #33. This middleware
+// used to be global, so it also answered GET /, GET /style.css and every other
+// static asset with a JSON 403 — and the first-run lock's entire purpose is to
+// be escapable through the UI. A locked account got a JSON error in the address
+// bar where the page should have been, could not load the CSS that renders the
+// change-password panel, and reasonably concluded the server was broken. The
+// lock blocked the product rather than the trading.
+//
+// The scope costs nothing: requireAuth/requireAdmin — which cover every route
+// that authenticates, placement-independently — never serve a static asset, and
+// a static file carries no account state, so there is nothing here to lock.
+app.use('/api', (req, res, next) => {
   if (req.method === 'OPTIONS') return next();
   if (isSetupRoute(req)) return next();
   if (!mustChangePassword(req.user)) return next();
