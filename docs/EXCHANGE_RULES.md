@@ -50,7 +50,10 @@ The server is the authority. It re-snaps every price it accepts, so a
 hand-typed price is never rejected for being off-ladder — it is corrected.
 `GET /api/format/:price` returns the same ladder's value in decimal, American,
 fractional and implied-probability form; the admin desk uses it so a trader never
-sees a conversion the engine would not agree with.
+sees a conversion the engine would not agree with. It is the one place that
+refuses rather than corrects: a price **outside** `[1.01, 1000]` is not a
+hand-typed near-miss, it is not a price at all, so it answers `400` instead of
+returning the clamped bound as though it had been asked about.
 
 *Tests:* `tests/odds.test.js` (T1–T10), `tests/seed.test.js` (S3).
 

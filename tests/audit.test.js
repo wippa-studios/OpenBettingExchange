@@ -84,7 +84,11 @@ check('A2 (F1) confirmation resolves by EXTERNAL id — a player cannot name an 
   // confirmByExternalId is the ONLY programmatic confirm, and it takes the
   // provider's external id, not our internal one — the caller must be the
   // entity that created the intent with the provider.
-  assert.throws(() => pay.confirmByExternalId(db, { provider: 'reference', externalId: 'wrong-id', amountCents: 25000 }), /No pending deposit/);
+  //
+  // The message says "No deposit intent", not "No PENDING deposit intent": the
+  // lookup is no longer filtered by status (#26), so an unknown id and an
+  // already-confirmed one are different answers, and this is the unknown one.
+  assert.throws(() => pay.confirmByExternalId(db, { provider: 'reference', externalId: 'wrong-id', amountCents: 25000 }), /No deposit intent/);
   // The internal-id confirm still exists for the webhook/admin paths and is
   // cap-bound; a player who somehow reached it would still hit A3's cap.
   const r = pay.confirmDeposit(db, intent.intent_id);

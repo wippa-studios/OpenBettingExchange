@@ -26,6 +26,7 @@ endpoint.
 | `:id` parameters | Routes that validate their id call `intId` and answer `400 id must be an integer` for anything non-numeric, before any query runs. Admin account routes take `Number(req.params.id)` instead and fall through to a `404` — the two conventions disagree, and both are documented below per route |
 | Body limit | `256 kB`. Over it is `413` with `{ "error": "request entity too large" }` |
 | Unknown `/api` path | `404 { "error": "Unknown endpoint" }`, never Express's HTML page |
+| Caching | **Every `/api` response carries `Cache-Control: no-store`**, including the money routes (`/api/me`, `/api/wallet`, `/api/positions`, `/api/settlements`, `/api/orders`) and the public catalogue. Those are cookie-authenticated GETs carrying balances and exposure — the shape a shared proxy caches and serves back to the wrong user. `no-store` rather than `no-cache`: the latter still permits storing a response and revalidating it. The rule is blanket because a per-route list is a list to forget, and the forgotten route is the one that leaks. `GET /api/stream` is the exception and keeps its own `no-cache` |
 | Scheduling | Reconciliation, the results poll, backups, the in-play delay release and WAL maintenance run on timers (`JOBS_INTERVALS` in `server.js`). Each is operator-triggerable through the routes below except maintenance |
 
 ### Authentication
@@ -36,17 +37,27 @@ endpoint.
 | Session | `401 Authentication required` with no valid, unexpired session |
 | Admin | `401` without a session; `403 Admin only` for a signed-in non-admin. `role` is authoritative, with `is_admin` accepted as a legacy mirror |
 | Ops token | `/metrics` and `POST /api/admin/backup` are additionally gated on `OPS_TOKEN` (`x-ops-token` header or `Authorization: Bearer`). Unset token ⇒ `404 Not found`; wrong token ⇒ `401 Unauthorized`. `/healthz` and `/readyz` are always public |
-| Payments webhook | HMAC-SHA256 over the **raw** body in `x-obx-signature`, compared in constant time. Without `PAYMENTS_WEBHOOK_SECRET` the route is `404` |
+| Payments webhook | HMAC-SHA256 over `"<x-obx-timestamp>." + rawBody`, hex in `x-obx-signature`, compared in constant time. `x-obx-timestamp` is **required** and **part of the MAC**, and a request outside a 300 s window is refused — see the webhook signing note below. Without `PAYMENTS_WEBHOOK_SECRET` the route is `404` |
 
 **The first-run lock.** An account still on a seeded demo password (`admin` /
 `admin123`, `demo` / `demo123`) can sign in but is refused `403` on every route
 outside a five-route allowlist — `GET /api/me`, `POST /api/auth/change-password`,
 `POST /api/auth/logout`, `GET /api/auth/sessions`,
-`DELETE /api/auth/sessions/:id`. The refusal carries
+`DELETE /api/auth/sessions/:id`. Each entry is a route **pattern**: a `:id`
+segment matches exactly one non-empty path segment, so `/api/auth/sessions/abc`
+is allowlisted while `/api/auth/sessions/a/b` is not, and the HTTP method is part
+of the match. The refusal carries
 `details.code = "password_change_required"`, `details.username` and
 `details.seeded_password`, so a fresh deployment can be unlocked from the UI.
 The check lives inside `requireAuth`/`requireAdmin`, so a route's position in
 the file cannot exempt it.
+
+The lock covers **`/api` only**. Static assets (`/`, `/style.css`, `/ladder.js`,
+`/js/*`) are served normally to a locked account, because the only route out of
+the lock is the UI that renders the change-password panel — a global lock blocked
+the product rather than the trading, and a locked operator saw a JSON `403` in
+the address bar with no way to conclude anything except that the server was
+broken.
 
 ### Error codes
 
@@ -88,12 +99,20 @@ a status that elsewhere in this API means "slow down, retry", yet it carries no
    on settlement — `POST /api/admin/markets/:id/settle` — is **`409 Market
    already settled`** ([`lib/settle.js`](../lib/settle.js)). Both are “this
    cannot happen again”; the statuses differ.
-3. **A deliberate `503` cannot reach the client.** [`lib/feedcreds.js`](../lib/feedcreds.js)
-   throws `503` when `FEED_CREDENTIALS_KEY` is unset, while `GET /api/feed/health`
-   and `GET /api/feed/board` genuinely answer `503` when the feed is unreachable —
-   they set the status themselves. But `errorHandler` clamps every `status >= 500`
-   to `500`, so the credential-storage refusal is reported to the caller as
-   `500 Internal error`. Verified.
+3. **A deliberate `503` reaches the client; a fault still does not.**
+   `errorHandler` clamps every `status >= 500` to `500 Internal error`, and that
+   is right for a **fault** — a thrown database error or a `TypeError` can carry
+   a path, a query or a stack frame. An application state that was chosen
+   deliberately and described in its own words is not a fault, so an error may
+   **opt in** with `err.expose` (built by `serviceUnavailable()` in
+   [`lib/auth.js`](../lib/auth.js)): the status and the message then survive, and
+   the message must contain no path, no internal identifier and no stack.
+   `lib/feedcreds.js` uses it for the `FEED_CREDENTIALS_KEY` refusal, whose
+   message carries the exact command that fixes it. The default is unchanged —
+   `httpError(503, …)` is *not* opted in and still clamps, so a module that does
+   not know about the mechanism cannot leak by accident. Nothing infers the
+   distinction: a deliberate `503` and a thrown fault are indistinguishable to the
+   handler, which is why it has to be stated.
 4. **Id validation is inconsistent.** `intId` routes answer `400` for
    `/api/markets/abc/book`; `Number()`-parsing admin routes answer `404` for
    `/api/admin/users/abc`.
@@ -123,7 +142,7 @@ session limit — the clock resets only after a real idle gap
 | `GET /api/sports` | — | `200 { sports: [{ id, name, slug, event_count }] }`; `event_count` covers `upcoming` and `live` events | — |
 | `GET /api/events` | `?sport=<slug>` | `200 { events }`, 3-level book per runner | `404 Unknown sport` |
 | `GET /api/markets/:id/book` | — | `200 { market, book }` at 5 levels | `400` non-integer id; `404` unknown market |
-| `GET /api/format/:price` | — | `200 { decimal, american, fractional, implied_prob }` | `400 Price must be a number` |
+| `GET /api/format/:price` | — | `200 { decimal, american, fractional, implied_prob }`. An off-tick price **inside** the ladder is snapped, so the desk can show a trader what the engine would make of a hand-typed `2.75` | `400 Price must be a number`; `400 Price is outside the 1.01-1000 ladder` |
 | `GET /api/branding` | — | `200 { tenant, name, logo, terms_url, palette }` — the caller's tenant, or the default when signed out | — |
 | `GET /api/stream` | — | `200 text/event-stream`; see the event table below | `503 Too many concurrent streams` at `MAX_SSE_CLIENTS`; `403` first-run lock |
 
@@ -168,14 +187,21 @@ cannot reach another account's row.
 `back` is what a backer can bet into; `lay` is what a layer can bet into. `ltp`
 is `null` until the runner trades.
 
-### `GET /api/format/:price` clamps rather than rejects
+### `GET /api/format/:price` refuses a price outside the ladder, and snaps one that is merely off-tick
 
-The price is snapped with `ODDS.snapToTick`, which **clamps to `[1.01, 1000]`**
-and rounds to the nearest tick, so `0.5`, `-1` and `99999` all answer `200` with
-`1.01`, `1.01` and `1000`. The `400 Price is outside the 1.01-1000 ladder` branch
-on the next line is therefore **unreachable** — a snapped price is always a valid
-tick. Issue #37 is open. The only `400` this route can return is a non-numeric
-price.
+The **range** is checked before the snap, with `ODDS.inLadderRange`. It used to
+be checked after, against the snapped value — and `snapToTick` clamps to
+`[1.01, 1000]` and always returns a tick, so that branch was dead code and
+`5000`, `99999` and `-5` all answered `200` with `1000`, `1000` and `1.01`. For a
+route whose job is to answer "is this a price", returning a confident different
+price is the worst kind of wrong answer, so it is now `400`.
+
+A price **inside** the ladder that is merely off-tick — `2.75` — is still
+snapped, and that is deliberate. It is the fair-price helper the trading desk
+types into, and it exists to show what the engine would make of a near-miss. The
+trading path makes the same promise: `POST /api/orders` corrects an off-ladder
+price rather than rejecting it, and [`EXCHANGE_RULES.md`](EXCHANGE_RULES.md)
+documents that.
 
 ### `GET /api/stream`
 
@@ -218,10 +244,12 @@ Selection not found` — which is also what a **feed** selection id gets, before
 any collateral is taken; `409` for market not open, selection not open, event
 completed, market suspended, or the event off.
 
-`validateOrder` also carries a `400 Price out of range` branch. Like the one on
-`GET /api/format/:price`, it is **unreachable**: `snapToTick` clamps to
-`[1.01, 1000]` first, and `lib/match.js` labels it a redundant backstop kept so
-a future ladder change fails at the API edge.
+`validateOrder` also carries a `400 Price out of range` branch. It is a
+**redundant backstop**: `snapToTick` clamps to `[1.01, 1000]` first, and
+`lib/match.js` labels it as kept so a future ladder change fails at the API edge.
+It is left in place on purpose — the clamp is what this route wants (a near-miss
+price still trades), so unlike `GET /api/format/:price`, which refuses rather
+than clamps, this one cannot make that branch the primary check.
 
 `order.status` is `open` (has a remainder), `fully_matched` or `cancelled`.
 `fills` is `[{ price, stake_cents }]` at the **resting** order's price. An order
@@ -262,9 +290,17 @@ prices, an unpriced matched runner, a non-positive fair value, a payout below
   "frozen_release_cents": 26900,   // the player's matched collateral, released
   "payout_cents": 966,             // what the venue paid them
   "matches_closed": 2,             // legs taken off the board
-  "transferred_cents": 26900,      // escrow the house took on
+  "transferred_cents": 26900,      // SAME figure as frozen_release_cents — see below
   "cancelled_orders": 1 }          // the player's resting orders in that market
 ```
+
+`transferred_cents` is **an alias for `frozen_release_cents`, not a second
+quantity**. The collateral released from the player per leg and the escrow the
+house takes on per leg are the same number moving between balances, so the two
+can never differ. Both are returned because both are documented response fields
+and dropping one would be a breaking API change; a client must not read the pair
+as independent. It used to be two separate accumulators producing two names for
+one number (#20), which promised a distinction that does not exist.
 
 It is all-or-nothing in one transaction, and the plan is recomputed **inside**
 it. The venue takes over the player's slot in each match so the counterparty is
@@ -281,8 +317,33 @@ pay them twice.
 | `GET /api/settlements` | — | `200 { settlements }` | `401` |
 | `POST /api/wallet/deposit` | `{ amount_cents }` | `200 { balance_cents, frozen_cents }` (play-money faucet, capped by `FAUCET_MAX_CENTS`) | `400` not a positive integer or over the cap; `403` self-excluded / suspended / over the RG deposit limit |
 | `POST /api/wallet/deposit-intent` | `{ amount_cents }` | `200 { intent_id, external_id, status, client_secret }` — **credits nothing** | `400` not positive, or over `DEPOSIT_MAX_CENTS`; `403` self-excluded or over the RG deposit limit |
-| `POST /api/wallet/withdraw` | `{ amount_cents, reason? }` | `200 { status: "pending", amount_cents }` — funds debited and held in `gateway_clearing` at once | `400` not positive, over available balance, or a bot account. **Not gated by self-exclusion** |
-| `POST /api/payments/webhook` | `{ provider, external_id, amount_cents }` + `x-obx-signature` | `200` confirms the matching pending deposit intent | `404` no `PAYMENTS_WEBHOOK_SECRET` or no matching pending intent; `401 Bad signature`; `400` provider mismatch or amount disagreeing with the recorded intent; `429` abuse counter |
+| `POST /api/wallet/withdraw` | `{ amount_cents, reason? }`. `amount_cents` must be a JSON **integer** — a quoted `"100"`, `true` or `[100]` is refused, not coerced | `200 { status: "pending", amount_cents }` — funds debited and held in `gateway_clearing` at once | `400` not a positive integer, over available balance, or a bot account. **Not gated by self-exclusion** |
+| `POST /api/payments/webhook` | `{ provider, external_id, amount_cents }` + `x-obx-timestamp` + `x-obx-signature` | `200` confirms the matching deposit intent. A **redelivery** of an already-confirmed intent is `200 { already_confirmed: true }`, not a `404` — at-least-once delivery is the normal case, not an error | `404` no `PAYMENTS_WEBHOOK_SECRET`, or an external id no deposit intent has; `401 Bad signature`; `400` missing/malformed `x-obx-timestamp`, outside the 300 s replay window, provider mismatch, or amount disagreeing with the recorded intent; `429` abuse counter |
+
+**Webhook signing and the replay window.** The signature is
+`hex(HMAC-SHA256(PAYMENTS_WEBHOOK_SECRET, "<timestamp>." + rawBody))`, where
+`<timestamp>` is `x-obx-timestamp` in unix seconds, compared in constant time
+against `x-obx-signature`.
+
+The timestamp is **required** and is **inside the MAC**, and both matter. It was
+neither before: the MAC covered the raw body alone, so a captured valid request
+was replayable indefinitely, and the only thing preventing a second credit was
+that the intent was no longer pending — a *state*-based defence, which stops
+re-delivery of one intent but not a captured request replayed later.
+
+Making the timestamp optional would have been worse than leaving it out: a
+caller can bypass an optional control by omitting it, so a captured body-only
+request could be replayed forever with a fresh timestamp beside it. A signature
+over the body alone is therefore refused, not accepted for compatibility.
+Requests older or newer than **300 seconds** are rejected with `400`; five
+minutes is generous for clock skew between provider and venue and comfortably
+covers a retry cycle.
+
+Note the ordering: the timestamp's *shape* is checked first (a malformed one is
+a `400` protocol error), then the signature (`401`), then the *window* (`400`).
+The window is evaluated only after the request has authenticated, so the
+timestamp it reads is one the provider actually signed rather than one the caller
+asserted.
 
 There is deliberately **no player-callable confirm route.** A deposit is credited
 only by the provider-authenticated webhook or by the admin desk below, and both
@@ -406,9 +467,14 @@ missing condition (`FEED_ENABLED is false`, `FEED_RUNNER_ENABLED is false`,
 `FEED_DATABASE_URL is not set`, `FEED_CREDENTIALS_KEY is not set`, or no
 credentials stored) rather than a `200` claiming a start that did not happen.
 
-If `FEED_CREDENTIALS_KEY` is unset, storing is refused and **nothing is
-written** — no plaintext fallback. The module's `503` is clamped to `500` by
-`errorHandler`; see the error-code divergences.
+If `FEED_CREDENTIALS_KEY` is unset, storing is refused with `503` and **nothing
+is written** — no plaintext fallback. That `503` is one of the deliberately
+exposable ones, so its message — including the `openssl rand -hex 32` that fixes
+it — reaches the caller; see the error-code divergences.
+
+A tenant that does not exist is `404` **whatever the key is set to**: the tenant
+is resolved before the key is required, matching the sibling `DELETE`, so the two
+halves of this API cannot disagree about the same request.
 
 ```jsonc
 // GET /api/admin/feed/credentials/1
@@ -447,7 +513,7 @@ exits 0.
 | Route | Request | Success | Errors |
 | --- | --- | --- | --- |
 | `GET /api/admin/tenants` | — | `200 { tenants }` — all rows; `brand` and `jurisdictions` are stored as JSON **strings** | `401`/`403` |
-| `PUT /api/admin/tenants/:id` | `{ name?, status?, commission_bps?, brand?, jurisdictions? }`. `status` is `active`/`suspended`; `commission_bps` an integer in `[0, 2000]`; `brand` and `jurisdictions` are **objects**, stored JSON-encoded. An absent key leaves that column untouched | `200` the tenant row | `400` unknown status or out-of-range `commission_bps`; `404 No such tenant` |
+| `PUT /api/admin/tenants/:id` | `{ name?, status?, commission_bps?, brand?, jurisdictions? }`. `status` is `active`/`suspended`; `commission_bps` an integer in `[0, 2000]`; `brand` and `jurisdictions` are **objects**, stored JSON-encoded. An absent key leaves that column untouched | `200` the tenant row. The `UPDATE` and its `tenant.configured` audit row are one transaction, and the change is **refused outright** if the audit write fails — a commission rate or a tenant status that cannot be recorded does not stand | `400` unknown status or out-of-range `commission_bps`; `404 No such tenant`; `500` the audit log could not be written |
 
 A `NULL` `tenant_id` on a user means the default tenant. Jurisdiction is enforced
 at **session mint**, not at bet placement, and only from a proxy-overwritten
@@ -469,7 +535,7 @@ Every route answers `401` without a session and `403 Admin only` for a non-admin
 | `POST /api/admin/markets` | `{ event_id, name }` | `201 { market }` | `400` missing fields or a rejected `event_id` |
 | `POST /api/admin/selections` | `{ market_id, name, fair_price? }`. `fair_price` is snapped to the ladder; when bots are on, the market is quoted immediately | `201 { selection }` | `400` missing fields, a non-finite `fair_price`, or a rejected `market_id` |
 | `PATCH /api/admin/markets/:id` | `{ status: "open" \| "suspended", reason? }` | `200 { market }`, audited, broadcasts `book` | `400` any other status or a non-integer id; `404` unknown market; `409 Market is settled` |
-| `POST /api/admin/markets/:id/settle` | Exactly one of `{ winner_selection_id }`, `{ dead_heat: [ids] }` or `{ void: true }`. Values pass through **unchanged** — a string `"false"` is not a boolean, `true` is not a selection id | `200 { market, per_user: [{ user_id, pnl_cents, commission_cents }] }`, audited, broadcasts `book` and `settlement` | `400` bad input, a winner from a different market, a `dead_heat` naming fewer than two distinct ids, or a non-integer id; `404` unknown market; `409` already settled, or held pending review |
+| `POST /api/admin/markets/:id/settle` | Exactly one of `{ winner_selection_id }`, `{ dead_heat: [ids] }` or `{ void: true }`. Values pass through **unchanged** — a string `"false"` is not a boolean, `true` is not a selection id | `200 { market, previous_status, per_user: [{ user_id, pnl_cents, commission_cents }] }`, audited, broadcasts `book` and `settlement`. `previous_status` is the status the market **was** — it comes from the row the settlement transaction itself read, so the `market.settled` audit row records an observed prior state rather than an asserted one | `400` bad input, a winner from a different market, a `dead_heat` naming fewer than two distinct ids, or a non-integer id; `404` unknown market; `409` already settled, or held pending review |
 | `GET /api/admin/stats` | — | `200 { markets }` — latest 200 with `total_matched_cents`, `open_orders`, `overround` | `401`/`403` |
 
 `overround` is Σ implied probability of the best price a backer can get on every
@@ -521,7 +587,7 @@ because an order that vanished for no stated reason is a support incident.
 | Route | Request | Success | Errors |
 | --- | --- | --- | --- |
 | `GET /api/admin/risk` | — | `200 { kill_switch, bots }`; each bot carries `liability_cents`, `daily_pnl_cents`, `pressure` (0–1), `quoting_allowed` and `reason` | `401`/`403` |
-| `PUT /api/admin/risk/kill-switch` | `{ on, reason }` — **reason required**, 5–500 chars | `200 { kill_switch }`, audited | `400` missing, under 5 or over 500 chars |
+| `PUT /api/admin/risk/kill-switch` | `{ on, reason }` — **reason required**, 5–500 chars | `200 { kill_switch }`. The setting write and its `risk.kill_switch` audit row are one transaction, and the switch is **not pulled** if the audit write fails — the most consequential write the venue offers must not land with no record of who did it | `400` missing, under 5 or over 500 chars; `500` the audit log could not be written |
 | `POST /api/admin/risk/withdraw` | `{ reason }` — same requirement | `200 { cancelled_orders, released_cents }`, audited | `400` on the reason |
 | `PUT /api/admin/risk/bots/:id` | `{ max_liability_cents?, max_daily_loss_cents?, quote_skew?, enabled? }` — caps are **positive integers**, `quote_skew` is `0`–`1` | `200` the updated `risk_bots` row, audited | `400` a non-positive cap, `quote_skew must be between 0 and 1`, or a non-bot account; `404 No such bot` |
 | `GET /api/admin/risk/cashout` | — | `200 { outstanding_cents, outlay_today_cents, realised_loss_today_cents, open_buyouts, taken_today, max_outstanding_cents, max_daily_outlay_cents, outstanding_headroom_cents, daily_outlay_headroom_cents, quoting_allowed }` | `401`/`403` |
@@ -554,7 +620,7 @@ executed buyouts, which resolve at settlement.
 | `POST /api/admin/results/poll` | — | `200 { considered, applied, results, error, feed }` — runs one cycle through the same fetcher the scheduled job uses, including `RESULTS_FEED_SECRET` | `401`/`403`; a transport failure is reported inside the payload, not as a status |
 | `GET /api/admin/results/void-rules` | — | `200 { sports, rules, default }` — the per-sport table from [`lib/voidrules.js`](../lib/voidrules.js) | `401`/`403` |
 | `GET /api/admin/results/held` | — | `200 { markets }` — every market with `settlement_hold = 1`, with its `hold_reason` | `401`/`403` |
-| `POST /api/admin/results/held/:id/release` | `{ decision: "settle" \| "void", winner_selection_id?, dead_heat?, reason }` — reason required, ≥5 chars | `200` the settlement result, audited | `400` missing reason, unknown `decision`, a `settle` with neither a winner nor a `dead_heat`, a `void` **and** a winner, a `dead_heat` naming fewer than two distinct ids, or a non-integer id; `404` unknown market; `409` already settled |
+| `POST /api/admin/results/held/:id/release` | `{ decision: "settle" \| "void", winner_selection_id?, dead_heat?, reason }` — reason required, ≥5 chars. Ids pass through **uncoerced**: `winner_selection_id` and every `dead_heat` entry must be a JSON integer, so a quoted `"2"`, `true` or `[2]` is refused rather than parsed | `200` the settlement result, audited | `400` missing reason, unknown `decision`, a `settle` with neither a winner nor a `dead_heat`, a `void` **and** a winner, a `dead_heat` that is not an array or names fewer than two distinct integer ids, a winner id that is not a positive integer, or a non-integer `:id`; `404` unknown market; `409` already settled. On refusal the market stays **held and open** — a malformed request must never clear the hold, even to roll it back |
 | `GET /api/admin/reconciliation/findings` | `?limit=` (default 100). Unresolved first, then by descending drift | `200 { findings }` | `401`/`403` |
 | `POST /api/admin/reconciliation/findings/:id/resolve` | `{ reason }` — required, ≥5 chars | `200 { id, resolved }`, or `{ id, already_resolved }`, audited | `400` on the reason; `404 Finding not found`; `400` non-integer id |
 | `POST /api/admin/markets/:id/suspend` | `{ suspended?, until?, reason? }`. `suspended` defaults to `true`; `until` is `null` for open-ended | `200 { market_id, suspended, until, reason }` | `400` unparseable `until`, or a non-integer id; `404` unknown market; `409` only an open market can be suspended |

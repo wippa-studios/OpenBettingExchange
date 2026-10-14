@@ -117,10 +117,75 @@ check('K6 with no encryption key, a credential is REFUSED and nothing is written
       (e) => e.status === 503 && /refused rather than stored in plaintext/.test(e.message)
     );
     assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM feed_credentials').get().c, 0, 'NOTHING was written');
+
+    // #36. With no key configured, an UNKNOWN TENANT must still be a 404 and
+    // not the 503. `requireKey()` used to run first, so the tenant lookup it
+    // was supposed to precede never happened and this branch was unreachable —
+    // while the sibling `clearCredentials` answered 404 for the same request.
+    // Both halves of one API disagreed with each other.
+    //
+    // The order is also the contract: WHO you are asking about, before WHETHER
+    // THE VENUE IS CONFIGURED to answer. An unknown tenant is a fact about the
+    // request that holds regardless of configuration.
+    assert.throws(
+      () => FC2.setCredentials(db, { actor: admin, tenantId: 99999, ...GOOD }),
+      (e) => e.status === 404 && /No such tenant/.test(e.message),
+      'an unknown tenant is 404 even with no key configured — not masked by the 503'
+    );
+    // And the control: a KNOWN tenant with no key is still the 503, so the
+    // check above cannot pass by refusing everything.
+    assert.throws(
+      () => FC2.setCredentials(db, { actor: admin, tenantId: tenant.id, ...GOOD }),
+      (e) => e.status === 503,
+      'a known tenant with no key is still the 503'
+    );
   } finally {
     unconfigured.FEED_CREDENTIALS_KEY = savedKey;
     db.close();
   }
+});
+
+// #36, part 1: a deliberate 503 must actually REACH the client. `errorHandler`
+// clamped every status >= 500 to 500 with a generic message, so this refusal —
+// whose message contains the exact command that fixes it — arrived as
+// `500 Internal error` and the remediation was logged and never delivered.
+//
+// The default must not move: a genuine FAULT still clamps and still says
+// nothing. Both halves are asserted, because a fix that let every 5xx through
+// would pass the first assertion and fail the second.
+check('K6b a deliberate 503 reaches the client; a genuine fault still does not', async () => {
+  const { errorHandler } = require('../server');
+  const call = (err) => {
+    let out = null;
+    const res = {
+      statusCode: null,
+      status(c) { this.statusCode = c; return this; },
+      json(b) { out = { status: this.statusCode, body: b }; return this; },
+    };
+    errorHandler(err, { method: 'GET', path: '/x' }, res, () => {});
+    return out;
+  };
+
+  // Opted in: status and message both survive.
+  const deliberate = call(auth.serviceUnavailable('set FEED_CREDENTIALS_KEY (openssl rand -hex 32)'));
+  assert.strictEqual(deliberate.status, 503, 'the deliberate 503 is not clamped');
+  assert.match(deliberate.body.error, /FEED_CREDENTIALS_KEY/, 'and its remediation reaches the caller');
+
+  // A plain httpError(503) is NOT opted in — the old call shape stays clamped,
+  // so a module that does not know about this mechanism cannot leak by
+  // accident.
+  const plain = call(auth.httpError(503, 'something internal leaked'));
+  assert.strictEqual(plain.status, 500, 'an un-marked 5xx is still clamped to 500');
+  assert.strictEqual(plain.body.error, 'Internal error', 'and its message is still replaced');
+
+  // A thrown fault carrying a path and a stack frame.
+  const fault = call(Object.assign(new Error('SQLITE_ERROR at /home/venue/data/ob.db line 412'), { status: 500 }));
+  assert.strictEqual(fault.status, 500);
+  assert.strictEqual(fault.body.error, 'Internal error', 'a fault still leaks nothing');
+
+  // And a 4xx is untouched by any of this.
+  assert.strictEqual(call(auth.httpError(400, 'bad input')).status, 400);
+  assert.strictEqual(call(auth.httpError(400, 'bad input')).body.error, 'bad input');
 });
 
 // ── what an API is allowed to return ─────────────────────────────────────────

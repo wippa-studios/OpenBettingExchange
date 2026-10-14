@@ -97,6 +97,39 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Caching ─────────────────────────────────────────────────────────────────
+//
+// EVERY /api response is `no-store`, without exception.
+//
+// The money routes (`/api/me`, `/api/wallet`, `/api/positions`,
+// `/api/settlements`, `/api/orders`) are cookie-authenticated GETs carrying
+// balances, frozen escrow and per-runner exposure. That is precisely the shape a
+// shared or corporate proxy caches, and precisely the shape it serves back to
+// the WRONG user behind that proxy when the cache key ignores the cookie. The
+// venue is loopback-only by default, but the moment it sits behind an edge — the
+// deployment this codebase already has `TRUST_PROXY_JURISDICTION` for — a
+// cached balance is a real failure mode: a player sees yesterday's money, or
+// somebody else's.
+//
+// `no-store` rather than `no-cache`: `no-cache` still permits STORING a response
+// and revalidating it, which is one round trip away from a stale balance.
+//
+// Blanket, not a list of "sensitive" routes. A per-route list is a second list
+// to keep in step with the routes, and the route someone forgets is the one that
+// leaks. The public catalogue (`/api/sports`, `/api/events`) could safely be
+// cached and deliberately is not: on a loopback venue HTTP caching buys nothing,
+// and one rule that cannot be applied to the wrong route is worth more than the
+// optimisation. `tests/api.test.js` asserts the header on the money routes, so a
+// future blanket relaxation has to be a deliberate edit.
+//
+// The SSE stream is exempt in effect, not in code: `/api/stream` sets its own
+// `Cache-Control: no-cache` through `res.writeHead`, and a header passed to
+// writeHead takes precedence over one set with setHeader.
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+
 // ── Origin guard FIRST, before any body parsing ───────────────────────────────
 //
 // The rule is SIMPLE, and it was previously two rules that were each wrong:
@@ -244,21 +277,61 @@ app.use((req, res, next) => {
 // desk, which is the account that matters most. An admin left on admin123 who
 // can read the ledger and move other people's money is the worst state this
 // project can be deployed in.
-const SETUP_ALLOWLIST = new Set([
-  'GET /api/me',
-  'POST /api/auth/change-password',
-  'POST /api/auth/logout',
-  'GET /api/auth/sessions',
-  'DELETE /api/auth/sessions/:id',
-]);
+// Each entry is a route PATTERN: a segment beginning with `:` matches exactly
+// one non-empty segment. Writing them as patterns rather than literals is what
+// lets a parameterised route be expressible at all — see isSetupRoute below.
+const SETUP_ALLOWLIST = [
+  ['GET', '/api/me'],
+  ['POST', '/api/auth/change-password'],
+  ['POST', '/api/auth/logout'],
+  ['GET', '/api/auth/sessions'],
+  ['DELETE', '/api/auth/sessions/:id'],
+];
 
-// isSetupRoute: the exact key the allowlist is written in, from the request.
-// `req.path` is used rather than `req.originalUrl` so a query string does not
-// turn an allowlisted route into a locked one — `GET /api/me?x=1` must behave
-// identically to `GET /api/me`, and originalUrl would compare 'GET /api/me?x=1'
-// against 'GET /api/me' and miss.
+// Compile one entry to a matcher. The pattern is anchored at both ends and each
+// segment is compared individually, so `/api/auth/sessions/:id` matches
+// `/api/auth/sessions/abc` and NOT `/api/auth/sessions/a/b`, and no allowlisted
+// prefix can grow to cover a route nobody approved.
+function compileAllowlistEntry([method, pattern]) {
+  const re = new RegExp(
+    `^${pattern
+      .split('/')
+      // The leading empty segment of an absolute path splits to '' and is kept.
+      .map((seg) => (seg.startsWith(':') ? '[^/]+' : seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+      .join('/')}$`
+  );
+  return { method, re };
+}
+
+const SETUP_ALLOWLIST_COMPILED = SETUP_ALLOWLIST.map(compileAllowlistEntry);
+
+// isSetupRoute: does the request match an allowlisted route PATTERN?
+//
+// It compared the literal string `${req.method} ${req.path}` against the Set
+// before. Four of the five entries happened to be literal already, so the set
+// lookup worked and nobody noticed that `DELETE /api/auth/sessions/:id` could
+// never match: `req.path` is `/api/auth/sessions/abc` for every real request,
+// and comparing that against the string `/api/auth/sessions/:id` misses. The
+// entry was dead BY CONSTRUCTION, not by an accident of data — a locked account
+// was refused `GET /api/auth/sessions` (200) but `DELETE` of one of them (403),
+// which is the exact trap this lock is supposed to avoid being.
+//
+// Two properties are deliberately preserved from that comparison:
+//
+//   - `req.path`, not `req.originalUrl`, so a query string cannot turn an
+//     allowlisted route into a locked one: `GET /api/me?x=1` must behave
+//     identically to `GET /api/me`. (Verified: req.path excludes the query.)
+//   - the METHOD is part of the match, not just the path, so allowing a GET
+//     never implies allowing a POST to the same path.
+//
+// Matching a pattern rather than dropping the entry is the right direction: the
+// list's own comment says session management is part of the minimum needed to
+// reach the fix, and a player who believes a device is stolen should be able to
+// sign it out. Narrowing the lock is a product decision; making the mechanism
+// match what it already claims is not.
 function isSetupRoute(req) {
-  return SETUP_ALLOWLIST.has(`${req.method} ${req.path}`);
+  const path = req.path;
+  return SETUP_ALLOWLIST_COMPILED.some((e) => e.method === req.method && e.re.test(path));
 }
 
 function firstRunLockResponse(req, res) {
@@ -764,7 +837,21 @@ async function enforceFirstRunLock() {
   return flagged;
 }
 
-app.use((req, res, next) => {
+// The second enforcement point described above: it catches a route that reads
+// req.user WITHOUT requireAuth, which is what /api/branding is.
+//
+// IT IS SCOPED TO /api, AND THAT SCOPE IS THE FIX FOR #33. This middleware
+// used to be global, so it also answered GET /, GET /style.css and every other
+// static asset with a JSON 403 — and the first-run lock's entire purpose is to
+// be escapable through the UI. A locked account got a JSON error in the address
+// bar where the page should have been, could not load the CSS that renders the
+// change-password panel, and reasonably concluded the server was broken. The
+// lock blocked the product rather than the trading.
+//
+// The scope costs nothing: requireAuth/requireAdmin — which cover every route
+// that authenticates, placement-independently — never serve a static asset, and
+// a static file carries no account state, so there is nothing here to lock.
+app.use('/api', (req, res, next) => {
   if (req.method === 'OPTIONS') return next();
   if (isSetupRoute(req)) return next();
   if (!mustChangePassword(req.user)) return next();
@@ -1064,8 +1151,25 @@ app.get('/api/markets/:id/book', (req, res) => {
 app.get('/api/format/:price', (req, res) => {
   const raw = Number(req.params.price);
   if (!Number.isFinite(raw)) return res.status(400).json({ error: 'Price must be a number' });
+  // THE RANGE IS CHECKED BEFORE THE SNAP, which is what makes the documented 400
+  // reachable at all.
+  //
+  // It used to be checked after, against the snapped value — and
+  // `snapToTick` CLAMPS to [1.01, 1000] and then returns a tick, by
+  // construction. So `validTick(snapped)` is always true and that branch was
+  // dead code: `GET /api/format/5000` answered `200 {decimal: 1000}` and
+  // `GET /api/format/-5` answered `200 {decimal: 1.01}`. A caller checking a
+  // price was told a *different* price was fine, which for a validation
+  // endpoint is the worst kind of wrong answer.
+  //
+  // Range only, NOT tick. An off-tick price inside the range — 2.75 — is still
+  // snapped, because that is what the desk's fair-price helper is for: a trader
+  // types a near-miss and is shown what the engine would make of it (the desk
+  // renders "snaps to 2.76"). docs/EXCHANGE_RULES.md makes the same promise for
+  // the trading path, where `POST /api/orders` documents the clamp. What is
+  // refused here is a number that is not a price at all.
+  if (!ODDS.inLadderRange(raw)) return res.status(400).json({ error: 'Price is outside the 1.01-1000 ladder' });
   const p = ODDS.snapToTick(raw);
-  if (!ODDS.validTick(p)) return res.status(400).json({ error: 'Price is outside the 1.01-1000 ladder' });
   res.json({
     decimal: p,
     american: ODDS.toAmerican(p),
@@ -1171,6 +1275,10 @@ function slugify(name) {
 // Every route here is audited inside lib/admin.js, in the same transaction as
 // the mutation it describes — so an audit row can never exist for a change
 // that was rolled back.
+//
+// The desk's other audited mutators, in lib/tenants.js (commission rate, tenant
+// status) and lib/risk.js (the kill switch), are now held to the same rule.
+// They were the two exceptions, and the comment above did not mark them (#27).
 
 app.get('/api/admin/users', requireAdmin, limit('admin'), (req, res) => {
   res.json(
@@ -1372,16 +1480,42 @@ app.post('/api/wallet/deposit-intent', requireAuth, limit('wallet'), (req, res, 
 
 // ── Payments webhook ───────────────────────────────────────────────────────
 // The ONLY automated deposit-confirmation path, and it authenticates the
-// CALLER, not the session: an HMAC over the raw body with a shared secret,
-// compared in constant time. Without the secret the route 404s rather than
-// accepting unsigned events — the safe default, since this is the path that
-// creates money.
+// CALLER, not the session: an HMAC with a shared secret, compared in constant
+// time. Without the secret the route 404s rather than accepting unsigned events
+// — the safe default, since this is the path that creates money.
+//
+// THE SIGNATURE COVERS A DELIVERY TIMESTAMP AS WELL AS THE BODY. It used to
+// cover the raw body alone, which meant a captured valid request was replayable
+// FOREVER. The only thing stopping a second credit was that the intent was no
+// longer PENDING — a STATE-based defence, not a replay defence. Those are not
+// the same: state-based idempotency stops re-delivery of one intent, and nothing
+// stopped a captured request being replayed later against a still-pending one.
+// Binding the timestamp into the MAC bounds the window by time as well.
+//
+// The timestamp is REQUIRED, not optional. An optional one would be a control the
+// caller could bypass by omitting the header, which is worse than no control
+// because it would read as one. Five minutes is generous for clock skew between
+// the provider and the venue, and comfortably covers a retry cycle.
+//
+// Wire format: `x-obx-timestamp` is unix seconds; `x-obx-signature` is
+// `hex(HMAC-SHA256(secret, "<timestamp>." + rawBody))`. Documented in
+// docs/API.md.
 const crypto = require('crypto');
+const WEBHOOK_REPLAY_WINDOW_SECONDS = 300;
 app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
   if (!config.PAYMENTS_WEBHOOK_SECRET) return res.status(404).json({ error: 'Not found' });
+
+  // Shape first: the timestamp is an input to the MAC, so a malformed one is a
+  // protocol error and is reported as one rather than as a bad signature.
+  const ts = String(req.headers['x-obx-timestamp'] || '');
+  if (!/^\d{1,15}$/.test(ts)) {
+    return res.status(400).json({ error: 'x-obx-timestamp is required and must be unix seconds' });
+  }
+
   const sig = String(req.headers['x-obx-signature'] || '');
   const expected = crypto
     .createHmac('sha256', config.PAYMENTS_WEBHOOK_SECRET)
+    .update(`${ts}.`)
     .update(req.rawBody || Buffer.alloc(0))
     .digest('hex');
   const a = Buffer.from(sig);
@@ -1391,6 +1525,19 @@ app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
     return res.status(401).json({ error: 'Bad signature' });
   }
+
+  // Authenticated, so the freshness of THIS request is a fact about the signed
+  // payload rather than anything the caller could have asserted on its own.
+  // Checked after the signature deliberately: an unsigned caller learns nothing
+  // about the window, and a replay of a genuinely captured request is caught
+  // here with its signature still valid.
+  const age = Math.abs(Math.floor(Date.now() / 1000) - Number(ts));
+  if (age > WEBHOOK_REPLAY_WINDOW_SECONDS) {
+    return res.status(400).json({
+      error: `Webhook timestamp is outside the ${WEBHOOK_REPLAY_WINDOW_SECONDS}s replay window`,
+    });
+  }
+
   const body = req.body || {};
   try {
     const r = PAY.confirmByExternalId(db, {
@@ -1400,9 +1547,11 @@ app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
     });
     res.json(r);
   } catch (e) {
-    // A webhook the provider RETRIES must not credit twice, and one that
-    // references an unknown or already-confirmed intent is the normal result
-    // of at-least-once delivery — answer it, do not crash the process.
+    // A webhook the provider RETRIES must not credit twice. One referencing an
+    // already-confirmed intent is the NORMAL result of at-least-once delivery,
+    // and lib/payments now answers it 200 {already_confirmed: true} rather than
+    // 404 — so this branch is for genuinely unknown ids, which is a real fault.
+    // Either way: answer it, do not crash the process.
     if (e && e.status) return res.status(e.status).json({ error: e.message, details: e.details || null });
     throw e;
   }
@@ -1431,7 +1580,22 @@ app.post('/api/admin/payments/intents/:id/fail', requireAdmin, limit('admin'), (
 
 app.post('/api/wallet/withdraw', requireAuth, limit('wallet'), (req, res) => {
   const { amount_cents, reason } = req.body || {};
-  res.json(PAY.openWithdrawal(db, req.user.id, Number(amount_cents), reason));
+  // UNCOERCED, and the reason is the shape of every other money route here.
+  //
+  // This route called `Number(amount_cents)`, which made it the ONLY money edge
+  // in the codebase that accepted a non-integer: `"100"`, `true` and `[100]` all
+  // became a valid cent amount and were DEBITED, each with a proper intent row.
+  // Nothing was minted — the coerced amount is exactly what was withdrawn — so
+  // this was never a money-printing bug. It was a boundary defect, and boundaries
+  // are load-bearing in this codebase: the rest of the money path rejects these
+  // types at the edge, which is what stops a future refactor from reaching the
+  // ledger believing a half-cent or a boolean is a quantity.
+  //
+  // lib/payments' `openWithdrawal` ALREADY has the correct check — its first
+  // line refuses anything that is not a positive integer. The coercion here was
+  // defeating an existing validator, so the fix is to pass the value through
+  // untouched and let that validator do its job, not to add a second one.
+  res.json(PAY.openWithdrawal(db, req.user.id, amount_cents, reason));
 });
 
 app.get('/api/admin/reconciliation', requireAdmin, limit('admin'), (req, res, next) => {
@@ -1644,7 +1808,12 @@ app.post('/api/admin/results/held/:id/release', requireAdmin, limit('admin'), (r
       actor: req.user,
       marketId: intId(req.params.id),
       decision,
-      winnerSelectionId: winner_selection_id === undefined ? null : Number(winner_selection_id),
+      // UNCHANGED, and `Number()` is gone from here too. This route carried the
+      // same coercion the joint-favourite list was meant to be free of:
+      // `Number(true)` is 1 and `Number("2")` is 2, so a hand-rolled `curl` with
+      // a quoted id settled on it as though the operator had chosen it. lib/
+      // settle.js refuses both, which is the whole point of that strictness.
+      winnerSelectionId: winner_selection_id === undefined ? null : winner_selection_id,
       // A held DEAD HEAT is exactly the case a hold exists for, and this route
       // could only express a single winner — so releasing one paid a whole stake
       // to one runner and charged a joint winner's backer his whole stake. The
@@ -2093,7 +2262,15 @@ app.post('/api/admin/markets/:id/settle', requireAdmin, limit('admin'), (req, re
     db, req.user,
     AUDIT.ACTIONS.MARKET_SETTLED,
     `market:${mid}`,
-    { status: 'open' },
+    // The status this market WAS, taken from the row the settlement
+    // transaction itself read (`settleMarket` returns it). It used to be the
+    // string literal 'open', so every settlement audit row asserted a prior
+    // state that was simply asserted rather than observed — and a suspended
+    // market (which settles normally; only `settled` and `held` are refused)
+    // was recorded as having been open. This is the `before` an operator,
+    // auditor or regulator reads on the most money-moving action the venue
+    // offers, so it must be a record and not a fabrication.
+    { status: result.previous_status ?? null },
     { void: !!body.void, winner_selection_id: body.winner_selection_id ?? null, users_settled: result.per_user.length },
     body.reason || null
   );
@@ -2140,15 +2317,31 @@ app.use('/api', (req, res) => {
 app.use(express.static(path.join(__dirname, 'public')));
 
 // A 4xx is a decision this app made and its message is safe to return. A 5xx
-// may carry a database message, a file path or a stack frame, so the client
-// gets a generic message and the real one goes to the log. Exported so the
-// behaviour is unit-testable (no API path can provoke a 5xx on purpose).
+// FAULT may carry a database message, a file path or a stack frame, so the
+// client gets a generic message and the real one goes to the log.
+//
+// THE EXCEPTION IS OPT-IN, NOT INFERRED. An application state it chose
+// deliberately and described in its own words — "FEED_CREDENTIALS_KEY is not
+// set, here is the command that fixes it" — is not a fault, and arriving as
+// `500 Internal error` leaves an operator unable to distinguish "you have not
+// configured this" from "the venue is broken". Two states with completely
+// different remedies, one of them written into the message that never arrived.
+//
+// Such an error sets `err.expose` (see lib/auth.js `serviceUnavailable`). The
+// default for anything that does not is unchanged — clamp to 500, generic
+// message, real error logged — so a genuine fault still cannot leak. A module
+// has to SAY that a 5xx is deliberate; nothing infers it, because a deliberate
+// 503 and a thrown TypeError are indistinguishable to this function.
+//
+// Exported so the behaviour is unit-testable from both sides: a real fault, and
+// an opted-in 503.
 // eslint-disable-next-line no-unused-vars
 function errorHandler(err, req, res, next) {
   const raw = Number(err.status) || 500;
-  const status = raw >= 500 ? 500 : raw;
-  if (status >= 500) console.error('[api]', err);
-  const body = { error: status >= 500 ? 'Internal error' : err.message || 'Request failed' };
+  const expose = raw >= 500 && err.expose === true;
+  const status = raw >= 500 && !expose ? 500 : raw;
+  if (status >= 500 && !expose) console.error('[api]', err);
+  const body = { error: status >= 500 && !expose ? 'Internal error' : err.message || 'Request failed' };
   // Structured context (which limit was breached, what it is) is a 4xx-only
   // affordance. It is deliberately absent from a 5xx even if present on the
   // error, so an internal failure cannot leak detail through it.

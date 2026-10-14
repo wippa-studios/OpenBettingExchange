@@ -204,6 +204,106 @@ check('R5 releasing a hold requires a reason and is audited', async () => {
   assert.strictEqual(acc.assertConserved(f.db), 0);
 });
 
+// #61. lib/settle.js is strict about id types on purpose — "[true, 2] became
+// [1, 2] … a malformed request becomes a valid settlement of somebody's real
+// money" — and the route says it passes the joint-favourite list through
+// UNCHANGED. It did not: releaseHold ran `.map(Number)` over it first, and
+// `Number(true) === 1`, so the coercion the engine was hardened against was
+// reintroduced one layer up. This is the hold-release path, where a human is
+// adjudicating a market the system explicitly refused to settle.
+//
+// Each case gets a FRESH fixture, because a release that wrongly SUCCEEDS
+// settles the market and cannot be re-tried. Asserting only that it throws would
+// not be enough: a throw after the market was already settled would still leave
+// real money moved. So the market's held-and-unsetted state is asserted too.
+check('R5b a malformed id cannot be laundered into a valid settlement', async () => {
+  const heldWith = async (patch) => {
+    const f = (await fixture());
+    bet(f);
+    R.applyOutcome(f.db, f.marketId, { status: 'completed', winners: [f.s1], disputed: true });
+    const ops = (await A.registerUser(f.db, { username: 'ops', password: 'pw-ops-1234', balance_cents: 0 }));
+    f.db.prepare("UPDATE users SET role='admin', is_admin=1 WHERE id=?").run(ops.id);
+    return { f, ops };
+  };
+  const untouched = (f, what) => {
+    assert.strictEqual(status(f.db, f.marketId).status, 'open', `${what}: the market is still OPEN, not settled`);
+    assert.strictEqual(status(f.db, f.marketId).settlement_hold, 1, `${what}: and still held for review`);
+  };
+
+  // [true, 2] → [1, 2] before the fix: a clean two-winner joint favourite
+  // settlement of a DISPUTED market.
+  {
+    const { f, ops } = await heldWith();
+    assert.throws(
+      () => R.releaseHold(f.db, { actor: ops, marketId: f.marketId, decision: 'settle', deadHeatSelectionIds: [true, f.s2], reason: 'adjudicating the dispute' }),
+      (e) => e.status === 400,
+      'dead_heat: [true, id] must be refused, not coerced to a joint favourite'
+    );
+    untouched(f, 'dead_heat [true, id]');
+    f.db.close();
+  }
+  // The trailing `true` is the sharper case: the length check still passes
+  // after the coercion, so a filter-style fix would let this through.
+  {
+    const { f, ops } = await heldWith();
+    assert.throws(
+      () => R.releaseHold(f.db, { actor: ops, marketId: f.marketId, decision: 'settle', deadHeatSelectionIds: [f.s1, f.s2, true], reason: 'adjudicating the dispute' }),
+      (e) => e.status === 400,
+      'a malformed element in an otherwise valid dead_heat must not be silently dropped'
+    );
+    untouched(f, 'dead_heat [id, id, true]');
+    f.db.close();
+  }
+  // Strings are the same laundering by another route.
+  {
+    const { f, ops } = await heldWith();
+    assert.throws(
+      () => R.releaseHold(f.db, { actor: ops, marketId: f.marketId, decision: 'settle', deadHeatSelectionIds: [String(f.s1), String(f.s2)], reason: 'adjudicating the dispute' }),
+      (e) => e.status === 400,
+      'quoted selection ids are refused, not parsed'
+    );
+    untouched(f, 'dead_heat ["id", "id"]');
+    f.db.close();
+  }
+  // The single-winner path, which the route ALSO coerced with Number().
+  {
+    const { f, ops } = await heldWith();
+    assert.throws(
+      () => R.releaseHold(f.db, { actor: ops, marketId: f.marketId, decision: 'settle', winnerSelectionId: true, reason: 'adjudicating the dispute' }),
+      (e) => e.status === 400,
+      'winner_selection_id: true must not become selection 1'
+    );
+    untouched(f, 'winner true');
+    f.db.close();
+  }
+  {
+    const { f, ops } = await heldWith();
+    assert.throws(
+      () => R.releaseHold(f.db, { actor: ops, marketId: f.marketId, decision: 'settle', winnerSelectionId: String(f.s1), reason: 'adjudicating the dispute' }),
+      (e) => e.status === 400,
+      'a quoted winner id is refused, not parsed'
+    );
+    untouched(f, 'winner "id"');
+    f.db.close();
+  }
+
+  // The control: the same shape with REAL integer ids still settles. Without
+  // it, a check that merely refused everything would pass.
+  {
+    const { f, ops } = await heldWith();
+    R.releaseHold(f.db, { actor: ops, marketId: f.marketId, decision: 'settle', deadHeatSelectionIds: [f.s1, f.s2], reason: 'adjudicating the dispute' });
+    assert.strictEqual(status(f.db, f.marketId).status, 'settled', 'two real integer ids still release as a dead heat');
+    assert.strictEqual(acc.assertConserved(f.db), 0, 'and the books still balance');
+    f.db.close();
+  }
+  {
+    const { f, ops } = await heldWith();
+    R.releaseHold(f.db, { actor: ops, marketId: f.marketId, decision: 'settle', winnerSelectionId: f.s1, reason: 'adjudicating the dispute' });
+    assert.strictEqual(status(f.db, f.marketId).status, 'settled', 'a real integer winner id still releases');
+    f.db.close();
+  }
+});
+
 // R6: a winner from ANOTHER market is refused, not silently settled. Paying
 // the wrong selection is worse than refusing.
 check('R6 a winner outside the market is held, not settled', async () => {

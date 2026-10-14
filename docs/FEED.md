@@ -205,8 +205,9 @@ was probed against a view its board never reads: the probe passed while every
 board request failed, and an operator holding a green health check and a dead
 board had nothing to connect them.
 
-**One exception**, and it is not fixed: `GET /api/feed/nav` reads `v_feed2` on
-feed 1. See [Known gaps](#known-gaps).
+`GET /api/feed/nav` was the remaining exception and is now fixed too: `navSql`
+is parameterised like `boardSql` and `healthSql`, so the navigation tree reads
+the configured view (#69).
 
 ---
 
@@ -678,7 +679,6 @@ discovered by reading a green dashboard.
 
 | Gap | Where | What actually happens |
 | --- | --- | --- |
-| The nav tree reads feed 2 on feed 1 | `NAV_SQL`, `lib/feed.js` | `NAV_SQL` interpolates `feedView(2)` at module load while `boardSql` and `healthSql` take the configured feed, and `fetchNav()` takes no argument. With `FEED_NUMBER=1` the navigation tree describes `v_feed2` while the board and market routes read `v_feed1`. |
 | The results poll set is uncapped | `pendingMarkets`, `lib/results.js` | Every open, non-held, off market is polled and POSTed, every cycle. A venue whose results feed is quietly broken accumulates off-but-unsettled markets and the request body grows without bound. |
 | The delay probe asks for a column that does not exist | `delayProbe`, `lib/feed.js` | It selects `feed_run.payload`; the collector's `feed_run` has no such column, so the query raises, the fallback is `is_delay: true`, and `app_key_delay` is always `true` with `data_age_seconds` always `null`. The response does not publish the probe's `source`, so nothing tells an operator the flag was assumed. |
 
@@ -749,7 +749,6 @@ the boundary** rather than carried into the UI, where it would render as
 | Board empty, `/api/feed/board` returns `409` | `FEED_ENABLED` is off. `/api/feed/health` answers `409` for the same reason |
 | Every board request returns `503` | the feed database is unreachable, or the view does not exist. The real message is in the server log |
 | Feed 1 board renders but every market is `stale` | correct — feed 1 has no prices, so there is no poll age to be fresh |
-| Nav tree lists markets the board does not show | `FEED_NUMBER=1`; the nav query is still hardcoded to `v_feed2`. See [Known gaps](#known-gaps) |
 | `markets_with_odds: 0` on feed 2 | the collector's price block is empty. `markets` counts `DISTINCT market_id`, not rows, so the two numbers are not comparable to a row count — but `markets` high and `markets_with_odds` zero means the view is publishing no prices |
 | `app_key_delay: true`, `data_age_seconds: null` | expected on a Delay key; also what you get when the probe cannot read `feed_run.payload`. See [Known gaps](#known-gaps) |
 | `DSC-0018` in the collector log | `VENUE` or `EVENT_RUNNER_DESCRIPTION` added to the collector's `CATALOGUE_PROJECTION`. Live-key-only; `betfeed validate` fails on it |

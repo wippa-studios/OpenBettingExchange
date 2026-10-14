@@ -15,6 +15,9 @@ process.env.BOT_ENABLED = 'false';
 
 const assert = require('assert');
 const srv = require('../server');
+// Only for `verifyPassword`, so the first-run-lock checks below can sign in with
+// whichever password the seeded demo account currently holds.
+const A = require('../lib/auth');
 
 let passed = 0;
 const check = async (name, fn) => {
@@ -225,6 +228,25 @@ const check = async (name, fn) => {
       assert.ok(r.json && r.json.error, 'JSON error body');
     });
 
+    // #3. Money-bearing responses must say `no-store`. These are cookie-
+    // authenticated GETs carrying balances and per-runner exposure — the shape a
+    // shared proxy caches, and the shape it serves back to the WRONG user if the
+    // cache key ignores the cookie. Asserted on the HEADER, not the status: a 200
+    // with no cache directive is exactly the bug.
+    await check('money routes answer no-store so no proxy may cache a balance', async () => {
+      for (const path of ['/api/me', '/api/wallet', '/api/positions', '/api/settlements', '/api/orders']) {
+        const r = await j('GET', path, { cookie: alice });
+        assert.strictEqual(r.status, 200, `${path} answers 200`);
+        // Assert the directive is EXACTLY no-store. `assert.ok(/no-store/...)`
+        // would also pass on `public, no-store`, which permits a shared cache.
+        assert.strictEqual(
+          r.headers['cache-control'],
+          'no-store',
+          `${path} must answer Cache-Control: no-store (got ${JSON.stringify(r.headers['cache-control'])})`
+        );
+      }
+    });
+
     await check('foreign origin rejected even with a malformed body', async () => {
       const res = await fetch(`${base}/api/wallet/deposit`, {
         method: 'POST',
@@ -248,14 +270,40 @@ const check = async (name, fn) => {
       assert.strictEqual(short.json.fractional, '2/5');
     });
 
-    await check('GET /api/format snaps to the ladder and rejects junk', async () => {
+    // #37. The route snapped FIRST and validated the snapped value, which made the
+    // 400 branch dead by construction: snapToTick clamps to [1.01, 1000] and
+    // always returns a tick, so `GET /api/format/5000` answered 200 {decimal:
+    // 1000}. A caller checking a price was told a DIFFERENT price was fine.
+    //
+    // The off-tick case stays 200 on purpose: the desk's fair-price helper shows
+    // a trader what the engine would make of a hand-typed near-miss, and
+    // POST /api/orders documents the same clamp. Only a number that is not a
+    // price at all is refused.
+    await check('GET /api/format refuses a price outside the ladder instead of clamping', async () => {
+      // Off-tick but IN range: still snapped. The desk depends on this.
       const snap = await j('GET', '/api/format/2.75'); // 2.75 is not a tick
-      assert.strictEqual(snap.status, 200);
+      assert.strictEqual(snap.status, 200, 'an off-tick price inside the ladder is still snapped');
       assert.ok([2.74, 2.76].includes(snap.json.decimal), `snapped to ${snap.json.decimal}`);
-      assert.strictEqual((await j('GET', '/api/format/abc')).status, 400);
-      const clamped = await j('GET', '/api/format/0.5');
-      assert.strictEqual(clamped.status, 200);
-      assert.strictEqual(clamped.json.decimal, 1.01); // clamped UP to the ladder floor — assert the body, not just 200
+
+      assert.strictEqual((await j('GET', '/api/format/abc')).status, 400, 'non-numeric is refused');
+
+      // Out of range in every direction. Before the fix each answered 200 with a
+      // confident clamp — 5000 -> 1000, 0.5 -> 1.01.
+      for (const bad of ['5000', '1000.01', '-5', '0.5', '0']) {
+        const r = await j('GET', `/api/format/${bad}`);
+        assert.strictEqual(r.status, 400, `${bad} is outside the ladder and must be refused (got ${r.status})`);
+        assert.strictEqual(r.json.error, 'Price is outside the 1.01-1000 ladder', `and says why (${bad})`);
+        // The decisive assertion: a clamp would answer 200, so a body carrying
+        // a DIFFERENT price than the one asked for must not exist at all.
+        assert.strictEqual(r.json.decimal, undefined, `${bad} must not come back as some other price`);
+      }
+
+      // Both ends of the ladder itself are IN range, and must still answer.
+      for (const good of ['1.01', '1000']) {
+        const r = await j('GET', `/api/format/${good}`);
+        assert.strictEqual(r.status, 200, `${good} is on the ladder and must answer (got ${r.status})`);
+        assert.strictEqual(r.json.decimal, Number(good), `${good} is returned unchanged`);
+      }
     });
 
     // ── admin stats carry the per-market overround ──────────────────────
@@ -347,6 +395,98 @@ const check = async (name, fn) => {
       assert.strictEqual(anon.status, 401);
       const forbidden = await j('POST', `/api/admin/markets/${marketId}/settle`, { body: { void: true }, cookie: alice });
       assert.strictEqual(forbidden.status, 403);
+    });
+
+    // #30. The settle audit row recorded the LITERAL 'open' as the "before"
+    // state, whatever the market actually was. Settling an open market makes
+    // the lie invisible, so this check settles a SUSPENDED one: settleTx refuses
+    // only `settled` and `held`, so a suspended market settles normally, and
+    // the recorded prior state is then provably not 'open'.
+    //
+    // The audit row is the record an operator, an auditor or a regulator reads
+    // to answer "what state was this market in when you settled it", on the
+    // single most money-moving action the venue offers.
+    await check('the settle audit row records the market\'s ACTUAL prior status', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+
+      // Build a dedicated market so the check does not disturb the ones other
+      // checks in this suite settled.
+      const sport = (await j('GET', '/api/sports')).json.sports.find((s) => s.slug === 'football');
+      const ev = await j('POST', '/api/admin/events', {
+        body: { sport_id: sport.id, name: 'audit-prior-state event', starts_at: '2031-01-01T00:00:00Z' },
+        cookie: admin,
+      });
+      assert.strictEqual(ev.status, 201, `event created (${JSON.stringify(ev.json)})`);
+      const comp = await j('GET', `/api/admin/competitions?sport_id=${sport.id}`, { cookie: admin });
+      const compId = (comp.json.competitions[0] || {}).id;
+      const mkt = await j('POST', '/api/admin/markets', {
+        body: { event_id: ev.json.event.id, name: 'audit-prior-state market' },
+        cookie: admin,
+      });
+      assert.strictEqual(mkt.status, 201, `market created (${JSON.stringify(mkt.json)})`);
+      const mid = mkt.json.market.id;
+      const sel = await j('POST', '/api/admin/selections', {
+        body: { market_id: mid, name: 'Runner A' },
+        cookie: admin,
+      });
+      assert.strictEqual(sel.status, 201);
+
+      // Put it in a state that is NOT 'open'.
+      const susp = await j('PATCH', `/api/admin/markets/${mid}`, { body: { status: 'suspended', reason: 'audit probe' }, cookie: admin });
+      assert.strictEqual(susp.status, 200, 'market suspended');
+      assert.strictEqual(susp.json.market.status, 'suspended', 'really suspended before the settle');
+
+      const settled = await j('POST', `/api/admin/markets/${mid}/settle`, { body: { winner_selection_id: sel.json.selection.id }, cookie: admin });
+      assert.strictEqual(settled.status, 200, `settled (${JSON.stringify(settled.json)})`);
+
+      const audit = await j('GET', `/api/admin/audit?limit=100`, { cookie: admin });
+      const row = audit.json.entries.find((r) => r.target === `market:${mid}` && r.action === 'market.settled');
+      assert.ok(row, 'a market.settled audit row exists for this market');
+      assert.ok(row.before, 'the row carries a "before" state at all');
+      assert.strictEqual(
+        row.before.status,
+        'suspended',
+        `the recorded prior status must be what the market WAS (suspended), not the literal 'open' (got ${JSON.stringify(row.before)})`
+      );
+    });
+
+    // #61, at the route. `releaseHold` no longer coerces, but the ROUTE also did:
+    // `Number(winner_selection_id)`, so `true` became selection 1 on the wire
+    // before the engine could ever see the boolean. Driven over HTTP because the
+    // route is a separate coercion site from the module's.
+    await check('the hold-release route passes a malformed winner id through, uncoerced', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      // Build and HOLD a dedicated market, so the refusal can be observed on a
+      // market that is genuinely held rather than on a 404.
+      const sport = (await j('GET', '/api/sports')).json.sports.find((s) => s.slug === 'football');
+      const ev = await j('POST', '/api/admin/events', {
+        body: { sport_id: sport.id, name: 'release-probe event', starts_at: '2031-01-01T00:00:00Z' },
+        cookie: admin,
+      });
+      const mkt = await j('POST', '/api/admin/markets', { body: { event_id: ev.json.event.id, name: 'release-probe market' }, cookie: admin });
+      const mid = mkt.json.market.id;
+      const selA = await j('POST', '/api/admin/selections', { body: { market_id: mid, name: 'Runner B' }, cookie: admin });
+      const selB = await j('POST', '/api/admin/selections', { body: { market_id: mid, name: 'Runner C' }, cookie: admin });
+      srv.db.prepare('UPDATE markets SET settlement_hold = 1, hold_reason = ? WHERE id = ?').run('disputed', mid);
+
+      for (const [label, body] of [
+        ['a boolean winner', { decision: 'settle', winner_selection_id: true, reason: 'adjudicating the dispute' }],
+        ['a quoted winner', { decision: 'settle', winner_selection_id: String(selA.json.selection.id), reason: 'adjudicating the dispute' }],
+        // The QUOTED id here is the one that matters. `Number("35")` is 35, so
+        // with the coercion this is a perfectly valid two-runner dead heat
+        // naming two selections of THIS market — and it settles. Using `true`
+        // instead would coerce to selection 1, which belongs to a different
+        // market, so settleMarket would refuse it for being foreign and the
+        // check would pass with the coercion still in place.
+        ['a dead_heat holding a quoted id', { decision: 'settle', dead_heat: [String(selA.json.selection.id), selB.json.selection.id], reason: 'adjudicating the dispute' }],
+        ['a dead_heat that is not an array', { decision: 'settle', dead_heat: `${selA.json.selection.id},${selB.json.selection.id}`, reason: 'adjudicating the dispute' }],
+      ]) {
+        const r = await j('POST', `/api/admin/results/held/${mid}/release`, { body, cookie: admin });
+        assert.strictEqual(r.status, 400, `${label} is refused (got ${r.status} ${JSON.stringify(r.json)})`);
+        const row = srv.db.prepare('SELECT status, settlement_hold FROM markets WHERE id = ?').get(mid);
+        assert.strictEqual(row.status, 'open', `${label}: the market is still open`);
+        assert.strictEqual(row.settlement_hold, 1, `${label}: and still held`);
+      }
     });
 
     // ── #25: the risk-cap route must not call every fault a 400 ──────────────
@@ -715,6 +855,49 @@ const check = async (name, fn) => {
       assert.ok(r.status === 404 || r.status === 401, `unsigned/unconfigured webhook is refused, got ${r.status}`);
     });
 
+    // #9. `POST /api/wallet/withdraw` called `Number(amount_cents)` before
+    // handing the value to lib/payments, so `"100"`, `true` and `[100]` were all
+    // coerced into a valid cent amount and DEBITED. Every other money edge in
+    // the codebase refuses them at the boundary.
+    //
+    // The balance is made large FIRST, deliberately. A player with 50c would
+    // get `400 Withdrawal exceeds available balance` for every one of these
+    // values, coercion or not — and a test that only asserted "400" would then
+    // pass with the bug present. Asserting the refusal happens *with money
+    // available to take* is what makes it a real test: before the fix these
+    // three debit real cents and answer 200; after, they are refused and the
+    // balance is untouched.
+    await check('W0 withdraw refuses non-integer cents at the route, with funds available', async () => {
+      const reg = await j('POST', '/api/auth/register', { body: { username: 'wendy', password: 'secret1' } });
+      const cookie = cookieOf(reg);
+      await j('POST', '/api/wallet/deposit', { body: { amount_cents: 50000 }, cookie });
+      const start = (await j('GET', '/api/wallet', { cookie })).json.balance_cents;
+      assert.strictEqual(start, 50000, 'the account really does have funds to withdraw');
+
+      for (const [label, amount] of [['a string', '100'], ['a boolean', true], ['an array', [100]]]) {
+        const r = await j('POST', '/api/wallet/withdraw', { body: { amount_cents: amount, reason: 'boundary test' }, cookie });
+        assert.strictEqual(r.status, 400, `${label} amount_cents is refused (got ${r.status} ${JSON.stringify(r.json)})`);
+        // Assert the message too: a 400 from an unrelated check (say, the
+        // balance cap) would satisfy the status assertion alone and hide a
+        // coercion that still went through.
+        assert.match(
+          r.json.error,
+          /positive integer/i,
+          `${label} is refused as a non-integer, not for some other reason (got ${JSON.stringify(r.json.error)})`
+        );
+      }
+
+      // The point of the whole check: not one cent left the account.
+      const after = (await j('GET', '/api/wallet', { cookie })).json.balance_cents;
+      assert.strictEqual(after, start, 'no coerced value debited anything');
+
+      // And the control: a REAL integer still works, so the check is not just
+      // "withdraw always 400s".
+      const ok = await j('POST', '/api/wallet/withdraw', { body: { amount_cents: 100, reason: 'boundary test' }, cookie });
+      assert.strictEqual(ok.status, 200, 'an integer withdrawal still opens an intent');
+      assert.strictEqual((await j('GET', '/api/wallet', { cookie })).json.balance_cents, start - 100);
+    });
+
     // ── Every operator/control route is CALLED at least once ──────────────
     // `const MATCH = M;` went missing to a shell-quoting failure and NOTHING
     // failed: the delay-release job and its admin route were dead, because no
@@ -840,6 +1023,104 @@ const check = async (name, fn) => {
       });
       assert.strictEqual(r.status, 400, 'the 50,000,000-cent exploit is refused at creation');
       assert.ok(/per-intent cap/.test(r.json.error));
+    });
+
+    // ── #33 + #34: the first-run lock must be escapable through the UI ──────
+    //
+    // A locked account must be able to load the page that fixes the lock, and
+    // must be able to reach every route on the setup allowlist. Both of these
+    // go wrong in the direction of an unusable deployment, which is what the
+    // lock's own comment calls a trap rather than a control.
+    await check('a locked account can load the frontend it must use to unlock', async () => {
+      // Flag exactly one account, and restore it afterwards, so the rest of
+      // this suite's seeded admin is untouched.
+      srv.db.prepare('UPDATE users SET must_change_password = 1 WHERE username = ?').run('demo');
+      const locked = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'demo', password: 'demo123' } }));
+      try {
+        // The control first: prove the lock IS engaged for this session. Without
+        // it, the static assertions below would pass vacuously — an unlocked
+        // account also gets 200 for these paths, which is exactly the trap of a
+        // test that cannot fail.
+        const refused = await j('GET', '/api/wallet', { cookie: locked });
+        assert.strictEqual(refused.status, 403, 'the lock really is engaged for this session');
+        assert.match(refused.json.error, /Change your password/i);
+
+        for (const [path, type] of [['/', /text\/html/], ['/style.css', /text\/css/], ['/ladder.js', /javascript/]]) {
+          const res = await fetch(`${base}${path}`, { headers: { cookie: locked } });
+          assert.strictEqual(res.status, 200, `a locked account must still load ${path} (got ${res.status})`);
+          const ct = res.headers.get('content-type') || '';
+          assert.match(ct, type, `${path} is served as itself, not as the lock's JSON error`);
+        }
+
+        // And the whole point: the account can still reach the fix, then load
+        // the UI again. Asserting only the static assets would pass even if the
+        // change-password route were itself behind the lock — which is the
+        // failure this codebase has already had once (server.js, firstRunLockResponse).
+        const cp = await j('POST', '/api/auth/change-password', {
+          body: { currentPassword: 'demo123', newPassword: 'demo-after-unlock' },
+          cookie: locked,
+        });
+        assert.strictEqual(cp.status, 200, `the lock is escapable (${JSON.stringify(cp.json)})`);
+      } finally {
+        // Leave the account usable for any later check, and unflag it.
+        srv.db.prepare('UPDATE users SET must_change_password = 0 WHERE username = ?').run('demo');
+      }
+    });
+
+    // #34. `SETUP_ALLOWLIST` held `DELETE /api/auth/sessions/:id` — a route
+    // PATTERN — while `isSetupRoute` compared the literal `${method} ${path}`
+    // against it. `req.path` is the concrete path, so that entry could never
+    // match and was dead by construction.
+    //
+    // This walks EVERY allowlisted route against a locked session, which is what
+    // the issue names as the missing test: one entry in the wrong form and this
+    // fails, rather than the next person adding a fifth.
+    await check('every first-run-lock allowlisted route is reachable while locked', async () => {
+      // The previous check changed this account's password, so sign in with the
+      // one it now has rather than the seed value.
+      const demoPw = srv.db
+        .prepare("SELECT pass_hash FROM users WHERE username = 'demo'")
+        .get().pass_hash;
+      const which = (await A.verifyPassword('demo-after-unlock', demoPw)) ? 'demo-after-unlock' : 'demo123';
+      srv.db.prepare('UPDATE users SET must_change_password = 1 WHERE username = ?').run('demo');
+      // A second session for the SAME account, so revoking one does not sign the
+      // caller out of the session it is calling from.
+      const locked = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'demo', password: which } }));
+      const other = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'demo', password: which } }));
+      try {
+        // Control: the lock is engaged. Without it every "reachable" assertion
+        // below would be vacuous.
+        assert.strictEqual((await j('GET', '/api/wallet', { cookie: locked })).status, 403, 'the lock is engaged');
+
+        // The five allowlisted entries, each exercised for real.
+        assert.strictEqual((await j('GET', '/api/me', { cookie: locked })).status, 200, 'GET /api/me');
+        assert.strictEqual((await j('GET', '/api/auth/sessions', { cookie: locked })).status, 200, 'GET /api/auth/sessions');
+
+        // The one that could never match. Revoke the OTHER session, so the
+        // caller survives and the assertion is about reachability, not self-logout.
+        const listed = await j('GET', '/api/auth/sessions', { cookie: locked });
+        const ids = listed.json.sessions.map((s) => s.id);
+        assert.ok(ids.length >= 2, `two sessions exist to choose between (${JSON.stringify(ids)})`);
+        const current = (await j('GET', '/api/auth/sessions', { cookie: locked })).json.sessions.find((s) => s.current).id;
+        const victim = ids.find((id) => id !== current);
+        assert.ok(victim, 'a non-current session id to revoke');
+        const del = await j('DELETE', `/api/auth/sessions/${victim}`, { cookie: locked });
+        assert.strictEqual(
+          del.status,
+          200,
+          `DELETE /api/auth/sessions/:id must be reachable while locked (got ${del.status} ${JSON.stringify(del.json)})`
+        );
+
+        // logout last: it ends the session, so anything after it would 401.
+        assert.strictEqual((await j('POST', '/api/auth/logout', { cookie: other })).status, 200, 'POST /api/auth/logout');
+
+        // And the pattern must stay a pattern: a two-segment path is not a
+        // session id, so it must NOT become allowlisted by the prefix.
+        const deeper = await fetch(`${base}/api/auth/sessions/a/b`, { method: 'DELETE', headers: { cookie: locked } });
+        assert.strictEqual(deeper.status, 403, 'a path the pattern does not describe stays locked');
+      } finally {
+        srv.db.prepare('UPDATE users SET must_change_password = 0 WHERE username = ?').run('demo');
+      }
     });
 
     console.log(`\napi.test.js: ${passed} checks passed`);
