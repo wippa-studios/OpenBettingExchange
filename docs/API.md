@@ -26,6 +26,7 @@ endpoint.
 | `:id` parameters | Routes that validate their id call `intId` and answer `400 id must be an integer` for anything non-numeric, before any query runs. Admin account routes take `Number(req.params.id)` instead and fall through to a `404` — the two conventions disagree, and both are documented below per route |
 | Body limit | `256 kB`. Over it is `413` with `{ "error": "request entity too large" }` |
 | Unknown `/api` path | `404 { "error": "Unknown endpoint" }`, never Express's HTML page |
+| Caching | **Every `/api` response carries `Cache-Control: no-store`**, including the money routes (`/api/me`, `/api/wallet`, `/api/positions`, `/api/settlements`, `/api/orders`) and the public catalogue. Those are cookie-authenticated GETs carrying balances and exposure — the shape a shared proxy caches and serves back to the wrong user. `no-store` rather than `no-cache`: the latter still permits storing a response and revalidating it. The rule is blanket because a per-route list is a list to forget, and the forgotten route is the one that leaks. `GET /api/stream` is the exception and keeps its own `no-cache` |
 | Scheduling | Reconciliation, the results poll, backups, the in-play delay release and WAL maintenance run on timers (`JOBS_INTERVALS` in `server.js`). Each is operator-triggerable through the routes below except maintenance |
 
 ### Authentication

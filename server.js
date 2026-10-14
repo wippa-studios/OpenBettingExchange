@@ -97,6 +97,39 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Caching ─────────────────────────────────────────────────────────────────
+//
+// EVERY /api response is `no-store`, without exception.
+//
+// The money routes (`/api/me`, `/api/wallet`, `/api/positions`,
+// `/api/settlements`, `/api/orders`) are cookie-authenticated GETs carrying
+// balances, frozen escrow and per-runner exposure. That is precisely the shape a
+// shared or corporate proxy caches, and precisely the shape it serves back to
+// the WRONG user behind that proxy when the cache key ignores the cookie. The
+// venue is loopback-only by default, but the moment it sits behind an edge — the
+// deployment this codebase already has `TRUST_PROXY_JURISDICTION` for — a
+// cached balance is a real failure mode: a player sees yesterday's money, or
+// somebody else's.
+//
+// `no-store` rather than `no-cache`: `no-cache` still permits STORING a response
+// and revalidating it, which is one round trip away from a stale balance.
+//
+// Blanket, not a list of "sensitive" routes. A per-route list is a second list
+// to keep in step with the routes, and the route someone forgets is the one that
+// leaks. The public catalogue (`/api/sports`, `/api/events`) could safely be
+// cached and deliberately is not: on a loopback venue HTTP caching buys nothing,
+// and one rule that cannot be applied to the wrong route is worth more than the
+// optimisation. `tests/api.test.js` asserts the header on the money routes, so a
+// future blanket relaxation has to be a deliberate edit.
+//
+// The SSE stream is exempt in effect, not in code: `/api/stream` sets its own
+// `Cache-Control: no-cache` through `res.writeHead`, and a header passed to
+// writeHead takes precedence over one set with setHeader.
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+
 // ── Origin guard FIRST, before any body parsing ───────────────────────────────
 //
 // The rule is SIMPLE, and it was previously two rules that were each wrong:

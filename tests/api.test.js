@@ -225,6 +225,25 @@ const check = async (name, fn) => {
       assert.ok(r.json && r.json.error, 'JSON error body');
     });
 
+    // #3. Money-bearing responses must say `no-store`. These are cookie-
+    // authenticated GETs carrying balances and per-runner exposure — the shape a
+    // shared proxy caches, and the shape it serves back to the WRONG user if the
+    // cache key ignores the cookie. Asserted on the HEADER, not the status: a 200
+    // with no cache directive is exactly the bug.
+    await check('money routes answer no-store so no proxy may cache a balance', async () => {
+      for (const path of ['/api/me', '/api/wallet', '/api/positions', '/api/settlements', '/api/orders']) {
+        const r = await j('GET', path, { cookie: alice });
+        assert.strictEqual(r.status, 200, `${path} answers 200`);
+        // Assert the directive is EXACTLY no-store. `assert.ok(/no-store/...)`
+        // would also pass on `public, no-store`, which permits a shared cache.
+        assert.strictEqual(
+          r.headers['cache-control'],
+          'no-store',
+          `${path} must answer Cache-Control: no-store (got ${JSON.stringify(r.headers['cache-control'])})`
+        );
+      }
+    });
+
     await check('foreign origin rejected even with a malformed body', async () => {
       const res = await fetch(`${base}/api/wallet/deposit`, {
         method: 'POST',
