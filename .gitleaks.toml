@@ -1,0 +1,71 @@
+# .gitleaks.toml — history scanning for OpenBettingExchange. See #10.
+#
+# WHY THIS FILE EXISTS AT ALL. The Betfair app key and username that were
+# committed to this PUBLIC repository were pasted into an ordinary .js test
+# fixture as "obviously fake sample data". They were not fake. Nothing caught it:
+# the guards in ci.yml matched key FILES by extension, and a credential VALUE
+# inside a tracked .js is not a file. `scripts/check-no-secrets.mjs` was added
+# afterwards and is honest that on CI — where there is no .env — it finds
+# nothing. gitleaks is the control that actually covers the gap: it reads every
+# commit, not the working tree.
+#
+# WHY THERE IS AN ALLOWLIST, AND WHY IT IS THIS NARROW. Run without one, gitleaks
+# reports 9 findings in this history and every one of them is FALSE POSITIVE: the
+# synthetic credentials the test suites authenticate with, such as
+# `password: 'pw-alice-1234'` and `app_key: 'TESTKEYnotreal12'`. A guard that is
+# red on day one for the wrong reason gets deleted, and then the real finding
+# never arrives either.
+#
+# So the exclusions match on the VALUE, never on the path. This is the whole
+# design and it is load-bearing:
+#
+#   A path allowlist (`paths = ['''tests/''']`) would be much shorter and would
+#   be a serious regression. This project's actual incident was a credential
+#   value pasted INTO A TEST FIXTURE — so allowlisting the tests directory would
+#   re-open exactly the hole gitleaks was added to close, while looking like it
+#   had fixed it. Every line in tests/ is still scanned.
+#
+#   `regexTarget` is left at its default, "secret", so each pattern is matched
+#   against the secret value rather than against surrounding line text. That is
+#   what makes an entry like `pw-alice-1234` mean "this literal test password is
+#   not a credential" instead of "any line mentioning it is fine".
+#
+# Each entry is one specific synthetic fixture literal. A real Betfair app key
+# is 16+ characters of unrelated entropy and matches none of them.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic credentials the test suites authenticate with. Matched on VALUE, not path, so tests/ stays fully scanned — a path allowlist would re-open the incident this scanner exists to catch."
+regexTarget = "secret"
+regexes = [
+  # `registerUser({ username: 'alice', password: 'pw-alice-1234' })` — the
+  # ordinary registered-user fixture, present in api/payments/reporting/offtime.
+  '''pw-alice-1234''',
+  # Another registered-user fixture, in feedcreds' cross-tenant case.
+  '''pw-other-1234''',
+  # The Betfair credential fixture: deliberately named to be obviously not real.
+  '''TESTKEYnotreal12''',
+  '''not-a-real-password''',
+]
+#
+# WHAT IS DELIBERATELY *NOT* HERE, AND WHY THIS FILE MUST NOT BE WIDENED.
+#
+# One finding in this repository's history is a REAL leaked credential, not a
+# false positive: commit 9eac3a4 put a live Betfair app key, username and
+# password into three test fixtures, and 173a68b removed them with an ordinary
+# follow-up commit rather than a history rewrite. They are therefore still
+# readable with `git log -p` today, by anyone, on a public repository.
+#
+# It is left FAILING on purpose. That is the scanner working. Making this file
+# green over it would mean writing the leaked value into .gitleaks.toml — which
+# would copy a live credential out of history and into the CURRENT tree, turning
+# a historical exposure into a permanent, tracked one, and would do it using the
+# very scanner added to prevent exactly that.
+#
+# The finding clears only by fixing the actual problem: rotate the Betfair
+# credential, then rewrite history to drop it. A `gitleaks --baseline` was
+# considered and rejected — the baseline JSON embeds the matched text, so
+# committing one re-commits the secret for the same reason.
+#
+# Until then this repository's scanner is expected to report that one finding.

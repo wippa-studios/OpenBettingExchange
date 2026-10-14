@@ -1,0 +1,44 @@
+# .github/dependabot.yml — #10
+#
+# Two ecosystems, because the repo has two kinds of dependency that rot silently.
+#
+# github-actions: the whole point of pinning every `uses:` in ci.yml to a commit
+# SHA is that the SHA cannot move on its own — but a SHA cannot patch itself
+# either, and without this the workflow would freeze on whatever was current
+# today. Dependabot rewrites the pin AND the version comment beside it, which
+# is why those comments are there: it is what makes the next upgrade legible
+# instead of an unexplained hash change in a diff.
+#
+# npm: the CI dependency-audit job reports a CVE only when someone runs it.
+# That is a control that fires on inspection, not on publication. A new advisory
+# against express or pg should open a PR, not wait to be noticed.
+#
+# The two are grouped into one schedule so they surface as the same recurring
+# maintenance rather than two. They are separate ecosystems because a bot that
+# tries to do both at once does neither well.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: '/'
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'ci'
+    # Grouped per action, so a bump of actions/checkout is one commit rather
+    # than one commit per workflow that uses it.
+    groups:
+      github-actions:
+        patterns:
+          - '*'
+
+  - package-ecosystem: npm
+    directory: '/'
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'deps'
+    groups:
+      npm-dependencies:
+        patterns:
+          - '*'
+    open-pull-requests-limit: 5

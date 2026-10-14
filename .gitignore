@@ -10,6 +10,48 @@ data/
 # browser-test output (the committed board image is docs/screenshot.png)
 ui-test.png
 
+# --- Credential files (#12) ------------------------------------------------
+# `git add .` is the normal workflow, so this file is the only thing between
+# that and a committed private key. The CI guard catches a tracked .key/.pem
+# AFTER the fact; ignoring them up front is cheaper, and these four names are
+# not caught by that guard at all — it matches extensions, and .netrc/pgpass
+# have none.
+#
+# Every pattern below is asserted by `npm run check:ignore`, which asks git
+# itself rather than grepping this file. Delete a line and that check names the
+# file that became committable.
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+
+# SSH private keys, including the ones an operator drops in from a host.
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+
+# Curl/machine credentials and postgres's password file. Both are bare
+# name==password, stored in the home directory, and both are routinely
+# symlinked or copied into a project tree by tooling that does not ask.
+.netrc
+_netrc
+pgpass
+.pgpass
+
+# Generic secret blobs that tooling drops next to the code.
+secrets.json
+credentials.json
+
+# Every other .env variant (.env.local, .env.production, ...) — but NEVER
+# .env.example itself. It is the file an operator is told to copy, so it has to
+# stay tracked; without this negation the glob above would silently exclude the
+# one .env file in the repo that is supposed to be public. check:ignore asserts
+# that .env.example is still NOT ignored.
+.env.*
+!.env.example
+
 # Companion odds recorder (a separate Python project, ~79MB). It carries its
 # own .gitignore, but it lives INSIDE this working tree with no git repo of its
 # own, so `git add .` from here would stage it — including
