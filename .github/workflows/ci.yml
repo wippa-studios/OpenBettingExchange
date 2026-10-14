@@ -283,6 +283,12 @@ jobs:
           mkdir -p "$HOME/bin"
           tar -xzf "${FILE}" -C "$HOME/bin" gitleaks
           chmod +x "$HOME/bin/gitleaks"
+          # BOTH. GITHUB_PATH only takes effect from the NEXT step onward, so the
+          # verification below has to reach the binary by absolute path or it
+          # exits 127 — a failure that looks like a broken download rather than a
+          # PATH that has not been rebuilt yet. Exporting covers this step;
+          # GITHUB_PATH covers the scan that follows.
+          export PATH="$HOME/bin:$PATH"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           gitleaks version
 
