@@ -570,9 +570,9 @@ real, and the record of how that was found is the useful part.
 2. **KYC and age verification.** Deliberately absent: an identity control with
    an external verification provider, not a limit. `lib/tenants.js` carries
    jurisdiction data, but nothing verifies anybody against it.
-3. **Complete `.env.example`.** 15 of the 50 keys in `lib/config.js`'s `DEFAULTS`
-   are documented, and the exchange has no CI guard keeping it honest — the
-   collector repo has one, and it would catch the drift.
+3. **Complete `.env.example`.** DONE — all 58 keys the server reads are documented,
+   and `scripts/check-env-example.mjs` (run in CI) fails if one goes missing,
+   if a default value drifts, or if the file documents a key nothing reads.
 4. **The escrow top-up path in `lib/match.js`.** A 1-cent rounding top-up when a
    resting layer has no available balance can abort the taker's entire
    placement, including a stranger's, and reports the taker as insufficient.

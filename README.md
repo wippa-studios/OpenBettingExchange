@@ -274,7 +274,7 @@ Configuration is read from `.env` (see [`.env.example`](.env.example)). Every
 value is validated at boot; an invalid value **aborts startup** rather than
 failing later.
 
-> **Note:** `.env.example` currently documents 15 of the 50 keys in
+> **Note:** `.env.example` now documents all 58 of the keys the server reads.
 > `lib/config.js`'s `DEFAULTS`. Undocumented keys are listed in the tables below.
 > Closing that gap — and adding the same CI guard the feed collector has — is
 > tracked as a known issue.
@@ -400,7 +400,7 @@ weight.
 ```bash
 
 
-npm test            # 674 checks: unit and API integration, fully offline
+npm test            # 677 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 78 checks: real Chromium via Playwright (board and admin desk)

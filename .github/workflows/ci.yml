@@ -218,15 +218,91 @@ jobs:
   # scripts/check-no-secrets.mjs came afterwards and is honest that it cannot
   # see this. gitleaks reads every commit, which is the only thing that does.
   #
-  # EXPECTED TO BE RED. It reports the 9eac3a4 credential above, and that
-  # finding is correct. .gitleaks.toml allowlists only the four synthetic
-  # fixture literals the test suites authenticate with; widening it to silence
-  # the real one would mean committing the leaked value to the working tree,
-  # which is the exact failure this scanner exists to prevent. See the long note
-  # at the bottom of .gitleaks.toml.
+  # TWO JOBS, AND WHY THEY ARE NOT ONE.
+  #
+  # `secrets` is BLOCKING and scans only commits after HISTORY_SCAN_BASELINE. It
+  # is the control that stops the next one. It is red for the second this history
+  # has leaked a credential and nothing has caught it.
+  #
+  # `secrets-history` is ADVISORY and scans all of history, `continue-on-error`.
+  # It reports the 9eac3a4 credential, and that finding is correct.
+  #
+  # Merging those two into a single blocking job over full history was the first
+  # version of this file, and it was wrong. A check that is red on every single
+  # run stops being a signal: people read CI as "known-broken", the red becomes
+  # wallpaper, and the moment a NEW secret lands it arrives as the twentieth red
+  # mark rather than as news. Shipping a permanently failing check is the same
+  # mistake as shipping no check, with more maintenance.
+  #
+  # So the historical finding is kept visible and kept NON-blocking, and the
+  # guard on new commits is what actually fails the build. The two are separate
+  # jobs precisely so neither has to compromise the other.
+  #
+  # .gitleaks.toml allowlists only the four synthetic fixture literals the test
+  # suites authenticate with. Widening it to silence the real one would mean
+  # committing the leaked value to the working tree — the exact failure this
+  # scanner exists to prevent. See the long note at the bottom of .gitleaks.toml.
+  #
+  # REMOVING HISTORY_SCAN_BASELINE is the real fix for the advisory job, and it
+  # needs two things only the credential's owner can do: rotate the Betfair key,
+  # and rewrite history. Neither is a code change.
   secrets:
-    name: Secret scan (gitleaks, full history)
+    name: Secret scan (new commits — blocking)
     runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is what makes this a commit scan at all. The default
+      # checkout is a shallow single commit, so a range scan would have an empty
+      # history to walk and would report nothing while looking like a pass.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks (pinned, checksum-verified)
+        # gitleaks-action CANNOT do this job. Its v3 action.yml takes no inputs at
+        # all — configuration is environment-only and the scan always covers the
+        # whole history — so there is no way to ask it for "commits since X". The
+        # binary is installed here instead, pinned to a version and verified by
+        # checksum, because an unpinned download would reintroduce exactly the
+        # supply-chain risk the SHA pins elsewhere in this file exist to remove.
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION=8.30.1
+          ARCH="$(uname -m | sed 's/x86_64/x64/; s/aarch64/arm64/')"
+          FILE="gitleaks_${GITLEAKS_VERSION}_linux_${ARCH}.tar.gz"
+          BASE="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          # Download the archive UNDER THE NAME THE CHECKSUM FILE USES. It is
+          # saved as a file in the working directory first and renamed here;
+          # verifying first and renaming after fails with "No such file or
+          # directory", because `sha256sum -c` resolves the name it reads from
+          # the list against the current directory, not against the download.
+          curl -sSfL "${BASE}/${FILE}" -o "${FILE}"
+          curl -sSfL "${BASE}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" -o sums.txt
+          # Verify BEFORE extracting. Unpacking first would put an unverified
+          # binary on disk for anything else on the runner to find.
+          grep " ${FILE}\$" sums.txt | sha256sum --check --strict
+          mkdir -p "$HOME/bin"
+          tar -xzf "${FILE}" -C "$HOME/bin" gitleaks
+          chmod +x "$HOME/bin/gitleaks"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          gitleaks version
+
+      - name: No secret in any commit since the baseline
+        run: |
+          gitleaks detect \
+            --redact \
+            --no-banner \
+            --log-opts="${HISTORY_SCAN_BASELINE}..HEAD" \
+            --config .gitleaks.toml \
+            --verbose
+        env:
+          HISTORY_SCAN_BASELINE: 4b58267bcc0c8f4326ab777383a95f559fcbcf58
+
+  secrets-history:
+    name: Secret scan (full history — advisory, known finding in 9eac3a4)
+    runs-on: ubuntu-latest
+    # Advisory on purpose. The finding is real and already public; failing every
+    # run on it would not make it any more true, and it would mask new findings.
+    continue-on-error: true
     permissions:
       contents: read
       # gitleaks-action posts the finding as a review comment on the PR.
