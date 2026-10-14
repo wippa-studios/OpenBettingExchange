@@ -517,9 +517,14 @@ Listed so nobody mistakes a scope decision for a bug:
   terminates in a reference provider that moves no money. No KYC/AML, no age
   verification, no licensing path, and the seeded bot's fair prices are a
   random walk rather than a model.
-- **Cash-out risk capping.** Phase 2 bounds market-maker liability; nothing yet
-  bounds a player repeatedly converting positions into guaranteed house
-  payouts. This is the most significant open risk in the system.
+- **Cash-out venue risk.** Bounded, by `lib/cashoutrisk.js`, which refuses a
+  quote once unpaid exposure reaches `CASHOUT_MAX_OUTSTANDING_CENTS` ($20k) or
+  the day's cash-out outlay reaches `CASHOUT_MAX_DAILY_LOSS_CENTS` ($5k). The
+  daily cap gates on **outlay** rather than realised loss: realised loss is
+  backward-looking, so by the time it is measurable the money is already gone,
+  whereas outlay is known at decision time and genuinely bounds the worst case.
+  The residual exposure is the venue's own account, which is why cash-out credits
+  `house_float → player_funds` rather than debiting the bot's balance.
 - **Horizontal scale.** SQLite is single-writer and synchronous — which is *why*
   the sweep is atomic, and a genuine strength — but it is one process on one
   machine. `npm run load` measures that single node (~500 orders/sec placed);
