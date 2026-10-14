@@ -213,6 +213,82 @@ check('G11 no source or test file carries a machine-absolute path', async () => 
   assert.deepStrictEqual(offenders, [], `machine-absolute paths: ${offenders.join('; ')}`);
 });
 
+// G12: a module declares 'use strict' AT MOST ONCE.
+//
+// This exists because lib/cashout.js did: the directive sat on line 1 and again
+// on line 45, immediately after the 43-line file header. Harmless to the runtime
+// — and that is exactly why it is worth a guard. A second directive is invisible
+// in every sense: it changes no behaviour, so nothing else in the suite could
+// ever notice it, and its only effect is to make the top of the file ambiguous
+// about where the header ends. It reads as a merge accident, because it is one.
+//
+// The check counts the directive rather than testing for a particular style, so
+// it cannot fire on a module that simply omits the directive (a CommonJS module
+// is not strict by default, but adding one is a separate convention and this
+// guard has no opinion about it). Comments are stripped first, so a directive
+// quoted inside a comment — as this check's own note does — is documentation
+// rather than a duplicate.
+check('G12 no module declares "use strict" twice', async () => {
+  const offenders = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'data') continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (!entry.name.endsWith('.js')) continue;
+      const src = fs.readFileSync(full, 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/^\s*\/\/.*$/gm, '');
+      const count = (src.match(/^\s*['"]use strict['"];?/gm) || []).length;
+      if (count > 1) offenders.push(`${path.relative(ROOT, full)}: ${count}`);
+    }
+  };
+  walk(LIB);
+  const srv = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  if ((srv.match(/^\s*['"]use strict['"];?/gm) || []).length > 1) offenders.push('server.js');
+  assert.deepStrictEqual(offenders, [], `modules declaring 'use strict' more than once: ${offenders.join(', ')}`);
+});
+
+// G13: a leg's escrow is accumulated into exactly ONE variable.
+//
+// lib/settle.js's cashoutPosition carried two accumulators — `frozenRelease`
+// and `transferred` — both summing `legFrozen` on adjacent lines, and both
+// returned. They can never differ: the collateral the player releases and the
+// escrow the house takes on per leg are the same number moving between
+// balances. Two names for one number is a promise of a distinction that does
+// not exist, and it is two variables free to drift the next time somebody edits
+// one of them.
+//
+// This cannot be caught by asserting the two are EQUAL: they were equal before
+// the fix and after it, so such a test passes with the duplication present —
+// the trap of a test that cannot fail. The duplication IS the defect, so the
+// guard counts the accumulations.
+//
+// Comments are stripped first, so the explanation of why there is now only one
+// (which necessarily names both) is not read as a second accumulation.
+check('G13 a cash-out leg escrow is accumulated once, not into two variables', async () => {
+  const src = fs.readFileSync(path.join(LIB, 'settle.js'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  const fn = src.match(/function cashoutPosition\([\s\S]*?\n}\n/);
+  assert.ok(fn, 'cashoutPosition still exists');
+  const accumulations = [...fn[0].matchAll(/(\w+)\s*\+=\s*legFrozen\b/g)].map((m) => m[1]);
+  assert.deepStrictEqual(
+    accumulations,
+    ['frozenRelease'],
+    `legFrozen is accumulated into ${JSON.stringify(accumulations)} — one variable, not two`
+  );
+  // And the response field it feeds is documented as an alias rather than a
+  // second quantity, so a client does not read the pair as independent.
+  assert.match(
+    fn[0],
+    /transferred_cents:\s*frozenRelease/,
+    'transferred_cents is returned as an alias of frozen_release_cents, not from a second accumulator'
+  );
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -229,6 +305,6 @@ check('G11 no source or test file carries a machine-absolute path', async () => 
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 11) { console.error('expected 11 checks'); process.exit(1); }
+  if (passed < 13) { console.error("expected 13 checks"); process.exit(1); }
   console.log(`\nguard.test.js: ${passed} checks passed`);
 })();

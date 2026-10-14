@@ -187,6 +187,56 @@ check('C6 a mixed back/lay position across runners is now supported', async () =
 //
 // A test asserting a guard fired must exclude every OTHER reason for the same
 // outcome. Both exclusions are below.
+// C8: `transferred_cents` and `frozen_release_cents` are the SAME figure, and
+// that is a fact about the money rather than a naming coincidence — the
+// collateral the player releases per leg is the escrow the house takes on per
+// leg (#20).
+//
+// They were equal before this assertion existed too, so this does NOT prove the
+// duplication is gone; tests/guard.test.js G13 does that, by counting the
+// accumulations. What this pins is the DRIFT risk: if a future edit changes one
+// of them, the response would report two figures that disagree, and a client
+// reading the pair as independent quantities would be wrong.
+//
+// The independent figure — what the HOUSE actually holds afterwards — is read
+// from the ledger rather than from the response, so this is not the response
+// agreeing with itself.
+check('C8 transferred_cents and frozen_release_cents are one figure, not two', async () => {
+  const { db, users } = (await fresh());
+  const bots = require('../lib/bots');
+  await bots.primeBotHash();
+  const { market_id, s1 } = mkMarket(db, [['Alpha', 2.0], ['Beta', 2.0]]);
+  M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.5, stake_cents: 10000 });
+  M.placeOrder(db, users.bob, { selection_id: s1, side: 'lay', price: 2.5, stake_cents: 10000 });
+
+  const before = balances(db, users.alice.id);
+  const r = C.cashoutMarket(db, users.alice, market_id);
+  assert.ok(r.value_cents > 0, `a quote was paid out (${JSON.stringify(r)})`);
+  assert.ok(r.frozen_release_cents > 0, 'collateral was released');
+
+  assert.strictEqual(
+    r.transferred_cents,
+    r.frozen_release_cents,
+    'the two documented figures are one number, not a pair that can drift apart'
+  );
+
+  // The figure is not arbitrary: it is what the player's escrow fell by.
+  assert.strictEqual(
+    r.frozen_release_cents,
+    before.f - balances(db, users.alice.id).f,
+    'and it equals the escrow actually released from the player'
+  );
+  // …and what the house took on, read from the house's own ledger rather than
+  // from the response being checked.
+  const house = bots.ensureBot(db);
+  const houseEscrow = db.prepare('SELECT frozen_cents f FROM users WHERE id = ?').get(house.id).f;
+  assert.strictEqual(
+    r.transferred_cents,
+    houseEscrow,
+    'and it equals the escrow the house actually holds against the replacement matches'
+  );
+});
+
 check('C7 the house account is not given a cash-out quote', async () => {
   const { db, users } = (await fresh());
   const bots = require('../lib/bots');
@@ -246,6 +296,6 @@ check('C7 the house account is not given a cash-out quote', async () => {
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 7) { console.error('expected 7 checks'); process.exit(1); }
+  if (passed < 8) { console.error("expected 8 checks"); process.exit(1); }
   console.log(`\ncashout.test.js: ${passed} checks passed`);
 })();

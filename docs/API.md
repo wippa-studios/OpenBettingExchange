@@ -290,9 +290,17 @@ prices, an unpriced matched runner, a non-positive fair value, a payout below
   "frozen_release_cents": 26900,   // the player's matched collateral, released
   "payout_cents": 966,             // what the venue paid them
   "matches_closed": 2,             // legs taken off the board
-  "transferred_cents": 26900,      // escrow the house took on
+  "transferred_cents": 26900,      // SAME figure as frozen_release_cents — see below
   "cancelled_orders": 1 }          // the player's resting orders in that market
 ```
+
+`transferred_cents` is **an alias for `frozen_release_cents`, not a second
+quantity**. The collateral released from the player per leg and the escrow the
+house takes on per leg are the same number moving between balances, so the two
+can never differ. Both are returned because both are documented response fields
+and dropping one would be a breaking API change; a client must not read the pair
+as independent. It used to be two separate accumulators producing two names for
+one number (#20), which promised a distinction that does not exist.
 
 It is all-or-nothing in one transaction, and the plan is recomputed **inside**
 it. The venue takes over the player's slot in each match so the counterparty is
