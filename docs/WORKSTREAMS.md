@@ -228,9 +228,11 @@ margin.
 
 ### Work
 
-**a. Carve `server.js` into a composition root.** 880 lines with SSE lifecycle,
-rate limiting, auth middleware, slugify, ISO-date validation and SQL-constraint
-mapping is too much in one file. Target:
+**a. Carve `server.js` into a composition root.** **2,367 lines** across 87
+routes — SSE lifecycle, rate limiting, auth middleware, slugify, ISO-date
+validation, SQL-constraint mapping and now the feed credential and collector
+supervisor wiring. This was written when the file was 880 lines and has since
+grown 2.7x, so the case is stronger rather than weaker. Target:
 
 ```
 server.js              boot, middleware order, route mounting
