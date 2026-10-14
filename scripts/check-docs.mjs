@@ -319,6 +319,60 @@ for (const fam of [...families].sort()) {
   );
 }
 
+// ── 7. docs/API.md's promise about the feed-credential refusal ORDER ──────
+//
+// docs/API.md states: "A tenant that does not exist is 404 whatever the key is
+// set to: the tenant is resolved before the key is required." That is a claim
+// about the ORDER of two calls in one function, so it is checkable against the
+// code rather than a matter of judgement.
+//
+// It is worth checking because the bug it guards against is invisible to every
+// other test in the suite: when `requireKey()` ran first with no key
+// configured, an unknown tenant got the 503 and the 404 branch became dead —
+// but only in the no-key configuration, which is the one the suite's own default
+// is not. tests/feedcreds.test.js K6 pins it at the module; this pins the
+// DOCUMENTED promise against the source, so the two cannot drift apart.
+//
+// It cannot false-positive on a refactor: if `setCredentials` cannot be located
+// the check FAILS rather than passing, because the doc would then be making a
+// claim nothing verifies. That is the correct direction — a silently-skipped
+// check is a checker that reports and does not act.
+if (exists('docs/API.md')) {
+  const claim = read('docs/API.md');
+  // Whitespace-tolerant: the sentence WRAPS in the rendered markdown, so a
+  // literal-space pattern would silently match nothing and the check would
+  // report green forever while verifying nothing. That is the failure mode this
+  // whole file exists to prevent, so it is proven in both directions below.
+  if (/the tenant\s+is resolved before the key is required/i.test(claim)) {
+    const src = read('lib/feedcreds.js');
+    const fn = src.match(/function setCredentials\([\s\S]*?\n}\n/);
+    if (!fn) {
+      note(false, 'lib/feedcreds.js no longer has a setCredentials function, but docs/API.md still documents the order it must check the tenant in.');
+    } else {
+      // COMMENTS ARE STRIPPED FIRST, exactly as tests/guard.test.js does. The
+      // first version of this check did not, and it was WRONG for a reason
+      // worth recording: the comment above `setCredentials` explains the bug
+      // this fix addresses and necessarily NAMES `requireKey()` — and it does so
+      // ABOVE the `actorTenant()` call. So `indexOf('requireKey(')` matched the
+      // prose, `indexOf('actorTenant(')` matched the code below it, and the check
+      // reported the bug PRESENT while the code was correct. A check that fires
+      // for the wrong reason trains people to ignore it, which is worse than
+      // having no check at all.
+      const code = fn[0].replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+      const tenant = code.indexOf('actorTenant(');
+      const key = code.indexOf('requireKey(');
+      if (tenant === -1 || key === -1) {
+        note(false, 'docs/API.md says the tenant is resolved before the key is required, but setCredentials no longer does either of those lookups.');
+      } else {
+        note(
+          tenant < key,
+          'lib/feedcreds.js requires the key before resolving the tenant, so an unknown tenant answers 503 instead of the documented 404. Move the actorTenant() lookup above requireKey(), or update docs/API.md.'
+        );
+      }
+    }
+  }
+}
+
 // ── Report ────────────────────────────────────────────────────────────────
 if (failures.length) {
   console.error(`\n  Documentation is out of date (${failures.length}):\n`);

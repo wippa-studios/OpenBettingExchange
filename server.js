@@ -2250,15 +2250,31 @@ app.use('/api', (req, res) => {
 app.use(express.static(path.join(__dirname, 'public')));
 
 // A 4xx is a decision this app made and its message is safe to return. A 5xx
-// may carry a database message, a file path or a stack frame, so the client
-// gets a generic message and the real one goes to the log. Exported so the
-// behaviour is unit-testable (no API path can provoke a 5xx on purpose).
+// FAULT may carry a database message, a file path or a stack frame, so the
+// client gets a generic message and the real one goes to the log.
+//
+// THE EXCEPTION IS OPT-IN, NOT INFERRED. An application state it chose
+// deliberately and described in its own words — "FEED_CREDENTIALS_KEY is not
+// set, here is the command that fixes it" — is not a fault, and arriving as
+// `500 Internal error` leaves an operator unable to distinguish "you have not
+// configured this" from "the venue is broken". Two states with completely
+// different remedies, one of them written into the message that never arrived.
+//
+// Such an error sets `err.expose` (see lib/auth.js `serviceUnavailable`). The
+// default for anything that does not is unchanged — clamp to 500, generic
+// message, real error logged — so a genuine fault still cannot leak. A module
+// has to SAY that a 5xx is deliberate; nothing infers it, because a deliberate
+// 503 and a thrown TypeError are indistinguishable to this function.
+//
+// Exported so the behaviour is unit-testable from both sides: a real fault, and
+// an opted-in 503.
 // eslint-disable-next-line no-unused-vars
 function errorHandler(err, req, res, next) {
   const raw = Number(err.status) || 500;
-  const status = raw >= 500 ? 500 : raw;
-  if (status >= 500) console.error('[api]', err);
-  const body = { error: status >= 500 ? 'Internal error' : err.message || 'Request failed' };
+  const expose = raw >= 500 && err.expose === true;
+  const status = raw >= 500 && !expose ? 500 : raw;
+  if (status >= 500 && !expose) console.error('[api]', err);
+  const body = { error: status >= 500 && !expose ? 'Internal error' : err.message || 'Request failed' };
   // Structured context (which limit was breached, what it is) is a 4xx-only
   // affordance. It is deliberately absent from a 5xx even if present on the
   // error, so an internal failure cannot leak detail through it.

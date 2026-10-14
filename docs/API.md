@@ -99,12 +99,20 @@ a status that elsewhere in this API means "slow down, retry", yet it carries no
    on settlement — `POST /api/admin/markets/:id/settle` — is **`409 Market
    already settled`** ([`lib/settle.js`](../lib/settle.js)). Both are “this
    cannot happen again”; the statuses differ.
-3. **A deliberate `503` cannot reach the client.** [`lib/feedcreds.js`](../lib/feedcreds.js)
-   throws `503` when `FEED_CREDENTIALS_KEY` is unset, while `GET /api/feed/health`
-   and `GET /api/feed/board` genuinely answer `503` when the feed is unreachable —
-   they set the status themselves. But `errorHandler` clamps every `status >= 500`
-   to `500`, so the credential-storage refusal is reported to the caller as
-   `500 Internal error`. Verified.
+3. **A deliberate `503` reaches the client; a fault still does not.**
+   `errorHandler` clamps every `status >= 500` to `500 Internal error`, and that
+   is right for a **fault** — a thrown database error or a `TypeError` can carry
+   a path, a query or a stack frame. An application state that was chosen
+   deliberately and described in its own words is not a fault, so an error may
+   **opt in** with `err.expose` (built by `serviceUnavailable()` in
+   [`lib/auth.js`](../lib/auth.js)): the status and the message then survive, and
+   the message must contain no path, no internal identifier and no stack.
+   `lib/feedcreds.js` uses it for the `FEED_CREDENTIALS_KEY` refusal, whose
+   message carries the exact command that fixes it. The default is unchanged —
+   `httpError(503, …)` is *not* opted in and still clamps, so a module that does
+   not know about the mechanism cannot leak by accident. Nothing infers the
+   distinction: a deliberate `503` and a thrown fault are indistinguishable to the
+   handler, which is why it has to be stated.
 4. **Id validation is inconsistent.** `intId` routes answer `400` for
    `/api/markets/abc/book`; `Number()`-parsing admin routes answer `404` for
    `/api/admin/users/abc`.
@@ -417,9 +425,14 @@ missing condition (`FEED_ENABLED is false`, `FEED_RUNNER_ENABLED is false`,
 `FEED_DATABASE_URL is not set`, `FEED_CREDENTIALS_KEY is not set`, or no
 credentials stored) rather than a `200` claiming a start that did not happen.
 
-If `FEED_CREDENTIALS_KEY` is unset, storing is refused and **nothing is
-written** — no plaintext fallback. The module's `503` is clamped to `500` by
-`errorHandler`; see the error-code divergences.
+If `FEED_CREDENTIALS_KEY` is unset, storing is refused with `503` and **nothing
+is written** — no plaintext fallback. That `503` is one of the deliberately
+exposable ones, so its message — including the `openssl rand -hex 32` that fixes
+it — reaches the caller; see the error-code divergences.
+
+A tenant that does not exist is `404` **whatever the key is set to**: the tenant
+is resolved before the key is required, matching the sibling `DELETE`, so the two
+halves of this API cannot disagree about the same request.
 
 ```jsonc
 // GET /api/admin/feed/credentials/1
