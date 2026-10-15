@@ -85,7 +85,12 @@ The dependency direction is strictly one way: `match → ledger → tx`, with
 | `lib/ops.js` | health, readiness, metrics, backup, restore | write to balances |
 | `lib/audit.js` | the append-only operator action log | be a source of truth for state |
 | `lib/admin.js` | operator account mutations: status, role, balance | move money without an audit row |
-| `lib/feed.js` | read the feed collector's database (`v_feed1`/`v_feed2`) and serve the board | decide what a feed price means (see [FEED.md](FEED.md)) |
+| `lib/feed.js` | the feed seam: resolve the configured provider and forward to it | decide what a feed price means (see [FEED.md](FEED.md)) |
+| `lib/feed/provider.js` | the price-feed contract, the provider registry, and the `FEED_PROVIDER` lookup | serve anything itself |
+| `lib/feed/shape.js` | **the one shaper**: rows → markets, markets → nav tree, health → payload | talk to a transport, or be forked for one |
+| `lib/feed/postgres.js` | the collector's `v_feed1`/`v_feed2`, as a provider | be the only reader of the feed |
+| `lib/feed/http.js` | a generic JSON-over-HTTP feed provider, mapped from configuration | shape markets of its own |
+| `lib/feed/fieldmap.js` | the field-map grammar and vocabularies, dependency-free so `lib/config.js` can validate them at boot | import `lib/config.js` — that is the cycle it exists to avoid |
 | `lib/feedcreds.js` | per-tenant Betfair credentials: seal, open, status | **return a plaintext credential to an HTTP caller** — no function here does, and a test asserts adding one would be deliberate |
 | `lib/feedrunner.js` | supervise the collector as a child process: spawn, restart, backoff, redact its output | poll Betfair itself (the collector does that) |
 | `lib/seed.js` | first-run fixtures, board roll-forward | run on every boot unconditionally |
@@ -264,7 +269,7 @@ Deliberately narrow, and asserted by tests rather than assumed:
 
 ## Testing strategy
 
-948 checks across 71 suites, plus a 217-check browser suite and a live smoke script.
+1015 checks across 72 suites, plus a 217-check browser suite and a live smoke script.
 | Layer | Where | What it proves |
 | --- | --- | --- |
 | Pure maths | `tests/odds.test.js`, `tests/tx.test.js` | ladder, conversions, transaction depth |

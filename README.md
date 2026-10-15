@@ -346,7 +346,8 @@ failing later.
 | Variable | Default | Description |
 | --- | --- | --- |
 | `FEED_ENABLED` | `false` | Read fixtures and prices from the feed. Display only |
-| `FEED_DATABASE_URL` | none | Collector's Postgres URL; required when the feed is on |
+| `FEED_PROVIDER` | `postgres` | `postgres` reads the collector's views; `http` reads the operator's own JSON-over-HTTP feed API (`FEED_HTTP_*` below) |
+| `FEED_DATABASE_URL` | none | Collector's Postgres URL; required when the feed is on **and** `FEED_PROVIDER=postgres` |
 | `FEED_NUMBER` | `2` | Feed to read: `1` fixtures only, `2` fixtures, prices and results |
 | `FEED_STALE_SECONDS` | `300` | Frame age beyond which the board reports stale |
 | `FEED_MARKET_LIMIT` | `60` | Markets returned to the board |
@@ -354,6 +355,9 @@ failing later.
 | `FEED_RUNNER_ENABLED` | `false` | Supervise the collector (spawn and restart) instead of running it separately |
 | `FEED_COLLECTOR_CMD` | `betfeed collect` | Collector command, split on whitespace; an absolute path or wrapper works |
 | `FEED_RUNNER_MIN_UPTIME_SECONDS` | `120` | Uptime a child must reach before a restart counts as a fresh start |
+| `FEED_HTTP_URL` | none | Base URL of the operator's feed API. Required when `FEED_PROVIDER=http` |
+| `FEED_HTTP_TOKEN` | unset | Bearer token for that API. Sent, never logged, never echoed |
+| `FEED_HTTP_MAP_BOARD` / `_NAV` / `_HEALTH` | identity | `key=path,key=path` maps of canonical feed fields onto the vendor's JSON. Parsed at boot: an unknown field or a missing required one aborts the launch |
 
 ### Payments, operations and results
 
@@ -436,7 +440,7 @@ weight.
 ```bash
 
 
-npm test            # 948 checks: unit and API integration, fully offline
+npm test            # 1015 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 217 checks: real Chromium via Playwright (board and admin desk)

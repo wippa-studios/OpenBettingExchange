@@ -332,7 +332,8 @@ Every `FEED_*` key, with the default read from `lib/config.js`:
 | Key | Default | Effect |
 | --- | --- | --- |
 | `FEED_ENABLED` | `false` | read fixtures and prices from the feed. Display only |
-| `FEED_DATABASE_URL` | `''` | collector's Postgres URL. **Required** when the feed is on, and must match `postgres://` or `postgresql://` |
+| `FEED_PROVIDER` | `'postgres'` | which implementation of the feed contract serves the board: `postgres` (the collector's views) or `http` (the operator's own JSON-over-HTTP feed API). Anything else aborts the launch |
+| `FEED_DATABASE_URL` | `''` | collector's Postgres URL. **Required** when the feed is on and `FEED_PROVIDER=postgres`, and must match `postgres://` or `postgresql://` |
 | `FEED_NUMBER` | `2` | which view to read: `1` fixtures only, `2` prices and results. Validated as the integer 1 or 2 |
 | `FEED_STALE_SECONDS` | `300` | age beyond which a price is reported stale. Range 30–86400 |
 | `FEED_MARKET_LIMIT` | `60` | markets returned to the board. Range 1–500 |
@@ -340,6 +341,40 @@ Every `FEED_*` key, with the default read from `lib/config.js`:
 | `FEED_RUNNER_ENABLED` | `false` | supervise the collector as a child process instead of running it separately |
 | `FEED_COLLECTOR_CMD` | `betfeed collect` | split on whitespace, so an absolute path or a wrapper works |
 | `FEED_RUNNER_MIN_UPTIME_SECONDS` | `120` | uptime a child must reach before a restart counts as healthy. Range 0–86400 |
+
+### The HTTP provider's keys
+
+Inert unless `FEED_PROVIDER=http`, and **required** when it is: `FEED_HTTP_URL`
+must be an `http(s)://` base URL with no credentials in it, or the launch aborts.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `FEED_HTTP_URL` | `''` | base URL. The resource paths are appended verbatim, so a base with a path (`https://example.com/v2/feed`) works |
+| `FEED_HTTP_BOARD_PATH` | `/board` | the capped board |
+| `FEED_HTTP_MARKET_PATH` | `/market` | one market. `{id}` is replaced, percent-encoded; with no placeholder the id is appended as `?id=` |
+| `FEED_HTTP_CATALOGUE_PATH` | `/catalogue` | the uncapped catalogue the nav tree is built from — never the capped board, or the tree is missing most of the sport |
+| `FEED_HTTP_HEALTH_PATH` | `/health` | the health document |
+| `FEED_HTTP_TOKEN` | unset | bearer token. Sent on the wire and **nowhere else**: not in an error, not in a log, not in a body |
+| `FEED_HTTP_HEADER_NAME` / `FEED_HTTP_HEADER_VALUE` | `''` | one static header, for vendors that use `X-Api-Key` and friends |
+| `FEED_HTTP_TIMEOUT_MS` | `10000` | one attempt, then this timeout. There is **no retry loop** |
+| `FEED_HTTP_PRICED` | `true` | does this feed carry prices at all? `false` is a fixtures-only catalogue — the HTTP analogue of `FEED_NUMBER=1` |
+| `FEED_HTTP_SIZE_SCALE` | `1` | multiplied into every ladder size. The canonical unit is **pounds**, so a vendor publishing cents sets `0.01`. Getting this wrong is a 100x error on every stake shown |
+| `FEED_HTTP_MAP_BOARD` / `_NAV` / `_HEALTH` | identity | `key=path,key=path`; a bare `key` means `key=key`. See below |
+
+**The field maps are parsed at boot, and that is the point.** An empty map, an
+unknown canonical field, an empty entry, a duplicate, or a missing required
+field all **abort the launch**. The reason is the one STATE.md §2.7 names: a
+misconfigured map yields markets with no id, no name and no runners, which render
+as an empty board — and an empty board looks like a quiet Tuesday, not like a
+misconfiguration. `back`/`lay` are read from *inside* the odds object and
+`price`/`size` from inside each level, so a vendor publishing
+`prices: {bets, offers}` maps as `odds=prices, back=bets, lay=offers`.
+
+**Every provider must pass `tests/feedprovider-conformance.test.js`.** It is a
+reusable battery, run here against both shipped providers against a real
+`node:http` server serving vendor-shaped JSON. `lib/feed/provider.js` refuses to
+register a provider whose `name` is not in its own capability table, so the
+battery is a gate rather than a suggestion.
 
 Two of these are worth their own paragraph because a wrong value is worse than a
 missing one.

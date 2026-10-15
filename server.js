@@ -1332,9 +1332,16 @@ function feedBootStatus(h, staleSeconds) {
   // that can go stale. "newest frame unknown" there is a warning about a number
   // this deployment was never going to publish.
   if (c.kind === 'unpriced') {
+    // `feed null` would be a confident falsehood in an operator's boot log. The
+    // field names the Betfair VIEW this answered from, and a provider behind
+    // FEED_PROVIDER=http has no view — healthPayload publishes `feed: null`
+    // rather than inventing one, which is the right call and needs a sentence
+    // here that does not contradict it. For every collector deployment `c.feed`
+    // is 1 or 2 and the line is unchanged.
+    const which = c.feed == null ? 'this feed API' : `feed ${c.feed}`;
     return {
       level: 'log',
-      message: `odds feed connected — feed ${c.feed}: ${h.markets || 0} fixtures, no prices on this feed`,
+      message: `odds feed connected — ${which}: ${h.markets || 0} fixtures, no prices on this feed`,
     };
   }
   return {
