@@ -130,11 +130,36 @@ what is deliberately odd about it:
 Still to land in that branch: the SSE stream as a documented subscription with
 reconnect semantics.
 
-### 2.2 A first release
+### 2.2 A first release — and a changelog that invents two
 
-No tags, no releases. `version: 0.1.0` with the entire `CHANGELOG.md` sitting in
-`[Unreleased]`. For an open-source project the first tag is the moment it becomes
-*used* rather than *read*.
+Measured, not remembered:
+
+| | |
+|---|---|
+| `git tag` | **0 tags** |
+| `package.json` version | `0.1.0` |
+| Was `0.2.0` ever set? | **No** — `git log -S'"version": "0.2'` returns nothing |
+| `CHANGELOG.md` sections | `[Unreleased]` (343 lines), `[0.2.0] - 2026-09-25`, `[0.1.0] - 2026-09-24` |
+
+So the changelog documents **two releases that never happened**, on the repo's
+first two days, with no tags and no version bump behind them. `[0.2.0]` describes
+"a real-browser Playwright suite (24 checks)" — that was day 2 of a 166-commit
+repo. It is 212 browser checks and 63 suites now.
+
+For an open-source project this is worse than an absent changelog, because it
+answers "is this maintained?" wrongly. A reader concludes there is a release
+history; there is none. `[0.2.0]` also contains **two separate `### Fixed`
+sections**, which Keep a Changelog forbids.
+
+`check-docs.mjs` does not catch any of it, which is the expected result: the
+question it asks is "does this doc match the code?", and a fabricated release is
+not a contradiction — it is a claim about a *fact that does not exist*. Same
+blind spot class as the conflict markers in §1.
+
+Cutting a real `v0.1.0` needs an authorial decision, not a mechanical fix: fold
+`0.1.0`/`0.2.0` into `[Unreleased]` (honest, loses nothing), or keep them as
+draft headings marked unreleased. Either way the tag and the `package.json`
+version have to be made to agree with each other, which today they do not.
 
 ### 2.3 User automation — specced, half-built
 
