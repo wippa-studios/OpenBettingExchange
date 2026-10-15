@@ -1,5 +1,6 @@
 'use strict';
-// tests/feedboot-line.test.js — the boot line about the odds feed.
+// tests/feedboot-line.test.js — what the venue says about the odds feed when it
+// is not ok: the boot line, and GET /api/feed/health.
 //
 // Run: node tests/feedboot-line.test.js   (plain assert, no deps)
 //
@@ -21,6 +22,22 @@
 // printed `[feed] unreachable: undefined`. The condition the line exists to
 // report was reported as an unreachable feed, with no message at all.
 //
+// ── WHY THE HTTP ROUTE IS IN THIS FILE (#85) ───────────────────────────────
+// The correction above was applied to the boot line ONLY. `GET /api/feed/health`
+// was the same reader of the same payload, elsewhere in the same file, and it was
+// missed: it logged `(h.error || h.detail) || '(no detail)'` — two fields
+// `healthPayload` never sets, so it printed `(no detail)` on every stale feed —
+// and answered a fixed `503 {ok:false, error:'Odds feed unavailable'}` for a
+// stale feed and an unreachable one alike. The boot line could tell them apart,
+// had a test proving it, and the twin still could not.
+//
+// That is the defect worth preventing: not one wrong line, but ONE rule copied to
+// two sites with a test on one of them. So the rule now lives once
+// (`classifyHealth`, in lib/feed.js next to the payload it reads) and the checks
+// below drive BOTH readers with the same fixtures — the boot line directly, the
+// route over its registered handler. Re-introducing a second copy of the
+// discriminator, on either site, fails here rather than at 3am.
+//
 // So the line is a PURE function (`feedBootStatus`) fed here by the REAL
 // `healthPayload`, which means the fixture cannot drift from what the server
 // actually receives: if health() stops returning a field, this file changes
@@ -36,6 +53,15 @@ process.env.DB_PATH = ':memory:';
 process.env.BOT_ENABLED = 'false';
 process.env.DRIFT_ENABLED = 'false';
 process.env.SCRYPT_N = '16384';
+// The HTTP route answers 409 before it looks at the feed at all, so without this
+// the route checks below would measure the disabled branch and pass while the
+// bug they exist for stayed unfixed. lib/config.js reads it at import, so it is
+// pinned here — above the `require('../server')` below — and nowhere later.
+process.env.FEED_ENABLED = 'true';
+// Required by lib/config.js whenever FEED_ENABLED is set, and deliberately a URL
+// nothing listens on (port 59999 is reserved). It is never dialled: the route
+// checks below replace the probe, so this only has to satisfy config validation.
+process.env.FEED_DATABASE_URL = 'postgresql://nobody:nobody@127.0.0.1:59999/nope';
 // Pinned so `healthPayload`'s own `ok` is deterministic: it compares the frame
 // age against THIS value, and the fixtures below are stated in seconds.
 process.env.FEED_STALE_SECONDS = '300';
@@ -77,6 +103,73 @@ function priced(seconds) {
     feed: 2,
     now: NOW,
   });
+}
+
+/** A priced feed the collector has never captured an odds frame for. */
+function neverPolled() {
+  return healthPayload({
+    row: { markets: 9976, markets_with_odds: 0, resolved: 12, newest_book: null, oldest_book: null, newest_publish: null },
+    delay: { is_delay: true, source: 'assumed' },
+    hasPrices: true,
+    feed: 2,
+    now: NOW,
+  });
+}
+
+/**
+ * Invoke the REGISTERED /api/feed/health handler with a stub `res` and a stubbed
+ * probe; returns what it sent and what it logged.
+ *
+ * The handler is pulled off the Express stack rather than driven over a socket,
+ * the way tests/feed.test.js calls the nav route: what regressed was the BODY the
+ * route builds, not the middleware around it, and binding a port to look at one
+ * JSON body is a flake waiting to happen.
+ *
+ * `health` is swapped because the probe needs a live recorder database and the
+ * condition under test is decided by the payload, not by the database — which is
+ * also what makes this offline: the fixtures above ARE what the server receives.
+ * Restored in a `finally`, and a `next` is supplied so a route that passes an
+ * error down is RECORDED and reported rather than surfacing as an unhandled
+ * rejection with the check's name missing.
+ */
+async function healthCall(probe) {
+  const srv = require('../server');
+  const feed = require('../lib/feed');
+  const router = srv.app.router || srv.app._router;
+  assert.ok(
+    router && Array.isArray(router.stack),
+    `neither app.router nor app._router exposes a stack (app.router=${typeof srv.app.router}); ` +
+    'the Express introspection this helper relies on has changed again'
+  );
+  const layer = router.stack.find((l) => l.route && l.route.path === '/api/feed/health');
+  assert.ok(layer, 'no /api/feed/health route is registered — the checks below would be measuring nothing');
+  const stack = layer.route.stack || [];
+  const handler = stack[stack.length - 1] && stack[stack.length - 1].handle;
+  assert.strictEqual(typeof handler, 'function', 'the /api/feed/health route has no handler function');
+
+  const originalProbe = feed.health;
+  const originalError = console.error;
+  const logs = [];
+  let thrown = null;
+  feed.health = probe;
+  console.error = (...args) => { logs.push(args.map(String).join(' ')); };
+  const sent = { code: null, body: null };
+  const res = {
+    status(c) { sent.code = c; return this; },
+    // Express's own res.json() sends 200 when no status was set, so the stub does
+    // too — otherwise a healthy route reads as "answered nothing" and a check
+    // about the success path fails for a reason that has nothing to do with it.
+    json(b) { if (sent.code === null) sent.code = 200; sent.body = b; return this; },
+  };
+  try {
+    await handler({}, res, (e) => { thrown = e; });
+  } finally {
+    feed.health = originalProbe;
+    console.error = originalError;
+  }
+  assert.strictEqual(thrown, null, `the route passed an error down instead of answering: ${thrown && thrown.message}`);
+  assert.ok(sent.body, 'the route sent no body at all');
+  return { code: sent.code, body: sent.body, logs };
 }
 
 (async () => {
@@ -285,7 +378,161 @@ function priced(seconds) {
     );
   });
 
+  // ── R1: the two conditions answer DIFFERENT bodies ───────────────────────
+  // The wire-level half of #85. Before the fix both of these payloads were
+  // discarded and replaced with one fixed `503 {ok:false, error:'Odds feed
+  // unavailable'}`, so a client could not tell a collector that had stopped
+  // polling from a database that was down — and neither could an operator reading
+  // the response.
+  await check('R1 a stale feed and an unreachable feed are not the same answer', async () => {
+    const stale = priced(5000);
+    const dead = { ok: false, error: 'Odds feed unavailable' }; // health()'s shape when the probe itself threw
+    // Pre-state: the two payloads really are as far apart as the rule says, and
+    // the age the client needs is computed on the stale one. Without these the
+    // rest of the check could pass on a fixture that no longer means "stale".
+    assert.strictEqual(stale.ok, false, 'fixture drift: a 5000s-old frame must not be ok');
+    assert.strictEqual(stale.error, undefined, 'fixture drift: healthPayload sets no error field');
+    assert.strictEqual(stale.odds_age_seconds, 5000, 'fixture drift: expected a 5000s-old frame');
+    assert.ok(dead.error, 'fixture drift: health() reports an unreachable probe with an error');
+
+    const a = await healthCall(async () => stale);
+    const b = await healthCall(async () => dead);
+    assert.strictEqual(a.code, 503, `a stale feed is still a 503; got ${a.code} ${JSON.stringify(a.body)}`);
+    assert.strictEqual(b.code, 503, `an unreachable feed is still a 503; got ${b.code} ${JSON.stringify(b.body)}`);
+    assert.notStrictEqual(
+      JSON.stringify(a.body),
+      JSON.stringify(b.body),
+      'a stale feed and an unreachable feed must not be byte-identical: the polling loop and the database are different pages of the same runbook (#85)'
+    );
+    assert.strictEqual(a.body.code, 'feed_stale', 'a stale feed needs its own code to branch on');
+    assert.strictEqual(a.body.odds_age_seconds, 5000, 'the age is the diagnostic the 503 used to discard');
+    assert.strictEqual(a.body.stale_after_seconds, STALE_SECONDS, 'an age with no window it broke is not a verdict');
+    assert.strictEqual(b.body.code, 'feed_unavailable', 'unreachable keeps the code the other feed routes use');
+    assert.strictEqual(b.body.odds_age_seconds, null, 'nothing measured is null — never zero, which reads as a fresh frame');
+  });
+
+  // ── R2: the log line, which exists to name the condition ─────────────────
+  await check('R2 the failure log names the condition instead of printing "(no detail)"', async () => {
+    const h = priced(5000);
+    // Pre-state, and the whole reason the old line was useless: healthPayload sets
+    // NEITHER `error` nor `detail`, so `h.error || h.detail` was undefined on
+    // every stale feed and the line printed `(no detail)` every time.
+    assert.strictEqual(h.error, undefined, 'fixture drift: healthPayload sets no error field');
+    assert.strictEqual(h.detail, undefined, 'fixture drift: healthPayload sets no detail field');
+    assert.strictEqual(h.odds_age_seconds, 5000, 'fixture drift: expected a 5000s-old frame');
+
+    const { logs } = await healthCall(async () => h);
+    const line = logs.join('\n');
+    assert.ok(logs.length > 0, 'the route refused to serve and said nothing about why');
+    assert.ok(!line.includes('(no detail)'), `the log must not fall back to "(no detail)"; got: ${line}`);
+    assert.ok(/\bstale\b/i.test(line), `the log must name the condition it is reporting; got: ${line}`);
+    assert.ok(line.includes('5000'), `and carry the age that identifies it; got: ${line}`);
+    assert.ok(line.includes(String(STALE_SECONDS)), `and the window that age broke; got: ${line}`);
+  });
+
+  // ── R3: the two readers, pinned against each other ──────────────────────
+  // THE defect class, not the defect. One payload, two readers, one rule: if
+  // either site is corrected alone, or a second copy of the discriminator is
+  // introduced on either, the two disagree about the same feed and this fails.
+  // Checked per condition rather than in a loop so a regression says WHICH feed.
+  const TWINS = [
+    { label: 'a stale feed', h: priced(5000), status: 503, code: 'feed_stale', stale: true, level: 'warn' },
+    { label: 'an unreachable feed', h: { ok: false, error: 'Odds feed unavailable' }, status: 503, code: 'feed_unavailable', stale: false, level: 'error' },
+    { label: 'a feed with no odds frame ever recorded', h: neverPolled(), status: 503, code: 'feed_stale', stale: true, level: 'warn' },
+    { label: 'a fresh feed', h: priced(100), status: 200, code: null, stale: false, level: 'log' },
+  ];
+  for (const t of TWINS) {
+    // eslint-disable-next-line no-await-in-loop
+    await check(`R3 the route and the boot line reach ONE verdict — ${t.label}`, async () => {
+      const boot = feedBootStatus(t.h, STALE_SECONDS);
+      const r = await healthCall(async () => t.h);
+      assert.strictEqual(boot.level, t.level, `boot line level: ${boot.message}`);
+      assert.strictEqual(
+        /\(STALE\)/.test(boot.message), t.stale,
+        `boot line staleness: ${boot.message}`
+      );
+      assert.strictEqual(r.code, t.status, `expected ${t.status}, got ${r.code} ${JSON.stringify(r.body)}`);
+      if (t.code === null) {
+        // The healthy path is unchanged: still the WHOLE payload. The fields the
+        // 503 now publishes were never removed from the 200.
+        assert.strictEqual(r.body.odds_age_seconds, 100, 'the healthy payload lost its age');
+        assert.ok(!r.body.code, 'a healthy feed must not carry an error code');
+        return;
+      }
+      assert.strictEqual(r.body.code, t.code, `expected code ${t.code}, got ${JSON.stringify(r.body)}`);
+      // The twin assertion proper: what one reader says, the other must not contradict.
+      assert.strictEqual(
+        r.body.code === 'feed_stale', /\(STALE\)/.test(boot.message),
+        `the route answered "${r.body.code}" while the boot line said "${boot.message}" — one payload, two conditions`
+      );
+    });
+  }
+
+  // ── R4: the two error PATHS, one response ────────────────────────────────
+  // health() catches its own driver errors and answers `{ok:false, error}`, so
+  // the route's `catch` is the defensive branch — it is what runs if that ever
+  // changes. It must still be the same response: to a client, "the probe threw"
+  // and "the probe answered unreachable" are one event.
+  await check('R4 a probe that THREW and a probe that answered not-ok are one response', async () => {
+    const threw = await healthCall(async () => {
+      throw new Error('connect ECONNREFUSED 10.0.0.5:5432 nobody@collector');
+    });
+    const answered = await healthCall(async () => ({ ok: false, error: 'Odds feed unavailable' }));
+    assert.strictEqual(threw.code, 503, `expected a 503 from a throwing probe, got ${threw.code}`);
+    assert.deepStrictEqual(
+      threw.body, answered.body,
+      'the thrown path and the answered path must be shaped by one shaper, or they will drift'
+    );
+    assert.strictEqual(threw.body.code, 'feed_unavailable');
+    assert.ok(
+      !/ECONNREFUSED|10\.0\.0\.5|nobody@|postgres:\/\//i.test(JSON.stringify(threw.body)),
+      `driver detail reached a body a client can read: ${JSON.stringify(threw.body)}`
+    );
+  });
+
+  // ── R5: the error shaper, on the body this fix changed ───────────────────
+  await check('R5 the stale 503 keeps the apiError() contract — error, code, then the diagnostics', async () => {
+    const r = await healthCall(async () => priced(5000));
+    assert.strictEqual(r.code, 503);
+    assert.deepStrictEqual(
+      Object.keys(r.body).slice(0, 2), ['error', 'code'],
+      `the well-known keys must stay in a predictable position in every body; got ${Object.keys(r.body).join(', ')}`
+    );
+    assert.ok(typeof r.body.error === 'string' && r.body.error.length > 0, 'the human string must still be there');
+    assert.strictEqual(r.body.ok, false, 'a refusal body must still say ok:false');
+    assert.ok(!('details' in r.body), `details is stripped from a 5xx; got ${JSON.stringify(r.body)}`);
+  });
+
+  // ── R6: the reference, which is the contract ─────────────────────────────
+  // Noted in passing by #85: the success payload was documented with `ok` in it,
+  // where it can only ever be true — this route serves a 200 only when `ok` is
+  // truthy. A client told `ok` is part of the success shape will branch on it and
+  // learn nothing, and the one place its value means anything is the 503, which
+  // documents it separately.
+  await check('R6 the documented success payload names only real fields, and not the one that is always true', () => {
+    const doc = require('fs').readFileSync(require('path').join(__dirname, '..', 'docs', 'API.md'), 'utf8');
+    // The ROUTE row, not the first line that mentions the path: the error-code
+    // table also names this route, and matching the first mention found the
+    // `feed_stale` row and reported a payload it never claimed to document.
+    const row = doc.split('\n').find((l) => /^\|\s*`GET \/api\/feed\/health`/.test(l));
+    assert.ok(row, 'docs/API.md no longer has a route-table row for GET /api/feed/health — reword this check, do not delete it');
+    const list = row.match(/`\s*200\s*\{([^}]*)\}`/);
+    assert.ok(list, `could not read the documented success payload out of: ${row}`);
+    const fields = list[1].split(',').map((s) => s.trim()).filter(Boolean);
+    assert.ok(fields.length > 3, `the row no longer lists a payload to check; got ${JSON.stringify(fields)}`);
+    assert.ok(
+      !fields.includes('ok'),
+      `the success payload must not document \`ok\`: on a 200 it is always true, so it promises a branch that cannot fire (got ${JSON.stringify(fields)})`
+    );
+    const real = priced(10);
+    const unknown = fields.filter((f) => !(f in real));
+    assert.deepStrictEqual(
+      unknown, [],
+      `docs/API.md promises fields healthPayload does not return: ${unknown.join(', ')} (it returns ${Object.keys(real).join(', ')})`
+    );
+  });
+
   console.log(`\nfeedboot-line.test.js: ${passed} checks passed, ${failures.length} failed`);
   if (failures.length) process.exit(1);
-  if (passed !== 8) { console.error(`expected 8 checks, ran ${passed}`); process.exit(1); }
+  if (passed !== 17) { console.error(`expected 17 checks, ran ${passed}`); process.exit(1); }
 })();

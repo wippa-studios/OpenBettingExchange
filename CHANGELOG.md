@@ -212,6 +212,28 @@ against a real database with 9,456 books in it:
 - **`health()` counted selection rows and called them markets** — 81,785 against
   9,976 actual.
 
+And one defect in this area was not about the feed schema at all (#85), which is
+why it is recorded separately: **the feed-health pair had drifted apart.**
+
+- **A stale feed and an unreachable feed answered byte-identical `503`s**, and the
+  log line beside them read `h.error || h.detail` — two fields `healthPayload`
+  never sets, so it printed `(no detail)` on every stale feed, every time. An
+  operator with an empty board could not tell "the collector stopped polling"
+  from "the collector's database is down": different pages of the same runbook,
+  one answer. `odds_age_seconds`, the number that separates them, was computed,
+  published on the healthy path, and discarded on the only path that needed it.
+  `/api/feed/health` now answers `503` with `code: "feed_stale"` and the measured
+  `odds_age_seconds` beside the `stale_after_seconds` it exceeded, or
+  `code: "feed_unavailable"` with `odds_age_seconds: null` when the probe never
+  reached the recorder. Both bodies still go through the one `apiError()` shaper.
+- **THE SAME BUG WAS ALREADY FIXED, AT THE TWIN SITE.** The boot line carried
+  this defect with its history written out and a test pinning the correction, and
+  the HTTP route 80 lines below was missed — because the rule had been copied into
+  two places and only one of them had a test. The rule now lives once, in
+  `lib/feed.js` as `classifyHealth` next to the payload it reads, and
+  `tests/feedboot-line.test.js` drives both readers with the same fixtures, so a
+  second copy of the discriminator fails the suite instead of the shift.
+
 ### Removed
 
 - **Delta carry-forward and the `carried` flag.** The Stream API sent only the

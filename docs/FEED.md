@@ -57,11 +57,19 @@ The read side is four routes, all public (no session required):
 | `GET /api/feed/nav` | the sport → country → competition → event → market tree | `200` with `{ enabled: false, sports: [] }` |
 | `GET /api/feed/health` | row counts, price age, whether the key is delayed | `409` |
 
-Every one of them returns `503 { "error": "Odds feed unavailable" }` when the
-feed database cannot be read. The message is deliberately generic: a `pg` driver
+Every one of them returns `503 { "error": "Odds feed unavailable", "code":
+"feed_unavailable", "ok": false, "odds_age_seconds": null }` when the feed
+database cannot be read. The message is deliberately generic: a `pg` driver
 error embeds the host, the user and often part of the connection string, so the
 detail goes to the server log and the client gets a status that is
 uninformative but true.
+
+`GET /api/feed/health` has a second `503`, for the case where the database was
+read perfectly well and what came back is out of date: `code: "feed_stale"`,
+`error: "Odds feed stale"`, and the measured `odds_age_seconds` beside the
+`stale_after_seconds` it exceeded. A stale feed is not an outage and the two send
+you to different places, so they are not one answer — see
+[API.md](API.md#feed-health-says-which-of-two-things-went-wrong).
 
 ### Feed markets are display only
 
@@ -256,14 +264,27 @@ On boot with the feed on, the server logs what it suppressed and what it found:
 ```
 [feed] on — bots suppressed (feed owns prices)
 [feed] on — drift suppressed (feed owns prices)
-[feed] odds feed connected — 9976 markets, newest frame unknown
+[feed] odds feed connected — 9976 markets, newest frame 92s old
 ```
 
 The two suppression lines print only when `BOT_ENABLED` / `DRIFT_ENABLED` were
-on, since suppressing something already off is not news. The connection line
-reads `health()`'s `age_seconds` and `stale`, and `health()` returns
-`odds_age_seconds` and neither — so it always prints `newest frame unknown` and
-never appends `(STALE)`. The freshness numbers are on `/api/feed/health`.
+on, since suppressing something already off is not news.
+
+The connection line reads the age from `odds_age_seconds` and compares it with the
+**same** `FEED_STALE_SECONDS` `/api/feed/health` compares it with, appending
+`(STALE)` and warning instead of logging when the prices are out of date — so the
+boot line and the health route cannot disagree about whether the feed is stale.
+(The line used to read two field names `health()` never returns, so it printed
+`newest frame unknown` and could never print `(STALE)` at all; and it reported a
+STALE feed as `unreachable: undefined`, because it asked `h.error` — a field only
+the unreachable shape carries — to mean two different conditions. One classifier
+in `lib/feed.js` answers for both this line and `/api/feed/health` now.)
+
+An unreachable collector is a different line, because it is a different problem:
+
+```
+[feed] unreachable: Odds feed unavailable
+```
 
 ---
 

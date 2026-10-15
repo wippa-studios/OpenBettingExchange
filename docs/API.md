@@ -261,12 +261,23 @@ than only the annotated few:
 | `unprocessable` | `422` | — |
 | `internal_error` | `500` | — |
 | `rate_limited` | `429` | the **request-volume** limiter only |
+| `feed_unavailable` | `503` | the odds-feed reads, when the collector cannot be reached |
+| `feed_stale` | `503` | `GET /api/feed/health` only, when the collector answered and its prices are out of date |
+
+The two feed codes are the reason the derived list cannot be the whole answer.
+Both are `503`, they mean opposite things operationally — go and look at the
+recorder's **database** versus at its **polling loop** — and they used to be one
+answer, so a client could not tell an outage from stale data and neither could an
+operator reading the response. See [the feed health 503](#feed-health-says-which-of-two-things-went-wrong).
 
 Two deliberate choices in that table:
 
 **The 5xx entries are coarse.** The message is a generic `Internal error` and
 inventing a precise code would tell a client more than the venue actually knows
-about a fault it has only just detected.
+about a fault it has only just detected. The two feed codes above are the
+deliberate exception: they name a condition the venue has *observed* — the
+recorder answered, and what it answered is out of date — rather than a fault it
+has detected.
 
 **A route-supplied `code` survives onto a 5xx, even though `details` does not.**
 This is the one asymmetry, and it is deliberate. `details` is the leak channel
@@ -634,7 +645,7 @@ this venue's database, so naming a feed selection id on `POST /api/orders` is a
 | `GET /api/feed/board?limit=` | `200 { markets }`; `limit` clamped to `[1, 500]` and counts **markets**, not rows | `409` feed disabled; `503 Odds feed unavailable` |
 | `GET /api/feed/market?id=` | `200 { market }`, or `{ "market": null }` when the id is not in the feed | `409`; `400 id is required`; `503` |
 | `GET /api/feed/nav` | `200 { enabled, sports }` — the browsing tree, expanded along one branch. **Always `200`**, including `{ "enabled": false, sports: [] }` when the feed is off, because the browser probes it at boot | `503` |
-| `GET /api/feed/health` | `200 { ok, markets, markets_with_odds, resolved, odds_age_seconds, oldest_odds_age_seconds, data_age_seconds, app_key_delay, delay_note }` | `409` feed disabled; `503 { ok: false, error: "Odds feed unavailable" }` |
+| `GET /api/feed/health` | `200 { feed, priced, markets, markets_with_odds, resolved, odds_age_seconds, oldest_odds_age_seconds, data_age_seconds, app_key_delay, app_key_delay_source, delay_note }` — the whole health payload; `ok` is deliberately absent because on a `200` it can only be `true` | `409` feed disabled; `503` — **two** bodies, see below |
 
 ```jsonc
 // GET /api/feed/board
@@ -658,6 +669,42 @@ this venue's database, so naming a feed selection id on `POST /api/orders` is a
 `data_age_seconds` is **null on a Delay key** and published as null rather than
 substituted: Betfair withholds `publish_time`, and a fabricated age would read as
 a measurement.
+
+<a id="feed-health-says-which-of-two-things-went-wrong"></a>
+### Feed health says WHICH of two things went wrong
+
+`GET /api/feed/health` answers `503` for two different failures, under two codes,
+because they send an operator to different places:
+
+| | Unreachable | Stale |
+| --- | --- | --- |
+| `code` | `feed_unavailable` | `feed_stale` |
+| `error` | `Odds feed unavailable` | `Odds feed stale` |
+| `odds_age_seconds` | `null` — nothing was measured | the measured age |
+| `stale_after_seconds` | absent | the `FEED_STALE_SECONDS` it exceeded |
+| `feed`, `priced` | absent | which view answered, and whether it has odds columns |
+| means | the probe could not reach the recorder — database, network, credentials | the probe answered, and what it returned is out of date — the collector's polling loop, or the threshold |
+
+```jsonc
+// 503, prices out of date
+{ "error": "Odds feed stale", "code": "feed_stale", "ok": false,
+  "odds_age_seconds": 5000, "stale_after_seconds": 300, "feed": 2, "priced": true }
+
+// 503, the collector could not be reached
+{ "error": "Odds feed unavailable", "code": "feed_unavailable", "ok": false,
+  "odds_age_seconds": null }
+```
+
+`ok: false` is on both, and `odds_age_seconds` is on both — `null` where nothing
+was measured, for the same reason `data_age_seconds` is published as null rather
+than substituted.
+
+This distinction did not exist before #85. Both conditions answered one fixed
+`503 { ok: false, error: "Odds feed unavailable" }`, and the log line beside them
+read fields the health payload never sets, so it printed `(no detail)` on every
+stale feed. A collector that had quietly stopped polling was indistinguishable
+from a database that was down, and the age that separates them — which the route
+computed and then discarded — never reached the client.
 
 ---
 
