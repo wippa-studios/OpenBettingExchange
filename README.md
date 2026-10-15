@@ -432,11 +432,11 @@ weight.
 ```bash
 
 
-npm test            # 885 checks: unit and API integration, fully offline
+npm test            # 908 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
-npm run test:ui     # 215 checks: real Chromium via Playwright (board and admin desk)
-npm run test:ui:shuffle   # the same 215 checks in a seeded random order (#134)
+npm run test:ui     # 217 checks: real Chromium via Playwright (board and admin desk)
+npm run test:ui:shuffle   # the same 217 checks in a seeded random order (#134)
 npm run docs:check  # fail if the documentation contradicts the code
 ```
 
