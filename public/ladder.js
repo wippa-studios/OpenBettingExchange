@@ -155,8 +155,10 @@
   //
   // `null` only when the level is EMPTY — no matched and no unmatched volume —
   // because there is then nothing to be a proportion of. A level with liquidity
-  // and no trading in it reads 0, which is the answer rather than the absence
-  // of one.
+  // and no trading in it reads 0, which is the true share of a level nothing has
+  // traded at. Whether that 0 is WORTH DRAWING is a separate decision and it is
+  // made in matchedCellParts(), not here: this function's contract is the ratio,
+  // and changing it to return null would change what `0` means for every caller.
   function matchedShare(level) {
     const f = levelFigures(level);
     const total = f.matched_cents + f.unmatched_cents;
@@ -184,20 +186,28 @@
       // every level of a quiet market is a row of zeros that reads as a broken
       // counter, which is the same objection board.js raises about
       // `$0.00 matched` in a market header.
-      //
-      // The BAR is still drawn at 0% when the level has unmatched size — a
-      // level with $5 available and nothing traded on it IS 0% done, and saying
-      // so beats leaving the row a different height. A level with neither has no
-      // bar, because there is nothing there to be a proportion OF.
       matchedRow: f.matched_cents
         ? `<span class="mv tn" title="${money(f.matched_cents)} matched across ${f.matched_fills} fill` +
           `${f.matched_fills === 1 ? '' : 's'} in the last ${MATCHED_WINDOW_MINUTES} minutes">` +
           `${money(f.matched_cents)}</span>`
         : '',
-      bar: share == null
+      // The BAR follows the same rule as the figure and is absent with it. 0% is a
+      // TRUE share and a worthless thing to draw: measured on the seeded board,
+      // 198 of the 198 bars rendered were 0%, because bots quote every market and
+      // almost none of them had traded. That is ~400 extra elements per board
+      // repaint every 15 seconds, saying nothing, over a ladder of real prices.
+      // The two fragments always agree — a cell shows a figure iff it shows a
+      // bar — so "nothing traded here" is one absence rather than two that could
+      // drift apart.
+      bar: !f.matched_cents || share == null
         ? ''
-        : `<span class="mbar" aria-hidden="true"><span class="mfill" style="width:${Math.round(
-            share * 100
+        // CLAMPED TO AT LEAST 1%. Something traded at this level, so a bar that
+        // rounds to 0% would say the opposite of what is true — and 0% is the
+        // rendering this whole rule exists to avoid. A $1 matched against
+        // $1,000,000 available is a hundredth of a percent and still happened.
+        : `<span class="mbar" aria-hidden="true"><span class="mfill" style="width:${Math.min(
+            100,
+            Math.max(1, Math.round(share * 100))
           )}%"></span></span>`,
       // Appended to the cell's accessible label, which leads with the unmatched
       // size because that is what pressing the button acts on.
@@ -205,11 +215,115 @@
     };
   }
 
+  // ── the price chart (#93) ────────────────────────────────────────────────
+  //
+  // `price_history` was write-only for the whole life of this codebase, and one
+  // of the two things the issue said were missing because of it was the CHART.
+  // The server endpoint (`GET /api/selections/:id/price-history`) and the
+  // retention policy that keeps its table exist; what did not exist was anything
+  // on the client that READ it, which is the same defect one layer up.
+  //
+  // WHY THE GEOMETRY LIVES HERE. Same reason the matched markup does: this file
+  // is require()able under Node, so tests/ladder_parity.test.js can assert the
+  // exact SVG the ladder ships — that it scales to the data, that it refuses to
+  // draw a line through a single point, and that a price containing a quote or
+  // a bracket cannot escape the attribute it is in. A chart drawn only in a
+  // browser is a chart nobody has ever checked.
+  const SPARK = { width: 120, height: 28, padding: 2 };
+
+  // Rounds to 2dp and strips a leading `.` artefact, so every coordinate is a
+  // short number. An SVG with coordinates carrying 15 significant digits is the
+  // same cost as one that does not, and this string is rebuilt on every poll.
+  const n2 = (v) => String(Math.round(v * 100) / 100);
+
+  // The polyline points for a series, in a SPARK-sized viewBox.
+  //
+  // Returns null for anything that cannot make a LINE, so the caller renders
+  // nothing rather than something misleading:
+  //   - no points, or one point. A single price is a flat line, which is a claim
+  //     about a trend that one observation cannot support — and a flat line at
+  //     the vertical centre also happens to be what an empty chart looks like, so
+  //     the two would be indistinguishable on screen.
+  //   - every price identical. Same reason: no movement is not a trend, and the
+  //     scale below would divide by zero.
+  function sparkPoints(series, opts = {}) {
+    const width = Number(opts.width) > 0 ? Number(opts.width) : SPARK.width;
+    const height = Number(opts.height) > 0 ? Number(opts.height) : SPARK.height;
+    const pad = Number.isFinite(Number(opts.padding)) ? Number(opts.padding) : SPARK.padding;
+    const pts = (Array.isArray(series) ? series : [])
+      .map((p) => (Array.isArray(p) ? p[1] : p && p.price))
+      .map(Number)
+      .filter((v) => Number.isFinite(v));
+    if (pts.length < 2) return null;
+    let lo = Math.min(...pts);
+    let hi = Math.max(...pts);
+    // A flat series has no range to scale into, and that is a REAL state: a
+    // market that traded repeatedly at one price is genuinely flat, and showing
+    // that as a straight line is the answer rather than the absence of one. The
+    // scale is widened by 1% of the price (never less than a tick) so the line
+    // lands in the middle instead of dividing by zero.
+    //
+    // What is NOT drawn is a single sample — see above.
+    if (hi - lo === 0) {
+      const nudge = Math.max(hi * 0.01, 0.01);
+      lo -= nudge;
+      hi += nudge;
+    }
+    const innerW = Math.max(1, width - pad * 2);
+    const innerH = Math.max(1, height - pad * 2);
+    return pts.map((v, i) => ({
+      x: pad + (innerW * i) / (pts.length - 1),
+      // INVERTED: SVG's y grows downward, a price chart's does not, so the high
+      // price has to be the SMALL number or the chart shows a falling market as
+      // a rising one.
+      y: pad + innerH - (innerH * (v - lo)) / (hi - lo),
+      price: v,
+    }));
+  }
+
+  // The chart markup for one runner, or '' when there is nothing to draw.
+  //
+  // `fmt` is injected like everywhere else in this file so it holds no money
+  // policy of its own. The accessible label carries the range and the number of
+  // fills, because a shape with no text is unreadable to a screen reader and
+  // says nothing to anyone on hover.
+  function sparkline(series, opts = {}) {
+    const money = opts.fmt || String;
+    const width = Number(opts.width) > 0 ? Number(opts.width) : SPARK.width;
+    const height = Number(opts.height) > 0 ? Number(opts.height) : SPARK.height;
+    const points = sparkPoints(series, opts);
+    if (!points) return '';
+    const pts = (Array.isArray(series) ? series : []).filter(
+      (p) => Number.isFinite(Number(Array.isArray(p) ? p[1] : p && p.price))
+    );
+    const first = Number(Array.isArray(pts[0]) ? pts[0][1] : pts[0].price);
+    const last = Number(Array.isArray(pts[pts.length - 1]) ? pts[pts.length - 1][1] : pts[pts.length - 1].price);
+    const lo = Math.min(...points.map((p) => p.price));
+    const hi = Math.max(...points.map((p) => p.price));
+    const fills = (Array.isArray(series) ? series : []).reduce((a, p) => {
+      const f = Number(Array.isArray(p) ? p[2] : p && p.fills);
+      return a + (Number.isFinite(f) ? f : 1);
+    }, 0);
+    const label = `Traded price ${money(first)} to ${money(hi)} over ${points.length} sample${
+      points.length === 1 ? '' : 's'
+    } and ${fills} fill${fills === 1 ? '' : 's'}; last ${money(last)}`;
+    return (
+      `<svg class="spark" viewBox="0 0 ${n2(width)} ${n2(height)}" width="${n2(width)}" height="${n2(
+        height
+      )}" preserveAspectRatio="none" role="img" aria-label="${String(label).replace(/[&<>"']/g, (c) =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
+      )}">` +
+      `<polyline class="sparkline" fill="none" points="${points.map((p) => `${n2(p.x)},${n2(p.y)}`).join(' ')}"/>` +
+      `</svg>`
+    );
+  }
+
   const api = {
     LADDER,
     LADDER_COLUMNS,
     LADDER_COLUMN_COUNT,
     MATCHED_WINDOW_MINUTES,
+    SPARK,
     MIN_CENTS,
     MAX_CENTS,
     priceToCents,
@@ -221,6 +335,8 @@
     levelFigures,
     matchedCellParts,
     matchedShare,
+    sparkPoints,
+    sparkline,
   };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api; // Node: parity test

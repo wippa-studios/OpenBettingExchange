@@ -605,10 +605,60 @@ button { font: inherit; cursor: pointer; }
   color: var(--muted); opacity: .75; margin-right: 4px;
   border: 1px solid var(--line); border-radius: 3px; padding: 0 3px;
 }
-/* The runner's windowed matched total (#93). It sits in the same place as the
-   LTP badge because it is the same kind of fact — a summary for the whole
-   runner rather than one price — and it is labelled for the same reason. */
-.lmid .matched-runner { color: var(--text); opacity: .8; }
+/* The market header's WINDOWED matched total (#93). It sits beside the
+   lifetime `matched` figure the header already carried, which is where it went
+   after a `MATCHED` badge in `.lmid` was measured squeezing the runner's NAME to
+   zero width at the 570px floor — see the note in public/js/board.js. */
+.mkthead .matched-win {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── the runner price chart (#93) ────────────────────────────────────────
+   The chart is the third thing the issue said was missing because the trade
+   tape was write-only: there was a series endpoint and nothing that read it.
+   Two rules govern its geometry, and both are about NOT touching `.lrow`:
+   the button is the only element the runner column gained, and the chart
+   itself renders in a SIBLING `.lrow.spark-row` whose one child spans
+   `1 / -1`. A fourth child of a price row would auto-place onto a second
+   implicit row and shift every label in the ladder. */
+.spark-btn {
+  flex: none;
+  align-self: center;
+  padding: 1px 3px;
+  font-size: 9px;
+  line-height: 1.1;
+  letter-spacing: -1px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  opacity: 0.6;
+}
+.spark-btn:hover { opacity: 1; color: var(--text); border-color: var(--line2); }
+.spark-btn[aria-expanded='true'] { opacity: 1; color: var(--text); border-color: var(--text); }
+.lrow.spark-row { display: block; background: var(--bg2); }
+.lrow.spark-row[hidden] { display: none; }
+.spark-host {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px 6px;
+  min-width: 0;
+}
+.spark {
+  display: block;
+  max-width: 100%;
+  overflow: visible;
+}
+.spark .sparkline {
+  stroke: var(--text);
+  stroke-width: 1.25;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.spark-wait { font-size: 11px; }
 
 /* Header row mirrors the price grid exactly so labels sit over their columns. */
 .lrow.lhdr { background: var(--bg2); border-bottom: 1px solid var(--line2); }
