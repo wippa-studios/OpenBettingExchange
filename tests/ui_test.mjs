@@ -369,6 +369,261 @@ try {
   await page.screenshot({ path: SHOT, fullPage: false });
   console.log('  info screenshot:', SHOT);
 
+  // ── #50: cash-out must not change which view is on screen ──────────────
+  //
+  // Two defects, and BOTH of them are "the wrong view is on screen":
+  //   (a) doCashOut called renderBets() with no OB.state.page check, so a
+  //       cash-out from the Exchange page replaced the whole ladder with the
+  //       My Bets card while the nav highlight and location.hash still said
+  //       "Exchange" — and the cash-out's own `book` broadcast then repainted
+  //       the board over it 200ms later, so whichever fetch resolved last won;
+  //   (b) the multi-position fallback assigned location.hash = '#/bets' while
+  //       ALREADY on '#/bets'. The same hash fires no `hashchange`, so route()
+  //       and renderBets() never ran and Open orders stayed on screen under a
+  //       toast promising Positions.
+  //
+  // So nothing below asserts that *something* rendered — that assertion shape
+  // passes with either bug present, and this repository already contains five
+  // of them. Every check names the view it expects: `.ladder` (Exchange) is
+  // present AND `#betsBody` (My Bets) is absent, plus the nav tab that claims
+  // to be showing it and the hash.
+  //
+  // (a) is also asserted from a RECORD rather than a sample: the wrong view
+  // appeared for ~200ms, which is invisible to a screenshot taken afterwards
+  // and invisible to any single read. The page therefore logs every mount
+  // transition while the cash-out runs.
+
+  const placeBack = async (mktId, stake) => {
+    const cell = page.locator(`.lcell[data-bet][data-mkt="${mktId}"]`).first();
+    if ((await cell.count()) === 0) return false;
+    await cell.click();
+    await page.waitForSelector('#slip:not([hidden]) .sliprow', { timeout: 5000 });
+    await page.fill('#slip input[data-stake]', String(stake));
+    await page.dispatchEvent('#slip input[data-stake]', 'change');
+    await page.click('#slip button.place');
+    await page.waitForFunction(
+      () => /Matched|Resting/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 10000 }
+    );
+    await page.waitForFunction(() => document.getElementById('slip').hidden, null, { timeout: 5000 });
+    return true;
+  };
+
+  // Which markets this account can actually cash out on, read back from the
+  // server rather than assumed. DISCOVERED, never hard-coded: the seeded ids
+  // follow from seed ordering, and lib/cashout.js returns no quote at all for a
+  // market whose selections carry no fair_price — so "the first market on the
+  // board" is not a usable stand-in.
+  const cashoutEligible = () =>
+    page.evaluate(async () => {
+      const r = await (await fetch('/api/positions')).json();
+      return (r.positions || [])
+        .filter((p) => p.cashout && p.market_status === 'open')
+        .map((p) => p.market_id);
+    });
+
+  // The identity of the view on screen, in one read.
+  const viewOnScreen = () =>
+    page.evaluate(() => ({
+      hash: location.hash,
+      statePage: window.OB.state.page,
+      ladder: !!document.querySelector('#page .ladder'),
+      betsBody: !!document.querySelector('#page #betsBody'),
+      wallet: !!document.querySelector('#page #wBal'),
+      activeTab: (() => {
+        const a = document.querySelector('#nav button.active');
+        return a ? a.dataset.page : null;
+      })(),
+      betsTab: (() => {
+        const t = document.querySelector('#page [data-tab].primary');
+        return t ? t.dataset.tab : null;
+      })(),
+    }));
+
+  // Log every change of which view owns #page, so a transient mount cannot be
+  // missed by an assertion taken after the repaint.
+  const recordViews = () =>
+    page.evaluate(() => {
+      window.__obViews = [];
+      const tick = () => {
+        const v = {
+          ladder: !!document.querySelector('#page .ladder'),
+          bets: !!document.querySelector('#page #betsBody'),
+        };
+        const last = window.__obViews[window.__obViews.length - 1];
+        if (!last || last.ladder !== v.ladder || last.bets !== v.bets) window.__obViews.push(v);
+        window.__obViewTimer = setTimeout(tick, 25);
+      };
+      tick();
+    });
+  const readViews = () =>
+    page.evaluate(() => {
+      clearTimeout(window.__obViewTimer);
+      return window.__obViews;
+    });
+
+  // The fixture is shared by the two checks below and is built ONCE: it is the
+  // expensive part (real matched bets), and each check is its own scenario so
+  // that neither can hide behind the other's failure. With the bug present the
+  // first scenario leaves the Open orders tab on screen, and a single combined
+  // scenario would then abort on a missing button — reporting (b) and never
+  // running (a) at all.
+  let cashoutFixture = [];
+  await scenario('#50 cash-out: the multi-position fallback moves the operator', async () => {
+    // ── fixture: TWO cash-out-eligible positions ──────────────────────────
+    const mktIds = await page.evaluate(() => [
+      ...new Set([...document.querySelectorAll('.lcell[data-bet]')].map((c) => c.dataset.mkt)),
+    ]);
+    let eligible = await cashoutEligible();
+    for (const id of mktIds.slice(0, 8)) {
+      if (eligible.length >= 2) break;
+      await placeBack(id, 50);
+      eligible = await cashoutEligible();
+    }
+    cashoutFixture = eligible;
+    check(
+      '#50 fixture: two cash-out-eligible positions exist',
+      eligible.length >= 2,
+      `(${eligible.length} of ${mktIds.length} markets quoted)`
+    );
+    if (eligible.length < 2) return;
+
+    // From the page the fallback TARGETS: My Bets, Open orders tab showing.
+    await page.click('#nav button[data-page="bets"]');
+    await page.waitForSelector('#page [data-tab="open"].primary', { timeout: 10000 });
+    const beforeMulti = await viewOnScreen();
+    check(
+      '#50 fixture: Open orders is the tab under test',
+      beforeMulti.betsTab === 'open' && !beforeMulti.ladder,
+      JSON.stringify(beforeMulti)
+    );
+
+    await page.locator('#cashoutBtn').click();
+    await page.waitForFunction(
+      () => /Multiple positions can be cashed out/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 10000 }
+    );
+    // Generous settle: any render that was going to happen has now happened.
+    // A "did the page change?" assertion taken too early passes by luck.
+    await page.waitForTimeout(800);
+    const afterMulti = await viewOnScreen();
+    check(
+      '#50 multi-position Cash Out lands on Positions, not Open orders',
+      afterMulti.betsTab === 'positions' && afterMulti.ladder === false && afterMulti.hash === '#/bets',
+      JSON.stringify(afterMulti)
+    );
+    check(
+      '#50 the promised Positions tab actually rendered position cards',
+      (await page.locator('#page #betsBody .poscard').count()) > 0,
+      `(${await page.locator('#page #betsBody .poscard').count()} cards)`
+    );
+  });
+
+  await scenario('#50 cash-out: the single-outcome branch stays on its own page', async () => {
+    if (cashoutFixture.length < 2) {
+      check('#50 fixture for the single-outcome branch', false, '(no eligible positions)');
+      return;
+    }
+    // Open the Positions tab explicitly rather than relying on the check
+    // above having switched it, so this scenario's starting point is the same
+    // whether or not the fallback above works.
+    await page.click('#nav button[data-page="bets"]');
+    await page.waitForSelector('#page #betsBody', { timeout: 10000 });
+    await page.click('#page [data-tab="positions"]');
+    await page.waitForSelector('#page #betsBody .poscard', { timeout: 10000 });
+
+    // ── (a) leave exactly one eligible position, cashing the rest out from
+    // the Positions tab. Those per-position controls do not route, so the
+    // board the next step needs is untouched by the reduction.
+    let eligible = await cashoutEligible();
+    for (const id of eligible.slice(0, -1)) {
+      await page.locator(`#betsBody [data-cashout="${id}"]`).click();
+      await page.waitForFunction(
+        (m) => !document.querySelector(`#betsBody [data-cashout="${m}"]`),
+        id,
+        { timeout: 10000 }
+      );
+    }
+    eligible = await cashoutEligible();
+    check('#50 fixture: exactly one cash-out-eligible position remains', eligible.length === 1, `(${eligible.length})`);
+    if (eligible.length !== 1) return;
+
+    await page.click('#nav button[data-page="markets"]');
+    await page.waitForSelector('#page .ladder', { timeout: 10000 });
+    const beforeSingle = await viewOnScreen();
+    check(
+      '#50 fixture: the Exchange ladder is the view under test',
+      beforeSingle.ladder && !beforeSingle.betsBody && beforeSingle.activeTab === 'markets',
+      JSON.stringify(beforeSingle)
+    );
+
+    await recordViews();
+    await page.locator('#cashoutBtn').click();
+    await page.waitForFunction(
+      () => /Cashed out/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    // Past the 200ms `book` debounce in boot.js AND the refresh it triggers.
+    await page.waitForTimeout(1500);
+    const views = await readViews();
+    // This is the ONLY shape of assertion on (a) that DISCRIMINATES from the
+    // markets page: boot.js repaints the ladder while state.page is still
+    // 'markets', so a view read after the settle looks correct and passes
+    // with the bug present — this repository's exact failure mode. The wrong
+    // view really did exist in between, which is why the transitions are
+    // RECORDED at 25ms intervals rather than sampled once.
+    check(
+      '#50 the My Bets card never mounts while the Exchange page is open',
+      !views.some((v) => v.bets),
+      `view transitions: ${JSON.stringify(views)}`
+    );
+  });
+
+  // (a), second half, on a page the repaint CANNOT rescue. refreshMarkets()
+  // only renders when state.page === 'markets', and the `balance` listener
+  // calls loadWallet(), which bails on a missing #wTx — so a cash-out from the
+  // Wallet strands the My Bets card over the wallet indefinitely. Same defect,
+  // no 200ms repair, and therefore assertable by a single read.
+  await scenario('#50 cash-out from another page leaves that page on screen', async () => {
+    // Top the fixture back up to exactly one eligible position: the check
+    // above cashed the last one out.
+    const mktIds = await page.evaluate(() => [
+      ...new Set([...document.querySelectorAll('.lcell[data-bet]')].map((c) => c.dataset.mkt)),
+    ]);
+    for (const id of mktIds.slice(0, 8)) {
+      if ((await cashoutEligible()).length >= 1) break;
+      await placeBack(id, 50);
+    }
+    const eligible = await cashoutEligible();
+    check('#50 fixture: exactly one cash-out-eligible position remains', eligible.length === 1, `(${eligible.length})`);
+    if (eligible.length !== 1) return;
+
+    await page.click('#nav button[data-page="wallet"]');
+    await page.waitForSelector('#page #wBal', { timeout: 10000 });
+    await page.waitForSelector('#page #wTx table, #page #wTx .empty', { timeout: 10000 });
+    const before = await viewOnScreen();
+    check(
+      '#50 fixture: the Wallet is the view under test',
+      before.wallet && !before.betsBody && before.activeTab === 'wallet',
+      JSON.stringify(before)
+    );
+
+    await page.locator('#cashoutBtn').click();
+    await page.waitForFunction(
+      () => /Cashed out/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    // Well past the debounce, and past the 15s poll — which also declines to
+    // repaint a page that is not the markets page.
+    await page.waitForTimeout(2000);
+    const after = await viewOnScreen();
+    check(
+      '#50 Cash Out on the Wallet page leaves the Wallet page on screen',
+      after.wallet && !after.betsBody && after.activeTab === 'wallet' && after.hash === '#/wallet',
+      JSON.stringify(after)
+    );
+  });
+
   // ── admin desk: overround column + the server-backed fair-price helper ──
   await scenario('admin desk renders the overround column', async () => {
     await page.click('#authBtn'); // sign out of the customer session
@@ -609,6 +864,901 @@ try {
       return true;
     });
     check('admin body is a stable shared mount', degrade);
+  });
+
+  // ── #51: a held market can be released as a DEAD HEAT, chosen by NAME ────
+  //
+  // Two defects, both on the operator's most consequential screen:
+  //   (a) the release route has accepted `dead_heat` since lib/results.js
+  //       gained it, and no screen could send it - so an operator facing a held
+  //       dead heat could only pick one winner (paying a whole stake to one
+  //       runner and charging the other joint winner's backer his entire stake
+  //       on a horse that TIED) or void every runner;
+  //   (b) the prompt demanded "Winning selection id (see the market on the
+  //       board)" - and the board renders NAMES only. cellHtml() puts ids in
+  //       data-sel and aria-label, never as text.
+  //
+  // (b) is checked by RECORDING every window.prompt the page raises and
+  // asserting that none of them asks for an id. (a) is checked by driving the
+  // real control - tick two runners - and reading the POST body the browser
+  // actually sent. Asserting that the endpoint accepts a dead_heat would prove
+  // nothing about the desk: that path already worked, and the bug is that
+  // nothing on screen reaches it.
+
+  // Every dialog the page raises, in order. Empty queue => DISMISS, which is
+  // exactly what Playwright does with an unhandled dialog, so registering this
+  // handler changes no other scenario's behaviour.
+  const prompts = [];
+  let promptQueue = [];
+  page.on('dialog', async (d) => {
+    if (d.type() === 'prompt' && promptQueue.length) {
+      prompts.push(d.message());
+      await d.accept(promptQueue.shift());
+      return;
+    }
+    prompts.push(d.message());
+    await d.dismiss();
+  });
+  // The release POST body, captured off the wire.
+  let releasePayload = null;
+  // Admin writes captured the same way, for #52.
+  const adminWrites = {};
+  page.on('request', (r) => {
+    const p = new URL(r.url()).pathname;
+    if (/\/api\/admin\/results\/held\/\d+\/release$/.test(p)) {
+      try {
+        releasePayload = JSON.parse(r.postData() || 'null');
+      } catch {
+        releasePayload = { __unparseable: r.postData() };
+      }
+      return;
+    }
+    if (r.method() === 'POST' || r.method() === 'PUT' || r.method() === 'PATCH') {
+      if (!/^\/api\/admin\/(users\/\d+\/(limits|exclude)|markets\/\d+(\/settle)?)$/.test(p)) return;
+      try {
+        adminWrites[`${r.method()} ${p}`] = JSON.parse(r.postData() || 'null');
+      } catch {
+        adminWrites[`${r.method()} ${p}`] = { __unparseable: r.postData() };
+      }
+    }
+  });
+
+  await scenario('#51 held release: joint winners are expressible from the desk', async () => {
+    // The desk is left on the Ops view by the previous scenario, so open
+    // Markets first: the id is read from a row that carries a Settle control,
+    // which by definition has not been settled yet. Discovered, not hard-coded.
+    await page.click('[data-view="markets"]');
+    await page.waitForSelector('#adminBody [data-settle]', { timeout: 10000 });
+    const heldMarketId = await page.evaluate(() => {
+      const b = document.querySelector('#adminBody [data-settle]');
+      return b ? Number(b.dataset.settle) : null;
+    });
+    if (heldMarketId === null) {
+      check('#51 fixture: an open market to hold', false, '(no markets on the desk)');
+      return;
+    }
+    // A held market is needed, and the seeded catalogue has none. Set the same
+    // columns the results poll writes, so this is the real hold rather than a
+    // mocked flag — the route under test reads them.
+    {
+      const { DatabaseSync } = await import('node:sqlite');
+      const db = new DatabaseSync(path.join(TMP, 'ui.db'));
+      db.prepare(
+        'UPDATE markets SET settlement_hold = 1, hold_reason = ? WHERE id = ? AND status = ?'
+      ).run('result feed: dead heat disputed', heldMarketId, 'open');
+      const n = db.prepare('SELECT settlement_hold FROM markets WHERE id = ?').get(heldMarketId);
+      db.close();
+      if (!n || n.settlement_hold !== 1) {
+        check('#51 fixture: the market is held', false, `(hold=${n && n.settlement_hold})`);
+        return;
+      }
+    }
+
+    await page.click('[data-view="results"]');
+    await page.waitForSelector('#adminBody [data-release-settle]', { timeout: 10000 });
+    const heldRow = page.locator(`#adminBody [data-release-settle="${heldMarketId}"]`);
+    check(
+      '#51 fixture: the held market is listed on the desk',
+      (await heldRow.count()) === 1,
+      `(market ${heldMarketId})`
+    );
+    if ((await heldRow.count()) === 0) return;
+
+    // The reason prompt is unchanged and still comes first (lib/results.js
+    // refuses a release with no reason).
+    prompts.length = 0;
+    promptQueue = ['ui test: joint winners confirmed against the results feed'];
+    await heldRow.click();
+    // The picker is CHECKED for, not awaited. An awaited one turns "the control
+    // does not exist" into an opaque 10s timeout that aborts the scenario, and
+    // every later assertion — including the dead-heat payload, which is the
+    // whole point — would then never run. A missing picker has to be a named
+    // failure, not a scenario that dies quietly.
+    const picker = page.locator('.modal[role="dialog"] #hoWinners');
+    let pickerPresent = true;
+    try {
+      await picker.waitFor({ state: 'attached', timeout: 5000 });
+    } catch {
+      pickerPresent = false;
+    }
+    check(
+      '#51 settling a held market opens a runner picker rather than a raw-id prompt',
+      pickerPresent,
+      `(${prompts.length} prompt(s): ${prompts.join(' | ').slice(0, 90)})`
+    );
+    check(
+      '#51 no prompt demands a raw selection id',
+      !prompts.some((m) => /selection id/i.test(m)),
+      `(saw: ${prompts.join(' | ').slice(0, 90)})`
+    );
+    if (!pickerPresent) {
+      check('#51 the release picker lists this market\'s runners by name', false, '(no picker on screen)');
+      check(
+        '#51 the release payload carries dead_heat for a two-way tie',
+        false,
+        `(the tie could not be expressed at all — payload ${JSON.stringify(releasePayload)})`
+      );
+      return;
+    }
+    check('#51 the release still asks for a written reason first', /reason/i.test(prompts[0] || ''), `("${(prompts[0] || '').slice(0, 60)}")`);
+
+    // (b) — by NAME. The runner names come from this market's own book.
+    const rows = await page.locator('.modal[role="dialog"] #hoWinners .optrow').allTextContents();
+    const bookNames = await page.evaluate(
+      async (id) => {
+        const r = await (await fetch(`/api/markets/${id}/book`)).json();
+        return r.book.map((s) => s.name);
+      },
+      heldMarketId
+    );
+    check(
+      '#51 the release picker lists this market\'s runners by name',
+      bookNames.length >= 2 && bookNames.every((n) => rows.some((r) => r.includes(n))),
+      `(${rows.length} rows for ${bookNames.length} runners: ${rows.join(' | ').slice(0, 80)})`
+    );
+
+    const goBtn = page.locator('.modal[role="dialog"] #hoGo');
+    const boxes = page.locator('.modal[role="dialog"] #hoWinners .hoPick');
+
+    // The button tracks the selection BOTH ways. Asserting only "disabled at
+    // rest" passes for a button that is permanently disabled, which is its own
+    // dead control — so a choice is made, then withdrawn.
+    const inertAtRest = await goBtn.isDisabled();
+    await boxes.nth(0).check();
+    const inertWhenChosen = await goBtn.isDisabled();
+    await boxes.nth(0).uncheck();
+    const inertAfterUntick = await goBtn.isDisabled();
+    check(
+      '#51 the release button is live only while a runner is chosen',
+      inertAtRest && !inertWhenChosen && inertAfterUntick,
+      `(rest=${inertAtRest}, chosen=${inertWhenChosen}, unticked=${inertAfterUntick})`
+    );
+
+    // ── (a) — drive the real control: tick TWO runners ─────────────────────
+    await boxes.nth(0).check();
+    await boxes.nth(1).check();
+    const summary = ((await page.locator('.modal[role="dialog"] #hoSummary').textContent()) || '').trim();
+    check('#51 two ticks read as a dead heat, not a single winner', /dead heat/i.test(summary), `("${summary.slice(0, 60)}")`);
+
+    // Cancelling WITH a selection made is the dangerous case. Cancelling with
+    // nothing ticked proves almost nothing — there is nothing to release — and
+    // a picker that released on cancel would sail past it. This is also the
+    // path an awaiter that never settles would break, leaving the operator
+    // facing a dialog whose buttons look dead.
+    releasePayload = null;
+    await page.locator('.modal[role="dialog"] #hoCancel').click();
+    await page.waitForTimeout(600);
+    check(
+      '#51 cancelling with runners chosen releases nothing',
+      releasePayload === null,
+      `(payload ${JSON.stringify(releasePayload)})`
+    );
+    check(
+      '#51 cancelling leaves the market held',
+      (await page.locator(`#adminBody [data-release-settle="${heldMarketId}"]`).count()) === 1
+    );
+    check(
+      '#51 cancelling closes the dialog',
+      (await page.locator('.modal[role="dialog"] #hoWinners').count()) === 0
+    );
+
+    // Reopen and commit the tie for real.
+    promptQueue = ['ui test: joint winners confirmed against the results feed'];
+    await page.locator(`#adminBody [data-release-settle="${heldMarketId}"]`).click();
+    await page.locator('.modal[role="dialog"] #hoWinners').waitFor({ state: 'attached', timeout: 10000 });
+    await page.locator('.modal[role="dialog"] #hoWinners .hoPick').nth(0).check();
+    await page.locator('.modal[role="dialog"] #hoWinners .hoPick').nth(1).check();
+    releasePayload = null;
+    await page.locator('.modal[role="dialog"] #hoGo').click();
+    await page.waitForFunction(
+      () => /settled/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+
+    const ids = await page.evaluate(
+      async (id) => {
+        const r = await (await fetch(`/api/markets/${id}/book`)).json();
+        return r.book.map((s) => s.selection_id);
+      },
+      heldMarketId
+    );
+    check(
+      '#51 the release payload carries dead_heat for a two-way tie',
+      !!releasePayload &&
+        Array.isArray(releasePayload.dead_heat) &&
+        releasePayload.dead_heat.length === 2 &&
+        releasePayload.dead_heat.every((x) => ids.includes(x)),
+      `(payload ${JSON.stringify(releasePayload)})`
+    );
+    check(
+      '#51 a dead heat sends no single winner_selection_id alongside it',
+      !!releasePayload && (releasePayload.winner_selection_id === null || releasePayload.winner_selection_id === undefined),
+      `(payload ${JSON.stringify(releasePayload)})`
+    );
+    check(
+      '#51 the release carries the operator\'s reason to the server',
+      !!releasePayload && typeof releasePayload.reason === 'string' && releasePayload.reason.length >= 5,
+      `(${releasePayload && releasePayload.reason})`
+    );
+
+    // The hold is cleared and the market is settled by the release, so the
+    // desk must stop offering it.
+    await page.waitForFunction(
+      (id) => !document.querySelector(`#adminBody [data-release-settle="${id}"]`),
+      heldMarketId,
+      { timeout: 10000 }
+    );
+    check('#51 the released market leaves the held queue', true);
+
+    // ── ONE tick is a plain win, not a one-element dead heat ────────────────
+    // lib/results.js refuses a dead_heat list shorter than two distinct ids, so
+    // a picker that sent `dead_heat: [x]` for a single winner would 400 on the
+    // commonest release of all. Held from the same columns as above.
+    await page.click('[data-view="markets"]');
+    await page.waitForSelector('#adminBody [data-settle]', { timeout: 10000 });
+    const soloMarketId = await page.evaluate(() => {
+      const b = document.querySelector('#adminBody [data-settle]');
+      return b ? Number(b.dataset.settle) : null;
+    });
+    if (soloMarketId === null) {
+      check('#51 fixture: a second market for the single-winner path', false, '(none left open)');
+      return;
+    }
+    {
+      const { DatabaseSync } = await import('node:sqlite');
+      const db = new DatabaseSync(path.join(TMP, 'ui.db'));
+      db.prepare('UPDATE markets SET settlement_hold = 1, hold_reason = ? WHERE id = ?').run(
+        'result feed: unrecognised result',
+        soloMarketId
+      );
+      db.close();
+    }
+    await page.click('[data-view="results"]');
+    await page.waitForSelector(`#adminBody [data-release-settle="${soloMarketId}"]`, { timeout: 10000 });
+
+    promptQueue = ['ui test: single winner confirmed against the results feed'];
+    releasePayload = null;
+    await page.locator(`#adminBody [data-release-settle="${soloMarketId}"]`).click();
+    await page.locator('.modal[role="dialog"] #hoWinners').waitFor({ state: 'attached', timeout: 10000 });
+    const soloBox = page.locator('.modal[role="dialog"] #hoWinners .hoPick').first();
+    const soloId = Number(await soloBox.getAttribute('value'));
+    await soloBox.check();
+    await page.locator('.modal[role="dialog"] #hoGo').click();
+    await page.waitForFunction(
+      () => /settled/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    check(
+      '#51 one ticked runner sends winner_selection_id and no dead_heat',
+      !!releasePayload &&
+        releasePayload.winner_selection_id === soloId &&
+        (releasePayload.dead_heat === undefined || releasePayload.dead_heat === null),
+      `(payload ${JSON.stringify(releasePayload)}, expected winner ${soloId})`
+    );
+  });
+
+  // ── #52 (2/3): settlement and suspend carry a written reason ─────────────
+  //
+  // admin.js's own header claims "Every mutating control below is gated
+  // server-side too (reason required, ...)". That holds for the user actions,
+  // where lib/admin.js's reasonOr400 refuses an empty one — but NOT for the two
+  // market actions. Both routes audit `body.reason || null`, which server.js
+  // describes as "always absent in practice": suspending a user could carry a
+  // justification, and settling one — "moves the most money of any operator
+  // action" — could not.
+  //
+  // Asserted on the wire and then in the audit trail, because the claim is
+  // about the RECORD: a reason typed into a dialog and dropped on the floor
+  // satisfies every DOM assertion there is.
+  await scenario('#52 settlement and suspend record a written reason', async () => {
+    await page.click('[data-view="markets"]');
+    await page.waitForSelector('#adminBody [data-settle], #adminBody [data-toggle]', { timeout: 10000 });
+
+    // ── suspend / restore ──────────────────────────────────────────────────
+    const suspendBtn = page.locator('#adminBody [data-toggle]').first();
+    if ((await suspendBtn.count()) === 0) {
+      check('#52 fixture: a market to suspend', false, '(every market already settled)');
+      return;
+    }
+    const mktId = Number(await suspendBtn.getAttribute('data-toggle'));
+    const willSuspend = (await suspendBtn.getAttribute('data-status')) === 'suspended';
+
+    // Cancelling the prompt must not suspend anything.
+    prompts.length = 0;
+    promptQueue = [];
+    delete adminWrites[`PATCH /api/admin/markets/${mktId}`];
+    await suspendBtn.click();
+    await page.waitForTimeout(600);
+    check(
+      '#52 suspending asks for a reason and sends nothing when cancelled',
+      adminWrites[`PATCH /api/admin/markets/${mktId}`] === undefined,
+      `(payload ${JSON.stringify(adminWrites[`PATCH /api/admin/markets/${mktId}`])})`
+    );
+    check('#52 the suspend prompt is about the reason', /reason/i.test(prompts[0] || ''), `("${(prompts[0] || '').slice(0, 60)}")`);
+
+    prompts.length = 0;
+    promptQueue = ['ui test: price feed disagreement, market withdrawn pending review'];
+    await suspendBtn.click();
+    await page.waitForFunction(
+      () => /^Market (suspended|open)$/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    const patch = adminWrites[`PATCH /api/admin/markets/${mktId}`] || null;
+    check(
+      '#52 suspend sends the operator\'s reason',
+      !!patch && typeof patch.reason === 'string' && patch.reason.length >= 5 && patch.status === 'suspended',
+      `(payload ${JSON.stringify(patch)})`
+    );
+
+    // Put it back, so the suite leaves the catalogue as it found it.
+    const restoreBtn = page.locator(`#adminBody [data-toggle="${mktId}"]`).first();
+    await restoreBtn.waitFor({ timeout: 10000 });
+    promptQueue = ['ui test: feed reconciled, market restored'];
+    await restoreBtn.click();
+    await page.waitForFunction(
+      (id) => document.querySelector(`#adminBody [data-toggle="${id}"]`)?.dataset.status === 'open',
+      mktId,
+      { timeout: 15000 }
+    );
+    const restore = adminWrites[`PATCH /api/admin/markets/${mktId}`] || null;
+    check(
+      '#52 restore sends the operator\'s reason too',
+      !!restore && restore.status === 'open' && typeof restore.reason === 'string' && restore.reason.length >= 5,
+      `(payload ${JSON.stringify(restore)})`
+    );
+
+    // ── settle ────────────────────────────────────────────────────────────
+    const settleBtn = page.locator('#adminBody [data-settle]').first();
+    if ((await settleBtn.count()) === 0) {
+      check('#52 fixture: a market to settle', false, '(none left open)');
+      return;
+    }
+    const settleId = Number(await settleBtn.getAttribute('data-settle'));
+    await settleBtn.click();
+    await page.waitForSelector('.modal[role="dialog"] #sdGo', { timeout: 10000 });
+    check(
+      '#52 the settle dialog carries a reason field',
+      (await page.locator('.modal[role="dialog"] #sdReason').count()) === 1
+    );
+
+    // No reason, no settlement.
+    await page.locator('.modal[role="dialog"] input[name="winner"]').first().check();
+    delete adminWrites[`POST /api/admin/markets/${settleId}/settle`];
+    await page.locator('.modal[role="dialog"] #sdGo').click();
+    // A bounded settle rather than a wait on the refusal toast. The refusal is
+    // synchronous; a real settlement is a round trip. Waiting on the toast
+    // alone HANGS when the control has no refusal at all — which is the state
+    // this check exists to catch — and then the scenario dies before the
+    // assertion that matters runs.
+    await page.waitForTimeout(1500);
+    check(
+      '#52 settling will not proceed without a written reason',
+      adminWrites[`POST /api/admin/markets/${settleId}/settle`] === undefined,
+      `(payload ${JSON.stringify(adminWrites[`POST /api/admin/markets/${settleId}/settle`])})`
+    );
+
+    await page.fill('.modal[role="dialog"] #sdReason', 'ui test: result confirmed against the official feed');
+    await page.locator('.modal[role="dialog"] #sdGo').click();
+    await page.waitForFunction(
+      () => /Settled \d+ position/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    const settle = adminWrites[`POST /api/admin/markets/${settleId}/settle`] || null;
+    check(
+      '#52 settle sends the operator\'s reason alongside the winner',
+      !!settle && typeof settle.reason === 'string' && settle.reason.length >= 5 && settle.winner_selection_id != null,
+      `(payload ${JSON.stringify(settle)})`
+    );
+
+    // And it is in the RECORD, which is the whole claim. Two filters: the
+    // settlement and the suspend/restore pair are different market ids.
+    const auditFor = async (target) => {
+      await page.click('[data-view="audit"]');
+      await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
+      await page.fill('#auditTarget', target);
+      await page.click('#auditGo');
+      await page.waitForFunction(
+        (t) => {
+          const tb = document.querySelector('#adminBody .adm-tbl tbody');
+          return !!tb && (tb.textContent || '').includes(t);
+        },
+        target,
+        { timeout: 10000 }
+      );
+      return (await page.locator('#adminBody .adm-tbl tbody').textContent()) || '';
+    };
+
+    const settleAudit = await auditFor(`market:${settleId}`);
+    check(
+      '#52 the settlement audit row carries the reason',
+      /market\.settled/.test(settleAudit) && settleAudit.includes('ui test: result confirmed against the official feed'),
+      `(${settleAudit.slice(0, 80)}…)`
+    );
+
+    const suspendAudit = await auditFor(`market:${mktId}`);
+    check(
+      '#52 the suspend and restore audit rows carry their reasons',
+      suspendAudit.includes('ui test: price feed disagreement, market withdrawn pending review') &&
+        suspendAudit.includes('ui test: feed reconciled, market restored'),
+      `(${suspendAudit.slice(0, 80)}…)`
+    );
+  });
+
+// ── #52 (3/3): tenant branding is served and never consumed ──────────────
+  //
+  // `grep -rn branding public/` returned zero hits before this: /api/branding
+  // has been served the whole time, no JS fetched it, no CSS variable was set,
+  // and editTenant could not even write the `brand` JSON. ROADMAP.md claimed
+  // per-tenant theming worked "through the frontend".
+  //
+  // Split into two halves that do not depend on each other, because they are
+  // two separate defects and one must not hide the other:
+  //   (a) the DESK can set the brand — the editor has no brand fields;
+  //   (b) the BROWSER consumes it — the response is never read at all.
+  // (b) is written through the API, not the desk, and asserted after a RELOAD.
+  // That matters twice over: the bug is precisely that nothing read the
+  // response, and asserting that a fetch happened would prove nothing about
+  // the UI — while reading a CSS variable that was never set returns the house
+  // palette, which is true whether or not the branding works. So the only
+  // honest assertion is a distinctive colour on :root after a fresh load.
+  const houseAccent = await page.evaluate(() => {
+    for (const sheet of document.styleSheets) {
+      let rules;
+      try {
+        rules = sheet.cssRules;
+      } catch {
+        continue;
+      }
+      for (const r of rules) {
+        if (r.selectorText === ':root') {
+          const m = /--accent:\s*([^;]+)/.exec(r.style.cssText);
+          if (m) return m[1].trim();
+        }
+      }
+    }
+    return null;
+  });
+
+  const branding = () =>
+    page.evaluate(async () => {
+      const b = await (await fetch('/api/branding')).json();
+      return b;
+    });
+  const rootVars = () =>
+    page.evaluate(() => {
+      const cs = getComputedStyle(document.documentElement);
+      return {
+        inline: document.documentElement.getAttribute('style') || '',
+        accent: cs.getPropertyValue('--accent').trim(),
+        pink: cs.getPropertyValue('--pink').trim(),
+        title: document.title,
+        slug: document.documentElement.getAttribute('data-tenant'),
+      };
+    });
+  const writeBrand = (id, brand) =>
+    page.evaluate(
+      async ([tid, b]) => {
+        await fetch(`/api/admin/tenants/${tid}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ brand: b }),
+        });
+      },
+      [id, brand]
+    );
+  const reload = async () => {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#balance:not([hidden])', { timeout: 15000 });
+  };
+
+  const brand = { name: 'UI Test Exchange', logo: '/assets/logo.png', terms_url: '/terms/ui-test', palette: { accent: '#ff6600', pink: '#00aa88' } };
+
+  await scenario('#52 the browser consumes /api/branding after a reload', async () => {
+    const before = await branding();
+    check(
+      '#52 /api/branding serves the caller\'s tenant',
+      !!before && !!before.tenant && !!before.tenant.id,
+      `(tenant ${before && JSON.stringify(before.tenant)})`
+    );
+    if (!before || !before.tenant) return;
+    const tid = before.tenant.id;
+
+    // Before anything: the house palette, whatever the response says.
+    const virgin = await rootVars();
+    check(
+      '#52 fixture: the house palette is what ships when no brand is set',
+      virgin.accent.toLowerCase() === (houseAccent || '').toLowerCase(),
+      `(accent=${virgin.accent}, house is ${houseAccent})`
+    );
+
+    await writeBrand(tid, brand);
+    await reload();
+    const after = await rootVars();
+    check(
+      '#52 the tenant palette reaches :root as a CSS custom property',
+      after.accent.toLowerCase() === '#ff6600' && after.pink.toLowerCase() === '#00aa88',
+      `(accent=${after.accent}, pink=${after.pink}, house is ${houseAccent})`
+    );
+    check(
+      '#52 the brand name reaches the page title',
+      /UI Test Exchange/.test(after.title),
+      `("${after.title}")`
+    );
+    check(
+      '#52 the tenant is marked on the document root',
+      typeof after.slug === 'string' && after.slug.length > 0,
+      `(data-tenant=${after.slug})`
+    );
+
+    // ── an UNUSABLE palette value must be IGNORED, not applied ──────────────
+    // A CSS custom property accepts nearly any token sequence, so applying
+    // garbage makes every rule using it fail at computed-value time: a blank
+    // venue, not a wrong accent. Written through the API on purpose — the desk
+    // refuses it, and the APPLY side is what is under test.
+    await writeBrand(tid, { ...brand, palette: { accent: 'not-a-colour', pink: '#00aa88', 'text;--x': '#000' } });
+    await reload();
+    const poisoned = await rootVars();
+    check(
+      '#52 a palette value that is not a colour is ignored, not applied',
+      poisoned.accent.toLowerCase() !== 'not-a-colour' &&
+        poisoned.accent.toLowerCase() === (houseAccent || '').toLowerCase(),
+      `(accent=${poisoned.accent}, house is ${houseAccent})`
+    );
+    check(
+      '#52 a valid palette key alongside an invalid one still applies',
+      poisoned.pink.toLowerCase() === '#00aa88',
+      `(pink=${poisoned.pink})`
+    );
+    check(
+      '#52 a palette key that is not a property name is refused',
+      !/--x/.test(poisoned.inline) && !/text;/.test(poisoned.inline),
+      `(inline=${poisoned.inline})`
+    );
+
+    // ── the terms URL needs a surface; the Account panel is the one there is ─
+    // COUNT first, then read: a missing element makes textContent() wait out
+    // the full 30s default, and the scenario must close the modal on BOTH
+    // paths — an overlay left open here breaks every scenario after this one
+    // and buries the real failure under four unrelated ones.
+    await page.click('#accountBtn');
+    await page.waitForSelector('#accountModal.show', { timeout: 5000 });
+    const hasTermsSlot = (await page.locator('#pwTerms').count()) === 1;
+    const termsText = hasTermsSlot ? ((await page.locator('#pwTerms').textContent()) || '').trim() : '';
+    check(
+      '#52 the tenant terms URL reaches the player',
+      hasTermsSlot && /\/terms\/ui-test/.test(termsText),
+      hasTermsSlot ? `("${termsText.slice(0, 60)}")` : '(the account panel has no terms slot at all)'
+    );
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 5000 });
+
+    // Back to the house palette, so the next scenario reads a clean venue.
+    await writeBrand(tid, { name: '', logo: '', terms_url: null, palette: {} });
+    await reload();
+    const reset = await rootVars();
+    check(
+      '#52 clearing the brand puts the house colours back',
+      reset.accent.toLowerCase() === (houseAccent || '').toLowerCase(),
+      `(accent=${reset.accent}, house is ${houseAccent})`
+    );
+  });
+
+  await scenario('#52 the desk can set the brand it serves', async () => {
+    await page.click('#nav button[data-page="admin"]');
+    await page.waitForSelector('[data-view="tenants"]', { timeout: 10000 });
+    await page.click('[data-view="tenants"]');
+    await page.waitForFunction(
+      () => /tenants/i.test((document.querySelector('#adminBody h4') || {}).textContent || ''),
+      null,
+      { timeout: 10000 }
+    );
+    const tid = await page.evaluate(() => {
+      const b = document.querySelector('#adminBody [data-tenant]');
+      return b ? Number(b.dataset.tenant) : null;
+    });
+    check('#52 fixture: the tenant view offers an edit control', tid !== null, `(tenant ${tid})`);
+    if (tid === null) return;
+
+    await page.locator(`#adminBody [data-tenant="${tid}"]`).click();
+    const hasName = (await page.locator('#tBrandName').count()) === 1;
+    check(
+      '#52 the tenant editor carries branding fields',
+      hasName,
+      '(the desk could not even SET the brand JSON before)'
+    );
+    if (!hasName) return;
+
+    await page.fill('#tBrandName', 'Desk Set Exchange');
+    await page.fill('#tBrandLogo', '/assets/logo.png');
+    await page.fill('#tBrandTerms', '/terms/from-the-desk');
+    await page.fill(`#tp_${tid}_accent`, '#123456');
+    await page.fill(`#tp_${tid}_pink`, '#654321');
+    await page.click('#tSave');
+    await page.waitForFunction(
+      () => /Tenant updated/.test((document.querySelector('#toast') || {}).textContent || ''),
+      null,
+      { timeout: 15000 }
+    );
+    const stored = await page.evaluate(async (id) => {
+      const d = await (await fetch('/api/admin/tenants')).json();
+      const t = d.tenants.find((x) => x.id === id);
+      try {
+        return JSON.parse(t.brand);
+      } catch {
+        return null;
+      }
+    }, tid);
+    check(
+      '#52 the desk writes the brand JSON the route already accepted',
+      !!stored &&
+        stored.name === 'Desk Set Exchange' &&
+        stored.palette.accent === '#123456' &&
+        stored.palette.pink === '#654321' &&
+        stored.terms_url === '/terms/from-the-desk',
+      `(brand ${JSON.stringify(stored)})`
+    );
+
+    // And the editor round-trips: reopening shows what was stored.
+    await page.locator(`#adminBody [data-tenant="${tid}"]`).click();
+    await page.waitForSelector('#tBrandName', { timeout: 10000 });
+    check(
+      '#52 the tenant editor reopens showing the brand it stored',
+      (await page.locator(`#tp_${tid}_pink`).inputValue()).toLowerCase() === '#654321' &&
+        (await page.locator('#tBrandTerms').inputValue()) === '/terms/from-the-desk',
+      `("${await page.locator(`#tp_${tid}_pink`).inputValue()}")`
+    );
+
+    // A palette value that is not a colour must never reach the venue: the
+    // apply side ignores it, but a blank page for every player is worse than a
+    // rejected form.
+    await page.fill(`#tp_${tid}_accent`, 'chartreuse');
+    delete adminWrites[`PUT /api/admin/tenants/${tid}`];
+    await page.click('#tSave');
+    await page.waitForTimeout(800);
+    check(
+      '#52 the desk refuses a palette value that is not a hex colour',
+      adminWrites[`PUT /api/admin/tenants/${tid}`] === undefined,
+      `(payload ${JSON.stringify(adminWrites[`PUT /api/admin/tenants/${tid}`])})`
+    );
+
+    // Restore, through the desk.
+    await page.fill('#tBrandName', '');
+    await page.fill('#tBrandTerms', '');
+    await page.fill('#tBrandLogo', '');
+    for (const k of ['accent', 'bg', 'text', 'blue', 'pink']) {
+      await page.fill(`#tp_${tid}_${k}`, '');
+    }
+    await page.click('#tSave');
+    await page.waitForFunction(
+      () => /Tenant updated/.test((document.querySelector('#toast') || {}).textContent || ''),
+      null,
+      { timeout: 15000 }
+    );
+    await reload();
+    const restored = await rootVars();
+    check(
+      '#52 clearing the palette from the desk puts the house colours back',
+      restored.accent.toLowerCase() === (houseAccent || '').toLowerCase(),
+      `(accent=${restored.accent}, house is ${houseAccent})`
+    );
+  });
+
+  // ── #52 (1/3): per-user limits and self-exclusion ────────────────────────
+  //
+  // lib/limits.js enforces the stake cap, the market-liability cap and the
+  // daily settled cap — and operator-recorded self-exclusion — on EVERY trade.
+  // Both were API routes with no control on the desk: `grep data-act` found
+  // balance, suspend/reinstate and promote/demote, and nothing else.
+  //
+  // The sharp assertion here is not "a dialog opens" — it is that raising ONE
+  // axis does not silently clear the others. The route's comment promises that
+  // an absent key leaves its axis untouched, and it does not: lib/limits.js's
+  // capOf() maps `undefined` to `null` and setLimits writes every axis on every
+  // call, so omitting a key CLEARS that cap. Measured against a running server
+  // before this control existed. So the checks read the caps back off the
+  // server after changing one of them.
+  await scenario('#52 per-user limits: reachable, and changing one axis keeps the others', async () => {
+    // Arrive at the desk explicitly: whatever scenario ran last may have left
+    // the browser on the board, and the tab strip only exists on #/admin.
+    if (!(await page.locator('[data-view="users"]').count())) {
+      await page.click('#nav button[data-page="admin"]');
+      await page.waitForSelector('[data-view="users"]', { timeout: 10000 });
+    }
+    await page.click('[data-view="users"]');
+    await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
+    // uitester, not demo: the first-run-lock scenario below signs demo in and
+    // needs it tradeable enough to be refused by exactly one thing.
+    await page.fill('#userSearch', 'uitester');
+    await page.click('#userSearchGo');
+    await page.waitForFunction(
+      () => {
+        const rows = [...document.querySelectorAll('#adminBody .adm-tbl tbody tr')];
+        return rows.length === 1 && (rows[0].textContent || '').includes('uitester');
+      },
+      null,
+      { timeout: 10000 }
+    );
+    const row = page.locator('#adminBody .adm-tbl tbody tr').first();
+    const uid = Number(((await row.locator('td').first().textContent()) || '').trim());
+
+    const hasLimits = (await row.locator('[data-act="limits"]').count()) === 1;
+    const hasExclude = (await row.locator('[data-act="exclude"]').count()) === 1;
+    check('#52 fixture: the account row carries a limits control', hasLimits, `(user ${uid})`);
+    check('#52 fixture: the account row carries a self-exclusion control', hasExclude, `(user ${uid})`);
+    if (!hasLimits || !hasExclude) return;
+
+    const limitsOf = () =>
+      page.evaluate(async (id) => {
+        const r = await (await fetch(`/api/admin/users/${id}/limits`)).json();
+        return r.limits;
+      }, uid);
+    const globalRow = async () => (await limitsOf()).find((r) => r.scope === 'global') || null;
+
+    // ── open the limits control ────────────────────────────────────────────
+    await row.locator('[data-act="limits"]').click();
+    await page.waitForSelector('.modal[role="dialog"] #lmSave', { timeout: 10000 });
+    check(
+      '#52 the limits control opens on the account under edit',
+      /uitester/.test((await page.locator('.modal[role="dialog"] h3').textContent()) || ''),
+      `("${((await page.locator('.modal[role="dialog"] h3').textContent()) || '').trim()}")`
+    );
+    check(
+      '#52 the limits control offers the global scope and per-market scopes',
+      (await page.locator('.modal[role="dialog"] #lmScope option[value="global"]').count()) === 1 &&
+        (await page.locator('.modal[role="dialog"] #lmScope option[value^="market:"]').count()) >= 1
+    );
+
+    // Three axes: two capped in dollars, one explicitly uncapped.
+    await page.selectOption('.modal[role="dialog"] #lmScope', 'global');
+    await page.fill('.modal[role="dialog"] [data-cents="max_open_stake_cents"]', '25');
+    await page.fill('.modal[role="dialog"] [data-cents="max_daily_settled_cents"]', '500');
+    await page.locator('.modal[role="dialog"] [data-nocap="max_market_liability_cents"]').check();
+    delete adminWrites[`PUT /api/admin/users/${uid}/limits`];
+    await page.locator('.modal[role="dialog"] #lmSave').click();
+    await page.waitForFunction(
+      () => /Limits saved/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    const wrote = adminWrites[`PUT /api/admin/users/${uid}/limits`] || null;
+    check(
+      '#52 the limits control sends every axis, not only the changed ones',
+      !!wrote &&
+        ['max_open_stake_cents', 'max_market_liability_cents', 'max_daily_settled_cents'].every((k) =>
+          Object.prototype.hasOwnProperty.call(wrote, k)
+        ),
+      `(payload ${JSON.stringify(wrote)})`
+    );
+    check(
+      '#52 the limits control sends integer cents and an explicit null for "no cap"',
+      !!wrote &&
+        wrote.scope === 'global' &&
+        wrote.max_open_stake_cents === 2500 &&
+        wrote.max_daily_settled_cents === 50000 &&
+        wrote.max_market_liability_cents === null,
+      `(payload ${JSON.stringify(wrote)})`
+    );
+    let g = await globalRow();
+    check(
+      '#52 the caps are stored on the server',
+      !!g && g.max_open_stake_cents === 2500 && g.max_daily_settled_cents === 50000,
+      `(row ${JSON.stringify(g)})`
+    );
+
+    // ── THE SHARP ONE: raise ONE axis, keep the others ─────────────────────
+    await row.locator('[data-act="limits"]').click();
+    await page.waitForSelector('.modal[role="dialog"] #lmSave', { timeout: 10000 });
+    check(
+      '#52 reopening shows the stored caps rather than a blank form',
+      (await page.locator('.modal[role="dialog"] [data-cents="max_daily_settled_cents"]').inputValue()) === '500.00',
+      `("${await page.locator('.modal[role="dialog"] [data-cents="max_daily_settled_cents"]').inputValue()}")`
+    );
+    await page.fill('.modal[role="dialog"] [data-cents="max_open_stake_cents"]', '50');
+    await page.locator('.modal[role="dialog"] #lmSave').click();
+    await page.waitForFunction(
+      () => /Limits saved/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    g = await globalRow();
+    check(
+      '#52 raising one cap does not clear the others',
+      !!g && g.max_open_stake_cents === 5000 && g.max_daily_settled_cents === 50000,
+      `(row ${JSON.stringify(g)} — a daily cap of null here is the server clearing an omitted axis)`
+    );
+    await page.locator('.modal[role="dialog"] #lmCancel').click().catch(() => {});
+
+    // ── self-exclusion, with a STRICT ISO end date ──────────────────────────
+    await row.locator('[data-act="exclude"]').click();
+    await page.waitForSelector('.modal[role="dialog"] #exGo', { timeout: 10000 });
+    check(
+      '#52 self-exclusion defaults to permanent',
+      await page.locator('.modal[role="dialog"] #exPermanent').isChecked() &&
+        (await page.locator('.modal[role="dialog"] #exUntil').isDisabled())
+    );
+    // An exclusion with no reason must not reach the server. The audit row is
+    // only as good as the reason in it, and this is the one action here with
+    // no inverse.
+    delete adminWrites[`POST /api/admin/users/${uid}/exclude`];
+    await page.locator('.modal[role="dialog"] #exGo').click();
+    await page.waitForFunction(
+      () => /reason is required/i.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 5000 }
+    );
+    check(
+      '#52 self-exclusion will not proceed without a written reason',
+      adminWrites[`POST /api/admin/users/${uid}/exclude`] === undefined,
+      `(payload ${JSON.stringify(adminWrites[`POST /api/admin/users/${uid}/exclude`])})`
+    );
+
+    await page.locator('.modal[role="dialog"] #exPermanent').uncheck();
+    const LOCAL = '2099-06-01T09:30';
+    await page.fill('.modal[role="dialog"] #exUntil', LOCAL);
+    await page.fill('.modal[role="dialog"] #exReason', 'ui test: exclusion recorded with a strict ISO end date');
+    delete adminWrites[`POST /api/admin/users/${uid}/exclude`];
+    await page.locator('.modal[role="dialog"] #exGo').click();
+    await page.waitForFunction(
+      () => /excluded/i.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    const ex = adminWrites[`POST /api/admin/users/${uid}/exclude`] || null;
+    check(
+      '#52 self-exclusion sends a strict ISO-8601 UTC instant, not a local wall clock',
+      !!ex && typeof ex.until === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(ex.until),
+      `(sent until=${JSON.stringify(ex && ex.until)}, field said "${LOCAL}")`
+    );
+    check(
+      '#52 self-exclusion sends the operator\'s reason',
+      !!ex && typeof ex.reason === 'string' && ex.reason.length >= 5,
+      `(${ex && ex.reason})`
+    );
+
+    // The only place the exclusion is visible afterwards: neither
+    // GET /api/admin/users nor GET /api/admin/users/:id returns self_excluded
+    // or excluded_until, so the audit trail is the record. Server-side read
+    // gap, reported rather than worked around.
+    await page.click('[data-view="audit"]');
+    await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
+    await page.fill('#auditTarget', `user:${uid}`);
+    await page.click('#auditGo');
+    await page.waitForFunction(
+      (id) => {
+        const tb = document.querySelector('#adminBody .adm-tbl tbody');
+        return !!tb && /user\.excluded/.test(tb.textContent || '') && (tb.textContent || '').includes(`user:${id}`);
+      },
+      uid,
+      { timeout: 10000 }
+    );
+    const auditText = (await page.locator('#adminBody .adm-tbl tbody').textContent()) || '';
+    // The end date reaches the trail in lib/util.js's normalised form — the same
+    // instant we sent, in SQLite's `YYYY-MM-DD HH:MM:SS` UTC. Asserting the
+    // ISO string verbatim here would fail while the trail was correct.
+    const inTrail = String(ex.until).replace('T', ' ').replace(/Z$/, '');
+    check(
+      '#52 the exclusion is audited with its reason and its end date',
+      /user\.excluded/.test(auditText) &&
+        auditText.includes(inTrail) &&
+        auditText.includes('ui test: exclusion recorded'),
+      `("${inTrail}" in: ${auditText.slice(0, 70)}…)`
+    );
   });
 
   // ── First-run lock ──────────────────────────────────────────────────────

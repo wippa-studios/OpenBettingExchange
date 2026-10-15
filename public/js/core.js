@@ -231,6 +231,9 @@
     OB.renderSlip();
     renderHeader();
     OB.connectSSE(); // the stream carries userId — rebind it to the new identity
+    // The tenant falls back to the default when signed out, so the palette has
+    // to go back with it — otherwise a player keeps an operator's branding.
+    await OB.loadBranding();
     OB.route();
     toast('Signed out');
   }

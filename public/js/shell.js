@@ -100,6 +100,7 @@
         closeAuth();
         OB.renderHeader();
         OB.connectSSE(); // private balance/orders events follow the new session
+        await OB.loadBranding(); // the tenant is resolved per user (#52)
         route();
         OB.toast(`Welcome back, ${r.user.username}`);
         // A seeded demo password locks the account out of everything except
@@ -117,6 +118,7 @@
         closeAuth();
         OB.renderHeader();
         OB.connectSSE();
+        await OB.loadBranding(); // the tenant is resolved per user (#52)
         route();
         OB.toast('Account created — top up in Wallet');
       }
@@ -195,6 +197,21 @@
     OB.$('pwNew').value = '';
     OB.$('pwNote').textContent = '';
     OB.openOverlay(OB.$('accountModal'), OB.$('pwCurrent'));
+    // The tenant's terms URL. There is no terms page and no footer in this
+    // shell, so the account panel is the one surface where a player is already
+    // looking at themselves and can be shown a per-tenant legal link. Absent
+    // (the default tenant sets none) the row is hidden rather than left empty.
+    const terms = OB.el('pwTerms');
+    const brandTerms = OB.state.branding && OB.state.branding.terms_url;
+    if (terms && brandTerms) {
+      terms.innerHTML = `Terms &amp; conditions: <a href="${OB.attr(brandTerms)}" target="_blank" rel="noopener noreferrer">${OB.esc(
+        brandTerms
+      )}</a>`;
+      terms.hidden = false;
+    } else if (terms) {
+      terms.textContent = '';
+      terms.hidden = true;
+    }
     renderSessions();
   }
 
@@ -215,7 +232,84 @@
     }
   }
 
+  // ── tenant branding (#52) ────────────────────────────────────────────────
+  // /api/branding has been served the whole time and NOTHING read it: a grep
+  // for "branding" across public/ returned zero hits, and editTenant could not
+  // even set the `brand` JSON, so ROADMAP.md's claim that per-tenant theming
+  // works "through the frontend" described a capability that did not exist.
+  // It is a CONFIG READ, which is exactly why the no-build frontend can do it:
+  // applying CSS custom properties from a JSON response.
+  //
+  // THE PALETTE IS UNTRUSTED INPUT. It comes from a tenant row anything with
+  // API access can write, and a CSS custom property accepts nearly any token
+  // sequence — so setProperty('--text', 'not a colour') really does set it,
+  // and every rule using var(--text) then fails at computed-value time. That
+  // is a blank venue, not a wrong accent. So: hex shapes only, property names
+  // restricted, and anything else IGNORED rather than applied. The house
+  // palette in :root stands for whatever is refused.
+  const HEX = /^#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+  const PROP_NAME = /^[a-z][a-z0-9-]{0,30}$/i;
+
+  function applyBranding(b) {
+    if (!b) return;
+    OB.state.branding = b;
+    const root = document.documentElement;
+    for (const [k, v] of Object.entries(b.palette || {})) {
+      if (!PROP_NAME.test(String(k))) continue;
+      if (!HEX.test(String(v).trim())) continue;
+      root.style.setProperty(`--${k}`, String(v).trim());
+    }
+    if (b.name) document.title = `${b.name} — paper-money betting exchange`;
+    const logo = document.querySelector('.logo img');
+    // The venue's own CSP is `img-src 'self' data:`, so a remote logo URL is
+    // refused by the browser whatever we do here. A path that would be blocked
+    // is left alone rather than swapped for a broken image.
+    if (logo && typeof b.logo === 'string' && /^\/(?!\/)/.test(b.logo)) {
+      logo.src = b.logo;
+      logo.alt = b.name || 'Exchange';
+    }
+    if (b.tenant && b.tenant.slug) root.setAttribute('data-tenant', b.tenant.slug);
+  }
+
+  // Called at boot and again whenever the SESSION changes, because the tenant
+  // is resolved per user (`TEN.ofUser`) and falls back to the default when
+  // signed out. A failure is not fatal: the :root palette is the default.
+  async function loadBranding() {
+    try {
+      applyBranding(await OB.api('GET', '/api/branding'));
+    } catch {
+      /* the default palette stands */
+    }
+  }
+
   // ── routing ──────────────────────────────────────────────────────────────
+
+  /**
+   * Navigate to a page BY NAME, handling the case where the caller is already
+   * on it.
+   *
+   * Assigning `location.hash` the value it already holds fires no `hashchange`,
+   * so `route()` never runs and the promised move never happens. This is not a
+   * corner: it is exactly what the Cash Out multi-position fallback did when
+   * pressed from My Bets — the most likely place to press it — so it told the
+   * user to pick one in Positions while Open orders stayed on screen.
+   *
+   * "Navigate to the page I am already on" is a recurring shape in this
+   * codebase and every occurrence needs the same guard, so it is a helper
+   * rather than a one-line patch at the call site.
+   *
+   * Re-rendering the current page is the honest meaning of that navigation:
+   * the caller asked for this view to be the one on screen, and it is.
+   */
+  function goTo(page) {
+    const hash = '#/' + page;
+    if (location.hash === hash) {
+      route();
+      return;
+    }
+    location.hash = hash;
+  }
+
   function route() {
     const hash = (location.hash || '#/markets').replace('#/', '');
     const known = ['markets', 'bets', 'wallet', 'admin'];
@@ -316,5 +410,5 @@
   }
 
 
-  Object.assign(OB, { closeAuth, closeNavRail, detectFeed, loadEvents, loadSports, openAccount, openAuth, openNavRail, refreshAll, refreshMarkets, renderPage, renderSessions, route, submitAuth, submitPasswordChange });
+  Object.assign(OB, { applyBranding, closeAuth, closeNavRail, detectFeed, goTo, loadBranding, loadEvents, loadSports, openAccount, openAuth, openNavRail, refreshAll, refreshMarkets, renderPage, renderSessions, route, submitAuth, submitPasswordChange });
 })();

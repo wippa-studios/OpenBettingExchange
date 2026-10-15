@@ -111,9 +111,10 @@
     // One-time static bindings. Page-level handlers are attached by the render
     // functions; nothing here touches rendered content.
     OB.qa('#nav button').forEach((b) => {
-      b.onclick = () => {
-        location.hash = '#/' + b.dataset.page;
-      };
+      // goTo() rather than `location.hash = ...`: clicking the tab you are
+      // already on assigns the same hash, which fires no `hashchange` and so
+      // re-renders nothing. #50.
+      b.onclick = () => OB.goTo(b.dataset.page);
     });
     OB.$('authBtn').onclick = () => (OB.state.user ? OB.logout() : OB.openAuth('login'));
     OB.$('accountBtn').onclick = () => OB.openAccount();
@@ -151,6 +152,10 @@
     if (co) co.onclick = OB.doCashOut;
 
     await OB.refreshMe();
+    // Before the first paint, and before the route: the tenant is part of who
+    // this session is, so a signed-in operator gets their tenant's palette on
+    // the board rather than the default one flashing first. (#52)
+    await OB.loadBranding();
     await OB.detectFeed();
     await OB.loadSports();
     // W2: single-pass boot. loadNav resolves the selection in state (it no

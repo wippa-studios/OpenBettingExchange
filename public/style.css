@@ -660,6 +660,37 @@ form.inline { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
 .creategrid .card { margin: 0; display: flex; flex-direction: column; gap: 6px; }
 .modal { z-index: 50; }
 .modal h3 { margin: 0 0 10px; }
+/* Dialogs take typed input (limits, exclusion, settlement reason). The input
+   rules above cover the slip, the create grid and #authModal only, so a number
+   field inside a .modal fell back to the UA default and looked like it had come
+   from somewhere else. Same tokens, same radius, same focus ring. */
+.modal input:not([type="checkbox"]):not([type="radio"]),
+.modal select,
+.modal textarea {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--line2);
+  color: var(--text);
+  padding: 6px 8px;
+  border-radius: 6px;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.modal input:not([type="checkbox"]):not([type="radio"]):focus,
+.modal select:focus,
+.modal textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+.modal input:disabled,
+.modal select:disabled { opacity: 0.55; }
+/* A field row: label above, control below, with a trailing toggle. */
+.fieldrow { display: flex; align-items: center; gap: 8px; }
+.fieldrow > .noflex { flex: 1; }
+.modal .optrow { cursor: pointer; }
+/* Tenant palette editor: a fixed-width key so the hex fields line up. */
+.palkey { min-width: 96px; flex: none; }
 .optrow { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
 .optrow .muted { margin-left: auto; font-size: 11px; }
 

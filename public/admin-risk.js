@@ -284,20 +284,141 @@
   async function releaseHeld(body, marketId, decision) {
     const reason = askReason(`Releasing this held market as ${decision}`);
     if (!reason) return;
-    let winner = null;
+    const payload = { decision, reason };
     if (decision === 'settle') {
-      const raw = window.prompt('Winning selection id (see the market on the board):');
-      if (raw === null) return;
-      winner = Number(raw);
-      if (!Number.isInteger(winner) || winner <= 0) { toast('A positive selection id is required'); return; }
+      // By NAME, from the market's own book. The id prompt this replaced -
+      // "Winning selection id (see the market on the board)" - asked the
+      // operator for a value the product renders NOWHERE: cellHtml() puts
+      // selection ids into data-sel and aria-label only, and the settle dialog
+      // showed names too. A wrong id is a 400 on the screen that moves the
+      // most money.
+      const picked = await pickJointWinners(marketId);
+      if (picked === null) return; // cancelled - releasing nothing
+      // ONE runner is a win; TWO OR MORE is the dead heat. Sending a single
+      // winner_selection_id for a tie is the harm lib/results.js records at
+      // lines 316-323: releasing a held joint favourite as one runner paid a
+      // whole stake to one person and charged the other joint winner's backer
+      // his entire stake on a horse that TIED. The route has accepted
+      // `dead_heat` for that reason and no screen could send it. This is it.
+      if (picked.length === 1) payload.winner_selection_id = picked[0];
+      else payload.dead_heat = picked;
     }
     try {
-      await api('POST', `/api/admin/results/held/${marketId}/release`, {
-        decision, winner_selection_id: winner, reason,
-      });
+      await api('POST', `/api/admin/results/held/${marketId}/release`, payload);
       toast(`Market ${marketId} ${decision === 'void' ? 'voided' : 'settled'}`);
       renderResultsView(body);
     } catch (e) { toast(e.message); }
+  }
+
+  /**
+   * Choose the winning runner(s) of a held market, BY NAME.
+   *
+   * Resolves with the chosen selection ids, or null when the operator
+   * cancelled. The runners come from the same `/api/markets/:id/book` call the
+   * settle dialog makes, so the two screens cannot drift about what a market's
+   * runners are.
+   *
+   * Checkboxes rather than radios because the engine settles a SET of winners:
+   * lib/settle.js takes `dead_heat` as the joint-winner set and divides each pot
+   * among them. One tick and two ticks are therefore the same control meaning
+   * two different outcomes, so the summary line says which one is about to
+   * happen BEFORE the operator commits money.
+   *
+   * The runner id is printed beside each name - muted, after the name - so the
+   * value that reaches the audit trail can be read off the screen instead of
+   * taken on trust. It is never something the operator has to type.
+   *
+   * The "at least one selection" guard is usability, NOT a control.
+   * lib/results.js is the authority: it refuses a dead_heat list shorter than
+   * two DISTINCT ids, a non-integer, a boolean and a quoted string, and a
+   * release carrying neither a winner nor a dead_heat is a 400.
+   */
+  async function pickJointWinners(marketId) {
+    let book;
+    try {
+      const r = await api('GET', `/api/markets/${marketId}/book`);
+      book = r.book || [];
+    } catch (e) {
+      toast(e.message, 'err');
+      return null;
+    }
+    if (!book.length) {
+      toast('This market has no runners to choose from', 'err');
+      return null;
+    }
+    const overlay = document.createElement('div');
+    overlay.className = 'modal';
+    // The shared overlay stack, so Escape closes THIS dialog, Tab stays inside
+    // it and focus returns to the button that opened it - the same treatment
+    // settleDialog gets.
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.innerHTML = `
+      <div class="box">
+        <h3>Release as settled</h3>
+        <p class="muted hint">Tick the one runner that won. Tick two or more if they tied - a joint
+          result splits each pot between them, which is NOT the same as paying one runner the whole pot.</p>
+        <div id="hoWinners" role="group" aria-label="Winning runners">
+          ${book
+            .map(
+              (s) => `<label class="optrow">
+              <input type="checkbox" class="hoPick" value="${attr(s.selection_id)}" />
+              <span>${esc(s.name)}</span>
+              <span class="muted tn">#${attr(s.selection_id)} &middot; LTP ${price2(s.ltp)}</span>
+            </label>`
+            )
+            .join('')}
+        </div>
+        <div class="muted fineprint" id="hoSummary" aria-live="polite">Nothing selected.</div>
+        <div class="row mt">
+          <button class="btn primary grow" id="hoGo" disabled>Release as settled</button>
+          <button class="btn" id="hoCancel">Cancel</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    openOverlay(overlay);
+
+    let settle;
+    const answered = new Promise((res) => { settle = res; });
+    // Cancel and the backdrop both mean "release nothing", and both must
+    // unblock the awaiter in releaseHeld as well as dismiss the overlay.
+    const dismiss = () => { closeOverlay(overlay); settle(null); };
+
+    const go = overlay.querySelector('#hoGo');
+    const summary = overlay.querySelector('#hoSummary');
+    const picked = () =>
+      Array.from(overlay.querySelectorAll('.hoPick'))
+        .filter((c) => c.checked)
+        .map((c) => {
+          const row = c.closest('.optrow');
+          const name = row.querySelector('span:not(.muted)');
+          return { id: Number(c.value), name: (name && name.textContent) || '' };
+        });
+
+    overlay.querySelectorAll('.hoPick').forEach((c) => {
+      c.onchange = () => {
+        const sel = picked();
+        go.disabled = sel.length === 0;
+        if (sel.length === 0) summary.textContent = 'Nothing selected.';
+        else if (sel.length === 1) summary.textContent = `Settling as ${sel[0].name}.`;
+        else
+          summary.textContent =
+            `Dead heat: ${sel.length} joint winners (${sel.map((p) => p.name).join(', ')}). ` +
+            'Each pot is split between them.';
+      };
+    });
+    overlay.querySelector('#hoCancel').onclick = dismiss;
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) dismiss();
+    });
+    go.onclick = () => {
+      const ids = picked().map((p) => p.id);
+      closeOverlay(overlay);
+      // DISTINCT: lib/results.js refuses a dead_heat of fewer than two
+      // DISTINCT ids, so the list must never carry a repeat.
+      settle(ids.length ? [...new Set(ids)] : null);
+    };
+    return answered;
   }
 
   // ── Tenants ───────────────────────────────────────────────────────────────
@@ -338,31 +459,105 @@
     });
   }
 
+  // ── Branding ────────────────────────────────────────────────────────────
+  // The keys the desk offers. The APPLY side (shell.js) accepts any property
+  // name a tenant row carries, so an operator who sets `red` or `card2` through
+  // the API gets it too; this is the curated subset worth surfacing, not a
+  // closed vocabulary.
+  const PALETTE_KEYS = [
+    ['accent', 'Accent'],
+    ['bg', 'Background'],
+    ['text', 'Text'],
+    ['blue', 'Back prices'],
+    ['pink', 'Lay prices'],
+  ];
+  const HEX_RE = /^#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+
+  function currentBrand(tenant) {
+    try {
+      const b = JSON.parse(tenant.brand || 'null');
+      return b && typeof b === 'object' ? b : {};
+    } catch {
+      return {};
+    }
+  }
+
+  // Prefixed so two tenants can be edited on one screen without their palettes
+  // bleeding into each other.
+  const pf = (tenantId, key) => `tp_${tenantId}_${key.replace(/[^a-z0-9]/gi, '')}`;
+
   function editTenant(body, tenant) {
     const out = body.querySelector('#tenantOut');
+    const brand = currentBrand(tenant);
+    const pal = brand.palette && typeof brand.palette === 'object' ? brand.palette : {};
     out.innerHTML = `
       <div class="card">
         <h4>Edit ${esc(tenant.name)}</h4>
         <label>Commission (bps)</label>
-        <input id="tBps" type="number" min="0" max="2000" value="${tenant.commission_bps}">
+        <input id="tBps" type="number" min="0" max="2000" value="${attr(tenant.commission_bps)}">
         <label>Jurisdictions (comma-separated ISO codes; empty = unrestricted)</label>
         <input id="tJuris" value="${esc(JSON.parse(tenant.jurisdictions || '[]').join(', '))}">
         <label>Status</label>
         <select id="tStatus"><option value="active" ${tenant.status === 'active' ? 'selected' : ''}>active</option>
           <option value="suspended" ${tenant.status === 'suspended' ? 'selected' : ''}>suspended</option></select>
+
+        <h4 class="fieldlabel adm-sub">Branding</h4>
+        <p class="muted fineprint">A config read, not a build step: these become CSS custom properties on
+          :root. Every player of this tenant sees them.</p>
+        <label>Brand name (page title, logo alt text)</label>
+        <input id="tBrandName" value="${esc(brand.name || '')}">
+        <label>Logo (a path on this venue, e.g. /assets/logo.png)</label>
+        <input id="tBrandLogo" value="${esc(brand.logo || '')}">
+        <label>Terms URL (shown in the player's Account panel)</label>
+        <input id="tBrandTerms" value="${esc(brand.terms_url || '')}">
+        <label>Palette — hex colours, empty = the house default</label>
+        ${PALETTE_KEYS.map(
+          ([k, label]) =>
+            `<div class="fieldrow">
+              <span class="muted tn palkey">${esc(label)}</span>
+              <input id="${pf(tenant.id, k)}" value="${esc(pal[k] || '')}" placeholder="unset" spellcheck="false" />
+            </div>`
+        ).join('')}
+
         <div class="row gap"><button class="btn primary" id="tSave">Save</button>
         <button class="btn" id="tCancel">Cancel</button></div>
       </div>`;
     out.querySelector('#tCancel').onclick = () => { out.innerHTML = ''; };
     out.querySelector('#tSave').onclick = async () => {
       const jurisRaw = out.querySelector('#tJuris').value.trim();
+      // Validate HERE, not server-side: lib/tenants.js stores `brand` as an
+      // opaque JSON.stringify with no inspection at all, so the desk is the
+      // only thing standing between a typo and a venue whose --text is not a
+      // colour and every rule using it fails at computed-value time.
+      const palette = {};
+      for (const [k] of PALETTE_KEYS) {
+        const raw = out.querySelector(`#${pf(tenant.id, k)}`).value.trim();
+        if (!raw) continue;
+        if (!HEX_RE.test(raw)) return toast(`Palette "${k}" must be a hex colour, e.g. #1b5fd9`, 'err');
+        palette[k] = raw;
+      }
+      const logo = out.querySelector('#tBrandLogo').value.trim();
+      if (logo && !/^\/(?!\/)/.test(logo)) {
+        return toast('The logo must be a path on this venue, e.g. /assets/logo.png', 'err');
+      }
+      const termsUrl = out.querySelector('#tBrandTerms').value.trim();
+      const nextBrand = {
+        name: out.querySelector('#tBrandName').value.trim(),
+        logo: logo || '/assets/logo.png',
+        terms_url: termsUrl || null,
+        palette,
+      };
       try {
         await api('PUT', `/api/admin/tenants/${tenant.id}`, {
           commission_bps: Number(out.querySelector('#tBps').value),
           status: out.querySelector('#tStatus').value,
           jurisdictions: jurisRaw ? jurisRaw.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean) : [],
+          brand: nextBrand,
         });
-        toast('Tenant updated');
+        // ONE toast, not two. toast() overwrites #toast in place, so a second
+        // call silently replaces the first: the "Tenant updated" confirmation
+        // this used to be followed by was never seen by anybody.
+        toast('Tenant updated · branding applies on the next page load');
         renderTenantsView(body);
       } catch (e) { toast(e.message); }
     };
