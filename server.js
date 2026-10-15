@@ -1699,9 +1699,18 @@ app.get('/api/events', limit('read'), (req, res) => {
     };
   });
   if (books.length) {
-    const matched = MARKETDATA.matchedByLevel(db, { marketIds: books.map((b) => b.market_id) });
+    // The window is passed to BOTH calls, because `matched_window_minutes` is
+    // what the ladder's runner badge prints in its tooltip. Pinning the badge to
+    // the default while querying some other window would make the caption lie,
+    // and no test would see it: both values would still be internally consistent.
+    const matched = MARKETDATA.matchedByLevel(db, {
+      marketIds: books.map((b) => b.market_id),
+      window: MARKETDATA.DEFAULT_WINDOW_MINUTES,
+    });
     for (const b of books) {
-      MARKETDATA.attachRows(b.book, matched.filter((r) => r.market_id === b.market_id));
+      MARKETDATA.attachRows(b.book, matched.filter((r) => r.market_id === b.market_id), {
+        window: MARKETDATA.DEFAULT_WINDOW_MINUTES,
+      });
     }
   }
   res.json({ events });

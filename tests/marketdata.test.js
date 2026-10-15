@@ -454,7 +454,43 @@ const tapeRows = (db, selectionId) => db.prepare('SELECT COUNT(*) c FROM price_h
     fs2.rmSync(dir, { recursive: true, force: true });
   });
 
-  // ── The routes. #93's second acceptance item is an ENDPOINT, and an endpoint
+  // M10b: the window the book REPORTS is the window it was computed over.
+  //
+  // `matched_window_minutes` is what the ladder renders in the runner badge's
+  // tooltip, so a book that reported the DEFAULT while its rows came from a
+  // 180-minute aggregate would put "in the last 10 minutes" beside a number
+  // that is not one. The pre-state here is the failure itself: assert the
+  // window is the caller's BEFORE any trade exists, because a version that
+  // hardcoded the constant would answer 10 for both windows and pass a check
+  // written only against the default.
+  await check('M10b the book reports the window its matched figures were taken over', async () => {
+    const { db, market_id, alpha, alice, bob } = await fixture();
+    restBack(db, alice, alpha, 2.0, 9000);
+    M.placeOrder(db, bob, { selection_id: alpha, side: 'lay', price: 2.0, stake_cents: 1500 });
+
+    const forWindow = (w) => MD.attachMatchedLevels(db, bookOf(db, market_id), { marketId: market_id, window: w })
+      .find((s) => s.selection_id === alpha);
+
+    // PRE-STATE, at two windows that differ: the old code answered 10 for both.
+    assert.strictEqual(forWindow(10).matched_window_minutes, 10);
+    assert.strictEqual(forWindow(180).matched_window_minutes, 180);
+    // The rows are identical here (one recent fill) — what must differ is the
+    // LABEL, so the assertion is on the label and not on the money.
+    assert.strictEqual(forWindow(180).matched_cents, forWindow(10).matched_cents);
+
+    // attachRows is the pure form and is the one the BOARD route calls, so it is
+    // pinned directly: a caller that forgot to forward the window is the bug.
+    const rows = MD.matchedByLevel(db, { marketIds: [market_id], window: 45 });
+    assert.strictEqual(rows.length, 1, 'pre-state: there is a row to attach');
+    const bare = MD.attachRows(bookOf(db, market_id), rows, { window: 45 });
+    assert.strictEqual(bare.find((s) => s.selection_id === alpha).matched_window_minutes, 45,
+      'attachRows forwards the window it was given');
+    // And with no window at all it still names the default, so the field is never
+    // undefined for a client to print.
+    assert.strictEqual(MD.attachRows(bookOf(db, market_id), rows)[0].matched_window_minutes, MD.DEFAULT_WINDOW_MINUTES);
+  });
+
+  // ── M11: the routes. #93's second acceptance item is an ENDPOINT, and an endpoint
   // nobody called is how `price_history` became write-only in the first place.
   await check('M11 the three routes answer, and the series is fed by the tape', async () => {
     const srv = require('../server');
