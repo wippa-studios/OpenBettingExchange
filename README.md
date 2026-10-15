@@ -427,11 +427,7 @@ weight.
 ```bash
 
 
-<<<<<<< HEAD
-npm test            # 842 checks: unit and API integration, fully offline
-=======
-npm test            # 843 checks: unit and API integration, fully offline
->>>>>>> fix/nonrunner
+npm test            # 868 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 212 checks: real Chromium via Playwright (board and admin desk)
