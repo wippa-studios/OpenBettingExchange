@@ -46,7 +46,7 @@ delay, per-user abuse limits, responsible-gambling controls, and an operator des
 
 | | |
 |---|---|
-| Tests | **833 checks / 65 suites**, plus a **212-check** Playwright browser suite |
+| Tests | **842 checks / 65 suites**, plus a **212-check** Playwright browser suite |
 | CI | 8 jobs: node 22 + 24, browser, guards, load smoke, dependency audit, and two secret scans |
 | Supply chain | every action pinned to a full commit SHA, dependabot configured |
 | Docs | `check-docs.mjs` **fails the build** when documentation contradicts the code |
