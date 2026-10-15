@@ -17,6 +17,8 @@ against the code as it stands, not an aspiration.
 ## Contents
 
 - [1. Where we actually are](#1-where-we-actually-are)
+  - [What the checks cannot see, and the one that now covers it](#what-the-checks-cannot-see-and-the-one-that-now-covers-it--84)
+  - [Do not re-add the `.env.example` key count to prose](#do-not-re-add-the-envexample-key-count-to-prose--103)
 - [2. Corrections to the risk picture](#2-corrections-to-the-risk-picture)
 - [3. Phase plan](#3-phase-plan)
   - [Phase 0 — Make it actually open source](#phase-0--make-it-actually-open-source)
@@ -80,6 +82,65 @@ preserve it.
 - No reconciliation timer — the report exists, nothing schedules it
 - No KYC, age verification, reality checks or session limits
 - No backup/restore path, and no monitoring surface
+
+### What the checks cannot see, and the one that now covers it — #84
+
+`scripts/check-docs.mjs` is the unusual part of this repository, and its track
+record is kept in **`STATE.md` §1** rather than duplicated here — a second copy of
+a list of findings is itself a number that rots. Read it there.
+
+The part worth carrying into this document is the *shape* of its limit. Every
+assertion it makes asks *"does this claim match the code?"* A conflict marker is
+not a wrong claim, it is the **absence** of a file's intended content:
+`0597862` shipped `<<<<<<< HEAD` inside `docs/API.md`'s route table, every CI
+run was green, and `3f9d648` (#82) is what added
+`scripts/check-conflict-markers.mjs`. Nothing that reads a file and reasons about
+what it says can see it, because it says nothing.
+
+`scripts/check-release-facts.mjs` is a check about a fact that is **absent**
+rather than a claim that is wrong — the same blind spot class, one step further
+out. `CHANGELOG.md` documents `[0.1.0] - 2026-09-24` and `[0.2.0] - 2026-09-25`;
+`git tag` returns nothing and `package.json` says `0.1.0`. No count, link or
+contradiction check can see a release that was never tagged, because nothing in
+the codebase contradicts a tag that does not exist. The check asserts that every
+dated release heading has a git tag, and that `package.json` agrees with the
+highest released heading.
+
+**It is red on `main` today, and that is the check working.** Two dated releases
+with no tag, and the manifest disagreeing with the changelog. Which of the three
+sources is right is an author decision (#84), not a mechanical one, and the script
+reports the disagreement without taking a side.
+
+Its most important behaviour is the one that is *not* an assertion. It refuses to
+run on a shallow checkout, because a depth-1 fetch carries no tags and "no tags"
+cannot be told apart from "never tagged". A checker that produces a specific and
+wrong accusation because of how the harness fetched the repository is worse than
+no checker at all, so it reports that it cannot verify, and stops.
+
+### DO NOT RE-ADD THE `.env.example` KEY COUNT TO PROSE — #103
+
+Three documents gave three numbers for one fact: `README.md` said **61**,
+`docs/ROADMAP.md` said **58**, and the derived surface is **61**. All three were
+true when written, and all three rotted, which is the entire argument.
+
+**The count now appears in no prose at all.** It is printed by
+`npm run check:env-example`, derived from `lib/config.js` and `server.js`, and it
+is written down nowhere a future contributor could copy it and let it drift. The
+guarantee that actually matters — every key the code reads is documented, with
+the value the code defaults to, and no phantoms — is asserted mechanically by a
+check that fails the build, so it does not need a number beside it to be
+believed. If you find yourself adding a key count to a document, do not: add the
+key to `.env.example` and let the checker count it.
+
+That decision was **not** applied to the unit test count, because
+`check-docs.mjs` already derives that number by running `npm test` and comparing
+it against every document that states it — one derivation, several correct
+restatements. `STATE.md` was the exception: it is not in that check's document
+list, deliberately, because §2.2 quotes the fabricated `[0.2.0]` changelog
+verbatim and an unscoped count check would destroy that evidence. So `STATE.md`'s
+own table row is asserted separately and **anchored on the row** rather than on a
+pattern, and the row now says in the cell that it is a dated snapshot — because a
+reader who lands on the number never sees the preamble that says so.
 
 ---
 
@@ -570,9 +631,11 @@ real, and the record of how that was found is the useful part.
 2. **KYC and age verification.** Deliberately absent: an identity control with
    an external verification provider, not a limit. `lib/tenants.js` carries
    jurisdiction data, but nothing verifies anybody against it.
-3. **Complete `.env.example`.** DONE — all 58 keys the server reads are documented,
-   and `scripts/check-env-example.mjs` (run in CI) fails if one goes missing,
-   if a default value drifts, or if the file documents a key nothing reads.
+3. **Complete `.env.example`.** DONE — every key the server reads is documented
+   with the value `lib/config.js` actually defaults to, and
+   `scripts/check-env-example.mjs` (run in CI) fails if one goes missing, if a
+   default value drifts, or if the file documents a key nothing reads.
+   *Deliberately no count is written here — see §1.*
 4. **The escrow top-up path in `lib/match.js`.** A 1-cent rounding top-up when a
    resting layer has no available balance can abort the taker's entire
    placement, including a stranger's, and reports the taker as insufficient.

@@ -493,16 +493,6 @@ why it is recorded separately: **the feed-health pair had drifted apart.**
   It now always answers 200 with `enabled:false` when off. A configured feed
   whose database is down still answers 503, so a genuine outage is not mistaken
   for "no markets today".
-
-### Security
-- `HOST` is validated as loopback-only; a routable bind now aborts the launch.
-- Origin guard moved ahead of body parsing so a foreign origin is rejected even
-  with a malformed body.
-- 5xx responses return a generic message; internals only reach the log.
-- Constant-time login for unknown users; expired sessions purged at boot.
-- `nosniff` and `same-origin` referrer headers; JSON `404` for `/api/*`.
-
-### Fixed
 - Settlement input is validated strictly — `void: "false"` no longer voids a
   market and a boolean can no longer become a selection id.
 - Cash-out quotes exclude the caller's own resting orders and pre-validate
@@ -518,6 +508,14 @@ why it is recorded separately: **the feed-health pair had drifted apart.**
   container connectivity; the SSE stream rebinds on sign-in/out.
 - Seeded fair prices are stored on the ladder (a hand-written `2.75` is not a
   tick in the `2.02–3.00` band).
+
+### Security
+- `HOST` is validated as loopback-only; a routable bind now aborts the launch.
+- Origin guard moved ahead of body parsing so a foreign origin is rejected even
+  with a malformed body.
+- 5xx responses return a generic message; internals only reach the log.
+- Constant-time login for unknown users; expired sessions purged at boot.
+- `nosniff` and `same-origin` referrer headers; JSON `404` for `/api/*`.
 
 ### Changed
 - Money column `CHECK` constraints in SQLite: non-negative integer cents,

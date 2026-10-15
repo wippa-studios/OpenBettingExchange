@@ -16,6 +16,7 @@
     "check:env-example": "node scripts/check-env-example.mjs",
     "check:pins": "node scripts/check-action-pins.mjs",
     "check:conflicts": "node scripts/check-conflict-markers.mjs",
+    "check:releases": "node scripts/check-release-facts.mjs",
     "load": "node scripts/load-test.mjs"
   },
   "engines": {

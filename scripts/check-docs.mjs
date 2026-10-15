@@ -197,6 +197,87 @@ if (checks) {
     }
   }
 
+  // ── STATE.md's own table row, anchored ───────────────────────────────────
+  //
+  // STATE.md is deliberately NOT in DOCS, and the unscoped prose regexes above
+  // are the reason it cannot simply be added to that list. Two of them fire on
+  // correct text in this file:
+  //
+  //   1. The browser-count consistency check reads any line mentioning "browser
+  //      suite". STATE.md §1 states the UNIT total and the browser suite in the
+  //      same table cell, in the shape "817 checks / 64 suites … 212-check
+  //      browser suite". Its heuristic reads `817 checks` as the browser figure
+  //      and disagrees with 212 — a guaranteed false positive, and exactly the
+  //      trap that made the `unitTotal` guard above necessary in the first place.
+  //   2. §2.2 QUOTES the fabricated [0.2.0] changelog text verbatim — "a
+  //      real-browser Playwright suite (24 checks)" — because quoting the false
+  //      claim is how that section makes its point. An unscoped present-tense
+  //      check would demand that "24 checks" become today's number, which would
+  //      DESTROY the evidence. (CHANGELOG.md is excluded from DOCS for the same
+  //      reason; see the note above the DOCS list.)
+  //
+  // So this asserts the ONE row that states a current count, found by its own
+  // leading cell rather than by scanning for numbers. It cannot fire on history
+  // elsewhere in the file because it does not look at any other line.
+  //
+  // The row is REQUIRED. A STATE.md that silently dropped or renamed it must fail
+  // here rather than quietly escape the one count that is checked: a check whose
+  // subject can vanish without complaint is a check that stops being one.
+  if (exists('STATE.md')) {
+    const stateRows = read('STATE.md').split('\n');
+    const row = stateRows.find((l) => /^\|\s*Tests\s*\|/.test(l));
+    if (!row) {
+      note(false, 'STATE.md has no "| Tests |" row in its engineering-discipline table, so the snapshot\'s check/suite counts are no longer asserted against `npm test`. Restore the row, or delete it deliberately — do not let it go missing by accident.');
+    } else {
+      const cm = row.match(/(\d+)\s+checks/);
+      const sm = row.match(/(\d+)\s+suites/);
+      if (!cm || !sm) {
+        note(false, `STATE.md's Tests row no longer states both a check count and a suite count (got: ${JSON.stringify(row.trim())}), so nothing is asserted against \`npm test\` there.`);
+      } else {
+        note(
+          Number(cm[1]) === checks && Number(sm[1]) === suites,
+          `STATE.md's Tests row claims "${cm[1]} checks / ${sm[1]} suites"; the suite reports ${checks} checks / ${suites} suites. STATE.md is a snapshot, but a stale number in its table is the defect #103 was filed for.`
+        );
+      }
+    }
+
+    // ── The CI row's job count, from ci.yml ───────────────────────────────
+    // Found while fixing #103: this cell said "8 jobs" and had been wrong the
+    // whole time, contradicting its OWN list of seven. The 8 was the number of
+    // RUNS — the `test` matrix executes on two node versions — so the number
+    // was not invented, only mislabelled, which is exactly why nothing caught
+    // it: it looked plausible.
+    //
+    // Anchored on the cell, for the same reason as the Tests row: STATE.md is
+    // full of numbers that are history and must not be dragged into a
+    // present-tense comparison.
+    //
+    // The row is REQUIRED, exactly as the Tests row is, and for the same reason:
+    // an assertion whose subject can be deleted without a word is an assertion
+    // that quietly stops being one. The first version of this block did skip
+    // silently when the row was absent, which is the exact behaviour §7 above
+    // refuses to have.
+    const ciRow = stateRows.find((l) => /^\|\s*CI\s*\|/.test(l));
+    if (!ciRow) {
+      note(false, 'STATE.md has no "| CI |" row in its engineering-discipline table, so its CI job count is no longer asserted against .github/workflows/ci.yml. Restore the row, or drop the claim deliberately — do not let it go missing by accident.');
+    } else {
+      const jm = ciRow.match(/(\d+)\s+jobs/);
+      const realJobs = countWorkflowJobs();
+      if (realJobs === null) {
+        note(false, '.github/workflows/ci.yml has no top-level `jobs:` key, so STATE.md\'s CI job count cannot be verified. Refusing to report it as correct.');
+      } else if (!jm) {
+        note(false, `STATE.md's CI row no longer states a job count (got: ${JSON.stringify(ciRow.trim())}), so nothing is asserted against .github/workflows/ci.yml there.`);
+      } else {
+        note(
+          Number(jm[1]) === realJobs,
+          `STATE.md's CI row claims ${jm[1]} CI jobs; .github/workflows/ci.yml defines ${realJobs}. ` +
+            `If the difference is the \`test\` matrix, say "N jobs, M runs" rather than relabelling the runs as jobs — ` +
+            `that is the conflation this cell had been carrying.`
+        );
+      }
+    }
+  }
+
   // ── The BROWSER suite count, checked for CONSISTENCY across the docs ─────
   // Not checked against a live run: that needs Playwright and a browser, which
   // is too expensive for a doc checker and would make it flaky.
@@ -347,6 +428,36 @@ if (exists('docs/API.md')) {
 }
 function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Count the jobs GitHub Actions will actually run in ci.yml.
+ *
+ * Hand-parsed rather than via a YAML library because there is no yaml dependency
+ * and adding one to fail a doc check would be absurd. The parse is one rule:
+ * after the top-level `jobs:` key, every line indented exactly two spaces whose
+ * value is empty names a job.
+ *
+ * The offset is what makes it correct. `on:` is also a top-level key and its
+ * children (`push:`, `pull_request:`) are also indented two spaces, so a scan of
+ * the whole file counts those as jobs and returns 8 instead of 7. It starts
+ * AFTER `jobs:` for exactly that reason — and 8 is the very number this function
+ * exists to catch STATE.md claiming.
+ *
+ * Returns null when the subject cannot be found, which callers treat as a
+ * failure: a parse that cannot locate what it is parsing must not report
+ * agreement.
+ */
+function countWorkflowJobs() {
+  if (!exists('.github/workflows/ci.yml')) return null;
+  const lines = read('.github/workflows/ci.yml').split('\n');
+  const start = lines.findIndex((l) => /^jobs:\s*$/.test(l));
+  if (start < 0) return null;
+  let n = 0;
+  for (const line of lines.slice(start + 1)) {
+    if (/^ {2}[A-Za-z0-9_-]+:\s*$/.test(line)) n++;
+  }
+  return n;
 }
 
 // ── 6. README's API table must not omit routes ────────────────────────────

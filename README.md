@@ -296,10 +296,11 @@ Configuration is read from `.env` (see [`.env.example`](.env.example)). Every
 value is validated at boot; an invalid value **aborts startup** rather than
 failing later.
 
-> **Note:** `.env.example` now documents all 61 of the keys the server reads.
-> `lib/config.js`'s `DEFAULTS`. Undocumented keys are listed in the tables below.
-> Closing that gap — and adding the same CI guard the feed collector has — is
-> tracked as a known issue.
+> **Note:** `.env.example` documents **every key the code reads**, with the value
+> `lib/config.js` actually defaults to, and `npm run check:env-example` fails the
+> build the moment that stops being true — a key read but undocumented, a key
+> documented that no code reads, or a default that drifts. The keys and their
+> defaults are in the tables below.
 
 ### Core
 

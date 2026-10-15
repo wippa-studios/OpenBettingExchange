@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // scripts/check-env-example.mjs — keep .env.example honest about lib/config.js.
 //
-// THE PROBLEM (#5). `.env.example` documented 15 keys while the server read 58.
+// THE PROBLEM (#5). `.env.example` documented 15 keys while the server read far more.
 // It drifted because nothing checked it. The consequence is not cosmetic: a key
 // missing from the example is a knob an operator cannot discover without reading
 // the source, and several of them fail CLOSED — FEED_CREDENTIALS_KEY unset means
@@ -25,8 +25,18 @@
 //      A check that cannot parse its input fails instead of passing empty.
 //   3. THE OTHER DIRECTION IS ASSERTED TOO (see MUST_REMAIN_TRACKABLE). The
 //      same parse is required to return a NON-trivial .env.example. Combined
-//      with rule 1, an empty file fails with 58 named missing keys, and a
-//      source that fails to parse fails loudly. Neither can be green.
+//      with rule 1, an empty file fails with every surface key named as missing,
+//      and a source that fails to parse fails loudly. Neither can be green.
+//
+// NO CONFIG-KEY COUNT IS WRITTEN IN THIS FILE, deliberately. #103 found
+// `README.md` claiming 61, `docs/ROADMAP.md` claiming 58, and `.env.example`
+// actually carrying 61 — three documents, three numbers, and the two that
+// disagreed were both correct on the day they were written. The count is
+// printed by this script's own PASS line, which is derived from `lib/config.js`
+// at run time, and the guarantee that actually matters — every key the code
+// reads is documented, with the right default — is what the rules below
+// enforce. A hand-maintained figure in a comment is exactly the kind of claim
+// that rots in silence. **DO NOT RE-ADD ONE.**
 //
 // COMMENTS ARE STRIPPED BEFORE THE SURFACE IS SCANNED, and that is not a
 // refinement — it is the difference between a check that is right and one that
@@ -52,7 +62,7 @@
 // itself is the failure this repo keeps paying for:
 //
 //   - COVERAGE: every key the code reads is present as a real assignment.
-//     Enforced for all 58 keys.
+//     Asserted against the derived surface, not against a number written here.
 //   - NO PHANTOMS: every key in .env.example is one the code actually reads, so
 //     a renamed or deleted key cannot linger as documentation of nothing.
 //   - DEFAULTS MATCH: where the code has a concrete default, the example states
@@ -219,7 +229,7 @@ function assertSurfaceIsReal(surface) {
     problems.push('no `raw.<KEY>` reads found in lib/config.js — the loader shape changed');
   }
   if (surface.size < 45) {
-    problems.push(`surface is only ${surface.size} keys (expected ~58) — extraction regressed`);
+    problems.push(`surface is only ${surface.size} keys (expected 45+) — extraction regressed`);
   }
   // Sentinels spanning the classes: a scalar server key, a security control, a
   // null-default secret, and a knob read straight off process.env.

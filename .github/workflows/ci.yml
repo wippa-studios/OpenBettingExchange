@@ -89,7 +89,17 @@ jobs:
     name: Repository guards
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 so the release-facts check below has TAGS to compare the
+      # changelog against. The default depth-1 checkout fetches no tags, and "no
+      # tags" is indistinguishable from "this project has never been tagged" —
+      # so without this the check would report a specific, false accusation on a
+      # perfectly correct repository. The script detects the shallow case and
+      # refuses rather than guessing; this makes it never reach that state. A few
+      # hundred commits of history is not a meaningful cost.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
@@ -210,6 +220,31 @@ jobs:
         # is not a wrong CLAIM about the code — it is the absence of a file's
         # intended content, which no count, link or contradiction check can see.
         run: node scripts/check-conflict-markers.mjs
+
+      - name: Released versions are tagged, and package.json agrees (advisory)
+        # #84. CHANGELOG.md documents [0.1.0] and [0.2.0] with substantive
+        # entries; `git tag` returns nothing and package.json says 0.1.0. So two
+        # dated releases were written as though shipped, and the changelog, the
+        # manifest and the tags disagree three ways. Nothing else in this file can
+        # see it: every other check reasons about a claim that a FILE makes, and
+        # a tag that was never cut is not a claim, it is an absence — the same
+        # blind spot class as the conflict markers above.
+        #
+        # ADVISORY, AND DELIBERATELY SO, by the reasoning the secrets-history job below
+        # states in full: a check that is red on every single run stops being a
+        # signal, people read CI as "known-broken", and the next real finding
+        # arrives as the twentieth red mark rather than as news. Which of the
+        # three sources above is right is an author decision (#84) that has not
+        # been made, and a BLOCKING gate on an unmade decision fails every pull
+        # request until it is made — which is the same failure as no gate at all,
+        # with more noise. The finding is real and is reported in full: the script
+        # exits 1, prints all three disagreements, and emits an `::error::`
+        # annotation for each one, so nothing is hidden behind the green.
+        #
+        # Flip it to blocking by deleting the `continue-on-error` line below. That
+        # is the right move the moment #84's decision lands, whichever way it goes.
+        continue-on-error: true
+        run: node scripts/check-release-facts.mjs
 
   # A capacity smoke, not a benchmark: it asserts the system survives concurrent
   # writes with the books still balanced, which is a correctness property and
