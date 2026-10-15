@@ -111,9 +111,10 @@
     // One-time static bindings. Page-level handlers are attached by the render
     // functions; nothing here touches rendered content.
     OB.qa('#nav button').forEach((b) => {
-      b.onclick = () => {
-        location.hash = '#/' + b.dataset.page;
-      };
+      // goTo() rather than `location.hash = ...`: clicking the tab you are
+      // already on assigns the same hash, which fires no `hashchange` and so
+      // re-renders nothing. #50.
+      b.onclick = () => OB.goTo(b.dataset.page);
     });
     OB.$('authBtn').onclick = () => (OB.state.user ? OB.logout() : OB.openAuth('login'));
     OB.$('accountBtn').onclick = () => OB.openAccount();

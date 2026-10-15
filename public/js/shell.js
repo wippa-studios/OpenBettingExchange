@@ -216,6 +216,33 @@
   }
 
   // ── routing ──────────────────────────────────────────────────────────────
+
+  /**
+   * Navigate to a page BY NAME, handling the case where the caller is already
+   * on it.
+   *
+   * Assigning `location.hash` the value it already holds fires no `hashchange`,
+   * so `route()` never runs and the promised move never happens. This is not a
+   * corner: it is exactly what the Cash Out multi-position fallback did when
+   * pressed from My Bets — the most likely place to press it — so it told the
+   * user to pick one in Positions while Open orders stayed on screen.
+   *
+   * "Navigate to the page I am already on" is a recurring shape in this
+   * codebase and every occurrence needs the same guard, so it is a helper
+   * rather than a one-line patch at the call site.
+   *
+   * Re-rendering the current page is the honest meaning of that navigation:
+   * the caller asked for this view to be the one on screen, and it is.
+   */
+  function goTo(page) {
+    const hash = '#/' + page;
+    if (location.hash === hash) {
+      route();
+      return;
+    }
+    location.hash = hash;
+  }
+
   function route() {
     const hash = (location.hash || '#/markets').replace('#/', '');
     const known = ['markets', 'bets', 'wallet', 'admin'];
@@ -316,5 +343,5 @@
   }
 
 
-  Object.assign(OB, { closeAuth, closeNavRail, detectFeed, loadEvents, loadSports, openAccount, openAuth, openNavRail, refreshAll, refreshMarkets, renderPage, renderSessions, route, submitAuth, submitPasswordChange });
+  Object.assign(OB, { closeAuth, closeNavRail, detectFeed, goTo, loadEvents, loadSports, openAccount, openAuth, openNavRail, refreshAll, refreshMarkets, renderPage, renderSessions, route, submitAuth, submitPasswordChange });
 })();

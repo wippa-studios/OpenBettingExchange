@@ -369,6 +369,261 @@ try {
   await page.screenshot({ path: SHOT, fullPage: false });
   console.log('  info screenshot:', SHOT);
 
+  // ── #50: cash-out must not change which view is on screen ──────────────
+  //
+  // Two defects, and BOTH of them are "the wrong view is on screen":
+  //   (a) doCashOut called renderBets() with no OB.state.page check, so a
+  //       cash-out from the Exchange page replaced the whole ladder with the
+  //       My Bets card while the nav highlight and location.hash still said
+  //       "Exchange" — and the cash-out's own `book` broadcast then repainted
+  //       the board over it 200ms later, so whichever fetch resolved last won;
+  //   (b) the multi-position fallback assigned location.hash = '#/bets' while
+  //       ALREADY on '#/bets'. The same hash fires no `hashchange`, so route()
+  //       and renderBets() never ran and Open orders stayed on screen under a
+  //       toast promising Positions.
+  //
+  // So nothing below asserts that *something* rendered — that assertion shape
+  // passes with either bug present, and this repository already contains five
+  // of them. Every check names the view it expects: `.ladder` (Exchange) is
+  // present AND `#betsBody` (My Bets) is absent, plus the nav tab that claims
+  // to be showing it and the hash.
+  //
+  // (a) is also asserted from a RECORD rather than a sample: the wrong view
+  // appeared for ~200ms, which is invisible to a screenshot taken afterwards
+  // and invisible to any single read. The page therefore logs every mount
+  // transition while the cash-out runs.
+
+  const placeBack = async (mktId, stake) => {
+    const cell = page.locator(`.lcell[data-bet][data-mkt="${mktId}"]`).first();
+    if ((await cell.count()) === 0) return false;
+    await cell.click();
+    await page.waitForSelector('#slip:not([hidden]) .sliprow', { timeout: 5000 });
+    await page.fill('#slip input[data-stake]', String(stake));
+    await page.dispatchEvent('#slip input[data-stake]', 'change');
+    await page.click('#slip button.place');
+    await page.waitForFunction(
+      () => /Matched|Resting/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 10000 }
+    );
+    await page.waitForFunction(() => document.getElementById('slip').hidden, null, { timeout: 5000 });
+    return true;
+  };
+
+  // Which markets this account can actually cash out on, read back from the
+  // server rather than assumed. DISCOVERED, never hard-coded: the seeded ids
+  // follow from seed ordering, and lib/cashout.js returns no quote at all for a
+  // market whose selections carry no fair_price — so "the first market on the
+  // board" is not a usable stand-in.
+  const cashoutEligible = () =>
+    page.evaluate(async () => {
+      const r = await (await fetch('/api/positions')).json();
+      return (r.positions || [])
+        .filter((p) => p.cashout && p.market_status === 'open')
+        .map((p) => p.market_id);
+    });
+
+  // The identity of the view on screen, in one read.
+  const viewOnScreen = () =>
+    page.evaluate(() => ({
+      hash: location.hash,
+      statePage: window.OB.state.page,
+      ladder: !!document.querySelector('#page .ladder'),
+      betsBody: !!document.querySelector('#page #betsBody'),
+      wallet: !!document.querySelector('#page #wBal'),
+      activeTab: (() => {
+        const a = document.querySelector('#nav button.active');
+        return a ? a.dataset.page : null;
+      })(),
+      betsTab: (() => {
+        const t = document.querySelector('#page [data-tab].primary');
+        return t ? t.dataset.tab : null;
+      })(),
+    }));
+
+  // Log every change of which view owns #page, so a transient mount cannot be
+  // missed by an assertion taken after the repaint.
+  const recordViews = () =>
+    page.evaluate(() => {
+      window.__obViews = [];
+      const tick = () => {
+        const v = {
+          ladder: !!document.querySelector('#page .ladder'),
+          bets: !!document.querySelector('#page #betsBody'),
+        };
+        const last = window.__obViews[window.__obViews.length - 1];
+        if (!last || last.ladder !== v.ladder || last.bets !== v.bets) window.__obViews.push(v);
+        window.__obViewTimer = setTimeout(tick, 25);
+      };
+      tick();
+    });
+  const readViews = () =>
+    page.evaluate(() => {
+      clearTimeout(window.__obViewTimer);
+      return window.__obViews;
+    });
+
+  // The fixture is shared by the two checks below and is built ONCE: it is the
+  // expensive part (real matched bets), and each check is its own scenario so
+  // that neither can hide behind the other's failure. With the bug present the
+  // first scenario leaves the Open orders tab on screen, and a single combined
+  // scenario would then abort on a missing button — reporting (b) and never
+  // running (a) at all.
+  let cashoutFixture = [];
+  await scenario('#50 cash-out: the multi-position fallback moves the operator', async () => {
+    // ── fixture: TWO cash-out-eligible positions ──────────────────────────
+    const mktIds = await page.evaluate(() => [
+      ...new Set([...document.querySelectorAll('.lcell[data-bet]')].map((c) => c.dataset.mkt)),
+    ]);
+    let eligible = await cashoutEligible();
+    for (const id of mktIds.slice(0, 8)) {
+      if (eligible.length >= 2) break;
+      await placeBack(id, 50);
+      eligible = await cashoutEligible();
+    }
+    cashoutFixture = eligible;
+    check(
+      '#50 fixture: two cash-out-eligible positions exist',
+      eligible.length >= 2,
+      `(${eligible.length} of ${mktIds.length} markets quoted)`
+    );
+    if (eligible.length < 2) return;
+
+    // From the page the fallback TARGETS: My Bets, Open orders tab showing.
+    await page.click('#nav button[data-page="bets"]');
+    await page.waitForSelector('#page [data-tab="open"].primary', { timeout: 10000 });
+    const beforeMulti = await viewOnScreen();
+    check(
+      '#50 fixture: Open orders is the tab under test',
+      beforeMulti.betsTab === 'open' && !beforeMulti.ladder,
+      JSON.stringify(beforeMulti)
+    );
+
+    await page.locator('#cashoutBtn').click();
+    await page.waitForFunction(
+      () => /Multiple positions can be cashed out/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 10000 }
+    );
+    // Generous settle: any render that was going to happen has now happened.
+    // A "did the page change?" assertion taken too early passes by luck.
+    await page.waitForTimeout(800);
+    const afterMulti = await viewOnScreen();
+    check(
+      '#50 multi-position Cash Out lands on Positions, not Open orders',
+      afterMulti.betsTab === 'positions' && afterMulti.ladder === false && afterMulti.hash === '#/bets',
+      JSON.stringify(afterMulti)
+    );
+    check(
+      '#50 the promised Positions tab actually rendered position cards',
+      (await page.locator('#page #betsBody .poscard').count()) > 0,
+      `(${await page.locator('#page #betsBody .poscard').count()} cards)`
+    );
+  });
+
+  await scenario('#50 cash-out: the single-outcome branch stays on its own page', async () => {
+    if (cashoutFixture.length < 2) {
+      check('#50 fixture for the single-outcome branch', false, '(no eligible positions)');
+      return;
+    }
+    // Open the Positions tab explicitly rather than relying on the check
+    // above having switched it, so this scenario's starting point is the same
+    // whether or not the fallback above works.
+    await page.click('#nav button[data-page="bets"]');
+    await page.waitForSelector('#page #betsBody', { timeout: 10000 });
+    await page.click('#page [data-tab="positions"]');
+    await page.waitForSelector('#page #betsBody .poscard', { timeout: 10000 });
+
+    // ── (a) leave exactly one eligible position, cashing the rest out from
+    // the Positions tab. Those per-position controls do not route, so the
+    // board the next step needs is untouched by the reduction.
+    let eligible = await cashoutEligible();
+    for (const id of eligible.slice(0, -1)) {
+      await page.locator(`#betsBody [data-cashout="${id}"]`).click();
+      await page.waitForFunction(
+        (m) => !document.querySelector(`#betsBody [data-cashout="${m}"]`),
+        id,
+        { timeout: 10000 }
+      );
+    }
+    eligible = await cashoutEligible();
+    check('#50 fixture: exactly one cash-out-eligible position remains', eligible.length === 1, `(${eligible.length})`);
+    if (eligible.length !== 1) return;
+
+    await page.click('#nav button[data-page="markets"]');
+    await page.waitForSelector('#page .ladder', { timeout: 10000 });
+    const beforeSingle = await viewOnScreen();
+    check(
+      '#50 fixture: the Exchange ladder is the view under test',
+      beforeSingle.ladder && !beforeSingle.betsBody && beforeSingle.activeTab === 'markets',
+      JSON.stringify(beforeSingle)
+    );
+
+    await recordViews();
+    await page.locator('#cashoutBtn').click();
+    await page.waitForFunction(
+      () => /Cashed out/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    // Past the 200ms `book` debounce in boot.js AND the refresh it triggers.
+    await page.waitForTimeout(1500);
+    const views = await readViews();
+    // This is the ONLY shape of assertion on (a) that DISCRIMINATES from the
+    // markets page: boot.js repaints the ladder while state.page is still
+    // 'markets', so a view read after the settle looks correct and passes
+    // with the bug present — this repository's exact failure mode. The wrong
+    // view really did exist in between, which is why the transitions are
+    // RECORDED at 25ms intervals rather than sampled once.
+    check(
+      '#50 the My Bets card never mounts while the Exchange page is open',
+      !views.some((v) => v.bets),
+      `view transitions: ${JSON.stringify(views)}`
+    );
+  });
+
+  // (a), second half, on a page the repaint CANNOT rescue. refreshMarkets()
+  // only renders when state.page === 'markets', and the `balance` listener
+  // calls loadWallet(), which bails on a missing #wTx — so a cash-out from the
+  // Wallet strands the My Bets card over the wallet indefinitely. Same defect,
+  // no 200ms repair, and therefore assertable by a single read.
+  await scenario('#50 cash-out from another page leaves that page on screen', async () => {
+    // Top the fixture back up to exactly one eligible position: the check
+    // above cashed the last one out.
+    const mktIds = await page.evaluate(() => [
+      ...new Set([...document.querySelectorAll('.lcell[data-bet]')].map((c) => c.dataset.mkt)),
+    ]);
+    for (const id of mktIds.slice(0, 8)) {
+      if ((await cashoutEligible()).length >= 1) break;
+      await placeBack(id, 50);
+    }
+    const eligible = await cashoutEligible();
+    check('#50 fixture: exactly one cash-out-eligible position remains', eligible.length === 1, `(${eligible.length})`);
+    if (eligible.length !== 1) return;
+
+    await page.click('#nav button[data-page="wallet"]');
+    await page.waitForSelector('#page #wBal', { timeout: 10000 });
+    await page.waitForSelector('#page #wTx table, #page #wTx .empty', { timeout: 10000 });
+    const before = await viewOnScreen();
+    check(
+      '#50 fixture: the Wallet is the view under test',
+      before.wallet && !before.betsBody && before.activeTab === 'wallet',
+      JSON.stringify(before)
+    );
+
+    await page.locator('#cashoutBtn').click();
+    await page.waitForFunction(
+      () => /Cashed out/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    // Well past the debounce, and past the 15s poll — which also declines to
+    // repaint a page that is not the markets page.
+    await page.waitForTimeout(2000);
+    const after = await viewOnScreen();
+    check(
+      '#50 Cash Out on the Wallet page leaves the Wallet page on screen',
+      after.wallet && !after.betsBody && after.activeTab === 'wallet' && after.hash === '#/wallet',
+      JSON.stringify(after)
+    );
+  });
+
   // ── admin desk: overround column + the server-backed fair-price helper ──
   await scenario('admin desk renders the overround column', async () => {
     await page.click('#authBtn'); // sign out of the customer session

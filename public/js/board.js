@@ -41,9 +41,15 @@
       // and silently picking open[0] cashed out a market the user never chose.
       // With several live offers, send the user to Positions to pick; with
       // exactly one there is nothing to choose between. (W8)
+      //
+      // goTo(), NOT `location.hash = '#/bets'`: the fallback is pressed from
+      // My Bets more often than from anywhere else, and assigning the hash it
+      // already holds fires no `hashchange` — so route()/renderBets() never
+      // ran, betsTab was 'positions' in state only, and the user was told to
+      // pick one in Positions while Open orders stayed on screen.
       if (open.length > 1) {
         OB.state.betsTab = 'positions';
-        location.hash = '#/bets';
+        OB.goTo('bets');
         OB.toast('Multiple positions can be cashed out — pick one in Positions');
         return;
       }
@@ -52,7 +58,14 @@
       const v = r.value_cents;
       OB.toast(`Cashed out ${v >= 0 ? '+' : '−'}${OB.fmt(Math.abs(v))} on ${target.market_name}`, v >= 0 ? 'ok' : 'err');
       await OB.refreshMe();
-      OB.renderBets();
+      // Refresh the bets view ONLY when it is the one on screen. renderBets()
+      // writes the WHOLE #page, so calling it unconditionally replaced the
+      // markets ladder with the My Bets card while the nav highlight and
+      // location.hash still said "Exchange" — and the cash-out's own `book`
+      // broadcast then repainted the board over it 200ms later, so the
+      // operator saw whichever of the two resolved last. Every sibling call
+      // is conditioned this way (the SSE `orders` listener in boot.js).
+      if (OB.state.page === 'bets') OB.renderBets();
     } catch (e) {
       OB.toast(e.message, 'err');
     } finally {
