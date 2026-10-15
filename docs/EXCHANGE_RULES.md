@@ -16,6 +16,7 @@ each rule so you can check the arithmetic yourself.
 - [Tenants and suspension](#tenants-and-suspension)
 - [Markets, events and lifecycle](#markets-events-and-lifecycle)
 - [Limits and configuration](#limits-and-configuration)
+- [Player rules](#player-rules)
 - [What is deliberately not implemented](#what-is-deliberately-not-implemented)
 
 ## Vocabulary
@@ -94,7 +95,10 @@ taker's price or some midpoint.
 - **Partial fills** are the norm. Remainder keeps resting.
 - **Self-match guard**: a user's own resting orders are skipped, so you cannot
   lay yourself. This also means your own displayed liquidity is not executable
-  against you — which is why cash-out quotes ignore it.
+  against you — which is why cash-out quotes ignore it. There is exactly one
+  deliberate exception, for [player rules](#player-rules): an **automated**
+  order may cross that same user's **manual** order, never the reverse and
+  never another automated order.
 - The book is kept consistent by construction: a resting back and a resting lay
   can never price-cross, because whichever arrived second would have matched.
 
@@ -102,6 +106,8 @@ taker's price or some midpoint.
 E4 (back sweep highest-first), E5 (lay sweep lowest-first), E13 (FIFO within a
 level), E6 (self-match guard), E11 (aggregation and ordering), E19 (self-match
 guard, back-taker side), E20 (lay-taker FIFO).
+`tests/selfcross.test.js` — the width of the automated/manual exception, in both
+directions, driven through real rules.
 
 ## Escrow
 
@@ -622,6 +628,129 @@ were silent successes that settled nothing while reporting healthy forever.
 A runner created **without** a fair price is never quoted by the bots — that is
 how you build a market with no demo liquidity in it.
 
+## Player rules
+
+A player may author a **rule**: place this order when this price crosses this
+threshold. It is a record, not a program — `lib/userrules.js` reads four fields
+(`op`, `threshold`, `side`, `stake`) off a `user_rules` row and there is no
+expression, no script, no `eval`, and no free-text column anywhere in the table
+that the engine reads. A player may hold **three live rules**, counted per user.
+
+The framing is *automated extension of a human's betting*: the orders you would
+have placed yourself without watching every race. Everything below follows from
+that.
+
+### Where it runs
+
+Server-side, in `lib/drift.js`, immediately after a selection's fair price
+changes and **before** the bot requote, inside the drift transaction.
+
+- It is the **only** place in the codebase that moves a fair price, so there is
+  no second price source for rules to drift out of step with.
+- It is **not** hooked to the SSE stream. An SSE client is a viewer; hooking
+  there would make evaluation depend on somebody having a browser tab open.
+- Killing the process stops evaluation by definition. There is nothing to
+  disable and no client-side copy to fall back to.
+- If no price event arrives, no evaluation happens. A rule on a market that has
+  stopped moving waits, still armed. This is asserted as a decision
+  (`tests/userrules.test.js` V32) rather than left as an accident: a periodic
+  re-scan would place orders on observations the venue never made.
+
+### One-shot per crossing — not the continuous semantics
+
+A rule **fires on a crossing**: the tick its condition becomes true, it places
+one order and disarms; the tick the condition lifts, it re-arms. State is one
+boolean (`user_rules.armed`).
+
+This is deliberately **narrower** than the continuous semantics chosen in #67
+("fire on every evaluation while the condition holds"), which needs a per-rule
+cool-down and a visible fire counter and is the next piece of work. Crossing
+semantics are the safe side of the difference and also the cheap one: a price
+resting on the threshold, or oscillating across it at the tick rate, places one
+order per genuine crossing rather than one per evaluation.
+
+A rule **created while its own condition already holds starts disarmed.** It
+fires when the price next leaves the condition and returns. Setting a threshold
+below the current price asks for a reaction to a move, not for the bet that move
+already made — and arming it would mean the first tick after creation places an
+order, before the player has read the confirmation.
+
+The threshold is **exclusive**. A price exactly on the threshold does not hold
+the condition; under continuous semantics `>=` would make such a rule permanently
+true and an order per evaluation forever.
+
+### The price the order is placed at
+
+The threshold, **or the observed price where that is better**:
+
+- **back** → the higher of (observed, threshold)
+- **lay** → the lower of (observed, threshold)
+
+So "back if the price drops below 2.00" places at 2.00, not at whatever the
+price happened to be — a fast market can gap a hundred ticks in one observation,
+which is a materially different bet from the one that was asked for. Where the
+observation is already the better price ("back if the price **rises** above
+2.00"), it is kept. Read as a limit order, which is what these are.
+
+### What a rule cannot do
+
+A rule places through `lib/match.js` `placeOrder` — **the same function
+`POST /api/orders` calls**. Consequently, for a rule exactly as for a hand:
+
+- `validateOrder` and every status, off-time and in-play gate;
+- the **in-play bet delay** — the rule's order carries the same `eligible_at`,
+  is marked `delayed`, and does not sweep on arrival. An automated strategy has
+  every incentive to route around the delay and no reason to, and it does not;
+- `max_open_stake_cents`, `max_market_liability_cents`,
+  `max_daily_settled_cents`, self-exclusion and the RG session/deposit limits,
+  which are **per user** and are not per rule;
+- the escrow contract, byte for byte.
+
+A rule that fires without the funds is **refused, counted and not retried**: the
+rule disarms *before* the placement is attempted, so a condition that keeps
+holding cannot hammer the engine every tick. `refusal_count` and `last_error`
+record it; `fire_count` counts **orders placed**, so the visible tally never
+claims a bet that did not happen.
+
+**Self-exclusion kills live rules on the spot** (`lib/limits.js` `exclude()`).
+The placement gate alone would have stopped the trade, but a rule left armed
+fires the first time the price crosses after a timed exclusion lapses.
+
+### Who may fill a rule's order
+
+**Not the house.** `lib/bots.js` must not fill an automated order (#67), and the
+sweep refuses a crossing where exactly one side is the house *and* exactly one
+side is automated — in both directions, because a rule taking the desk's resting
+quote is the same conflict of interest with the words reversed. Two players, or
+the house against a manual order, are untouched.
+
+With the house excluded and one player on the venue, the only counterparty left
+is **that player's own manual orders**, via the audited
+self-match exception under [Player rules](#player-rules) below. Every
+resulting fill is a `self_crossed` match row and a `trade.self_crossed` audit
+row, so the P&L that is partly self-generated is always identifiable.
+
+Two rules of the **same user never match each other**, and neither does a rule
+and another rule's order. That is the far larger hole, and it stays shut. The
+exact width, asserted behaviourally:
+
+| | |
+| --- | --- |
+| **Permitted** | one side automated, both this user, either is the taker |
+| **Blocked** | two manual orders of one user — unchanged |
+| **Blocked** | two automated orders of one user |
+| **Blocked** | the house on either side of an automated order |
+| **Blocked** | two different players' orders (an ordinary crossing) |
+
+### Not in this version
+
+Deliberately absent, because each is where a real evaluation engine and its cost
+arrive: derived state over a running position ("back if my net exposure across
+this event exceeds X"), multi-leg conditions, anything needing an expression
+language, and the continuous/cool-down/fire-count semantics of #77. There is no
+rule management API yet either — #78 owns the surface, so a player cannot
+currently author a rule over HTTP.
+
 ## What is deliberately not implemented
 
 Listed so nobody mistakes a scope decision for a bug:
@@ -655,8 +784,17 @@ Listed so nobody mistakes a scope decision for a bug:
   machine. `npm run load` measures that single node (~500 orders/sec placed);
   running more than one requires the Postgres migration, which makes the engine
   async and re-opens the escrow invariant under row-level locking.
+- **Rules over derived state.** [Player rules](#player-rules) cover a threshold
+  crossing on one runner's price. They do **not** compare against a running
+  position ("back if my net exposure across this event exceeds X"), do not span
+  legs, and have no expression language — those need a real evaluation engine,
+  and building one before the crossing case is proven is how an in-app strategy
+  builder turns into a sandbox. Continuous re-firing, a per-rule cool-down and
+  the visible fire count are also absent: rules are one-shot per crossing. See
+  [Where it runs](#where-it-runs).
 
 **Shipped since this list was first written:** the results feed with per-sport
 void rules and dispute holds, multi-runner cash-out, abuse limits and
 self-exclusion, market-maker risk caps, double-entry accounting, payments
-abstraction, tenancy, and the operational surface (health, metrics, backup).
+abstraction, tenancy, player-authored betting rules, and the operational surface
+(health, metrics, backup).

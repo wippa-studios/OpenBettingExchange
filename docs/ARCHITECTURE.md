@@ -40,7 +40,7 @@ server    server.js  2,560 lines, 87 routes
 engine    lib/       31 modules + lib/payments/ — see the table below
    │
    ▼
-storage   data/openbettingexchange.db   SQLite (WAL), 26 tables, created on first run
+storage   data/openbettingexchange.db   SQLite (WAL), 27 tables, created on first run
 ```
 
 There is no ORM, no migration framework and no service layer beyond `lib/`. The
@@ -76,8 +76,9 @@ The dependency direction is strictly one way: `match → ledger → tx`, with
 | `lib/inplay.js` | suspension and the in-play bet delay gates | unfreeze a market on its own authority |
 | `lib/offtime.js` | the pre-off cut-off | be bypassed by a route |
 | `lib/reports.js` | reporting: aggregate, state definitions, render CSV | settle anything or write to the ledger |
-| `lib/bots.js` | MarketMakers ladders, requote, withdraw-all | match itself (the engine's self-match guard covers it) |
-| `lib/drift.js` | fair-price random walk | move LTP (only real trades do) |
+| `lib/userrules.js` | player-authored betting rules: the record, the per-user cap, and evaluation on the price stream | bypass `placeOrder`, or interpret anything a player wrote — there is nothing to interpret |
+| `lib/bots.js` | MarketMakers ladders, requote, withdraw-all | match itself (the engine's self-match guard covers it), or fill an automated order — the engine refuses that |
+| `lib/drift.js` | fair-price random walk; also where player rules are evaluated | move LTP (only real trades do) |
 | `lib/tenants.js` | multi-tenancy, per-tenant commission, jurisdictions, **tenant suspension**, trusted-country extraction | decide a bet's outcome |
 | `lib/payments/` | provider interface, reference provider, withdrawal lifecycle, webhook confirmation | credit on initiation |
 | `lib/jobs.js` | scheduled reconciliation and maintenance timers | run inside a placement transaction |
@@ -120,7 +121,7 @@ that once made the automated results poll settle nothing while reporting success
 
 ## Why these choices
 
-- **No ORM, no migrations.** The schema is 26 tables of plain SQL with `CHECK`
+- **No ORM, no migrations.** The schema is 27 tables of plain SQL with `CHECK`
   constraints on the money columns. A contributor can read the whole data model
   in one file, and the database itself refuses an invalid cent. `docs:check`
   verifies the table count against the code, so the figure above cannot rot.
