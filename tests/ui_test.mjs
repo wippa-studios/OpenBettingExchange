@@ -866,6 +866,285 @@ try {
     check('admin body is a stable shared mount', degrade);
   });
 
+  // ── #51: a held market can be released as a DEAD HEAT, chosen by NAME ────
+  //
+  // Two defects, both on the operator's most consequential screen:
+  //   (a) the release route has accepted `dead_heat` since lib/results.js
+  //       gained it, and no screen could send it - so an operator facing a held
+  //       dead heat could only pick one winner (paying a whole stake to one
+  //       runner and charging the other joint winner's backer his entire stake
+  //       on a horse that TIED) or void every runner;
+  //   (b) the prompt demanded "Winning selection id (see the market on the
+  //       board)" - and the board renders NAMES only. cellHtml() puts ids in
+  //       data-sel and aria-label, never as text.
+  //
+  // (b) is checked by RECORDING every window.prompt the page raises and
+  // asserting that none of them asks for an id. (a) is checked by driving the
+  // real control - tick two runners - and reading the POST body the browser
+  // actually sent. Asserting that the endpoint accepts a dead_heat would prove
+  // nothing about the desk: that path already worked, and the bug is that
+  // nothing on screen reaches it.
+
+  // Every dialog the page raises, in order. Empty queue => DISMISS, which is
+  // exactly what Playwright does with an unhandled dialog, so registering this
+  // handler changes no other scenario's behaviour.
+  const prompts = [];
+  let promptQueue = [];
+  page.on('dialog', async (d) => {
+    if (d.type() === 'prompt' && promptQueue.length) {
+      prompts.push(d.message());
+      await d.accept(promptQueue.shift());
+      return;
+    }
+    prompts.push(d.message());
+    await d.dismiss();
+  });
+  // The release POST body, captured off the wire.
+  let releasePayload = null;
+  page.on('request', (r) => {
+    if (/\/api\/admin\/results\/held\/\d+\/release$/.test(new URL(r.url()).pathname)) {
+      try {
+        releasePayload = JSON.parse(r.postData() || 'null');
+      } catch {
+        releasePayload = { __unparseable: r.postData() };
+      }
+    }
+  });
+
+  await scenario('#51 held release: joint winners are expressible from the desk', async () => {
+    // The desk is left on the Ops view by the previous scenario, so open
+    // Markets first: the id is read from a row that carries a Settle control,
+    // which by definition has not been settled yet. Discovered, not hard-coded.
+    await page.click('[data-view="markets"]');
+    await page.waitForSelector('#adminBody [data-settle]', { timeout: 10000 });
+    const heldMarketId = await page.evaluate(() => {
+      const b = document.querySelector('#adminBody [data-settle]');
+      return b ? Number(b.dataset.settle) : null;
+    });
+    if (heldMarketId === null) {
+      check('#51 fixture: an open market to hold', false, '(no markets on the desk)');
+      return;
+    }
+    // A held market is needed, and the seeded catalogue has none. Set the same
+    // columns the results poll writes, so this is the real hold rather than a
+    // mocked flag — the route under test reads them.
+    {
+      const { DatabaseSync } = await import('node:sqlite');
+      const db = new DatabaseSync(path.join(TMP, 'ui.db'));
+      db.prepare(
+        'UPDATE markets SET settlement_hold = 1, hold_reason = ? WHERE id = ? AND status = ?'
+      ).run('result feed: dead heat disputed', heldMarketId, 'open');
+      const n = db.prepare('SELECT settlement_hold FROM markets WHERE id = ?').get(heldMarketId);
+      db.close();
+      if (!n || n.settlement_hold !== 1) {
+        check('#51 fixture: the market is held', false, `(hold=${n && n.settlement_hold})`);
+        return;
+      }
+    }
+
+    await page.click('[data-view="results"]');
+    await page.waitForSelector('#adminBody [data-release-settle]', { timeout: 10000 });
+    const heldRow = page.locator(`#adminBody [data-release-settle="${heldMarketId}"]`);
+    check(
+      '#51 fixture: the held market is listed on the desk',
+      (await heldRow.count()) === 1,
+      `(market ${heldMarketId})`
+    );
+    if ((await heldRow.count()) === 0) return;
+
+    // The reason prompt is unchanged and still comes first (lib/results.js
+    // refuses a release with no reason).
+    prompts.length = 0;
+    promptQueue = ['ui test: joint winners confirmed against the results feed'];
+    await heldRow.click();
+    // The picker is CHECKED for, not awaited. An awaited one turns "the control
+    // does not exist" into an opaque 10s timeout that aborts the scenario, and
+    // every later assertion — including the dead-heat payload, which is the
+    // whole point — would then never run. A missing picker has to be a named
+    // failure, not a scenario that dies quietly.
+    const picker = page.locator('.modal[role="dialog"] #hoWinners');
+    let pickerPresent = true;
+    try {
+      await picker.waitFor({ state: 'attached', timeout: 5000 });
+    } catch {
+      pickerPresent = false;
+    }
+    check(
+      '#51 settling a held market opens a runner picker rather than a raw-id prompt',
+      pickerPresent,
+      `(${prompts.length} prompt(s): ${prompts.join(' | ').slice(0, 90)})`
+    );
+    check(
+      '#51 no prompt demands a raw selection id',
+      !prompts.some((m) => /selection id/i.test(m)),
+      `(saw: ${prompts.join(' | ').slice(0, 90)})`
+    );
+    if (!pickerPresent) {
+      check('#51 the release picker lists this market\'s runners by name', false, '(no picker on screen)');
+      check(
+        '#51 the release payload carries dead_heat for a two-way tie',
+        false,
+        `(the tie could not be expressed at all — payload ${JSON.stringify(releasePayload)})`
+      );
+      return;
+    }
+    check('#51 the release still asks for a written reason first', /reason/i.test(prompts[0] || ''), `("${(prompts[0] || '').slice(0, 60)}")`);
+
+    // (b) — by NAME. The runner names come from this market's own book.
+    const rows = await page.locator('.modal[role="dialog"] #hoWinners .optrow').allTextContents();
+    const bookNames = await page.evaluate(
+      async (id) => {
+        const r = await (await fetch(`/api/markets/${id}/book`)).json();
+        return r.book.map((s) => s.name);
+      },
+      heldMarketId
+    );
+    check(
+      '#51 the release picker lists this market\'s runners by name',
+      bookNames.length >= 2 && bookNames.every((n) => rows.some((r) => r.includes(n))),
+      `(${rows.length} rows for ${bookNames.length} runners: ${rows.join(' | ').slice(0, 80)})`
+    );
+
+    const goBtn = page.locator('.modal[role="dialog"] #hoGo');
+    const boxes = page.locator('.modal[role="dialog"] #hoWinners .hoPick');
+
+    // The button tracks the selection BOTH ways. Asserting only "disabled at
+    // rest" passes for a button that is permanently disabled, which is its own
+    // dead control — so a choice is made, then withdrawn.
+    const inertAtRest = await goBtn.isDisabled();
+    await boxes.nth(0).check();
+    const inertWhenChosen = await goBtn.isDisabled();
+    await boxes.nth(0).uncheck();
+    const inertAfterUntick = await goBtn.isDisabled();
+    check(
+      '#51 the release button is live only while a runner is chosen',
+      inertAtRest && !inertWhenChosen && inertAfterUntick,
+      `(rest=${inertAtRest}, chosen=${inertWhenChosen}, unticked=${inertAfterUntick})`
+    );
+
+    // ── (a) — drive the real control: tick TWO runners ─────────────────────
+    await boxes.nth(0).check();
+    await boxes.nth(1).check();
+    const summary = ((await page.locator('.modal[role="dialog"] #hoSummary').textContent()) || '').trim();
+    check('#51 two ticks read as a dead heat, not a single winner', /dead heat/i.test(summary), `("${summary.slice(0, 60)}")`);
+
+    // Cancelling WITH a selection made is the dangerous case. Cancelling with
+    // nothing ticked proves almost nothing — there is nothing to release — and
+    // a picker that released on cancel would sail past it. This is also the
+    // path an awaiter that never settles would break, leaving the operator
+    // facing a dialog whose buttons look dead.
+    releasePayload = null;
+    await page.locator('.modal[role="dialog"] #hoCancel').click();
+    await page.waitForTimeout(600);
+    check(
+      '#51 cancelling with runners chosen releases nothing',
+      releasePayload === null,
+      `(payload ${JSON.stringify(releasePayload)})`
+    );
+    check(
+      '#51 cancelling leaves the market held',
+      (await page.locator(`#adminBody [data-release-settle="${heldMarketId}"]`).count()) === 1
+    );
+    check(
+      '#51 cancelling closes the dialog',
+      (await page.locator('.modal[role="dialog"] #hoWinners').count()) === 0
+    );
+
+    // Reopen and commit the tie for real.
+    promptQueue = ['ui test: joint winners confirmed against the results feed'];
+    await page.locator(`#adminBody [data-release-settle="${heldMarketId}"]`).click();
+    await page.locator('.modal[role="dialog"] #hoWinners').waitFor({ state: 'attached', timeout: 10000 });
+    await page.locator('.modal[role="dialog"] #hoWinners .hoPick').nth(0).check();
+    await page.locator('.modal[role="dialog"] #hoWinners .hoPick').nth(1).check();
+    releasePayload = null;
+    await page.locator('.modal[role="dialog"] #hoGo').click();
+    await page.waitForFunction(
+      () => /settled/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+
+    const ids = await page.evaluate(
+      async (id) => {
+        const r = await (await fetch(`/api/markets/${id}/book`)).json();
+        return r.book.map((s) => s.selection_id);
+      },
+      heldMarketId
+    );
+    check(
+      '#51 the release payload carries dead_heat for a two-way tie',
+      !!releasePayload &&
+        Array.isArray(releasePayload.dead_heat) &&
+        releasePayload.dead_heat.length === 2 &&
+        releasePayload.dead_heat.every((x) => ids.includes(x)),
+      `(payload ${JSON.stringify(releasePayload)})`
+    );
+    check(
+      '#51 a dead heat sends no single winner_selection_id alongside it',
+      !!releasePayload && (releasePayload.winner_selection_id === null || releasePayload.winner_selection_id === undefined),
+      `(payload ${JSON.stringify(releasePayload)})`
+    );
+    check(
+      '#51 the release carries the operator\'s reason to the server',
+      !!releasePayload && typeof releasePayload.reason === 'string' && releasePayload.reason.length >= 5,
+      `(${releasePayload && releasePayload.reason})`
+    );
+
+    // The hold is cleared and the market is settled by the release, so the
+    // desk must stop offering it.
+    await page.waitForFunction(
+      (id) => !document.querySelector(`#adminBody [data-release-settle="${id}"]`),
+      heldMarketId,
+      { timeout: 10000 }
+    );
+    check('#51 the released market leaves the held queue', true);
+
+    // ── ONE tick is a plain win, not a one-element dead heat ────────────────
+    // lib/results.js refuses a dead_heat list shorter than two distinct ids, so
+    // a picker that sent `dead_heat: [x]` for a single winner would 400 on the
+    // commonest release of all. Held from the same columns as above.
+    await page.click('[data-view="markets"]');
+    await page.waitForSelector('#adminBody [data-settle]', { timeout: 10000 });
+    const soloMarketId = await page.evaluate(() => {
+      const b = document.querySelector('#adminBody [data-settle]');
+      return b ? Number(b.dataset.settle) : null;
+    });
+    if (soloMarketId === null) {
+      check('#51 fixture: a second market for the single-winner path', false, '(none left open)');
+      return;
+    }
+    {
+      const { DatabaseSync } = await import('node:sqlite');
+      const db = new DatabaseSync(path.join(TMP, 'ui.db'));
+      db.prepare('UPDATE markets SET settlement_hold = 1, hold_reason = ? WHERE id = ?').run(
+        'result feed: unrecognised result',
+        soloMarketId
+      );
+      db.close();
+    }
+    await page.click('[data-view="results"]');
+    await page.waitForSelector(`#adminBody [data-release-settle="${soloMarketId}"]`, { timeout: 10000 });
+
+    promptQueue = ['ui test: single winner confirmed against the results feed'];
+    releasePayload = null;
+    await page.locator(`#adminBody [data-release-settle="${soloMarketId}"]`).click();
+    await page.locator('.modal[role="dialog"] #hoWinners').waitFor({ state: 'attached', timeout: 10000 });
+    const soloBox = page.locator('.modal[role="dialog"] #hoWinners .hoPick').first();
+    const soloId = Number(await soloBox.getAttribute('value'));
+    await soloBox.check();
+    await page.locator('.modal[role="dialog"] #hoGo').click();
+    await page.waitForFunction(
+      () => /settled/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    check(
+      '#51 one ticked runner sends winner_selection_id and no dead_heat',
+      !!releasePayload &&
+        releasePayload.winner_selection_id === soloId &&
+        (releasePayload.dead_heat === undefined || releasePayload.dead_heat === null),
+      `(payload ${JSON.stringify(releasePayload)}, expected winner ${soloId})`
+    );
+  });
+
   // ── First-run lock ──────────────────────────────────────────────────────
   // A locked account must be told what to do immediately, not left to
   // discover the lock by getting a 403 on their first bet.

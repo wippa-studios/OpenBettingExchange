@@ -284,20 +284,141 @@
   async function releaseHeld(body, marketId, decision) {
     const reason = askReason(`Releasing this held market as ${decision}`);
     if (!reason) return;
-    let winner = null;
+    const payload = { decision, reason };
     if (decision === 'settle') {
-      const raw = window.prompt('Winning selection id (see the market on the board):');
-      if (raw === null) return;
-      winner = Number(raw);
-      if (!Number.isInteger(winner) || winner <= 0) { toast('A positive selection id is required'); return; }
+      // By NAME, from the market's own book. The id prompt this replaced -
+      // "Winning selection id (see the market on the board)" - asked the
+      // operator for a value the product renders NOWHERE: cellHtml() puts
+      // selection ids into data-sel and aria-label only, and the settle dialog
+      // showed names too. A wrong id is a 400 on the screen that moves the
+      // most money.
+      const picked = await pickJointWinners(marketId);
+      if (picked === null) return; // cancelled - releasing nothing
+      // ONE runner is a win; TWO OR MORE is the dead heat. Sending a single
+      // winner_selection_id for a tie is the harm lib/results.js records at
+      // lines 316-323: releasing a held joint favourite as one runner paid a
+      // whole stake to one person and charged the other joint winner's backer
+      // his entire stake on a horse that TIED. The route has accepted
+      // `dead_heat` for that reason and no screen could send it. This is it.
+      if (picked.length === 1) payload.winner_selection_id = picked[0];
+      else payload.dead_heat = picked;
     }
     try {
-      await api('POST', `/api/admin/results/held/${marketId}/release`, {
-        decision, winner_selection_id: winner, reason,
-      });
+      await api('POST', `/api/admin/results/held/${marketId}/release`, payload);
       toast(`Market ${marketId} ${decision === 'void' ? 'voided' : 'settled'}`);
       renderResultsView(body);
     } catch (e) { toast(e.message); }
+  }
+
+  /**
+   * Choose the winning runner(s) of a held market, BY NAME.
+   *
+   * Resolves with the chosen selection ids, or null when the operator
+   * cancelled. The runners come from the same `/api/markets/:id/book` call the
+   * settle dialog makes, so the two screens cannot drift about what a market's
+   * runners are.
+   *
+   * Checkboxes rather than radios because the engine settles a SET of winners:
+   * lib/settle.js takes `dead_heat` as the joint-winner set and divides each pot
+   * among them. One tick and two ticks are therefore the same control meaning
+   * two different outcomes, so the summary line says which one is about to
+   * happen BEFORE the operator commits money.
+   *
+   * The runner id is printed beside each name - muted, after the name - so the
+   * value that reaches the audit trail can be read off the screen instead of
+   * taken on trust. It is never something the operator has to type.
+   *
+   * The "at least one selection" guard is usability, NOT a control.
+   * lib/results.js is the authority: it refuses a dead_heat list shorter than
+   * two DISTINCT ids, a non-integer, a boolean and a quoted string, and a
+   * release carrying neither a winner nor a dead_heat is a 400.
+   */
+  async function pickJointWinners(marketId) {
+    let book;
+    try {
+      const r = await api('GET', `/api/markets/${marketId}/book`);
+      book = r.book || [];
+    } catch (e) {
+      toast(e.message, 'err');
+      return null;
+    }
+    if (!book.length) {
+      toast('This market has no runners to choose from', 'err');
+      return null;
+    }
+    const overlay = document.createElement('div');
+    overlay.className = 'modal';
+    // The shared overlay stack, so Escape closes THIS dialog, Tab stays inside
+    // it and focus returns to the button that opened it - the same treatment
+    // settleDialog gets.
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.innerHTML = `
+      <div class="box">
+        <h3>Release as settled</h3>
+        <p class="muted hint">Tick the one runner that won. Tick two or more if they tied - a joint
+          result splits each pot between them, which is NOT the same as paying one runner the whole pot.</p>
+        <div id="hoWinners" role="group" aria-label="Winning runners">
+          ${book
+            .map(
+              (s) => `<label class="optrow">
+              <input type="checkbox" class="hoPick" value="${attr(s.selection_id)}" />
+              <span>${esc(s.name)}</span>
+              <span class="muted tn">#${attr(s.selection_id)} &middot; LTP ${price2(s.ltp)}</span>
+            </label>`
+            )
+            .join('')}
+        </div>
+        <div class="muted fineprint" id="hoSummary" aria-live="polite">Nothing selected.</div>
+        <div class="row mt">
+          <button class="btn primary grow" id="hoGo" disabled>Release as settled</button>
+          <button class="btn" id="hoCancel">Cancel</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    openOverlay(overlay);
+
+    let settle;
+    const answered = new Promise((res) => { settle = res; });
+    // Cancel and the backdrop both mean "release nothing", and both must
+    // unblock the awaiter in releaseHeld as well as dismiss the overlay.
+    const dismiss = () => { closeOverlay(overlay); settle(null); };
+
+    const go = overlay.querySelector('#hoGo');
+    const summary = overlay.querySelector('#hoSummary');
+    const picked = () =>
+      Array.from(overlay.querySelectorAll('.hoPick'))
+        .filter((c) => c.checked)
+        .map((c) => {
+          const row = c.closest('.optrow');
+          const name = row.querySelector('span:not(.muted)');
+          return { id: Number(c.value), name: (name && name.textContent) || '' };
+        });
+
+    overlay.querySelectorAll('.hoPick').forEach((c) => {
+      c.onchange = () => {
+        const sel = picked();
+        go.disabled = sel.length === 0;
+        if (sel.length === 0) summary.textContent = 'Nothing selected.';
+        else if (sel.length === 1) summary.textContent = `Settling as ${sel[0].name}.`;
+        else
+          summary.textContent =
+            `Dead heat: ${sel.length} joint winners (${sel.map((p) => p.name).join(', ')}). ` +
+            'Each pot is split between them.';
+      };
+    });
+    overlay.querySelector('#hoCancel').onclick = dismiss;
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) dismiss();
+    });
+    go.onclick = () => {
+      const ids = picked().map((p) => p.id);
+      closeOverlay(overlay);
+      // DISTINCT: lib/results.js refuses a dead_heat of fewer than two
+      // DISTINCT ids, so the list must never carry a repeat.
+      settle(ids.length ? [...new Set(ids)] : null);
+    };
+    return answered;
   }
 
   // ── Tenants ───────────────────────────────────────────────────────────────
