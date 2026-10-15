@@ -514,6 +514,46 @@ button { font: inherit; cursor: pointer; }
 }
 .lcell.back { background: var(--blue-bg); color: var(--blue); }
 .lcell.lay { background: var(--pink-bg); color: var(--pink); }
+/* MATCHED VOLUME AT THIS LEVEL (#93) — the column Betfair shows beside the
+   unmatched size.
+   It is rendered INSIDE the cell and NOT as a new grid column, and that is the
+   whole geometry argument: `.lrow` is exactly seven columns (1 runner + 3 back
+   + 3 lay) and public/ladder.js states that as LADDER_COLUMNS so the two cannot
+   drift. At the 570px floor (#136) there is no spare width for an eighth, and
+   the ladder already floors its price columns at 70px. A bar costs no width at
+   all, and "how much of this price is done" is what the eye reads before either
+   number. */
+.lcell .mv {
+  font-size: 10px;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.9;
+  min-width: 0;
+  overflow: hidden;
+  /* The matched figure sits in the cell's own colour rather than a new hue, so
+     the back/lay distinction in STATE.md §2.6 — the blue/pink pair the ladder
+     depends on — is untouched by adding a second quantity to the cell. */
+}
+/* The bar is a fixed 3px strip at the foot of the cell: matched share of
+   (matched + unmatched) at this price. `width` is set inline from
+   matchedShare(); the track is always drawn so an empty cell still has one. */
+.lcell .mbar {
+  display: block;
+  width: 100%;
+  height: 3px;
+  margin-top: 2px;
+  border-radius: 2px;
+  background: currentColor;
+  opacity: 0.28;
+  overflow: hidden;
+}
+.lcell .mfill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: currentColor;
+  opacity: 1;
+}
 .lcell[data-bet]:hover { border-color: currentColor; }
 .lcell.empty { background: transparent; cursor: default; color: var(--empty-cell); }
 .lcell.flash-up { background: var(--green-bg); color: var(--green); }
@@ -565,6 +605,10 @@ button { font: inherit; cursor: pointer; }
   color: var(--muted); opacity: .75; margin-right: 4px;
   border: 1px solid var(--line); border-radius: 3px; padding: 0 3px;
 }
+/* The runner's windowed matched total (#93). It sits in the same place as the
+   LTP badge because it is the same kind of fact — a summary for the whole
+   runner rather than one price — and it is labelled for the same reason. */
+.lmid .matched-runner { color: var(--text); opacity: .8; }
 
 /* Header row mirrors the price grid exactly so labels sit over their columns. */
 .lrow.lhdr { background: var(--bg2); border-bottom: 1px solid var(--line2); }
@@ -592,6 +636,39 @@ button { font: inherit; cursor: pointer; }
 /* Outer cells are the next prices down the queue: present but visually
    recessed, so the best price stays the thing your eye lands on. */
 .lcell.depth { opacity: 0.72; }
+
+/* ── movers (#93) ───────────────────────────────────────────────────────
+   One strip of chips under the board, ranked by what traded in the window.
+   Deliberately OUTSIDE `.ladder`: it is a summary of many ladders rather than a
+   row of one, and putting it inside the seven-column grid would have it claim a
+   cell the geometry does not have. */
+#movers { margin-top: 4px; }
+.movers {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 0 2px;
+  font-size: 12px;
+}
+.movers-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.movers-win { font-weight: 400; text-transform: none; letter-spacing: 0; }
+.mover {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--line2);
+  border-radius: 999px;
+}
+.mover-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mover-vol { font-weight: 700; font-variant-numeric: tabular-nums; }
+.movers-scope { font-size: 11px; }
 
 .event { padding: 8px 0 12px; border-bottom: 1px solid var(--line); }
 .event:last-child { border-bottom: 0; }

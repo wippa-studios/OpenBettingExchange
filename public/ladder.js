@@ -101,8 +101,115 @@
     return Math.round(((priceToCents(price) - 100) * stakeCents) / 100);
   }
 
+  // ── The matched column (#93) ──────────────────────────────────────────────
+  //
+  // Betfair's ladder shows, at every level, BOTH the unmatched size available
+  // to take and the volume already matched there. This board showed only the
+  // first, because there was no query for the second anywhere in the codebase.
+  // There is one now (lib/marketdata.js), and the pure half of rendering it
+  // lives HERE rather than in board.js for one reason: this file is
+  // require()able under Node, so tests/ladder_parity.test.js can assert the
+  // column's arithmetic and its grid contract against the real code. A column
+  // whose correctness can only be checked in a browser is a column nobody
+  // checks.
+  //
+  // LADDER_COLUMNS is the grid's shape, stated once. style.css's `.lrow`
+  // template is `1 runner + 3 back + 3 lay`; the matched figure rides INSIDE
+  // each price cell rather than becoming an eighth column, and this constant is
+  // what proves the two cannot drift. See style.css for why it has to stay
+  // seven at the 570px floor (#136).
+  const LADDER_COLUMNS = { runner: 1, back: 3, lay: 3 };
+  const LADDER_COLUMN_COUNT = LADDER_COLUMNS.runner + LADDER_COLUMNS.back + LADDER_COLUMNS.lay;
+
+  // The window the matched figure covers, as the client states it in the cell's
+  // tooltip. It MUST equal lib/marketdata.js's DEFAULT_WINDOW_MINUTES, and
+  // tests/ladder_parity.test.js pins that — the same job this file already does
+  // for the tick table. A tooltip that says "last 10 minutes" beside a figure
+  // computed over 30 is a lie told by the interface, and nothing else in the
+  // repo would catch it.
+  const MATCHED_WINDOW_MINUTES = 10;
+
+  // Normalise one level into the three figures a cell renders.
+  //
+  // `matched_cents` is ABSENT on a payload from before #93, and absent means
+  // zero — never `undefined`, and never the unmatched size reused as a
+  // fallback. Defaulting to the size would put a matched figure on every level
+  // of a market where nothing has traded, which is the one thing worse than a
+  // missing column.
+  function levelFigures(level) {
+    const lv = level || {};
+    const matched = Number(lv.matched_cents);
+    const fills = Number(lv.matched_fills);
+    return {
+      price: lv.price == null ? null : lv.price,
+      // `size_cents` is the UNMATCHED size: what is still available to take.
+      unmatched_cents: Math.max(0, Math.round(Number(lv.size_cents) || 0)),
+      matched_cents: Number.isFinite(matched) && matched > 0 ? Math.round(matched) : 0,
+      matched_fills: Number.isFinite(fills) && fills > 0 ? Math.round(fills) : 0,
+    };
+  }
+
+  // The bar's share of the cell, 0–1: matched volume as a proportion of what
+  // has traded at this level plus what is still available there. A trader's eye
+  // reads "how much of this price is done" before it reads either number.
+  //
+  // `null` only when the level is EMPTY — no matched and no unmatched volume —
+  // because there is then nothing to be a proportion of. A level with liquidity
+  // and no trading in it reads 0, which is the answer rather than the absence
+  // of one.
+  function matchedShare(level) {
+    const f = levelFigures(level);
+    const total = f.matched_cents + f.unmatched_cents;
+    return total > 0 ? f.matched_cents / total : null;
+  }
+
+  // The matched column's MARKUP, as the three fragments a price cell renders.
+  //
+  // Here rather than in board.js for the same reason levelFigures is: this file
+  // is require()able under Node, so tests/ladder_parity.test.js asserts the exact
+  // strings the ladder ships — that the figure and the bar are PRESENT when
+  // something traded and BOTH ABSENT when nothing did. Asserting that through
+  // board.js is impossible, and an untestable column is the reason columns go
+  // stale.
+  //
+  // `fmt` is passed in rather than imported so this file keeps no money-formatting
+  // policy of its own: the board's formatter is the only one the venue has.
+  function matchedCellParts(level, fmt) {
+    const f = levelFigures(level);
+    const share = matchedShare(level);
+    const money = fmt || String;
+    return {
+      figures: f,
+      // No FIGURE when nothing traded at this level: "$0.00 matched" printed on
+      // every level of a quiet market is a row of zeros that reads as a broken
+      // counter, which is the same objection board.js raises about
+      // `$0.00 matched` in a market header.
+      //
+      // The BAR is still drawn at 0% when the level has unmatched size — a
+      // level with $5 available and nothing traded on it IS 0% done, and saying
+      // so beats leaving the row a different height. A level with neither has no
+      // bar, because there is nothing there to be a proportion OF.
+      matchedRow: f.matched_cents
+        ? `<span class="mv tn" title="${money(f.matched_cents)} matched across ${f.matched_fills} fill` +
+          `${f.matched_fills === 1 ? '' : 's'} in the last ${MATCHED_WINDOW_MINUTES} minutes">` +
+          `${money(f.matched_cents)}</span>`
+        : '',
+      bar: share == null
+        ? ''
+        : `<span class="mbar" aria-hidden="true"><span class="mfill" style="width:${Math.round(
+            share * 100
+          )}%"></span></span>`,
+      // Appended to the cell's accessible label, which leads with the unmatched
+      // size because that is what pressing the button acts on.
+      labelSuffix: f.matched_cents ? `, ${money(f.matched_cents)} matched` : '',
+    };
+  }
+
   const api = {
     LADDER,
+    LADDER_COLUMNS,
+    LADDER_COLUMN_COUNT,
+    MATCHED_WINDOW_MINUTES,
     MIN_CENTS,
     MAX_CENTS,
     priceToCents,
@@ -111,6 +218,9 @@
     snapPrice,
     stepPrice,
     exposureCents,
+    levelFigures,
+    matchedCellParts,
+    matchedShare,
   };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api; // Node: parity test

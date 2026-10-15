@@ -133,7 +133,7 @@ are not rate limits and cannot be retried.
 
 | Surface | Requirement |
 | --- | --- |
-| Public | `GET /api/sports`, `/api/events`, `/api/markets/:id/book`, `/api/format/:price`, `/api/branding`, `/api/stream`, the four `/api/feed/*` reads, `/healthz`, `/readyz` |
+| Public | `GET /api/sports`, `/api/events`, `/api/markets/:id/book`, `/api/selections/:id/price-history`, `/api/movers`, `/api/format/:price`, `/api/branding`, `/api/stream`, the four `/api/feed/*` reads, `/healthz`, `/readyz` |
 | Session | `401 Authentication required` with no valid, unexpired session |
 | Admin | `401` without a session; `403 Admin only` for a signed-in non-admin. `role` is authoritative, with `is_admin` accepted as a legacy mirror |
 | Ops token | `/metrics` and `POST /api/admin/backup` are additionally gated on `OPS_TOKEN` (`x-ops-token` header or `Authorization: Bearer`). Unset token ⇒ `404 Not found`; wrong token ⇒ `401 Unauthorized`. `/healthz` and `/readyz` are always public |
@@ -377,8 +377,11 @@ session limit — the clock resets only after a real idle gap
 (`RG_SESSION_IDLE_RESET_MINUTES`, 15 minutes by default).
 | `GET /api/me` | — | `200 { user }` with `available_cents = balance_cents − frozen_cents` and `tenant_status` (`'active'` \| `'suspended'`) | `401`; `403` first-run lock |
 | `GET /api/sports` | — | `200 { sports: [{ id, name, slug, event_count }] }`; `event_count` covers `upcoming` and `live` events | — |
-| `GET /api/events` | `?sport=<slug>` | `200 { events }`, 3-level book per runner | `404 Unknown sport` |
-| `GET /api/markets/:id/book` | — | `200 { market, book }` at 5 levels | `400` non-integer id; `404` unknown market |
+| `GET /api/events` | `?sport=<slug>` | `200 { events }`, 3-level book per runner, each level carrying `size_cents` **and** `matched_cents`/`matched_fills` for the matched-volume window, each runner carrying the window's `matched_cents`/`matched_fills`/`matched_window_minutes` | `404 Unknown sport` |
+| `GET /api/markets/:id/book` | — | `200 { market, book }` at 5 levels, with the same matched figures as `/api/events` | `400` non-integer id; `404` unknown market |
+| `GET /api/selections/:id/price-history` | `?window=` minutes (default 10, ceiling 43200), `?points=` (1–240) | `200 { selection_id, name, market_id, ltp, window_minutes, bucket_seconds, retention_days, points, series: [{ at, price, low, high, fills }] }` — the price shape over the window, bucketed in SQL | `400` non-integer id; `400` `window_too_wide` (asked for further back than [`EXCHANGE_RULES.md`](EXCHANGE_RULES.md#the-trade-tape-and-its-retention) keeps); `404` unknown selection |
+| `GET /api/movers` | `?window=` minutes (default 10), `?limit=` (1–200, default 20) | `200 { window_minutes, markets_considered, markets_available, movers: [{ selection_id, market_id, name, matched_cents, fills, levels, top_price, lowest_price }] }` ranked by money | `400` `window_too_wide` |
+| `POST /api/admin/maintenance/price-history` | `{ retention_days? }` | `200 { retention_days, cutoff, oldest_remaining_at, tape_rows_deleted, rollup_rows_deleted, batches, more_remaining }` — one **bounded** pass; `more_remaining: true` means there is more to delete and the operator should call again | `401`/`403` |
 | `GET /api/format/:price` | — | `200 { decimal, american, fractional, implied_prob }`. An off-tick price **inside** the ladder is snapped, so the desk can show a trader what the engine would make of a hand-typed `2.75` | `400 Price must be a number`; `400 Price is outside the 1.01-1000 ladder` |
 | `GET /api/branding` | — | `200 { tenant, name, logo, favicon, terms_url, palette }` — the caller's tenant, or the default when signed out. `logo` and `favicon` default to `/assets/logo.png` and `/assets/favicon.png`; both must be a path **on this venue**, because the CSP is `img-src 'self' data:` and a remote URL is refused by the browser | — |
 | `GET /api/stream` | — | `200 text/event-stream`; see the event table below | `403` first-run lock. Capacity: `503 Too many concurrent streams` at `MAX_SSE_CLIENTS`, `503` once anonymous streams hold their reserved share (a fifth of the pool), `429` for a caller over `MAX_SSE_CLIENTS_PER_SOURCE` (anonymous streams from one address) or `MAX_SSE_CLIENTS_PER_USER` (one account) |
@@ -386,6 +389,60 @@ session limit — the clock resets only after a real idle gap
 `user` is always `lib/auth.js`'s `sanitizeUser` shape:
 `{ id, username, email, role, is_admin, is_bot, status, must_change_password,
 balance_cents, frozen_cents }`.
+
+### Matched volume, price history and movers
+
+Before this existed there was **no matched volume at any price anywhere in this
+venue**, because there was no query for it. `bookFor` aggregates unmatched size
+only; `selections.ltp` carries the last price; and the trade tape was written on
+every fill and read by nothing. A ladder without matched volume is missing the
+column traders scan.
+
+Every level in a book — from `GET /api/events` and `GET /api/markets/:id/book`
+alike — now carries:
+
+| Field | Meaning |
+| --- | --- |
+| `size_cents` | **unmatched** size still available at this price. Unchanged by this feature. |
+| `matched_cents` | Volume **already matched** at this price inside the window. |
+| `matched_fills` | How many fills that was. |
+
+and every runner carries `matched_cents` / `matched_fills` /`matched_window_minutes`
+for the window across **all** its prices. The runner figure is not a convenience:
+the ladder only lists prices with unmatched size left, so a level that has been
+completely traded out disappears from it — and the runner figure is what stops the
+volume vanishing from the screen at exactly the moment it matters.
+
+**The mover view is built from the same query as the column, not a second one.**
+`GET /api/movers` and the ladder's `matched_cents` are the same statement over
+the same rows in the same window; the mover view only rolls them up by runner.
+Two queries would drift, and the drift would be silent. `GET /api/movers` covers
+the open markets (`markets_considered` of `markets_available` says how many it
+reached, rather than implying it covered them all).
+
+**Cashed-out legs are included**, and that is deliberate: `matches.cashout` is
+authoritative for money and every report filters `cashout = 0`, but the ladder
+renders this beside `markets.total_matched_cents` and the in-play
+`tradedVolume`, neither of which excludes buyouts. A ladder whose matched column
+disagreed with the market's own matched total would be worse than no column.
+
+**Bounds, because `node:sqlite` is synchronous.** A scan "blocks the whole
+single-threaded server for its duration" (see
+[`ARCHITECTURE.md`](ARCHITECTURE.md#matched-volume-and-why-there-is-a-rollup)),
+and `MAX_SSE_CLIENTS` bounds long-lived streams and nothing else. The matched
+figures come from a minute-bucketed rollup whose read cost depends on how many
+distinct `(runner, price, minute)` combinations traded rather than on how many
+fills occurred; the series is one runner's index range, bucketed in SQL, capped
+at `points`. Neither is a scan, and `tests/marketdata.test.js` asserts the query
+plan rather than assuming it.
+
+**Retention.** `price_history` is kept for **30 days** and pruned beyond that by
+`POST /api/admin/maintenance/price-history`, which is admin-only, bounded per
+call, and reports `more_remaining`. A window wider than the retention window is
+**refused** with `400 window_too_wide` rather than silently truncated. The full
+reasoning, and why the ladder's money figures deliberately do not read a
+prunable table, is in
+[`EXCHANGE_RULES.md`](EXCHANGE_RULES.md#the-trade-tape-and-its-retention).
 
 ### Account self-service
 
