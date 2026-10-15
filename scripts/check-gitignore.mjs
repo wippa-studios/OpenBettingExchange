@@ -27,6 +27,9 @@
 //
 // Exit 0 when every probe lands where it should. Exit 1 otherwise.
 
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -160,6 +163,69 @@ for (const p of MUST_REMAIN_TRACKABLE) {
   }
 }
 
+// ── A SYMLINK IS NOT A DIRECTORY ───────────────────────────────────────────
+//
+// The probes above CANNOT see the defect this check exists for. `git
+// check-ignore` answers identically for `node_modules` and `node_modules/`,
+// because in the real checkout node_modules IS a directory — verified by running
+// it. Adding the bare form to MUST_BE_IGNORED would have been theatre: it would
+// have looked like coverage while proving nothing.
+//
+// A trailing slash matches a directory and nothing else. A symlink is not a
+// directory to git, so `node_modules/` protected the real directory and did
+// nothing against the symlinked one — which is what every agent worktree here
+// creates. Three agents hit that and reported it as cosmetic; it was deferred,
+// and it then cost a `git add -A` that committed a symlink to node_modules into
+// this repository. The merge installed it over the real directory and
+// `require('express')` stopped resolving in the main checkout.
+//
+// So: ask git the only question that separates the two forms, in a throwaway
+// repo, with a real symlink on disk.
+{
+  const scratch = mkdtempSync(join(tmpdir(), 'gitignore-symlink-'));
+  try {
+    writeFileSync(join(scratch, '.gitignore'), readFileSync(join(ROOT, '.gitignore'), 'utf8'));
+    // ONLY node_modules, and that scoping is the point.
+    //
+    // `data/` and `betfair-market-snapshots/` are real directories that stay
+    // real directories; a trailing slash on those is correct and tightening it
+    // would be churn. node_modules is different: it is symlinked by every git
+    // worktree, which is why the failure is reachable at all. A check that
+    // flagged all three would have been reporting two non-problems to look
+    // thorough, and would have taught people to ignore it.
+    const dirPatterns = ['node_modules'];
+    const offenders = [];
+    for (const name of dirPatterns) {
+      // A fresh repo per pattern. `git init` over an existing one keeps the
+      // previous symlink, and then git status reports the wrong name.
+      const repo = mkdtempSync(join(scratch, 'r-'));
+      writeFileSync(join(repo, '.gitignore'), readFileSync(join(ROOT, '.gitignore'), 'utf8'));
+      spawnSync('git', ['init', '-q'], { cwd: repo });
+      mkdirSync(join(repo, 'target-dir'), { recursive: true });
+      writeFileSync(join(repo, 'target-dir', 'f.txt'), 'x');
+      symlinkSync(join(repo, 'target-dir'), join(repo, name));
+      const r = spawnSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+        cwd: repo, encoding: 'utf8',
+      });
+      const listed = String(r.stdout || '');
+      // `?? <name>` and nothing after it means git would happily track it.
+      if (listed.split('\n').some((l) => l === `?? ${name}`)) offenders.push(name);
+    }
+    for (const name of offenders) {
+      problems.push({
+        kind: 'SYMLINK-EXPOSED',
+        path: name,
+        detail:
+          `.gitignore uses \`${name}/\`, which matches a DIRECTORY and nothing else. ` +
+          `It does not cover the symlinked form every agent worktree creates, so a ` +
+          `symlink at this path is committable. Drop the trailing slash.`,
+      });
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
 if (problems.length) {
   console.error(`\ncheck-gitignore: FAILED — ${problems.length} path(s) are on the wrong side of .gitignore.\n`);
   for (const { kind, path, detail } of problems) {
@@ -168,13 +234,15 @@ if (problems.length) {
     console.error(`  ${gh}`);
   }
   console.error('\n  COMMITTABLE    a file git would stage on `git add .`. Add the pattern.');
-  console.error('  WRONGLY IGNORED a tracked file git would refuse to add. Add a ! exception.\n');
+  console.error('  WRONGLY IGNORED a tracked file git would refuse to add. Add a ! exception.');
+  console.error('  SYMLINK-EXPOSED a name a trailing-slash pattern fails to protect when it is a symlink. Drop the slash.\n');
   process.exit(1);
 }
 
 console.log(
   `check-gitignore: clean — ${MUST_BE_IGNORED.length - skipped.length} credential path(s) ignored, ` +
-    `${MUST_REMAIN_TRACKABLE.length} path(s) confirmed still committable` +
+    `${MUST_REMAIN_TRACKABLE.length} path(s) confirmed still committable, ` +
+    `node_modules verified against the symlink form` +
     (skipped.length ? `, ${skipped.length} unanswerable in this working tree.` : '.')
 );
 

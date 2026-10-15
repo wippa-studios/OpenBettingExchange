@@ -1,5 +1,5 @@
 # OpenBettingExchange
-node_modules/
+node_modules
 data/
 .env
 *.log
