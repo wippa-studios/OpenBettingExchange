@@ -749,7 +749,19 @@ app.post('/api/auth/logout', (req, res) => {
 });
 
 app.get('/api/me', requireAuth, (req, res) => {
-  res.json({ user: { ...req.user, available_cents: req.user.balance_cents - req.user.frozen_cents } });
+  // `tenant_status` is here because reads REMAIN AVAILABLE on a suspended
+  // tenant (#32), and a player who is allowed to look at the book but refused
+  // at the bet slip deserves to be told why without having to place an order to
+  // find out. It is the only surface that reports it; the refusals carry it in
+  // `details.code`.
+  const tenant = TEN.ofUser(db, req.user.id);
+  res.json({
+    user: {
+      ...req.user,
+      available_cents: req.user.balance_cents - req.user.frozen_cents,
+      tenant_status: tenant ? tenant.status : null,
+    },
+  });
 });
 
 // ── Account self-service ───────────────────────────────────────────────────

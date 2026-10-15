@@ -1123,6 +1123,110 @@ const check = async (name, fn) => {
       }
     });
 
+    // #32. Tenant status 'suspended' used to be validated, stored, audited and
+    // rendered — and obeyed by nothing. This is the HTTP surface of the fix:
+    // everything that moves money or takes on liability is refused with a 403
+    // that names the reason, and everything that only reads keeps working.
+    //
+    // The reads-are-kept half is a JUDGEMENT and therefore an assertion: a
+    // player who can look at the book but not trade is the intended state, and
+    // the admin desk has to stay open or the operator cannot restore their own
+    // venue.
+    await check('#32 a suspended tenant refuses acting over HTTP and keeps reads', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      const reg = await j('POST', '/api/auth/register', { body: { username: 'susplayer', password: 'secret1' } });
+      assert.strictEqual(reg.status, 201, 'the player registers while the tenant is active');
+      const player = cookieOf(reg);
+      const tenantId = srv.db.prepare("SELECT id FROM tenants WHERE slug='default'").get().id;
+
+      // A market of the player's own, so the acting paths below have something
+      // real to act on. Placed BEFORE the suspension: the order rests, and the
+      // suspension is expected to take it off the book.
+      srv.db.prepare("INSERT INTO sports (name, slug) VALUES ('Sus Football', 'sus-football')").run();
+      const sport = srv.db.prepare("SELECT id FROM sports WHERE slug='sus-football'").get();
+      srv.db.prepare("INSERT INTO events (sport_id, name, starts_at) VALUES (?, 'Sus Event', datetime('now','+2 hours'))").run(sport.id);
+      const ev = srv.db.prepare("SELECT id FROM events WHERE name='Sus Event'").get();
+      srv.db.prepare("INSERT INTO markets (event_id, name) VALUES (?, 'Match Odds')").run(ev.id);
+      const mkt = srv.db.prepare('SELECT id FROM markets WHERE event_id=? ORDER BY id DESC').get(ev.id);
+      const selIds = [];
+      for (const n of ['Red', 'Blue']) {
+        srv.db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, 2.0)').run(mkt.id, n);
+        selIds.push(srv.db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, n).id);
+      }
+      // A resting order, so suspension has something to cancel. Funded through
+      // the faucet first — while the tenant is still active, which is also the
+      // control for the deposit refusal below.
+      const funded = await j('POST', '/api/wallet/deposit', { body: { amount_cents: 50000 }, cookie: player });
+      assert.strictEqual(funded.status, 200, `the faucet works while active (got ${funded.status} ${JSON.stringify(funded.json)})`);
+      const order = await j('POST', '/api/orders', {
+        body: { selection_id: selIds[0], side: 'back', price: 2.0, stake_cents: 1000 },
+        cookie: player,
+      });
+      assert.strictEqual(order.status, 201, `the order is accepted while active (got ${order.status} ${JSON.stringify(order.json)})`);
+
+      const suspended = await j('PUT', `/api/admin/tenants/${tenantId}`, { body: { status: 'suspended' }, cookie: admin });
+      assert.strictEqual(suspended.status, 200, 'the suspension is accepted');
+      assert.strictEqual(suspended.json.status, 'suspended');
+      try {
+        // ── REFUSED: anything that moves money or creates liability ───────
+        const refused = [
+          ['POST /api/orders', await j('POST', '/api/orders', { body: { selection_id: selIds[0], side: 'back', price: 2.0, stake_cents: 1000 }, cookie: player })],
+          ['POST /api/wallet/deposit', await j('POST', '/api/wallet/deposit', { body: { amount_cents: 1000 }, cookie: player })],
+          ['POST /api/wallet/deposit-intent', await j('POST', '/api/wallet/deposit-intent', { body: { amount_cents: 1000 }, cookie: player })],
+          [`POST /api/markets/${mkt.id}/cashout`, await j('POST', `/api/markets/${mkt.id}/cashout`, { cookie: player })],
+        ];
+        for (const [name, r] of refused) {
+          assert.strictEqual(r.status, 403, `${name} is refused (got ${r.status} ${JSON.stringify(r.json)})`);
+          assert.strictEqual(r.json.details && r.json.details.code, 'tenant_suspended', `${name} names the reason`);
+          assert.match(r.json.error, /venue is suspended/i, `${name} says so in words`);
+        }
+
+        // The resting order is gone, and its escrow is back. A gate cannot do
+        // this: a resting order is live liquidity, not a request.
+        const open = await j('GET', '/api/orders', { cookie: player });
+        assert.strictEqual(open.status, 200, 'the orders list is still readable');
+        assert.strictEqual(open.json.orders.length, 0, 'and the resting order was cancelled by the suspension');
+
+        // ── ALLOWED: reads, and the reason is visible without acting ──────
+        const me = await j('GET', '/api/me', { cookie: player });
+        assert.strictEqual(me.status, 200, 'GET /api/me still answers');
+        assert.strictEqual(me.json.user.tenant_status, 'suspended', 'and reports the tenant status');
+        assert.ok(Number.isInteger(me.json.user.balance_cents), 'with the balance still readable');
+        for (const path of ['/api/wallet', '/api/positions', '/api/orders', '/api/settlements', '/api/sports', `/api/markets/${mkt.id}/book`]) {
+          const r = await j('GET', path, { cookie: player });
+          assert.strictEqual(r.status, 200, `${path} still answers on a suspended tenant (got ${r.status})`);
+        }
+        // The admin desk stays open, or the operator could not undo this.
+        const stats = await j('GET', '/api/admin/stats', { cookie: admin });
+        assert.strictEqual(stats.status, 200, 'the admin desk is not a trap');
+
+        // ── THE LOGIN, AND THE ORDERING ──────────────────────────────────
+        const good = await j('POST', '/api/auth/login', { body: { username: 'susplayer', password: 'secret1' } });
+        assert.strictEqual(good.status, 403, 'the right password is refused');
+        assert.strictEqual(good.json.details.code, 'tenant_suspended');
+        // …but not before it is proven. A 401 and a 403 that names the venue
+        // are different answers, and a caller who has proved nothing must not
+        // be able to tell a suspended account from a missing one.
+        const bad = await j('POST', '/api/auth/login', { body: { username: 'susplayer', password: 'wrong-one' } });
+        assert.strictEqual(bad.status, 401, 'a wrong password is still the generic 401');
+        assert.strictEqual(bad.json.details, undefined, 'and carries no reason code');
+        const missing = await j('POST', '/api/auth/login', { body: { username: 'nosuchplayer', password: 'wrong-one' } });
+        assert.strictEqual(missing.status, 401, 'and an unknown username is indistinguishable from it');
+        assert.deepStrictEqual(bad.json, missing.json, 'byte-identical: no oracle');
+
+        // ── RESTORING ────────────────────────────────────────────────────
+        const back = await j('PUT', `/api/admin/tenants/${tenantId}`, { body: { status: 'active' }, cookie: admin });
+        assert.strictEqual(back.status, 200, 'the tenant can be restored from the API');
+        const again = await j('POST', '/api/orders', {
+          body: { selection_id: selIds[0], side: 'back', price: 2.0, stake_cents: 1000 },
+          cookie: player,
+        });
+        assert.strictEqual(again.status, 201, `and orders are accepted again (got ${again.status} ${JSON.stringify(again.json)})`);
+      } finally {
+        await j('PUT', `/api/admin/tenants/${tenantId}`, { body: { status: 'active' }, cookie: admin });
+      }
+    });
+
     console.log(`\napi.test.js: ${passed} checks passed`);
   } finally {
     server.close();

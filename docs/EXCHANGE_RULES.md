@@ -13,6 +13,7 @@ each rule so you can check the arithmetic yourself.
 - [Commission](#commission)
 - [Voiding](#voiding)
 - [Cash-out](#cash-out)
+- [Tenants and suspension](#tenants-and-suspension)
 - [Markets, events and lifecycle](#markets-events-and-lifecycle)
 - [Limits and configuration](#limits-and-configuration)
 - [What is deliberately not implemented](#what-is-deliberately-not-implemented)
@@ -451,6 +452,87 @@ revisited — but neither has a caller driving an in-play suspension now. See
 [ROADMAP.md](ROADMAP.md).
 
 ---
+
+## Tenants and suspension
+
+A tenant is a venue. `status = 'suspended'` is the operator taking that venue
+off, and it **blocks**: a suspended tenant's players are refused trading.
+
+It used to do nothing at all. The value was validated, stored, audited and
+rendered in the admin UI, and read by no code anywhere — so an operator who
+suspended a partner brand got a `200`, an audit row saying
+`{status: "suspended"}`, a dashboard showing the tenant as suspended, and a
+venue that carried on taking bets. That is the most dangerous shape a bug can
+take: every signal an operator would check to confirm the suspension took
+effect says it did.
+
+### What is refused
+
+| | |
+| --- | --- |
+| **Placing an order** | `403`, `details.code: "tenant_suspended"` |
+| **Cash-out** | `403` — it closes a position and pays the player |
+| **Deposits and deposit intents** | `403` — money in creates liability |
+| **Logging in, and minting a session** | `403` after the password is proven |
+| **The house quoting (bot ladders)** | skipped — a suspended venue does not make markets |
+
+### What is still available, and why
+
+**Reads.** The board and order book, positions, balances, the wallet ledger,
+settlement history, `/api/me` (which now reports `tenant_status`). **The admin
+desk**, including settlement and the restore call itself.
+
+A suspended tenant's players can be holding **matched** positions. Those are
+collateralised on both sides and must still settle, and a player who is not even
+shown what they hold, what they are owed, or what their balance is, on a venue
+the operator has taken off, produces a complaint the only answer to which is to
+un-suspend. That is the opposite of what a suspension is for. It is also the
+reasoning `lib/limits.js` already applies to self-exclusion: matched positions
+are left alone because releasing them, or refusing to serve them, would mean the
+venue chooses which side of a matched bet to honour.
+
+The admin desk stays for the same reason plus one more: **a lock that also
+blocks the operator holding the key is a trap, not a control.** The first-run
+credential lock in `server.js` already had to be repaired for exactly that, and
+a venue that cannot be un-suspended without a direct database edit is a venue
+somebody will reach for one.
+
+### Resting orders go with it
+
+Suspending a tenant **cancels its resting orders and releases their escrow**,
+inside the same transaction as the status change and its audit row.
+
+No gate can do this. A resting order is not a request, it is live liquidity, and
+after the gates it would keep matching: a suspended venue's players taking new
+matched positions is precisely what the suspension exists to prevent, and it
+re-opens the hole the jurisdiction gate at session creation was built to close.
+Matched positions are left alone.
+
+### Where the gates live, and why there
+
+| Gate | Where | Why there |
+| --- | --- | --- |
+| Session creation | `lib/auth.js` `createSession` | next to the jurisdiction gate, for the same reason: a player who cannot get in never holds a position |
+| Trading | `lib/limits.js` `assertTradeable` | the **one** function every money path already calls, so a route added later cannot forget it — and it stops an **already-signed-in** player, not only the next login |
+| Resting orders | `lib/tenants.js` `configure` | a status change is the only moment a gate cannot cover |
+
+Both gates run **after** authentication, never before. A refusal raised before
+the password check would turn `POST /api/auth/login` into a probe that tells an
+unauthenticated caller which usernames exist and which venue is suspended — the
+exact disclosure the single generic `401` exists to prevent, and the ordering
+`lib/auth.js` already documents for a suspended *account*. A wrong password on a
+suspended tenant is still `401 Invalid username or password`, byte-identical to
+the answer for an account that does not exist.
+
+A self-excluded player on a suspended tenant is told they are **excluded**, not
+that their venue is suspended: the exclusion message is the only answer to that
+question that is not an argument, and a suspension leads nowhere straight back
+in either.
+
+*Tests:* `tests/tenants.test.js` (T21 login gate and its ordering, T22 the
+already-signed-in player, T23 reads and the admin desk survive, T24 resting
+orders and escrow, T25 scoped to its own tenant, T26 restoring opens the gate
+again), `tests/api.test.js` (the whole surface over HTTP).
 
 ## Markets, events and lifecycle
 

@@ -129,6 +129,7 @@ in place.
 | Results feed: transport, per-sport void rules, held disputes, provenance, manual release | Available (transport requires `RESULTS_FEED_URL`) |
 | Reporting: financial summary with self-check, player statements, volume, commission, operational | Available (`/api/admin/reports/*`, CSV or `?format=json`) |
 | Session limit, reality check, deposit limit | Available, operator-configured (`0` = off; boot warns) |
+| Tenant suspension: cancels resting orders, refuses betting, cash-out, deposits and login | Available (`PUT /api/admin/tenants/:id`; reads and the admin desk stay up — see [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#tenants-and-suspension)) |
 | Responsible gambling: session, reality check, deposit cap, self-exclusion | Available (`lib/rg.js`) |
 | Abuse controls: stake, market liability and daily settlement caps | Available (`lib/limits.js`) |
 | Odds feed ([OpenBettingExchangeDataFeed](https://github.com/wippa-studios/OpenBettingExchangeDataFeed)) | Display only; feed markets are not tradeable |
@@ -187,7 +188,7 @@ layered on `match`.
 | `lib/risk` | Market-maker risk: caps, skew, kill switch |
 | `lib/odds` | Tick ladder, American/fractional/implied formats, overround |
 | `lib/offtime` | Pre-off cut-off enforcement |
-| `lib/tenants` | Multi-tenancy, per-tenant commission, jurisdictions |
+| `lib/tenants` | Multi-tenancy, per-tenant commission, jurisdictions, tenant suspension |
 | `lib/payments` | Provider interface and reference provider |
 | `lib/reports` | Regulatory, financial and operational exports |
 | `lib/jobs` | Scheduled reconciliation and maintenance |
