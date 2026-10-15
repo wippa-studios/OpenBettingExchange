@@ -150,6 +150,53 @@ if (checks) {
     }
   }
 
+  // ── The UNIT count, wherever it is stated in PROSE ─────────────────────────
+  //
+  // The block above only reads lines containing the literal `npm test`, so it
+  // sees the command block in README and CONTRIBUTING and nothing else. Prose
+  // states the same number in a different shape and was never checked:
+  //
+  //   docs/ARCHITECTURE.md:211  "648 checks across 48 suites, plus a browser…"
+  //   docs/ROADMAP.md:502       "The suite is now **648 checks across 48 suites**"
+  //   docs/ROADMAP.md:54        "| Test suite | `tests/` | 48 suites, …"
+  //
+  // All three were stale by the time this was written. They are the most
+  // persuasive claims in the documentation — a reader deciding whether to trust
+  // the suite is reading exactly those sentences — and nothing policed them.
+  //
+  // Scoped carefully, because the number also appears as HISTORY. "grew from 340
+  // to 584 checks" is an accurate record and rewriting it would make the history
+  // less accurate. So this matches the PRESENT-tense shapes only, and
+  // CHANGELOG.md is excluded for the same reason the anti-hedge check excludes
+  // it.
+  const unitClaims = [
+    // "648 checks across 48 suites" — both numbers in one phrase.
+    { re: /(\d+)\s+checks\s+across\s+(\d+)\s+suites/gi, checks: true, suites: true },
+    // A bare "48 suites" in a table cell or sentence about the test suite.
+    { re: /(\d+)\s+suites/gi, checks: false, suites: true },
+  ];
+  for (const rel of DOCS) {
+    if (!exists(rel)) continue;
+    for (const line of read(rel).split('\n')) {
+      // Skip the npm-test command line: that is the other check's job, and it
+      // reports the same drift with a better message.
+      if (/npm test\b/.test(line)) continue;
+      const m1 = line.match(/(\d+)\s+checks\s+across\s+(\d+)\s+suites/i);
+      if (m1) {
+        note(
+          Number(m1[1]) === checks && Number(m1[2]) === suites,
+          `${rel}: claims "${m1[1]} checks across ${m1[2]} suites"; the suite reports ` +
+            `${checks} checks / ${suites} suites.`
+        );
+        continue;
+      }
+      const m2 = line.match(/(?<![\d.])(\d+)\s+suites/i);
+      if (m2) {
+        note(Number(m2[1]) === suites, `${rel}: claims ${m2[1]} suites; there are ${suites}.`);
+      }
+    }
+  }
+
   // ── The BROWSER suite count, checked for CONSISTENCY across the docs ─────
   // Not checked against a live run: that needs Playwright and a browser, which
   // is too expensive for a doc checker and would make it flaky.

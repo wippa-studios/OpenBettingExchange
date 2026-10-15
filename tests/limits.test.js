@@ -139,6 +139,58 @@ check('L6 daily cap stops matching but the order still rests', async () => {
   assert.strictEqual(L.marketLiability(db, alice.id, MKT), 5000);
 });
 
+// ── ABSENT is not NULL ─────────────────────────────────────────────────────
+//
+// The route documents "a key that is ABSENT leaves that axis untouched; a key
+// present with a null CLEARS the cap", and tries to honour it by omitting absent
+// keys from the object it passes down. That cannot work: destructuring gives an
+// absent key the same `undefined` as an explicit one, `capOf(undefined)` returns
+// null, and the axis is cleared.
+//
+// The failure is a silent WIDENING of a risk control. Tightening a stake limit
+// while leaving the daily cap out would hand the account an unlimited daily cap
+// — the exact harm the comment says it is preventing, in the comment's own words.
+check('L18 an ABSENT axis is left untouched; an explicit null CLEARS it', async () => {
+  const { db, alice, marketId: MKT } = (await fixture());
+  L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global',
+    max_open_stake_cents: 5000, max_market_liability_cents: 7000, max_daily_settled_cents: 9000 });
+
+  // Tighten ONE axis and say nothing about the others.
+  const after = L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global',
+    max_open_stake_cents: 1000 });
+
+  assert.strictEqual(after.max_open_stake_cents, 1000, 'the named axis was not applied');
+  assert.strictEqual(after.max_market_liability_cents, 7000,
+    'an ABSENT liability cap was silently cleared');
+  assert.strictEqual(after.max_daily_settled_cents, 9000,
+    'tightening the stake cap silently granted an UNLIMITED daily cap');
+
+  // An EXPLICIT null still clears, which is the other half of the contract.
+  const cleared = L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global',
+    max_daily_settled_cents: null });
+  assert.strictEqual(cleared.max_daily_settled_cents, null, 'an explicit null must clear the cap');
+  assert.strictEqual(cleared.max_open_stake_cents, 1000, 'clearing one axis must not disturb another');
+});
+
+check('L18 absent axes on a user with NO existing row are null, not an error', async () => {
+  const { db, alice } = (await fixture());
+  // No prior row. Every axis is absent, so all three resolve to null.
+  const after = L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global',
+    max_open_stake_cents: 1000 });
+  assert.strictEqual(after.max_open_stake_cents, 1000);
+  assert.strictEqual(after.max_market_liability_cents, null);
+  assert.strictEqual(after.max_daily_settled_cents, null);
+});
+
+check('L18 an absent axis is not RE-VALIDATED, so a no-op PUT still succeeds', async () => {
+  const { db, alice } = (await fixture());
+  L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global', max_open_stake_cents: 5000 });
+  // Sending only the same value must not disturb the others, and must not throw.
+  const after = L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global',
+    max_open_stake_cents: 5000 });
+  assert.strictEqual(after.max_open_stake_cents, 5000);
+});
+
 // ── #14: the RESTING side ───────────────────────────────────────────────────
 //
 // L6 above proves the cap stops a capped user TAKING. It says nothing about the

@@ -243,9 +243,23 @@
       }
       const back = sel.back || [];
       const lay = sel.lay || [];
-      // Back arrives sorted high→low and lay low→high, so the best price is
-      // index 0 in each; reverse the back list to place it nearest the runner.
-      const b = cellsFor(sel, back.slice().reverse(), 'back', 'atright');
+      // Back arrives sorted high→low and lay low→high, so the BEST price is
+      // index 0 on both sides. `atright` parks a side's first cell at the far
+      // edge of that side's group and `atleft` at the near edge, which is why the
+      // two classes are mirrored: with the best price first on both, the two best
+      // prices land in the middle of the row and meet there (style.css:436).
+      //
+      // THE REVERSE THAT WAS HERE WAS THE BUG, AND IT INVERTED THE DOCUMENTED
+      // INVARIANT. It made the back list worst-first, so `atright` parked the
+      // WORST back price in the rightmost column of the back group — the column
+      // touching the lay side. The junction between blue and pink, the most
+      // prominent boundary in the row, was where the two prices a trader least
+      // wants to meet were placed. Measured over 33 runner rows: the price
+      // touching the lay group was the worst back on every one.
+      //
+      // Removing it makes the code match the comment it was written next to, and
+      // makes "the two best prices meet in the middle" expressible at all.
+      const b = cellsFor(sel, back, 'back', 'atright');
       const l = cellsFor(sel, lay, 'lay', 'atleft');
       // LAST TRADED PRICE — only worth showing when it says something the
       // ladder does not.
