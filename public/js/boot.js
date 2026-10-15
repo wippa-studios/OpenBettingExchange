@@ -114,7 +114,19 @@
       // goTo() rather than `location.hash = ...`: clicking the tab you are
       // already on assigns the same hash, which fires no `hashchange` and so
       // re-renders nothing. #50.
-      b.onclick = () => OB.goTo(b.dataset.page);
+      // goTo() rather than `location.hash = ...`: clicking the tab you are
+      // already on assigns the same hash, which fires no `hashchange` and so
+      // re-renders nothing. #50.
+      //
+      // AND close the rail. On a narrow screen the header nav sits BESIDE the
+      // open drawer, so navigating left the drawer sitting on top of the page
+      // it had just navigated to, with no scrim, until the user worked out that
+      // the hamburger would close it. Choosing a destination and staying
+      // covered by the navigation is what makes a drawer read as broken. #68.
+      b.onclick = () => {
+        OB.closeNavRail();
+        OB.goTo(b.dataset.page);
+      };
     });
     OB.$('authBtn').onclick = () => (OB.state.user ? OB.logout() : OB.openAuth('login'));
     OB.$('accountBtn').onclick = () => OB.openAccount();

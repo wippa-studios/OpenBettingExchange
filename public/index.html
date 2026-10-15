@@ -10,6 +10,11 @@
   <meta name="theme-color" content="#ffffff" />
   <link rel="preload" href="/fonts/inter-400.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="preload" href="/fonts/inter-700.woff2" as="font" type="font/woff2" crossorigin />
+  <!-- BEFORE the stylesheet, and NOT deferred: the whole point is that it has
+       run before the first paint. The CSP is `script-src 'self'`, so an inline
+       snippet is refused outright - this is an external file for that reason,
+       exactly as the app's other scripts are. -->
+  <script src="/js/theme.js"></script>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -99,6 +104,37 @@
     <div class="box">
       <h3 id="accountTitle">Account</h3>
       <p class="muted fineprint" id="accountWho"></p>
+
+      <!-- Colour theme (#66). Real radios in a fieldset rather than a toggle
+           button, because there are genuinely three answers - follow the OS,
+           force light, force dark - and a two-state switch cannot get a user
+           back to "follow the OS" once they have left it. Keyboard grouping,
+           arrow-key navigation and the announced state all come from the
+           browser rather than being re-implemented here.
+
+           IN HERE, NOT IN THE HEADER. The header measures 1400px of content at
+           1400px: adding 130px squeezed "Sign out" onto two lines, which grew
+           the header past --header-h and so moved the rail's top and the slip's
+           sticky offset out of alignment with it. The panel is where the other
+           preferences live and the header has no room to give. -->
+      <fieldset id="themePicker" class="themepick">
+        <legend class="fieldlabel">Appearance</legend>
+        <div class="themepick-row">
+          <label class="chip themepick-opt">
+            <input type="radio" name="theme" value="auto" />
+            <span>Auto</span>
+          </label>
+          <label class="chip themepick-opt">
+            <input type="radio" name="theme" value="light" />
+            <span>Light</span>
+          </label>
+          <label class="chip themepick-opt">
+            <input type="radio" name="theme" value="dark" />
+            <span>Dark</span>
+          </label>
+        </div>
+        <p class="muted fineprint">Auto follows your operating system. A choice made here is kept on this device.</p>
+      </fieldset>
 
       <label class="fieldlabel" for="pwCurrent">Current password</label>
       <input id="pwCurrent" type="password" autocomplete="current-password" />

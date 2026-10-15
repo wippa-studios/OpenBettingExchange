@@ -20,7 +20,7 @@
     console.error('[admin-risk] window.OB missing — app.js must load first');
     return;
   }
-  const { api, fmt, price2, esc, attr, openOverlay, closeOverlay, toast } = OB;
+  const { api, fmt, price2, esc, attr, openOverlay, closeOverlay, toast, signed } = OB;
 
   // A panel that failed to load must say WHY. A blank card reads as "nothing
   // to see", which is the opposite of the truth when the server is old or the
@@ -29,8 +29,15 @@
     return `<div class="empty">${esc(msg)}</div>`;
   }
 
+  // ONE negative-money format across the product. This used to use fmt(), which
+  // renders a negative as `$-140.43` — a shape nobody writes — while the
+  // player-facing signed() in core.js renders `−$140.43` for the same number.
+  // Two formats for one quantity, on two screens, in the same product.
+  //
+  // Zero is unsigned on purpose: "+$0.00" claims a gain that did not happen.
   function money(cents) {
-    return `<span class="${cents > 0 ? 'win' : cents < 0 ? 'loss' : 'muted'}">${fmt(cents)}</span>`;
+    const text = cents === 0 ? fmt(0) : signed(cents);
+    return `<span class="${cents > 0 ? 'win' : cents < 0 ? 'loss' : 'muted'}">${text}</span>`;
   }
 
   // The prompt says the reason is recorded, so it must actually reach the
@@ -38,29 +45,41 @@
   // and the server wrote a hard-coded null into the audit row — the operator was
   // told their justification was kept and it was thrown away.
   //
-  // The length floor is enforced HERE as well as on the server: the server's is
-  // the control, but a raw 400 from `window.prompt` is a worse experience than
-  // being told the minimum before submitting.
+  // The length floor is enforced in the dialog as well as on the server: the
+  // server's is the control, but lib/results.js refuses a held release under
+  // five characters, and being told the minimum before submitting is better
+  // than a 400 on the screen that moves the most money.
   const MIN_REASON = 5;
-  function askReason(what) {
-    for (;;) {
-      const reason = window.prompt(`${what}\n\nReason (recorded in the audit log):`);
-      if (reason === null) return null;
-      const trimmed = reason.trim();
-      if (!trimmed) return null;
-      if (trimmed.length < MIN_REASON) {
-        toast(`A reason of at least ${MIN_REASON} characters is required`);
-        continue;
-      }
-      return trimmed;
-    }
-  }
+  // `danger` paints the CONFIRM button red, so it is passed per action and
+  // defaults to false. Left always-on, "Release kill switch" — the one button on
+  // this desk that puts quoting BACK — offered a red confirmation, which is the
+  // same inversion the button itself had.
+  const askReason = (what, extra) =>
+    OB.askReason(what, Object.assign({ minLength: MIN_REASON }, extra || {}));
+
+  /**
+   * Every toast that reports a failure has to say so.
+   *
+   * `toast()` defaults its kind to 'ok', and five call sites here passed
+   * `toast(e.message)` — so a REJECTED tenant update, a refused kill switch and a
+   * failed withdrawal all rendered in the green success style. A failure the
+   * product presents as a success is worse than no feedback at all: the
+   * operator walks away believing an action they did not take happened.
+   */
+  const toastError = (e) => toast((e && e.message) || String(e), 'err');
 
   // ── Risk desk ─────────────────────────────────────────────────────────────
   // The numbers an operator MUST be able to see: how much the market maker
   // owes, how far it is from its caps, and whether the kill switch is pulled.
   // A venue that cannot see its own market-maker loss discovers it by going
   // bankrupt.
+  //
+  // ONE alarm threshold, stated once. The fill is healthy below it and red at
+  // or above it; the percentage beside the bar carries the precision. There is
+  // deliberately no middle band: the palette has two alarm hues and a third
+  // state drawn in neutral grey would make a 60% bar look calmer than a 30% one.
+  const METRE_ALARM_PCT = 80;
+
   async function renderRiskView(body) {
     let data;
     try {
@@ -77,7 +96,7 @@
         <td class="muted">${fmt(b.max_liability_cents)}</td>
         <td>${money(b.daily_pnl_cents)}</td>
         <td>
-          <div class="meter" title="${pct}% of cap"><div class="meterfill ${pct > 80 ? 'bad' : pct > 50 ? 'warn' : ''} w-${Math.round(pct / 10) * 10}"></div></div>
+          <div class="meter" role="img" aria-label="${attr(pct)}% of cap${pct >= METRE_ALARM_PCT ? ', over the alarm threshold' : ''}" title="${attr(pct)}% of cap"><div class="meterfill${pct >= METRE_ALARM_PCT ? ' bad' : ''} w-${Math.round(pct / 10) * 10}"></div></div>
           <span class="muted">${pct}%</span>
         </td>
         <td>${b.quoting_allowed ? '<span class="chip live">quoting</span>' : `<span class="chip suspended">${esc(b.reason || 'stopped')}</span>`}</td>
@@ -109,7 +128,7 @@
         <tbody>${bots || '<tr><td colspan="6" class="muted">No market makers</td></tr>'}${cashout}</tbody>
       </table>
       <div class="row gap">
-        <button class="btn ${data.kill_switch ? 'danger' : ''}" id="riskKill">${data.kill_switch ? 'Release kill switch' : 'PULL KILL SWITCH'}</button>
+        <button class="btn ${data.kill_switch ? '' : 'red'}" id="riskKill">${data.kill_switch ? 'Release kill switch' : 'PULL KILL SWITCH'}</button>
         <button class="btn" id="riskWithdraw">Withdraw all bot quotes</button>
       </div>
       <p class="muted small">Killing stops NEW quotes; it does not cancel resting ones, because a quote
@@ -117,26 +136,41 @@
       <div id="riskOut"></div>`;
 
     const out = body.querySelector('#riskOut');
+    // THE DESTRUCTIVE CONTROL MUST LOOK LIKE THE DESTRUCTIVE CONTROL. The label
+    // is conditional — pulling is destructive, releasing is not — so the styling
+    // has to be conditional the same way. It used to be the other way round:
+    // `data.kill_switch ? 'danger' : ''` painted the danger style onto the
+    // button that says "Release kill switch" and left "PULL KILL SWITCH" in the
+    // neutral .btn face, identical to "Withdraw all bot quotes" beside it.
     body.querySelector('#riskKill').onclick = async () => {
       const on = !data.kill_switch;
       const why = on ? 'releasing the desk' : 'pulling the desk kill switch';
-      const reason = askReason(`You are ${why}`);
+      const reason = await askReason(`You are ${why}`, {
+        // `on` is the state the switch is moving TO, so it is also the verb:
+        // moving it on is PULLING, which is the destructive one. (Getting this
+        // backwards would have put a red "Release" on the screen.)
+        confirmLabel: on ? 'Pull' : 'Release',
+        danger: on,
+      });
       if (!reason) return;
       try {
         await api('PUT', '/api/admin/risk/kill-switch', { on, reason });
         toast(`Kill switch ${on ? 'released' : 'pulled'}`);
         renderRiskView(body);
-      } catch (e) { toast(e.message); }
+      } catch (e) { toastError(e); }
       void why;
     };
     body.querySelector('#riskWithdraw').onclick = async () => {
-      const reason = askReason('Withdrawing every resting bot quote');
+      const reason = await askReason('Withdrawing every resting bot quote', {
+        confirmLabel: 'Withdraw',
+        danger: true, // it cancels promises the venue already made
+      });
       if (!reason) return;
       try {
         const r = await api('POST', '/api/admin/risk/withdraw', { reason });
         toast(`Cancelled ${r.cancelled_orders} quote(s), released ${fmt(r.released_cents)}`);
         renderRiskView(body);
-      } catch (e) { toast(e.message); }
+      } catch (e) { toastError(e); }
     };
     void out;
   }
@@ -214,12 +248,14 @@
         <tbody>${rows || '<tr><td colspan="7" class="muted">No findings — the books agree.</td></tr>'}</tbody>
       </table>`;
     body.querySelectorAll('[data-resolve]').forEach((b) => {
-      b.onclick = () => {
-        const reason = askReason('Closing this reconciliation finding');
+      b.onclick = async () => {
+        const reason = await askReason('Closing this reconciliation finding', { confirmLabel: 'Close' });
         if (!reason) return;
-        api('POST', `/api/admin/reconciliation/findings/${b.dataset.resolve}/resolve`, { reason })
-          .then(() => { toast('Finding resolved'); renderReconView(body); })
-          .catch((e) => toast(e.message));
+        try {
+          await api('POST', `/api/admin/reconciliation/findings/${b.dataset.resolve}/resolve`, { reason });
+          toast('Finding resolved');
+          renderReconView(body);
+        } catch (e) { toastError(e); }
       };
     });
   }
@@ -282,7 +318,9 @@
   }
 
   async function releaseHeld(body, marketId, decision) {
-    const reason = askReason(`Releasing this held market as ${decision}`);
+    const reason = await askReason(`Releasing this held market as ${decision}`, {
+      confirmLabel: decision === 'void' ? 'Void market' : 'Continue to winners',
+    });
     if (!reason) return;
     const payload = { decision, reason };
     if (decision === 'settle') {
@@ -307,7 +345,7 @@
       await api('POST', `/api/admin/results/held/${marketId}/release`, payload);
       toast(`Market ${marketId} ${decision === 'void' ? 'voided' : 'settled'}`);
       renderResultsView(body);
-    } catch (e) { toast(e.message); }
+    } catch (e) { toastError(e); }
   }
 
   /**
@@ -339,7 +377,7 @@
       const r = await api('GET', `/api/markets/${marketId}/book`);
       book = r.book || [];
     } catch (e) {
-      toast(e.message, 'err');
+      toastError(e);
       return null;
     }
     if (!book.length) {
@@ -508,6 +546,8 @@
         <input id="tBrandName" value="${esc(brand.name || '')}">
         <label>Logo (a path on this venue, e.g. /assets/logo.png)</label>
         <input id="tBrandLogo" value="${esc(brand.logo || '')}">
+        <label>Favicon (tab and home-screen icon; a path on this venue, e.g. /assets/favicon.png)</label>
+        <input id="tBrandFavicon" value="${esc(brand.favicon || '')}">
         <label>Terms URL (shown in the player's Account panel)</label>
         <input id="tBrandTerms" value="${esc(brand.terms_url || '')}">
         <label>Palette — hex colours, empty = the house default</label>
@@ -540,10 +580,19 @@
       if (logo && !/^\/(?!\/)/.test(logo)) {
         return toast('The logo must be a path on this venue, e.g. /assets/logo.png', 'err');
       }
+      // The same rule as the logo, and for the same reason: the venue's CSP is
+      // `img-src 'self' data:`, so a remote icon is a refused fetch and a tab
+      // pointing at a third-party host. Refused HERE rather than written and
+      // left broken.
+      const favicon = out.querySelector('#tBrandFavicon').value.trim();
+      if (favicon && !/^\/(?!\/)/.test(favicon)) {
+        return toast('The favicon must be a path on this venue, e.g. /assets/favicon.png', 'err');
+      }
       const termsUrl = out.querySelector('#tBrandTerms').value.trim();
       const nextBrand = {
         name: out.querySelector('#tBrandName').value.trim(),
         logo: logo || '/assets/logo.png',
+        favicon: favicon || '/assets/favicon.png',
         terms_url: termsUrl || null,
         palette,
       };
@@ -559,7 +608,7 @@
         // this used to be followed by was never seen by anybody.
         toast('Tenant updated · branding applies on the next page load');
         renderTenantsView(body);
-      } catch (e) { toast(e.message); }
+      } catch (e) { toastError(e); }
     };
   }
 

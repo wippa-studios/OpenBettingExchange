@@ -112,6 +112,11 @@ const EXPECTED_PREAUTH_401 = /401 \(Unauthorized\)/;
 // WORKING, exactly as the signed-out 401 above is the whoami probe working.
 let expectLock403 = false;
 const EXPECTED_LOCK_403 = /403 \(Forbidden\)/;
+// Set while #68 injects a 500 on /api/events on purpose. Chromium logs the
+// refused response as a console error, and a test that manufactures the fault
+// it then asserts on must not be failed by its own instrumentation.
+let expectEvents500 = false;
+const EXPECTED_EVENTS_500 = /500 \(Internal Server Error\)/;
 page.on('pageerror', (e) => pageErrors.push(String(e)));
 page.on('console', (msg) => {
   if (msg.type() !== 'error') return;
@@ -119,6 +124,7 @@ page.on('console', (msg) => {
   if (!signedIn && EXPECTED_PREAUTH_401.test(msg.text())) return;
   if (expectAuth401 && EXPECTED_PREAUTH_401.test(msg.text())) return;
   if (expectLock403 && EXPECTED_LOCK_403.test(msg.text())) return;
+  if (expectEvents500 && EXPECTED_EVENTS_500.test(msg.text())) return;
   pageErrors.push(text);
 });
 
@@ -866,6 +872,597 @@ try {
     check('admin body is a stable shared mount', degrade);
   });
 
+// ── #68 §2.4: the operator console's visual language does not exist ───────
+  //
+  // public/admin-risk.js renders ten class names style.css never defines. A
+  // missing class is invisible to every check that asserts an element EXISTS —
+  // the meter, the stat tiles and the tables are all in the DOM — so every
+  // assertion here is about GEOMETRY, VISIBILITY or COLOUR: the things that
+  // change when a rule exists.
+  await scenario('#68 the risk desk renders its meter, its KPI row and a kill switch that looks like one', async () => {
+    await page.click('[data-view="risk"]');
+    // `attached`, not `visible`: a .meter with zero height is not visible, which
+    // IS the defect. Waiting for visible here would turn it into a 10s timeout
+    // instead of the measured failure below.
+    await page.waitForSelector('#adminBody .meter', { state: 'attached', timeout: 10000 });
+
+    const desk = await page.evaluate(() => {
+      const box = (sel) => {
+        const n = document.querySelector(sel);
+        if (!n) return null;
+        const r = n.getBoundingClientRect();
+        const cs = getComputedStyle(n);
+        return { w: Math.round(r.width), h: Math.round(r.height), display: cs.display, background: cs.backgroundColor };
+      };
+      return { meter: box('#adminBody .meter'), fill: box('#adminBody .meterfill'), kill: box('#riskKill'), withdraw: box('#riskWithdraw') };
+    });
+    check(
+      '#68 the market-maker pressure meter has height',
+      !!desk.meter && desk.meter.h > 0 && desk.meter.display !== 'none',
+      `(meter ${desk.meter ? `${desk.meter.w}x${desk.meter.h} display:${desk.meter.display}` : 'absent'})`
+    );
+    check(
+      '#68 the meter fill is painted, not a zero-box',
+      !!desk.fill && desk.fill.h > 0 && desk.fill.background !== 'rgba(0, 0, 0, 0)',
+      `(fill ${desk.fill ? `${desk.fill.w}x${desk.fill.h} ${desk.fill.background}` : 'absent'})`
+    );
+    check(
+      '#68 the fill is the width the markup asked for',
+      !!desk.fill && !!desk.meter && desk.fill.w > 0 && desk.fill.w < desk.meter.w + 1,
+      `(fill ${desk.fill ? desk.fill.w : '?'} within meter ${desk.meter ? desk.meter.w : '?'})`
+    );
+
+    // THE HIGHEST-CONSEQUENCE ITEM IN THE BATCH. The most destructive control
+    // in the product rendered identically to the second-most destructive, so an
+    // operator could not see which one they were about to press.
+    check(
+      '#68 the kill switch does not look like the button beside it',
+      !!desk.kill && !!desk.withdraw && desk.kill.background !== desk.withdraw.background,
+      `(kill ${desk.kill ? desk.kill.background : '?'} vs withdraw ${desk.withdraw ? desk.withdraw.background : '?'})`
+    );
+    check(
+      '#68 the kill switch is drawn in the danger colour',
+      !!desk.kill && desk.kill.background === 'rgb(253, 236, 235)',
+      `(kill bg ${desk.kill ? desk.kill.background : '?'} — --red-bg is rgb(253,236,235))`
+    );
+    check(
+      '#68 the withdraw button is NOT drawn as a second danger control',
+      !!desk.withdraw && desk.withdraw.background === 'rgb(255, 255, 255)',
+      `(withdraw bg ${desk.withdraw ? desk.withdraw.background : '?'})`
+    );
+
+    // The KPI row: six numbers intended as a row, stacked in a column because
+    // .statgrid had no rule.
+    await page.click('[data-view="ledger"]');
+    await page.waitForSelector('#adminBody .statgrid .stat', { timeout: 10000 });
+    const kpi = await page.evaluate(() => {
+      const stats = [...document.querySelectorAll('#adminBody .statgrid .stat')];
+      const boxes = stats.map((n) => n.getBoundingClientRect());
+      const grid = document.querySelector('#adminBody .statgrid');
+      return {
+        n: stats.length,
+        rows: new Set(boxes.map((b) => Math.round(b.y))).size,
+        gridDisplay: grid ? getComputedStyle(grid).display : null,
+        gridWidth: grid ? Math.round(grid.getBoundingClientRect().width) : 0,
+        widest: Math.round(Math.max(...boxes.map((b) => b.width))),
+      };
+    });
+    check('#68 the ledger KPI tiles are laid out by a real grid', kpi.gridDisplay === 'grid', `(display ${kpi.gridDisplay})`);
+    check(
+      '#68 the six ledger figures share a row rather than a column',
+      kpi.n >= 6 && kpi.rows === 1 && kpi.widest < kpi.gridWidth * 0.3,
+      `(${kpi.n} tiles in ${kpi.rows} row(s), widest ${kpi.widest}px of ${kpi.gridWidth}px)`
+    );
+
+    // .small: the sub-labels were rendering at 14px body size because the class
+    // meant nothing. Type SIZE is out of scope for this issue, so this asserts
+    // that the class RESOLVES — a rule exists and it is smaller than body —
+    // rather than that any particular number is correct.
+    const small = await page.evaluate(() => {
+      const n = document.querySelector('#adminBody .small');
+      if (!n) return null;
+      return { px: parseFloat(getComputedStyle(n).fontSize), body: parseFloat(getComputedStyle(document.body).fontSize) };
+    });
+    check(
+      '#68 the small sub-label class actually makes text smaller',
+      !!small && small.px < small.body,
+      `(${small ? `${small.px}px vs body ${small.body}px` : 'no .small on the ledger'})`
+    );
+
+    // Each of the ten names must now have a rule of its own. The geometry
+    // assertions above prove three of them are load-bearing; this proves the
+    // rest exist, which is the only way to catch one being renamed back.
+    await page.click('[data-view="risk"]');
+    await page.waitForSelector('#adminBody table.tbl', { timeout: 10000 });
+    const defined = await page.evaluate((names) => {
+      const found = new Set();
+      for (const sheet of document.styleSheets) {
+        let rules;
+        try {
+          rules = sheet.cssRules;
+        } catch {
+          continue;
+        }
+        for (const r of rules) {
+          if (!r.selectorText) continue;
+          for (const part of r.selectorText.split(',')) {
+            const t = part.trim();
+            if (names.includes(t)) found.add(t);
+          }
+        }
+      }
+      const tbl = document.querySelector('#adminBody table.tbl');
+      const cell = tbl ? tbl.querySelector('td') : null;
+      return {
+        missing: names.filter((n) => !found.has(n)),
+        tblPadding: cell ? getComputedStyle(cell).padding : null,
+      };
+    }, ['.meter', '.meterfill', '.statgrid', '.stat', '.small', '.bad', '.ok', '.gap', '.tbl']);
+    check(
+      '#68 every class the operator console renders now has a rule',
+      defined.missing.length === 0,
+      `(no rule for: ${defined.missing.join(', ') || 'none'})`
+    );
+    check(
+      '#68 the operator tables take their own cell padding',
+      defined.tblPadding === '6px 8px',
+      `(td padding ${defined.tblPadding})`
+    );
+
+    // The dialog's own confirm button has to match what it is about to do, for
+    // the same reason the kill switch's own styling had to: a red "Release" is
+    // an action dressed as a danger, and an operator reads colour faster than
+    // they read the verb.
+    await page.click('[data-view="risk"]');
+    await page.waitForSelector('#riskKill', { timeout: 10000 });
+    const killLabel = ((await page.locator('#riskKill').textContent()) || '').trim();
+    await page.click('#riskKill');
+    await page.waitForSelector('.modal[role="dialog"] #askGo', { timeout: 10000 });
+    const confirmTone = await page.evaluate(() => getComputedStyle(document.querySelector('.modal[role="dialog"] #askGo')).backgroundColor);
+    const confirmLabel = ((await page.locator('.modal[role="dialog"] #askGo').textContent()) || '').trim();
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('.modal[role="dialog"]', { state: 'detached', timeout: 5000 }).catch(() => {});
+    check(
+      '#68 the kill-switch dialog\'s confirm button matches what the button does',
+      // Off (the dangerous direction) => red. On (releasing) => the neutral
+      // primary face, never red.
+      /pull/i.test(killLabel)
+        ? confirmTone === 'rgb(253, 236, 235)' && /pull/i.test(confirmLabel)
+        : confirmTone === 'rgb(10, 10, 11)' && /release/i.test(confirmLabel),
+      `(button said "${killLabel}", confirm "${confirmLabel}" in ${confirmTone})`
+    );
+
+  });
+
+  // ── #68 §2.2: the account panel claims to be a modal and is not ───────────
+  //
+  // `#accountModal` is declared `role="dialog" aria-modal="true"` and is
+  // hidden/shown through the overlay stack like #authModal — but it matched no
+  // rule in style.css, so `openOverlay()` toggled a class nothing styled. The
+  // result was a permanent full-width block at the bottom of <body>, on screen
+  // on every short page (My Bets, Wallet, all ten admin tabs).
+  //
+  // Asserted as VISIBILITY and GEOMETRY, never as presence: the panel is in the
+  // DOM either way, which is exactly why this survived.
+  await scenario('#68 the account panel is a modal, not a permanent block at the bottom of the page', async () => {
+    // Wallet is a short page, so the leaked panel was on screen there.
+    await page.click('#nav button[data-page="wallet"]');
+    await page.waitForSelector('#wBal', { timeout: 10000 });
+    await page.waitForTimeout(400);
+    const closed = await page.evaluate(() => {
+      const n = document.getElementById('accountModal');
+      const r = n.getBoundingClientRect();
+      return {
+        display: getComputedStyle(n).display,
+        visible: r.width > 0 && r.height > 0,
+        position: getComputedStyle(n).position,
+        coversViewport: r.width >= window.innerWidth - 1 && r.height >= window.innerHeight - 1,
+        onScreen: r.top < window.innerHeight && r.bottom > 0,
+      };
+    });
+    check('#68 the account panel is not rendered until it is opened', !closed.visible && closed.display === 'none', `(display ${closed.display}, ${closed.visible ? 'visible' : 'not visible'})`);
+    check(
+      '#68 no account panel is left on screen over a short page',
+      !closed.onScreen,
+      `(it occupies the viewport ${closed.onScreen ? '' : 'nowhere'}; position ${closed.position})`
+    );
+    // The controls inside it occupied real boxes on the page, so a screen
+    // reader walking My Bets or the Wallet reached a password form as ordinary
+    // in-flow content with no dialog announced. An empty box is the observable
+    // form of "not in the page".
+    const leaked = await page.evaluate(() => {
+      const ids = ['pwCurrent', 'pwNew', 'pwGo'];
+      return ids.map((id) => {
+        const n = document.getElementById(id);
+        return n ? Math.round(n.getBoundingClientRect().height) : -1;
+      });
+    });
+    check(
+      '#68 the password form occupies no space on the page',
+      leaked.every((h) => h === 0),
+      `(heights ${leaked.join(', ')}px)`
+    );
+
+    await page.click('#accountBtn');
+    await page.waitForSelector('#accountModal.show', { timeout: 5000 });
+    const open = await page.evaluate(() => {
+      const n = document.getElementById('accountModal');
+      const cs = getComputedStyle(n);
+      const r = n.getBoundingClientRect();
+      const box = document.querySelector('#accountModal .box');
+      return {
+        display: cs.display,
+        position: cs.position,
+        coversViewport: r.width >= window.innerWidth - 1 && r.height >= window.innerHeight - 1,
+        boxWidth: box ? Math.round(box.getBoundingClientRect().width) : 0,
+        boxCentred: box
+          ? Math.abs((box.getBoundingClientRect().left + box.getBoundingClientRect().right) / 2 - window.innerWidth / 2) < 2
+          : false,
+        focused: document.activeElement ? document.activeElement.id : null,
+      };
+    });
+    check('#68 opening the account panel overlays the page', open.display === 'flex' && open.position === 'fixed' && open.coversViewport, `(display ${open.display}, position ${open.position})`);
+    check('#68 the account panel is a centred box, not a full-width bar', open.boxWidth > 100 && open.boxWidth < 600 && open.boxCentred, `(box ${open.boxWidth}px, centred ${open.boxCentred})`);
+    check('#68 opening it moves focus into the dialog', open.focused === 'pwCurrent', `(focus on ${open.focused})`);
+
+    // Escape closes it and returns focus where it came from — the behaviour a
+    // static block can never have, and the one that makes it a modal.
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 3000 });
+    const after = await page.evaluate(() => ({
+      display: getComputedStyle(document.getElementById('accountModal')).display,
+      focused: document.activeElement ? document.activeElement.id : null,
+    }));
+    check('#68 Escape closes the account panel', after.display === 'none', `(display ${after.display})`);
+    check('#68 Escape returns focus to the button that opened it', after.focused === 'accountBtn', `(focus on ${after.focused})`);
+
+    // Leave the desk where the next scenario expects to find it.
+    await page.click('#nav button[data-page="admin"]');
+    await page.waitForSelector('[data-view="markets"]', { timeout: 10000 });
+  });
+
+// ── #68 §3.1: a 500 and an empty venue rendered the same screen ───────────
+  //
+  // shell.js answered a failed /api/events with `state.events = []`, which
+  // board.js rendered as "No open events right now" — the same card a venue
+  // with genuinely nothing on it produces. The operator's first conclusion on
+  // seeing that is "we have gone out of business", which is the inverse of the
+  // truth, and it happened on every transient blip.
+  // ── #68 §5 cheap wins, on the surfaces they touch ─────────────────────────
+  await scenario('#68 the one-liners: slip label, ledger column, drawer, money format', async () => {
+    // `Place —` on a disabled button read as a truncated string.
+    await page.evaluate(async () => {
+      window.location.hash = '#/markets';
+      await window.OB.refreshMarkets();
+    });
+    await page.waitForSelector('.ladder .lcell[data-bet]', { timeout: 20000 });
+    await page.locator('.ladder button.lcell[data-bet]').first().click();
+    await page.waitForSelector('#slip .sliprow [data-stake]', { timeout: 5000 });
+    await page.fill('#slip [data-stake]', '0.40');
+    await page.dispatchEvent('#slip [data-stake]', 'change');
+    await page.waitForTimeout(300);
+    const placeLabel = (await page.locator('#slip button.place').first().textContent()) || '';
+    check(
+      '#68 a disabled Place button says Place, not a truncated "Place —"',
+      placeLabel.trim() === 'Place' && (await page.locator('#slip button.place').first().isDisabled()),
+      `("${placeLabel.trim()}")`
+    );
+    // Clean the slip up so the next section starts empty.
+    await page.locator('#slip [data-rm]').first().click();
+
+    // The wallet ledger's BALANCE column means "balance after" while the figure
+    // at the top of the same screen labelled BALANCE means the total.
+    await page.click('#nav button[data-page="wallet"]');
+    await page.waitForSelector('#wBal', { timeout: 10000 });
+    // The faucet writes a transaction, so the ledger table exists. Without one
+    // there is no table at all and the column name cannot be read.
+    await page.locator('#page [data-dep]').first().click();
+    await page.waitForSelector('#wTx table', { timeout: 15000 });
+    const walletHeads = await page.evaluate(() =>
+      [...document.querySelectorAll('#wTx th')].map((n) => n.textContent.trim())
+    );
+    check(
+      '#68 the ledger column says which balance it is',
+      walletHeads.indexOf('Balance after') >= 0 && walletHeads.indexOf('Balance') < 0,
+      `(${walletHeads.join(' / ')})`
+    );
+
+    // One negative-money format: admin.js rendered $-140.43, core.js -$140.43.
+    check(
+      '#68 the player-facing signed format is the minus-sign one',
+      (await page.evaluate(() => window.OB.signed(-14043))) === '−$140.43',
+      `(signed(-14043) = ${await page.evaluate(() => window.OB.signed(-14043))})`
+    );
+    //
+    // A loss is MADE, not hoped for: `daily_pnl_cents` is the bot's balance
+    // minus its day-start balance, so raising the baseline in the same column
+    // lib/risk.js reads produces a real negative. Without it the check is
+    // vacuous — a venue whose bot happens to be up today renders no negative
+    // and the assertion passes whatever the formatter does. The baseline is
+    // restored immediately afterwards.
+    {
+      const { DatabaseSync } = await import('node:sqlite');
+      const db = new DatabaseSync(path.join(TMP, 'ui.db'));
+      const rows = db.prepare('SELECT bot_id, day_start_balance FROM risk_bots').all();
+      for (const r of rows) {
+        db.prepare('UPDATE risk_bots SET day_start_balance = ? WHERE bot_id = ?').run(
+          r.day_start_balance + 12345,
+          r.bot_id
+        );
+      }
+      db.close();
+      await page.click('#nav button[data-page="admin"]');
+      await page.click('[data-view="risk"]');
+      await page.waitForSelector('#adminBody .meter', { timeout: 10000 });
+      const adminMoney = await page.evaluate(() => {
+        const cells = [...document.querySelectorAll('#adminBody td span')].map((n) => n.textContent.trim());
+        return cells.filter((t) => /^[-−+]?\$/.test(t));
+      });
+      const negatives = adminMoney.filter((t) => /^[-−]/.test(t));
+      check(
+        '#68 the operator console renders a negative amount to check the format of',
+        negatives.length > 0,
+        `(${adminMoney.length} figures: ${adminMoney.slice(0, 5).join(' | ')})`
+      );
+      check(
+        '#68 the operator console uses the same negative-money format as the player screens',
+        negatives.length > 0 && negatives.every((t) => !/^\$-/.test(t)),
+        `(${negatives.join(' | ')})`
+      );
+      const db2 = new DatabaseSync(path.join(TMP, 'ui.db'));
+      for (const r of rows) {
+        db2.prepare('UPDATE risk_bots SET day_start_balance = ? WHERE bot_id = ?').run(r.day_start_balance, r.bot_id);
+      }
+      db2.close();
+    }
+
+    // The drawer: picking a destination left the drawer open over it.
+    await page.setViewportSize({ width: 700, height: 900 });
+    await page.waitForTimeout(200);
+    await page.click('#navToggle');
+    await page.waitForFunction(() => document.body.classList.contains('nav-open'), null, { timeout: 3000 });
+    await page.click('#nav button[data-page="wallet"]');
+    await page.waitForTimeout(500);
+    check(
+      '#68 choosing a destination closes the navigation drawer',
+      !(await page.evaluate(() => document.body.classList.contains('nav-open'))),
+      '(the drawer was still open over the page it navigated to)'
+    );
+    await page.setViewportSize({ width: 1400, height: 900 });
+    await page.click('#nav button[data-page="admin"]');
+    await page.waitForSelector('[data-view="markets"]', { timeout: 10000 });
+    await page.click('[data-view="markets"]');
+    await page.waitForSelector('#adminBody', { timeout: 10000 });
+  });
+
+  // ── 
+  await scenario('#68 the board says which of the two it is: a fault, or an empty catalogue', async () => {
+   // A deliberately broken route is a hazard to everything after it: the board
+   // stays broken, and every later scenario inherits a page with an error card on
+   // it. Undo the injection and restore the board on EVERY path, so a failure in
+   // here is a named failure rather than a cascade.
+   try {
+    // A real 500, injected on the route the app actually calls.
+    expectEvents500 = true;
+    await page.route('**/api/events*', (route) =>
+      route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'catalogue unavailable' }) })
+    );
+    await page.evaluate(() => {
+      location.hash = '#/markets';
+      window.OB.refreshMarkets();
+    });
+    await page.waitForSelector('#boardRetry', { timeout: 15000 });
+    const failed = await page.evaluate(() => {
+      const card = document.querySelector('#page .card');
+      return {
+        text: (card ? card.textContent : '') || '',
+        retry: !!document.getElementById('boardRetry'),
+        coloured: card ? getComputedStyle(card.querySelector('.empty')).color : null,
+      };
+    });
+    check(
+      '#68 a failed board load says it FAILED and names the reason',
+      /could not be loaded/i.test(failed.text) && /catalogue unavailable/i.test(failed.text),
+      `("${failed.text.replace(/\s+/g, ' ').slice(0, 90)}")`
+    );
+    check(
+      '#68 a failed board load is NOT the empty-catalogue message',
+      !/no open events right now/i.test(failed.text),
+      `("${failed.text.replace(/\s+/g, ' ').slice(0, 90)}")`
+    );
+    check('#68 a failed board load offers a retry', failed.retry);
+    check(
+      '#68 a fault is drawn in the alarm colour, not the muted empty state',
+      failed.coloured === 'rgb(194, 38, 31)',
+      `(colour ${failed.coloured} — --red is rgb(194,38,31))`
+    );
+
+    // The retry has to work, or the button is decoration.
+    await page.unroute('**/api/events*');
+    expectEvents500 = false;
+    await page.click('#boardRetry');
+    await page.waitForSelector('.ladder .lcell[data-bet]', { timeout: 15000 });
+    check('#68 retrying after a failure loads the board again', true);
+
+    // Now the genuinely empty case, with the route answering 200 and no
+    // events. It must be a DIFFERENT screen, not a differently-worded one.
+    await page.route('**/api/events*', (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ events: [] }) })
+    );
+    await page.evaluate(() => window.OB.refreshMarkets());
+    await page.waitForSelector('#page .card .empty', { timeout: 15000 });
+    const empty = await page.evaluate(() => {
+      const card = document.querySelector('#page .card');
+      return {
+        text: (card ? card.textContent : '') || '',
+        retry: !!document.getElementById('boardRetry'),
+      };
+    });
+    check(
+      '#68 a genuinely empty catalogue says so, and says the load worked',
+      /no open events right now/i.test(empty.text) && /genuinely empty|loaded/i.test(empty.text),
+      `("${empty.text.replace(/\s+/g, ' ').slice(0, 90)}")`
+    );
+    check('#68 an empty catalogue offers no retry — nothing failed', !empty.retry);
+   } finally {
+    await page.unroute('**/api/events*').catch(() => {});
+    expectEvents500 = false;
+    await page.evaluate(() => window.OB.refreshMarkets()).catch(() => {});
+    await page.waitForSelector('.ladder .lcell[data-bet]', { timeout: 20000 }).catch(() => {});
+   }
+  });
+
+  // ── #68 §3.3 / §3.4 / §5: the player and operator surfaces ────────────────
+  await scenario('#68 positions, the settle dialog and the cheap wins', async () => {
+    // ── §3.3 BACKED and FROZEN printed the same number on every back leg ───
+    //
+    // Driven from a FIXTURE rather than from a bet placed through the slip. A
+    // position needs a matched order, and whether a given price crosses depends
+    // on what the bots are quoting at that moment — so the fixture made this
+    // check fail roughly a third of runs for reasons that had nothing to do with
+    // what it is checking. This is the same renderer on the same endpoint; only
+    // the response is pinned.
+    //
+    // The payload is built to contain exactly the case the finding is about: a
+    // back-only leg, where lib/match.js's escrowFor equals the stake, so the
+    // old FROZEN column printed the BACKED number again on every such row.
+    await page.route('**/api/positions', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          positions: [
+            {
+              market_id: 1,
+              market_name: 'Match Odds',
+              market_status: 'open',
+              event_name: 'Fixture vs Server',
+              cashout: null,
+              selections: [
+                { name: 'Back only', my_back_stake_cents: 5051, my_lay_stake_cents: 0, frozen_cents: 5051 },
+                { name: 'Laid too', my_back_stake_cents: 0, my_lay_stake_cents: 2000, frozen_cents: 4000 },
+              ],
+              pnl_if_win: [
+                { name: 'Back only', pnl_cents: 5000 },
+                { name: 'Laid too', pnl_cents: -4000 },
+              ],
+            },
+          ],
+        }),
+      })
+    );
+    await page.click('#nav button[data-page="bets"]');
+    await page.click('[data-tab="positions"]');
+    await page.waitForSelector('#betsBody .poscard', { timeout: 10000 });
+    const pos = await page.evaluate(() => {
+      const card = document.querySelector('#betsBody .poscard');
+      if (!card) return null;
+      return {
+        heads: [...card.querySelectorAll('th')].map((n) => n.textContent.trim()),
+        rows: [...card.querySelectorAll('tbody tr')].map((r) =>
+          [...r.querySelectorAll('td')].map((n) => n.textContent.trim())
+        ),
+        head: (card.querySelector('.poshead') || {}).textContent.replace(/\s+/g, ' ').trim() || '',
+      };
+    });
+    check(
+      '#68 the positions table drops the column that duplicated Backed',
+      !!pos && pos.heads.indexOf('Frozen') < 0,
+      `(${pos ? pos.heads.join(' / ') : 'no position card'})`
+    );
+    check(
+      '#68 a back-only leg is shown once, not twice',
+      !!pos && pos.rows.some((r) => r[1] === '$50.51') && pos.rows.every((r) => r.length === 3),
+      `(${pos ? JSON.stringify(pos.rows) : ''})`
+    );
+    check(
+      '#68 the escrow a position holds is stated once, on the position',
+      !!pos && /escrow held \$90\.51/i.test(pos.head),
+      `("${pos ? pos.head.slice(0, 90) : ''}")`
+    );
+    await page.unroute('**/api/positions');
+
+    // ── §3.4 the settle dialog named nothing ────────────────────────────────
+    await page.click('#nav button[data-page="admin"]');
+    await page.click('[data-view="markets"]');
+    await page.waitForSelector('#adminBody [data-settle]', { timeout: 10000 });
+    const target = await page.evaluate(() => {
+      const b = document.querySelector('#adminBody [data-settle]');
+      return b ? Number(b.dataset.settle) : null;
+    });
+    if (target === null) {
+      // Every market in the catalogue has already been settled by the #51 and
+      // #52 scenarios that follow. Say so by name rather than skipping: a
+      // silent pass here would be a check that verifies nothing.
+      check('#68 fixture: a market to settle', false, '(every market is settled — the dialog checks could not run)');
+      await page.click('#nav button[data-page="admin"]');
+      await page.waitForSelector('[data-view="markets"]', { timeout: 10000 });
+      return;
+    }
+    await page.locator(`#adminBody [data-settle="${target}"]`).click();
+    await page.waitForSelector('.modal[role="dialog"] #sdGo', { timeout: 10000 });
+    const named = await page.evaluate(() => {
+      const title = document.querySelector('#sdTitle');
+      const facts = document.querySelector('.sd-facts');
+      const rows = [...document.querySelectorAll('.modal[role="dialog"] #sdWinners .optrow')];
+      return {
+        title: (title ? title.textContent : '').trim(),
+        facts: (facts ? facts.textContent : '').replace(/\s+/g, ' ').trim(),
+        ariaLabel: document.querySelector('.modal[role="dialog"]').getAttribute('aria-label') || '',
+        rows: rows.map((r) => r.textContent.replace(/\s+/g, ' ').trim()),
+      };
+    });
+    check(
+      '#68 the settle dialog names the EVENT, not the market type',
+      /settle/i.test(named.title) && !/^settle winner$/i.test(named.title.trim()),
+      `("${named.title}")`
+    );
+    check(
+      '#68 the settle dialog is labelled to assistive tech by event and market',
+      /settle .+ — /i.test(named.ariaLabel),
+      `("${named.ariaLabel}")`
+    );
+    check(
+      '#68 the settle dialog states what the decision moves',
+      /matched/i.test(named.facts) && /runners/i.test(named.facts) && /\$/.test(named.facts),
+      `("${named.facts.slice(0, 80)}")`
+    );
+    check(
+      '#68 every runner in the settle dialog carries a price, not a bare dash',
+      named.rows.length > 0 && named.rows.every((r) => /LTP|best back|no trades/i.test(r)),
+      `(${named.rows.length} rows: ${named.rows.slice(0, 2).join(' | ').slice(0, 90)})`
+    );
+    await page.click('.modal[role="dialog"] #sdCancel');
+    await page.waitForTimeout(300);
+
+    // ── §5: two status chips three lines apart, and a row of $0.00 ─────────
+    const boardCopy = await page.evaluate(async () => {
+      window.location.hash = '#/markets';
+      await window.OB.refreshMarkets();
+      await new Promise((r) => setTimeout(r, 900));
+      const heads = [...document.querySelectorAll('.mkthead .chip')].map((n) => n.textContent.trim());
+      const heads2 = [...document.querySelectorAll('.evmeta .chip')].map((n) => n.textContent.trim());
+      const matched = [...document.querySelectorAll('.mkthead .muted')].map((n) => n.textContent.trim());
+      return { heads, heads2, matched };
+    });
+    check(
+      '#68 a market never repeats "open" under an event chip that already says it is trading',
+      !boardCopy.heads.includes('open'),
+      `(event chips ${JSON.stringify(boardCopy.heads2.slice(0, 3))}, market chips ${JSON.stringify(boardCopy.heads.slice(0, 3))})`
+    );
+    check(
+      '#68 no market advertises $0.00 matched',
+      !boardCopy.matched.some((m) => /\$0\.00\s+matched/.test(m)),
+      `(${boardCopy.matched.length} matched labels: ${boardCopy.matched.slice(0, 3).join(' | ')})`
+    );
+    await page.evaluate(() => {
+      window.location.hash = '#/admin';
+    });
+    await page.waitForSelector('[data-view="markets"]', { timeout: 10000 });
+    await page.click('[data-view="markets"]');
+    await page.waitForSelector('#adminBody', { timeout: 10000 });
+  });
+
   // ── #51: a held market can be released as a DEAD HEAT, chosen by NAME ────
   //
   // Two defects, both on the operator's most consequential screen:
@@ -964,11 +1561,39 @@ try {
     );
     if ((await heldRow.count()) === 0) return;
 
-    // The reason prompt is unchanged and still comes first (lib/results.js
-    // refuses a release with no reason).
+// The reason dialog comes first and the picker second (lib/results.js
+    // refuses a release with no reason). Both are now REAL dialogs on the
+    // shared overlay stack rather than window.prompt, so they are driven
+    // through the DOM. `prompts` is still recorded so that "no native dialog is
+    // raised any more" is an assertion rather than an assumption.
     prompts.length = 0;
-    promptQueue = ['ui test: joint winners confirmed against the results feed'];
     await heldRow.click();
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
+    check(
+      '#51 the release asks for a written reason in a dialog on the app, not a browser prompt',
+      (await page.locator('.modal[role="dialog"] [data-ask="reason"]').count()) === 1 && prompts.length === 0,
+      `(${prompts.length} native prompt(s): ${prompts.join(' | ').slice(0, 90)})`
+    );
+    // A reason under five characters is refused BEFORE anything is sent, with
+    // the error beside the field.
+    await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'no');
+    await page.click('.modal[role="dialog"] #askGo');
+    await page.waitForSelector('.modal[role="dialog"] .askerr:not([hidden])', { timeout: 3000 });
+    check(
+      '#51 a too-short reason is refused with the error beside the field',
+      /least 5 characters/i.test(
+        (await page.locator('.modal[role="dialog"] .askerr:not([hidden])').first().textContent()) || ''
+      ),
+      `("${((await page.locator('.modal[role="dialog"] .askerr:not([hidden])').first().textContent()) || '').trim()}")`
+    );
+    check(
+      '#51 nothing was released while the reason was refused',
+      releasePayload === null,
+      `(payload ${JSON.stringify(releasePayload)})`
+    );
+    await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'ui test: joint winners confirmed against the results feed');
+    await page.click('.modal[role="dialog"] #askGo');
+
     // The picker is CHECKED for, not awaited. An awaited one turns "the control
     // does not exist" into an opaque 10s timeout that aborts the scenario, and
     // every later assertion — including the dead-heat payload, which is the
@@ -1000,7 +1625,6 @@ try {
       );
       return;
     }
-    check('#51 the release still asks for a written reason first', /reason/i.test(prompts[0] || ''), `("${(prompts[0] || '').slice(0, 60)}")`);
 
     // (b) — by NAME. The runner names come from this market's own book.
     const rows = await page.locator('.modal[role="dialog"] #hoWinners .optrow').allTextContents();
@@ -1063,8 +1687,10 @@ try {
     );
 
     // Reopen and commit the tie for real.
-    promptQueue = ['ui test: joint winners confirmed against the results feed'];
     await page.locator(`#adminBody [data-release-settle="${heldMarketId}"]`).click();
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
+    await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'ui test: joint winners confirmed against the results feed');
+    await page.click('.modal[role="dialog"] #askGo');
     await page.locator('.modal[role="dialog"] #hoWinners').waitFor({ state: 'attached', timeout: 10000 });
     await page.locator('.modal[role="dialog"] #hoWinners .hoPick').nth(0).check();
     await page.locator('.modal[role="dialog"] #hoWinners .hoPick').nth(1).check();
@@ -1136,9 +1762,11 @@ try {
     await page.click('[data-view="results"]');
     await page.waitForSelector(`#adminBody [data-release-settle="${soloMarketId}"]`, { timeout: 10000 });
 
-    promptQueue = ['ui test: single winner confirmed against the results feed'];
     releasePayload = null;
     await page.locator(`#adminBody [data-release-settle="${soloMarketId}"]`).click();
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
+    await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'ui test: single winner confirmed against the results feed');
+    await page.click('.modal[role="dialog"] #askGo');
     await page.locator('.modal[role="dialog"] #hoWinners').waitFor({ state: 'attached', timeout: 10000 });
     const soloBox = page.locator('.modal[role="dialog"] #hoWinners .hoPick').first();
     const soloId = Number(await soloBox.getAttribute('value'));
@@ -1182,23 +1810,42 @@ try {
     }
     const mktId = Number(await suspendBtn.getAttribute('data-toggle'));
     const willSuspend = (await suspendBtn.getAttribute('data-status')) === 'suspended';
+    // Re-locate the row BY ID for every click. `.first()` resolves against the
+    // table as it is NOW, and the table re-renders after each action: clicking
+    // a stale row reads a stale `data-status` and suspends a market that was
+    // about to be restored. This was a real flake, not a theoretical one.
+    const toggleRow = (id) => page.locator(`#adminBody [data-toggle="${id}"]`).first();
 
-    // Cancelling the prompt must not suspend anything.
+    // Cancelling the dialog must not suspend anything. The reason control is a
+    // real dialog on the app's overlay stack now, so this is driven through the
+    // DOM; `prompts` is watched throughout to prove no NATIVE dialog is raised
+    // any more, because the old mechanism was window.prompt and "it still
+    // works" would have satisfied the original test.
     prompts.length = 0;
-    promptQueue = [];
     delete adminWrites[`PATCH /api/admin/markets/${mktId}`];
-    await suspendBtn.click();
-    await page.waitForTimeout(600);
+    await toggleRow(mktId).click();
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
     check(
-      '#52 suspending asks for a reason and sends nothing when cancelled',
+      '#52 suspending asks for a reason in an app dialog, and raises no browser prompt',
+      prompts.length === 0,
+      `(${prompts.length} native prompt(s): ${prompts.join(' | ').slice(0, 60)})`
+    );
+    await page.click('.modal[role="dialog"] #askCancel');
+    await page.waitForTimeout(400);
+    check(
+      '#52 suspending sends nothing when the reason dialog is cancelled',
       adminWrites[`PATCH /api/admin/markets/${mktId}`] === undefined,
       `(payload ${JSON.stringify(adminWrites[`PATCH /api/admin/markets/${mktId}`])})`
     );
-    check('#52 the suspend prompt is about the reason', /reason/i.test(prompts[0] || ''), `("${(prompts[0] || '').slice(0, 60)}")`);
+    check(
+      '#52 cancelling leaves no dialog behind',
+      (await page.locator('.modal[role="dialog"]').count()) === 0
+    );
 
-    prompts.length = 0;
-    promptQueue = ['ui test: price feed disagreement, market withdrawn pending review'];
-    await suspendBtn.click();
+    await toggleRow(mktId).click();
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
+    await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'ui test: price feed disagreement, market withdrawn pending review');
+    await page.click('.modal[role="dialog"] #askGo');
     await page.waitForFunction(
       () => /^Market (suspended|open)$/.test((document.querySelector('#toast') || {}).textContent || ''),
       { timeout: 15000 }
@@ -1211,12 +1858,29 @@ try {
     );
 
     // Put it back, so the suite leaves the catalogue as it found it.
-    const restoreBtn = page.locator(`#adminBody [data-toggle="${mktId}"]`).first();
-    await restoreBtn.waitFor({ timeout: 10000 });
-    promptQueue = ['ui test: feed reconciled, market restored'];
-    await restoreBtn.click();
+    //
+    // `data-status` is the status the button WILL SET, not the market's current
+    // one: a suspended market offers a button that sets 'open' and is labelled
+    // "Restore". So "is the market suspended now?" is answered by the LABEL.
+    //
+    // The old assertion here waited for `dataset.status === 'open'`, which is
+    // exactly what the row reads the moment the suspend succeeds — so it was
+    // satisfied before the restore was even attempted, and a restore that sent
+    // nothing at all would have passed it. The post-condition below is the real
+    // one: the row offers Suspend again, which only happens once the market is
+    // open again.
+    const restoreBtn = toggleRow(mktId);
     await page.waitForFunction(
-      (id) => document.querySelector(`#adminBody [data-toggle="${id}"]`)?.dataset.status === 'open',
+      (id) => /restore/i.test((document.querySelector(`#adminBody [data-toggle="${id}"]`) || {}).textContent || ''),
+      mktId,
+      { timeout: 15000 }
+    );
+    await restoreBtn.click();
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
+    await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'ui test: feed reconciled, market restored');
+    await page.click('.modal[role="dialog"] #askGo');
+    await page.waitForFunction(
+      (id) => /suspend/i.test((document.querySelector(`#adminBody [data-toggle="${id}"]`) || {}).textContent || ''),
       mktId,
       { timeout: 15000 }
     );
@@ -1463,6 +2127,371 @@ try {
     );
   });
 
+  // ── #65: the favicon is the last unbranded asset in the shell ─────────────
+  //
+  // Name, palette, logo and data-tenant all reach the browser (#52). The
+  // favicon did not: index.html hard-codes three icon links and nothing read
+  // them, so every tenant's browser tab showed the house mark.
+  //
+  // ASSERTED ON THE DOM, NOT ON A FETCH. The claim is "the tab icon is the
+  // tenant's", and a test that only checked /api/branding returned a
+  // `favicon` key would pass with the apply side entirely absent — exactly how
+  // the /api/branding route itself shipped with zero callers.
+  const iconHref = (sel) =>
+    page.evaluate((s) => {
+      const n = document.querySelector(s);
+      return n ? n.getAttribute('href') : null;
+    }, sel);
+  const iconHrefs = async () => ({
+    icon: await iconHref('link[rel="icon"]'),
+    apple: await iconHref('link[rel="apple-touch-icon"]'),
+    ico: await iconHref('link[rel="alternate icon"]'),
+  });
+  // `content` rather than a computed style: this is what the browser actually
+  // paints into the tab and the mobile URL bar.
+  const themeColor = () =>
+    page.evaluate(() => {
+      const m = document.querySelector('meta[name="theme-color"]');
+      return m ? m.getAttribute('content') : null;
+    });
+  // The RESOLVED background, which is what theme-color is compared against:
+  // a custom property computes to the literal that was declared (`#ffffff`)
+  // while backgroundColor is the rgb the browser actually paints.
+  const resolvedBg = () =>
+    page.evaluate(() => getComputedStyle(document.documentElement).backgroundColor);
+
+  await scenario('#65 the favicon follows the tenant, and only when it can load', async () => {
+    const before = await branding();
+    if (!before || !before.tenant) {
+      check('#65 fixture: a tenant to brand', false, '(no tenant served)');
+      return;
+    }
+    const tid = before.tenant.id;
+    const house = await iconHrefs();
+
+    check(
+      '#65 /api/branding serves a favicon',
+      typeof before.favicon === 'string' && before.favicon.length > 0,
+      `(favicon=${JSON.stringify(before.favicon)})`
+    );
+
+    // A path that EXISTS on the venue, and differs from every bundled default,
+    // so a change cannot be confused with the house mark already being there.
+    await writeBrand(tid, { name: '', logo: '', favicon: '/assets/apple-touch-icon.png', terms_url: null, palette: {} });
+    await reload();
+    const branded = await iconHrefs();
+    check(
+      '#65 the tenant favicon reaches the icon links',
+      branded.icon === '/assets/apple-touch-icon.png' && branded.apple === '/assets/apple-touch-icon.png',
+      `(icon=${branded.icon}, apple=${branded.apple})`
+    );
+    check(
+      '#65 the favicon changed from what the shell ships',
+      branded.icon !== house.icon || branded.apple !== house.apple,
+      `(house icon=${house.icon} apple=${house.apple})`
+    );
+
+    // THE CSP HALF. The venue's policy is `img-src 'self' data:`, so a remote
+    // favicon is refused by the browser whatever the page asks for — exactly
+    // why applyBranding already guards the logo. The href is asserted here, not
+    // the rendered image: a refused fetch leaves the link in place, and the
+    // thing a tenant gets wrong is the link pointing at someone else's server.
+    await writeBrand(tid, { name: '', logo: '', favicon: 'https://cdn.example.com/f.png', terms_url: null, palette: {} });
+    await reload();
+    const remote = await iconHrefs();
+    check(
+      '#65 a remote favicon is refused, not written into the page',
+      remote.icon !== 'https://cdn.example.com/f.png' && remote.apple !== 'https://cdn.example.com/f.png',
+      `(icon=${remote.icon}, apple=${remote.apple})`
+    );
+    check(
+      '#65 a protocol-relative favicon is refused too',
+      !String(remote.icon || '').startsWith('//'),
+      `(icon=${remote.icon})`
+    );
+
+    await writeBrand(tid, { name: '', logo: '', favicon: '/assets/favicon.png', terms_url: null, palette: {} });
+    await reload();
+    const fallback = await iconHrefs();
+    check(
+      '#65 clearing the favicon falls back to the bundled icon',
+      fallback.icon === '/assets/favicon.png' && fallback.apple === '/assets/apple-touch-icon.png',
+      `(icon=${fallback.icon}, apple=${fallback.apple})`
+    );
+
+    // ── theme-color ────────────────────────────────────────────────────────
+    // index.html hard-codes #ffffff, which paints a white bar in the browser
+    // chrome above a venue whose own background is whatever the tenant set.
+    // It has to track the RESOLVED background, so branding and a dark theme
+    // cannot both own it.
+    const houseBg = await resolvedBg();
+    check(
+      '#65 the meta theme-color follows the resolved background',
+      (await themeColor()) === houseBg,
+      `(meta=${await themeColor()}, background=${houseBg})`
+    );
+    await writeBrand(tid, { name: '', logo: '', favicon: '/assets/favicon.png', terms_url: null, palette: { bg: '#101014' } });
+    await reload();
+    check(
+      '#65 a tenant background repaints the browser chrome',
+      (await resolvedBg()) === 'rgb(16, 16, 20)' && (await themeColor()) === 'rgb(16, 16, 20)',
+      `(background=${await resolvedBg()}, meta=${await themeColor()})`
+    );
+
+    await writeBrand(tid, { name: '', logo: '', favicon: '/assets/favicon.png', terms_url: null, palette: {} });
+    await reload();
+  });
+
+// ── #66: dark mode ────────────────────────────────────────────────────────
+  //
+  // Three claims, in increasing order of how easily they could be faked:
+  //
+  //   1. THE LIGHT PALETTE DID NOT MOVE. Read out of the `:root` rule itself,
+  //      value by value, against the hexes the file ships. A theme delivered
+  //      "by media query" can still quietly have edited a light value, and
+  //      nothing else in the suite would notice.
+  //   2. THE DARK VALUES ACTUALLY APPLY, from the COMPUTED styles of the real
+  //      ladder cells — not from the token block, which proves only that a
+  //      block of text exists.
+  //   3. THE BACK/LAY PAIR IS READABLE ON THE DARK GROUND. The price contrast
+  //      is computed here, in the browser, from what the cells actually paint,
+  //      and asserted against 4.5:1. That is the whole reason this is not a
+  //      block copy: a straight inversion puts dark blue on a near-black
+  //      ground, and this check fails.
+  const _lum = (rgb) => {
+    const m = /rgba?\(([^)]+)\)/.exec(rgb);
+    if (!m) return null;
+    const p = m[1].split(/[,/]/).map(Number);
+    const lin = (c) => {
+      const s = c / 255;
+      return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * lin(p[0]) + 0.7152 * lin(p[1]) + 0.0722 * lin(p[2]);
+  };
+  const ratioOf = (a, b) => {
+    const [x, y] = [_lum(a) + 0.05, _lum(b) + 0.05].sort((p, q) => q - p);
+    return Math.round((x / y) * 100) / 100;
+  };
+  // Measured from the COMPUTED styles of the real elements, so it is the colour
+  // on screen rather than the colour someone intended.
+  const cellContrast = (sel) =>
+    page.evaluate((s) => {
+      const n = document.querySelector(s);
+      if (!n) return null;
+      const cs = getComputedStyle(n);
+      const parse = (v) => {
+        const m = /rgba?\(([^)]+)\)/.exec(v);
+        if (!m) return null;
+        const p = m[1].split(/[,/]/).map(Number);
+        return [p[0], p[1], p[2]];
+      };
+      const lin = (c) => {
+        const s = c / 255;
+        return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+      };
+      const L = ([r, g, b]) => 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+      const fg = parse(cs.color);
+      const bg = parse(cs.backgroundColor);
+      if (!fg || !bg) return null;
+      const a = L(fg) + 0.05;
+      const c = L(bg) + 0.05;
+      return Math.round((Math.max(a, c) / Math.min(a, c)) * 100) / 100;
+    }, sel);
+
+  // Every colour role the house palette ships, byte for byte.
+  const HOUSE = {
+    '--bg': '#ffffff', '--bg2': '#f7f7f8', '--card': '#ffffff', '--card2': '#f5f5f6',
+    '--line': '#e6e6e8', '--line2': '#d3d3d7', '--text': '#0a0a0b', '--muted': '#6b6b73',
+    '--accent': '#b9b9c0', '--accent-bg': '#f0f0f2',
+    '--blue': '#1b5fd9', '--blue-bg': '#e8f0fe', '--blue-line': '#c3dafb',
+    '--pink': '#d6147a', '--pink-bg': '#fdecf4', '--pink-line': '#f8c8de',
+    '--red': '#c2261f', '--red-bg': '#fdeceb', '--green': '#0f7a3d', '--green-bg': '#e6f5ec',
+  };
+
+  const declaredRootTokens = () =>
+    page.evaluate(() => {
+      const out = {};
+      for (const sheet of document.styleSheets) {
+        let rules;
+        try {
+          rules = sheet.cssRules;
+        } catch {
+          continue;
+        }
+        for (const r of rules) {
+          // The BASE :root only — the dark block is `:root[data-theme='dark']`,
+          // a different selectorText, so it cannot be picked up here.
+          if (r.selectorText !== ':root') continue;
+          for (const name of r.style) {
+            if (name.startsWith('--')) out[name] = r.style.getPropertyValue(name).trim();
+          }
+        }
+      }
+      return out;
+    });
+
+  const activeTheme = () => page.getAttribute('html', 'data-theme');
+  const pageBg = () => page.evaluate(() => getComputedStyle(document.documentElement).backgroundColor);
+  const freshLoad = async () => {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#balance:not([hidden])', { timeout: 15000 });
+  };
+  const clearTheme = () =>
+    page.evaluate(() => {
+      try {
+        localStorage.removeItem('obx.theme');
+      } catch {}
+    });
+
+  // A live, full-strength cell: `.depth` and `.carried` set opacity, and an
+  // empty cell has no price at all. Colour and background are read from the
+  // SAME element so the ratio is the one the eye receives.
+  const LIVE_BACK = '.lcell.back:not(.depth):not(.carried):not(.empty)';
+  const LIVE_LAY = '.lcell.lay:not(.depth):not(.carried):not(.empty)';
+  const onBoard = async () => {
+    await page.evaluate(() => {
+      location.hash = '#/markets';
+    });
+    await page.waitForSelector(`${LIVE_BACK}`, { timeout: 15000 });
+  };
+
+  await scenario('#66 dark mode: the light palette is untouched and the dark one is readable', async () => {
+   try {
+    await onBoard();
+    // ── 1. the light values, value by value ──────────────────────────────
+    const rootTokens = await declaredRootTokens();
+    const moved = Object.entries(HOUSE)
+      .filter(([k, v]) => (rootTokens[k] || '').toLowerCase() !== v)
+      .map(([k, v]) => `${k} is ${rootTokens[k]} not ${v}`);
+    check(
+      '#66 every light palette value is byte-identical',
+      moved.length === 0,
+      `(${moved.join(', ') || 'all 20 unchanged'})`
+    );
+
+    // ── the default follows the OS, and light is what light users get ─────
+    await page.emulateMedia({ colorScheme: 'light' });
+    await clearTheme();
+    await freshLoad();
+    check('#66 with no stored choice a light OS gets the light theme', (await activeTheme()) === 'light', `(data-theme=${await activeTheme()})`);
+    check('#66 the resolved light background is still #ffffff', (await pageBg()) === 'rgb(255, 255, 255)', `(${await pageBg()})`);
+    await onBoard();
+    const lBack = await cellContrast(LIVE_BACK);
+    const lLay = await cellContrast(LIVE_LAY);
+    check(
+      '#66 the light ladder prices are the numbers that shipped',
+      Math.abs(lBack - 4.97) < 0.02 && Math.abs(lLay - 4.36) < 0.02,
+      `(back ${lBack}:1, lay ${lLay}:1 — the lay price was already below the 4.5 AA floor before this issue)`
+    );
+
+    // ── 2. the dark values apply, from the computed styles ────────────────
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await clearTheme();
+    await freshLoad();
+    check(
+      '#66 a dark OS resolves to the dark theme with no stored choice',
+      (await activeTheme()) === 'dark',
+      `(data-theme=${await activeTheme()})`
+    );
+    check('#66 the dark ground is applied, not merely declared', (await pageBg()) === 'rgb(11, 11, 13)', `(${await pageBg()})`);
+
+    // ── 3. the pair, measured where it is painted ─────────────────────────
+    await onBoard();
+    const dBack = await cellContrast(LIVE_BACK);
+    const dLay = await cellContrast(LIVE_LAY);
+    check('#66 the dark back price clears AA on its own cell', dBack !== null && dBack >= 4.5, `(${dBack}:1)`);
+    check('#66 the dark lay price clears AA on its own cell', dLay !== null && dLay >= 4.5, `(${dLay}:1)`);
+    check(
+      '#66 both dark prices beat the light values they replace',
+      dBack > lBack && dLay > lLay,
+      `(dark ${dBack}/${dLay} vs light ${lBack}/${lLay})`
+    );
+
+    // The invariant style.css:39 states: the two sides are never allowed to be
+    // near enough. In light mode the two CELL FILLS are 1.01:1 apart — identical
+    // in luminance, separated by hue alone — so the dark pair is required to do
+    // better on lightness, not merely to differ.
+    const sides = await page.evaluate(() => {
+      const g = (s) => getComputedStyle(document.querySelector(s));
+      const b = document.querySelector('.lcell.back:not(.depth):not(.carried):not(.empty)');
+      const l = document.querySelector('.lcell.lay:not(.depth):not(.carried):not(.empty)');
+      return { backBg: g('.lcell.back').backgroundColor, layBg: g('.lcell.lay').backgroundColor, backFg: getComputedStyle(b).color, layFg: getComputedStyle(l).color };
+    });
+    const fillSep = ratioOf(sides.backBg, sides.layBg);
+    check(
+      '#66 the two sides differ in colour and in luminance',
+      sides.backBg !== sides.layBg && sides.backFg !== sides.layFg && fillSep >= 1.25,
+      `(fills ${fillSep}:1, ${sides.backBg} vs ${sides.layBg})`
+    );
+    const darkMeta = await themeColor();
+    check('#66 theme-color follows the dark ground', darkMeta === 'rgb(11, 11, 13)', `(${darkMeta})`);
+
+    // ── 4. the manual override persists, and beats the OS ────────────────
+    // Driven the way a user does it: open Account, click the visible chip. A
+    // hidden <input> cannot be clicked directly (the click and the label's own
+    // activation toggle it twice), so a test that pokes the input would prove
+    // the wiring works and not that the control is usable.
+    await page.click('#accountBtn');
+    await page.waitForSelector('#accountModal.show', { timeout: 5000 });
+    check(
+      '#66 the appearance control is offered where the other settings are',
+      await page.isVisible('#themePicker .themepick-row'),
+      '(the account panel carries no theme control)'
+    );
+    await page.click('#themePicker .themepick-opt:has(input[value="light"])');
+    await page.waitForFunction(() => document.documentElement.getAttribute('data-theme') === 'light', null, { timeout: 3000 });
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 3000 });
+    check(
+      '#66 an explicit Light choice overrides a dark OS',
+      (await activeTheme()) === 'light',
+      `(data-theme=${await activeTheme()})`
+    );
+    await freshLoad();
+    check(
+      '#66 the choice survives a reload, against a dark OS',
+      (await activeTheme()) === 'light',
+      `(data-theme=${await activeTheme()})`
+    );
+    check(
+      '#66 the control shows which ANSWER is stored, not which theme resulted',
+      await page.isChecked('#themePicker input[value="light"]'),
+      '(the Light chip is ticked while the OS still says dark)'
+    );
+
+    // And back to Auto, which a two-state toggle cannot offer.
+    await page.click('#accountBtn');
+    await page.waitForSelector('#accountModal.show', { timeout: 5000 });
+    await page.click('#themePicker .themepick-opt:has(input[value="auto"])');
+    await page.waitForFunction(() => document.documentElement.getAttribute('data-theme') === 'dark', null, { timeout: 3000 });
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 3000 });
+    check(
+      '#66 Auto hands the decision back to the OS',
+      (await activeTheme()) === 'dark',
+      `(data-theme=${await activeTheme()})`
+    );
+
+    // ── 5. no flash: the decision is made before the stylesheet parses ────
+    const order = await page.evaluate(() =>
+      [...document.querySelectorAll('head script[src], head link[rel="stylesheet"]')].map((n) => n.getAttribute('src') || n.getAttribute('href'))
+    );
+    const at = (s) => order.indexOf(s);
+    check(
+      '#66 the theme script is loaded before the stylesheet, so there is no flash',
+      at('/js/theme.js') >= 0 && at('/js/theme.js') < at('/style.css'),
+      `(${order.join(' -> ')})`
+    );
+
+   } finally {
+    // Leave the suite where it found it whatever happened above: no stored
+    // choice, a light OS. Every later scenario reads the house palette, and a
+    // run that aborted mid-theme would hand them a dark venue.
+    await clearTheme();
+    await page.emulateMedia({ colorScheme: 'light' });
+    await freshLoad();
+   }
+  });
   await scenario('#52 the desk can set the brand it serves', async () => {
     await page.click('#nav button[data-page="admin"]');
     await page.waitForSelector('[data-view="tenants"]', { timeout: 10000 });

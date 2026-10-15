@@ -420,7 +420,7 @@ weight.
 npm test            # 765 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
-npm run test:ui     # 142 checks: real Chromium via Playwright (board and admin desk)
+npm run test:ui     # 212 checks: real Chromium via Playwright (board and admin desk)
 npm run docs:check  # fail if the documentation contradicts the code
 ```
 
@@ -494,7 +494,8 @@ The full list and rationale are in
 - Accumulators and each-way markets
 - Odds-history charts and a market-mover view on the board
 - Complete `.env.example` coverage with a CI guard, matching the collector
-- Make per-tenant branding reachable from the frontend (`/api/branding` exists)
+- Per-tenant currency: `fmt` is hard-coded to a dollar sign, so a white-label
+  venue renders another currency's amounts with a `$`
 
 Completed items are recorded in the [changelog](CHANGELOG.md).
 

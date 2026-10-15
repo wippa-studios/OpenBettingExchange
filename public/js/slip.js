@@ -168,7 +168,10 @@
           <div class="prev tn">${detail}</div>
           ${err ? `<div class="stakeerr">${OB.esc(err)}</div>` : ''}
           <button type="button" class="btn primary place" data-place${err ? ' disabled' : ''}>${
-            err ? 'Place —' : `Place ${OB.fmt(it.stake_cents)}`
+            // The em-dash read as a truncated string rather than a disabled
+            // control. The row already says why it cannot be placed, one line
+            // above the button; the button says what it is.
+            err ? 'Place' : `Place ${OB.fmt(it.stake_cents)}`
           }</button>`;
   }
 
@@ -197,7 +200,7 @@
     const place = row.querySelector('[data-place]');
     if (place) {
       place.disabled = !!it.stake_error;
-      place.textContent = it.stake_error ? 'Place —' : `Place ${OB.fmt(it.stake_cents)}`;
+      place.textContent = it.stake_error ? 'Place' : `Place ${OB.fmt(it.stake_cents)}`;
     }
     // A rejected amount stays in the box; normalising it here would leave the
     // message referring to a figure that is no longer on screen.

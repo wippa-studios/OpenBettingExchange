@@ -218,7 +218,7 @@ Deliberately narrow, and asserted by tests rather than assumed:
 
 ## Testing strategy
 
-765 checks across 62 suites, plus a 142-check browser suite and a live smoke script.
+765 checks across 62 suites, plus a 212-check browser suite and a live smoke script.
 
 | Layer | Where | What it proves |
 | --- | --- | --- |
@@ -257,6 +257,7 @@ worse than no assertion, since it reads as coverage.
 - **A real matching venue in front**: the engine's sweep, price-time priority and
   self-match guard are the parts you would keep. Settlement and the ledger are
   independent of them.
-- **Multi-tenant branding**: `GET /api/branding` already returns a tenant's name,
-  logo, terms URL and palette, and the palette is already tokenised as CSS custom
-  properties. Nothing in the frontend calls it yet.
+- **Multi-tenant branding**: `GET /api/branding` returns a tenant's name,
+  logo, favicon, terms URL and palette, the palette is already tokenised as CSS
+  custom properties, and the frontend reads all of it at boot — so the theme
+  token set is the one place a rebrand has to touch.

@@ -12,6 +12,15 @@
   // narrowed to this list (app.js S6), so anything else is undefined here.
   const { api, toast, fmt, price2, esc, attr, state, refreshAll, openOverlay, closeOverlay } = OB;
 
+  // How long a justification must be before the desk will send one.
+  //
+  // A DESK POLICY, not a server rule: lib/admin.js's reasonOr400 refuses an
+  // EMPTY reason and a 500-character one, and enforces no floor in between.
+  // Asking for a whole sentence is what makes an audit row worth reading six
+  // months later, and the dialog states the requirement before the operator is
+  // told they got it wrong.
+  const MIN_REASON = 5;
+
   async function render(page) {
     if (!(state.user && state.user.role === 'admin')) {
       page.innerHTML = '<div class="card"><div class="empty">Admin only</div></div>';
@@ -55,13 +64,12 @@
 
   // ── accounts ──────────────────────────────────────────────────────────────
   // Every mutating control below is gated server-side too (reason required,
-  // self-actions refused, last-admin protected). The prompts here exist so the
+  // self-actions refused, last-admin protected). The dialogs here exist so the
   // operator is told WHY at the point of action rather than after a 400.
+
+  /** Justify an action. Resolves the reason, or null if the operator cancelled. */
   function askReason(what) {
-    const reason = window.prompt(`${what}\n\nReason (recorded in the audit log):`);
-    if (reason === null) return null;
-    const trimmed = reason.trim();
-    return trimmed ? trimmed : null;
+    return OB.askReason(what, { minLength: MIN_REASON });
   }
 
   // Every desk view renders into #adminBody, so they all share ONE sequence
@@ -114,20 +122,40 @@
         let body_ = {};
 
         if (act === 'balance') {
-          const raw = window.prompt('Adjustment in dollars (negative to claw back):');
-          if (raw === null) return;
-          const dollars = Number(raw);
-          if (!Number.isFinite(dollars) || dollars === 0) return toast('Enter a non-zero amount', 'err');
-          const cents = Math.round(dollars * 100);
-          reason = askReason('Adjusting a balance');
-          if (!reason) return;
-          body_ = { delta_cents: cents, reason };
+          // Amount AND justification in ONE dialog. They were two consecutive
+          // window.prompts, so cancelling the second silently discarded the
+          // first with nothing on screen to say so.
+          const r = await OB.askDialog({
+            title: 'Adjust balance',
+            message: `Adjusting ${(data.users.find((u) => u.id === id) || {}).username || `#${id}`}'s balance. The reason is recorded in the audit log.`,
+            confirmLabel: 'Adjust',
+            fields: [
+              {
+                id: 'amount',
+                label: 'Amount in dollars',
+                type: 'number',
+                step: '0.01',
+                placeholder: 'negative to claw back',
+                required: true,
+                validate: (v) => {
+                  const n = Number(v);
+                  if (!Number.isFinite(n)) return 'Enter a number of dollars';
+                  if (n === 0) return 'Enter a non-zero amount';
+                  return null;
+                },
+              },
+              { id: 'reason', label: 'Reason', placeholder: 'why this, in one line', required: true, minLength: MIN_REASON },
+            ],
+          });
+          if (!r.ok) return;
+          reason = r.values.reason;
+          body_ = { delta_cents: Math.round(Number(r.values.amount) * 100), reason };
         } else if (act === 'suspend' || act === 'reinstate') {
-          reason = askReason(act === 'suspend' ? 'Suspending an account' : 'Reinstating an account');
+          reason = await askReason(act === 'suspend' ? 'Suspending an account' : 'Reinstating an account');
           if (!reason) return;
           body_ = { status: act === 'suspend' ? 'suspended' : 'active', reason };
         } else if (act === 'promote' || act === 'demote') {
-          reason = askReason(act === 'promote' ? 'Granting admin' : 'Revoking admin');
+          reason = await askReason(act === 'promote' ? 'Granting admin' : 'Revoking admin');
           if (!reason) return;
           body_ = { role: act === 'promote' ? 'admin' : 'user', reason };
         } else if (act === 'limits' || act === 'exclude') {
@@ -571,11 +599,11 @@
           // `body.reason || null`, and it was always null in practice: the
           // desk could suspend a USER with a justification and could not
           // suspend a market with one. server.js enforces no minimum length
-          // here, so this prompt is the only place the requirement exists —
-          // which is why askReason refuses an empty answer rather than sending
-          // a blank and losing it again.
+          // here, so this dialog is the only place the requirement exists —
+          // which is why it refuses an empty answer rather than sending a
+          // blank and losing it again.
           const suspending = b.dataset.status === 'suspended';
-          const reason = askReason(`${suspending ? 'Suspending' : 'Restoring'} this market`);
+          const reason = await askReason(`${suspending ? 'Suspending' : 'Restoring'} this market`);
           if (!reason) return;
           b.disabled = true;
           try {
@@ -622,6 +650,7 @@
   async function settleDialog(marketId) {
     let book;
     let market;
+    let desk = null;
     try {
       const r = await api('GET', `/api/markets/${marketId}/book`);
       book = r.book;
@@ -629,6 +658,30 @@
     } catch (e) {
       return toast(e.message, 'err');
     }
+    // NAME THE MARKET. The title used to be `Settle ${market.name}` — and a
+    // market's name in this catalogue is literally "Winner", so the most
+    // consequential dialog in the product was titled "Settle Winner" and named
+    // an event, an outcome, a price, a volume and a number of affected
+    // accounts: nothing. The event name and the desk's own view of the market
+    // come from /api/admin/stats, which the markets table was just rendered
+    // from, so this is the same source rather than a second opinion.
+    try {
+      const stats = await api('GET', '/api/admin/stats');
+      desk = (stats.markets || []).find((m) => Number(m.id) === Number(marketId)) || null;
+    } catch {
+      desk = null; // a title is worth having; a dialog is not worth refusing over one
+    }
+    const eventName = (desk && desk.event_name) || `event ${market.event_id}`;
+    const title = `Settle ${OB.esc(eventName)} — ${OB.esc(market.name)}`;
+    // How much money this decision moves, and how many runners it moves it for.
+    const matched = (desk && desk.total_matched_cents) || market.total_matched_cents || 0;
+    const facts =
+      `<div class="sd-facts">` +
+      `<span><span class="muted">Matched</span> <strong>${fmt(matched)}</strong></span>` +
+      `<span><span class="muted">Runners</span> <strong>${book.length}</strong></span>` +
+      `<span><span class="muted">State</span> <strong>${OB.esc(market.status)}</strong></span>` +
+      (market.settled_at ? `<span><span class="muted">Settled</span> <strong>${OB.esc(market.settled_at)}</strong></span>` : '') +
+      `</div>`;
     const overlay = document.createElement('div');
     overlay.className = 'modal';
     // S4: a real dialog. It registers on app.js's overlay stack, so Escape
@@ -637,9 +690,11 @@
     // focus returns to the button that opened it.
     overlay.setAttribute('role', 'dialog');
     overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', `Settle ${eventName} — ${market.name}`);
     overlay.innerHTML = `
       <div class="box">
-        <h3 id="sdTitle">Settle ${esc(market.name)}</h3>
+        <h3 id="sdTitle">${title}</h3>
+        ${facts}
         <p class="muted hint">${
           // W6: whenText(market.settled_at) is ALWAYS truthy ('—' for null),
           // which hid the instruction on the desk's most consequential dialog.
@@ -647,11 +702,23 @@
         }</p>
         <div id="sdWinners" role="group" aria-label="Winning runner">
           ${book
-            .map(
-              (s) => `<label class="optrow"><input type="radio" name="winner" value="${attr(s.selection_id)}" /> ${esc(
+            .map((s) => {
+              // A runner that has never traded used to show "LTP —" and nothing
+              // else, so every radio in a fresh market read as the same blank
+              // row. Where there is no last trade, the ladder's own best prices
+              // are what the operator is actually choosing between.
+              const bestBack = s.back && s.back.length ? OB.price2(s.back[0].price) : null;
+              const bestLay = s.lay && s.lay.length ? OB.price2(s.lay[0].price) : null;
+              const priced =
+                s.ltp != null
+                  ? `LTP ${OB.price2(s.ltp)}`
+                  : bestBack || bestLay
+                    ? `no trades yet · best back ${bestBack || '—'} · best lay ${bestLay || '—'}`
+                    : 'no trades yet · no prices on the book';
+              return `<label class="optrow"><input type="radio" name="winner" value="${attr(s.selection_id)}" /> ${esc(
                 s.name
-              )} <span class="muted tn">LTP ${price2(s.ltp)}</span></label>`
-            )
+              )} <span class="muted tn">${esc(priced)}</span></label>`;
+            })
             .join('')}
         </div>
         <label class="optrow"><input type="checkbox" id="sdVoid" /> Void market (refund all stakes)</label>

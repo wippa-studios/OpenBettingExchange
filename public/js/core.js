@@ -293,10 +293,178 @@
     }
   }
 
+  /**
+   * One dialog for every "the operator has to say or type something" action.
+   *
+   * WHY THIS EXISTS. `window.prompt` was the reason-capture mechanism for every
+   * consequential admin action — balance adjustments, suspensions, grants and
+   * revocations of admin, market suspend/restore, the kill switch, withdrawing
+   * every bot quote, closing a reconciliation finding, releasing a held market.
+   * It cannot be styled, is outside the overlay stack (so Escape routed past it
+   * and focus was never trapped or returned), renders as a tiny native dialog on
+   * mobile Chrome, and it is the ONE piece of the operator console a keyboard
+   * user cannot tab through. The mechanism was collecting the audit trail's
+   * required field on the most money-moving screen in the product.
+   *
+   * It is built on the same overlay stack as the auth modal and the settle
+   * dialog, so Escape closes THIS dialog, Tab stays inside it, focus returns to
+   * the button that opened it, and the backdrop is a cancel. No new mechanism:
+   * one dialog the whole desk shares.
+   *
+   * `fields` is [{ id, label, type, placeholder, hint, required, minLength,
+   * min, max, step, validate(value) -> error string|null }]. Each field renders
+   * its OWN error under itself rather than a toast, because "the reason you
+   * typed is too short" has to point at the reason.
+   *
+   * Resolves { ok: true, values } on confirm and { ok: false } on cancel,
+   * backdrop or Escape — so a caller cannot mistake a cancellation for an empty
+   * answer and go on to send one.
+   */
+  function askDialog(opts) {
+    const o = opts || {};
+    const fields = Array.isArray(o.fields) ? o.fields : [];
+    const overlay = document.createElement('div');
+    overlay.className = 'modal';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', String(o.title || 'Confirm'));
+    overlay.innerHTML =
+      `<div class="box">` +
+      `<h3>${esc(o.title || 'Confirm')}</h3>` +
+      (o.message ? `<p class="muted hint">${esc(o.message)}</p>` : '') +
+      fields
+        .map(
+          (f) =>
+            `<label class="fieldlabel" for="ask_${esc(f.id)}">${esc(f.label || f.id)}${
+              f.hint ? ` <span class="muted">${esc(f.hint)}</span>` : ''
+            }</label>` +
+            `<input id="ask_${esc(f.id)}" data-ask="${esc(f.id)}" type="${esc(f.type || 'text')}"` +
+            `${f.placeholder ? ` placeholder="${esc(f.placeholder)}"` : ''}` +
+            `${f.min != null ? ` min="${attr(f.min)}"` : ''}${f.max != null ? ` max="${attr(f.max)}"` : ''}` +
+            `${f.step != null ? ` step="${attr(f.step)}"` : ''} autocomplete="off" />` +
+            `<div class="askerr" data-askerr="${esc(f.id)}" hidden></div>`
+        )
+        .join('') +
+      `<div class="row mt">` +
+      `<button class="btn ${o.danger ? 'red' : 'primary'} grow" id="askGo">${esc(o.confirmLabel || 'Confirm')}</button>` +
+      `<button class="btn" id="askCancel">Cancel</button>` +
+      `</div></div>`;
+    document.body.appendChild(overlay);
+    let settled = false;
+    let resolveAnswer;
+    const answered = new Promise((res) => {
+      resolveAnswer = res;
+    });
+    // Exactly one settlement, ever: a cancel that also closed the overlay must
+    // not overwrite an answer the confirm already gave.
+    const settle = (v) => {
+      if (settled) return;
+      settled = true;
+      resolveAnswer(v);
+    };
+    openOverlay(overlay);
+    const dismiss = () => {
+      closeOverlay(overlay);
+      settle({ ok: false });
+    };
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) dismiss();
+    });
+    overlay.querySelector('#askCancel').onclick = dismiss;
+
+    const input = (id) => overlay.querySelector(`[data-ask="${id}"]`);
+    const errBox = (id) => overlay.querySelector(`[data-askerr="${id}"]`);
+    const showError = (f, msg) => {
+      const box = errBox(f.id);
+      if (!box) return;
+      box.textContent = msg || '';
+      box.hidden = !msg;
+      const n = input(f.id);
+      if (n) n.setAttribute('aria-invalid', msg ? 'true' : 'false');
+    };
+    const valueOf = (f) => {
+      const n = input(f.id);
+      return n ? String(n.value).trim() : '';
+    };
+    const validate = (f) => {
+      const raw = valueOf(f);
+      if (f.required && raw === '') return 'This is required';
+      if (f.minLength && raw !== '' && raw.length < f.minLength) return `At least ${f.minLength} characters`;
+      if (f.validate) return f.validate(raw) || null;
+      return null;
+    };
+    // Clear a field's error as soon as it is edited, so a stale message does not
+    // sit under a field the operator has already fixed.
+    fields.forEach((f) => {
+      const n = input(f.id);
+      if (n) n.addEventListener('input', () => showError(f, null));
+    });
+    const go = overlay.querySelector('#askGo');
+    go.onclick = () => {
+      let firstBad = null;
+      for (const f of fields) {
+        const msg = validate(f);
+        showError(f, msg);
+        if (msg && !firstBad) firstBad = f;
+      }
+      if (firstBad) {
+        const n = input(firstBad.id);
+        if (n) n.focus();
+        return;
+      }
+      const values = {};
+      for (const f of fields) values[f.id] = valueOf(f);
+      closeOverlay(overlay);
+      settle({ ok: true, values });
+    };
+    // Enter confirms anywhere in the dialog, the way a form does; Escape cancels
+    // here rather than reaching boot.js's document handler, which would close
+    // this overlay without settling the promise and leave the caller awaiting.
+    overlay.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        go.click();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        dismiss();
+      }
+    });
+    const firstField = input(fields[0] && fields[0].id);
+    if (firstField) firstField.focus();
+    return answered;
+  }
+
+  /**
+   * The reason every audited operator action is asked for, as a dialog.
+   *
+   * Resolves the trimmed reason, or null when the operator cancelled. `null`
+   * means "ask me again later", never "no reason given" — the callers return
+   * immediately on null precisely so a cancellation cannot send a blank.
+   */
+  function askReason(what, opts) {
+    const o = opts || {};
+    return askDialog({
+      title: what,
+      message: 'This reason is recorded in the audit log against your name.',
+      confirmLabel: o.confirmLabel || 'Confirm',
+      danger: o.danger,
+      fields: [
+        {
+          id: 'reason',
+          label: 'Reason',
+          placeholder: 'why this, in one line',
+          required: true,
+          minLength: o.minLength || 0,
+        },
+      ],
+    }).then((r) => (r.ok ? r.values.reason : null));
+  }
+
 
   // Everything core declares, exported so the modules below can reach it.
   // Derived from the file's own definitions rather than hand-listed, because
   // a hand-written list is how a name goes missing and surfaces as an
   // undefined reference buried in a view three files away.
-  Object.assign(OB, { $, FOCUSABLE, Ladder, TREE_LEVELS, api, attr, beginLoad, closeOverlay, el, esc, fmt, isCurrent, logout, num, openOverlay, overlayStack, price2, qa, refreshMe, renderHeader, setHtml, signed, state, toast, trapTab });
+  Object.assign(OB, { $, FOCUSABLE, Ladder, TREE_LEVELS, api, askDialog, askReason, attr, beginLoad, closeOverlay, el, esc, fmt, isCurrent, logout, num, openOverlay, overlayStack, price2, qa, refreshMe, renderHeader, setHtml, signed, state, toast, trapTab });
 })();
