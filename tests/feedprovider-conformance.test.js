@@ -38,6 +38,16 @@
 // every green line above it is a lie. See C9, which also asserts WHICH checks
 // caught it — so a future edit cannot quietly weaken one the mutant misses.
 //
+// ── AND WHAT ENFORCES IT, STATED WITHOUT OVERCLAIMING ────────────────────────
+// This file is enforced by CI and by REVIEW. `lib/feed/provider.js` refuses to
+// register a provider whose `name` is not in its capability table, and that is a
+// real gate; it is NOT a conformance gate, because running an offline fixture
+// suite inside a venue's boot would be its own class of wrong. C10 now asserts
+// both halves of that statement, including the uncomfortable one: the mutant,
+// given a DECLARED name, is ACCEPTED by the interface. It is this file, not
+// `assertProvider`, that would catch it — which is the argument for the two
+// existing separately, stated as a fact rather than as a slogan.
+//
 // ── WHY IT PROVES THE TRANSPORT, NOT JUST THE MAPPER ────────────────────────
 // The HTTP provider runs against a real `node:http` server started here, on an
 // ephemeral loopback port, serving VENDOR-SHAPED JSON — `prices.bets` /
@@ -1058,7 +1068,7 @@ if (require.main === module) (async () => {
     // eslint-disable-next-line global-require
     const { postgresProvider } = require('../lib/feed/postgres');
     // eslint-disable-next-line global-require
-    const { httpProvider, marketPath, MAX_RESPONSE_BYTES } = require('../lib/feed/http');
+    const { httpProvider, marketPath, composeTarget, makeGate, MAX_RESPONSE_BYTES } = require('../lib/feed/http');
     assert.strictEqual(config.FEED_PROVIDER, 'http', `the pinned environment did not take: ${config.FEED_PROVIDER}`);
     assert.strictEqual(config.FEED_HTTP_URL, BASE, `the pinned base URL did not take: ${config.FEED_HTTP_URL}`);
 
@@ -1234,8 +1244,22 @@ if (require.main === module) (async () => {
     });
 
     await check('C10 the registry refuses a provider nobody declared', () => {
-      // The property that makes "pass the conformance suite before you can be
-      // used" enforceable rather than aspirational.
+      // PRECISELY WHAT C10 DOES AND DOES NOT ESTABLISH, because this suite's
+      // header used to imply more than it could:
+      //
+      //   IT DOES      enforce the six method names and the capability-table
+      //                name. That is a real gate — an adapter nobody declared
+      //                cannot be wired in at all.
+      //   IT DOES NOT  run this battery at registration, and cannot. Running an
+      //                offline fixture suite at production startup would turn a
+      //                boot into a test run and make the venue refuse to start
+      //                because an assertion about a synthetic fixture drifted. So
+      //                the battery is enforced by CI and by review, and this file
+      //                is the artefact the reviewer is pointed at.
+      //
+      // The mutant implements all six methods, so "complete" and "correct" are
+      // visibly different things — which is the whole argument for a battery that
+      // exists separately from the interface.
       assert.throws(
         () => provider.register(mutantProvider()),
         /not declared in lib\/feed\/provider\.js/,
@@ -1250,10 +1274,7 @@ if (require.main === module) (async () => {
         /missing/,
         'a provider missing half the contract must be refused'
       );
-      // And the gate is not merely a name filter: the mutant implements all six
-      // methods and is refused anyway. That is the property — an adapter cannot
-      // be wired in by someone who has not declared it and extended
-      // tests/feedprovider-conformance.test.js to cover it.
+      // And the gate is not merely a name filter.
       assert.throws(
         () => provider.assertProvider(mutantProvider()),
         /not declared in lib\/feed\/provider\.js/,
@@ -1267,6 +1288,16 @@ if (require.main === module) (async () => {
         () => provider.select('half'),
         /is not a provider this build knows/,
         'and selecting a name no build knows must refuse rather than fall back to a default'
+      );
+      // …and the complement, which is the whole reason this file exists: give
+      // the mutant a DECLARED name and the interface accepts it, because the
+      // interface cannot see that its prices are "abc". If this assertion ever
+      // starts failing the interface has become strong enough to do the battery's
+      // job and the battery is redundant; if it ever passes silently, someone has
+      // swapped it for a weaker check.
+      assert.doesNotThrow(
+        () => provider.assertProvider({ ...mutantProvider(), name: 'postgres' }),
+        'a complete provider with a declared name is ACCEPTED — which is exactly why the battery, not assertProvider, is the real control'
       );
     });
 
@@ -1361,6 +1392,348 @@ if (require.main === module) (async () => {
         `the failure must be logged server-side with its reason; got ${JSON.stringify(logged)}`);
       assert.ok(logged.every((l) => !/test-token-not-a-secret|test-header-value-not-a-secret/.test(l)),
         `a secret reached the log: ${JSON.stringify(logged)}`);
+    });
+
+    // ── Finding 1: the credential in the log ─────────────────────────────────
+    //
+    // C13's blind spot, and why it was blind. It drives the transport to
+    // ECONNREFUSED, where undici's message is the bare `fetch failed` — no host,
+    // no credential, nothing to leak. So a suite that asserted the no-leak
+    // invariant on that branch was asserting something true about a message that
+    // happened to be harmless, and said nothing at all about the messages that
+    // are not.
+    //
+    // The realistic trigger is a credential that undici REFUSES. A header value
+    // containing CRLF or NUL raises
+    //   TypeError: Headers.append: "<the entire value>" is an invalid header value.
+    // — the whole value, verbatim. A PEM private key pasted into
+    // FEED_HTTP_HEADER_VALUE is exactly that shape, and the exception was
+    // interpolated into this module's own error, which server.js logs at four
+    // call sites and this module logs at one. So an unauthenticated
+    // `GET /api/feed/board` printed the operator's licensed feed-API credential
+    // to stdout on every request.
+    //
+    // C14 reproduces it through the REAL transport — real `fetch`, real
+    // undici, a header value with real newlines in it — and asserts the secret
+    // appears in NONE of: the thrown error's message, `console.error` output, or
+    // anything a route could echo.
+    await check('C14 a credential undici REFUSES never reaches the log or the error', async () => {
+      // Obviously fake and obviously shaped like the real thing: a PEM block is
+      // newlines plus base64, and that shape is the vulnerability.
+      const PEM = [
+        '-----BEGIN PRIVATE KEY-----',
+        'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ',
+        '-----END PRIVATE KEY-----',
+      ].join('\n');
+      // A second value, so a fix that merely special-cases one shape is caught.
+      const NUL_BEARING = 'abc def';
+      const configured = [
+        Object.assign({}, config, { FEED_HTTP_URL: 'http://127.0.0.1:59997', FEED_HTTP_TOKEN: PEM, FEED_HTTP_HEADER_NAME: '' }),
+        Object.assign({}, config, {
+          FEED_HTTP_URL: 'http://127.0.0.1:59997', FEED_HTTP_TOKEN: null,
+          FEED_HTTP_HEADER_NAME: 'X-Api-Key', FEED_HTTP_HEADER_VALUE: PEM,
+        }),
+        Object.assign({}, config, {
+          FEED_HTTP_URL: 'http://127.0.0.1:59997', FEED_HTTP_TOKEN: NUL_BEARING, FEED_HTTP_HEADER_NAME: '',
+        }),
+      ];
+      const needles = [PEM, PEM.split('\n')[1], NUL_BEARING];
+
+      for (const cfg of configured) {
+        const labelled = httpProvider({ cfg });
+        // Every call site that can reach a secret-bearing failure. `board` is the
+        // unauthenticated GET an attacker can trigger; `health` is the one this
+        // module logs ITSELF, from its own catch, at lib/feed/http.js's
+        // `console.error`.
+        for (const call of [
+          () => labelled.board({ limit: 5 }),
+          () => labelled.nav(),
+          () => labelled.market('1.100'),
+          () => labelled.health(),
+        ]) {
+          const logged = [];
+          const realError = console.error;
+          console.error = (...a) => logged.push(a.map(String).join(' '));
+          let thrown = null;
+          let returned = null;
+          try {
+            returned = await call();
+          } catch (e) {
+            thrown = e;
+          } finally {
+            console.error = realError;
+          }
+          // `health()` answers rather than throwing by contract; the others must
+          // reject. Either way the message and the log line are the leak
+          // surface, so both are scanned.
+          const surfaces = [
+            thrown && thrown.message ? thrown.message : '',
+            thrown && thrown.stack ? thrown.stack : '',
+            JSON.stringify(returned),
+            logged.join('\n'),
+          ].join('\n');
+          for (const needle of needles) {
+            assert.ok(!surfaces.includes(needle),
+              `a configured credential reached an operator-visible surface.\n` +
+              `     needle : ${JSON.stringify(needle)}\n` +
+              `     surface: ${JSON.stringify(surfaces)}`);
+          }
+          // …and the failure is still a failure. A fix that swallowed the error
+          // to stop the leak would pass the scan above and break the contract,
+          // so the two are asserted together.
+          assert.ok(thrown || (returned && returned.error === 'Odds feed unavailable'),
+            `the call must still fail; it resolved with ${JSON.stringify(returned)}`);
+          // `health()` answers with the fixed generic message BY CONTRACT, so the
+          // resource is named in the LOG there rather than in the returned
+          // value — and the log was scanned above. Only a THROWN error has to
+          // name the resource in its own text.
+          if (thrown) {
+            assert.ok(thrown.message.startsWith('feed http: '),
+              `a thrown feed error must name the resource, which is the part an operator needs; got ${JSON.stringify(thrown.message)}`);
+            assert.strictEqual(returned, null,
+              'a call that threw must not also have resolved with an error object');
+          }
+        }
+      }
+    });
+
+    // The other half of C13's blind spot, asserted separately so a future fix
+    // cannot quietly restore it: even on the branch where undici's own message
+    // IS harmless today, nothing from the runtime may be forwarded. A host is
+    // exactly the thing that ends up in a support ticket, and the module's own
+    // header says the composed URL never appears in an error.
+    await check('C15 no runtime string is forwarded into a provider error, on any branch', async () => {
+      // A fetchImpl whose failure message is hostile by construction: it echoes
+      // back everything it was handed, which is the worst a real transport can
+      // be and is exactly what undici does with an invalid header value.
+      const hostile = new Error('connect ECONNREFUSED 127.0.0.1:59997 with token super-secret-token-value');
+      const cfg = Object.assign({}, config, {
+        FEED_HTTP_URL: 'http://127.0.0.1:59997',
+        FEED_HTTP_TOKEN: 'super-secret-token-value',
+      });
+      const p = httpProvider({ cfg, fetchImpl: async () => { throw hostile; } });
+      let thrown = null;
+      try {
+        await p.board({ limit: 5 });
+      } catch (e) {
+        thrown = e;
+      }
+      assert.ok(thrown, 'a transport failure must still reject');
+      for (const banned of ['super-secret-token-value', '127.0.0.1', 'ECONNREFUSED', '59997', 'http://']) {
+        assert.ok(!thrown.message.includes(banned),
+          `the thrown message forwarded a runtime string (${banned}): ${JSON.stringify(thrown.message)}`);
+      }
+      assert.match(thrown.message, /^feed http: \/board unreachable$/,
+        `the sanitised message must be exactly the path and the class, and nothing else; got ${JSON.stringify(thrown.message)}`);
+    });
+
+    // ── Finding 2a: in-flight requests are capped ──────────────────────────────
+    //
+    // Under FEED_PROVIDER=postgres the venue was implicitly bounded by
+    // `new Pool({ max: 4 })`. HTTP removed that bound: Node's global fetch agent
+    // is uncapped, so N concurrent board requests opened N sockets to the
+    // operator's OWN licensed feed API, each able to buffer up to 8 MiB.
+    //
+    // C16 proves the cap is real by MEASURING the provider's own concurrency
+    // from inside the transport, rather than by counting requests: a test that
+    // asserted "at most N requests were issued" would still pass against an
+    // implementation that queued without limit, which is the half of this that
+    // actually exhausts memory.
+    await check('C16 the provider caps in-flight requests and fails fast when its queue is full', async () => {
+      const CONCURRENCY = 2;
+      const QUEUE = 1;
+      let inFlight = 0;
+      let peak = 0;
+      let served = 0;
+      // A server that HOLDS each request, so overlap is real rather than
+      // something the event loop happened to serialise.
+      const gateCfg = Object.assign({}, config, {
+        FEED_HTTP_MAX_CONCURRENCY: CONCURRENCY,
+        FEED_HTTP_MAX_QUEUE: QUEUE,
+        // Long enough that no waiter can time out during the test and be
+        // mistaken for a queue-full refusal, short enough not to slow the suite.
+        FEED_HTTP_TIMEOUT_MS: 5000,
+      });
+      const holding = httpProvider({
+        cfg: gateCfg,
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          body: {
+            getReader() {
+              let sent = false;
+              return {
+                async read() {
+                  if (sent) return { done: true };
+                  sent = true;
+                  inFlight += 1;
+                  peak = Math.max(peak, inFlight);
+                  await new Promise((r) => setTimeout(r, 30));
+                  inFlight -= 1;
+                  served += 1;
+                  const body = JSON.stringify({ data: { events: [] } });
+                  return { done: false, value: Buffer.from(body, 'utf8') };
+                },
+                async cancel() { /* the stream is being abandoned */ },
+              };
+            },
+          },
+        }),
+      });
+
+      // CONCURRENCY in flight, plus QUEUE waiting, plus one that must be refused:
+      // the total that the cap and the bounded queue together permit.
+      const burst = CONCURRENCY + QUEUE + 3;
+      const results = await Promise.allSettled(
+        Array.from({ length: burst }, () => holding.board({ limit: 1 }))
+      );
+      const refused = results.filter((r) => r.status === 'rejected');
+      const ok = results.filter((r) => r.status === 'fulfilled');
+
+      assert.ok(ok.length >= CONCURRENCY,
+        `at least the configured ${CONCURRENCY} requests must be served, or the cap is refusing work it should hold; served ${ok.length}`);
+      assert.strictEqual(served, ok.length,
+        'and every served request must have reached the transport exactly once');
+      assert.ok(peak <= CONCURRENCY,
+        `at most ${CONCURRENCY} requests may be in flight at once; the peak was ${peak} — an unbounded fan-out`);
+      assert.ok(refused.length >= 3,
+        `past the cap and the queue, callers must be REFUSED rather than queued without limit; ${refused.length} of ${burst} were refused`);
+      for (const r of refused) {
+        assert.ok(r.reason && r.reason.reason === 'busy',
+          `a queue-full refusal must carry the provider's own 'busy' class, so the route turns it into the generic 503; got ${JSON.stringify(r.reason && r.reason.message)}`);
+        assert.ok(/^feed http: \/board — too many requests already in flight/.test(r.reason.message),
+          `and must say why, in words this module wrote; got ${JSON.stringify(r.reason.message)}`);
+      }
+      // The message reports the CONFIGURED numbers, so an operator reading the log
+      // can tell "the venue is full" from "I set that wrong".
+      const first = refused[0].reason.message;
+      assert.ok(first.includes(`${CONCURRENCY} in flight, ${QUEUE} queued`),
+        `the refusal must name the configured cap, which is the number an operator has to tune; got ${JSON.stringify(first)}`);
+    });
+
+    await check('C17 a freed slot is handed to the next caller, and close() drops the queue', async () => {
+      // The accounting half of C16, and the reason it is a separate check: a gate
+      // that leaks a slot looks correct under a burst and then serves one request
+      // at a time for ever, which is a DIFFERENT bug and one C16 cannot see — it
+      // only counts a peak.
+      const gate = makeGate({ max: 1, queue: 2, waitMs: 5000 });
+      const order = [];
+      const first = gate('/x').then((release) => { order.push('a'); return release; });
+      await new Promise((r) => setImmediate(r));
+      const second = gate('/x').then((release) => { order.push('b'); return release; });
+      await new Promise((r) => setImmediate(r));
+      assert.deepStrictEqual(order, ['a'], 'the second caller must wait while the slot is held');
+
+      const stats = gate.stats();
+      assert.strictEqual(stats.active, 1, 'exactly one slot is held');
+      assert.strictEqual(stats.queued, 1, 'and exactly one caller is waiting');
+
+      // Release the first. The slot must TRANSFER to the waiter with no window in
+      // which a third caller could overtake it, which is why `release` hands off
+      // rather than decrementing and re-acquiring.
+      const releaseA = await first;
+      releaseA();
+      const releaseB = await second;
+      releaseB();
+      assert.deepStrictEqual(order, ['a', 'b'], 'the slot goes to the waiter, in order');
+      assert.strictEqual(gate.stats().active, 0,
+        'and the count returns to zero, or the next burst is smaller than the cap it claims to have');
+
+      // close() must not leave callers waiting out the full timeout: a shutdown
+      // that lingers is a shutdown the operator notices. A caller has to be
+      // genuinely QUEUED for this to mean anything — one that finds a free slot
+      // is served immediately and `close` is irrelevant to it.
+      const held = await gate('/x');
+      const blocked = gate('/x');
+      await new Promise((r) => setImmediate(r));
+      assert.strictEqual(gate.stats().queued, 1, 'the second caller really is waiting, so close() has something to drop');
+      gate.close('closed');
+      held();
+      await blocked.then(
+        () => { throw new Error('a queued caller was handed a slot after close()'); },
+        (e) => {
+          assert.strictEqual(e.reason, 'busy');
+          assert.match(e.message, /the provider is closing/);
+        }
+      );
+      await gate('/x').then(
+        () => { throw new Error('a closed gate admitted a caller'); },
+        (e) => assert.strictEqual(e.reason, 'busy', 'and a closed gate admits nobody')
+      );
+    });
+
+    await check('C18 the default cap is the number the Postgres path effectively had', async () => {
+      // Not a tautology about a constant: it asserts the DEFAULT matches
+      // `new Pool({ max: 4 })` in lib/feed/postgres.js, read from that file. So
+      // somebody who raises the pool has to decide about the HTTP cap, rather
+      // than the two silently diverging and nobody noticing which one the venue
+      // is honouring.
+      const pgSrc = require('fs').readFileSync(require('path').join(__dirname, '..', 'lib', 'feed', 'postgres.js'), 'utf8');
+      const poolMax = /new Pool\(\{[\s\S]*?max:\s*(\d+)/.exec(pgSrc);
+      assert.ok(poolMax, 'the pg pool has a `max:` to read; if this fails the pool was restructured and the default needs re-deciding by hand');
+      assert.strictEqual(config.FEED_HTTP_MAX_CONCURRENCY, Number(poolMax[1]),
+        `the HTTP default cap must be what the collector's pool had (${poolMax[1]}), so switching provider does not silently change the venue's concurrency`);
+    });
+
+    // ── Finding 3: the composed target's authority ───────────────────────────
+    await check('C19 a resource path cannot move the request to another host', () => {
+      const base = 'https://legit-feed.example.com.au';
+      // The configuration-only path, checked at BOOT.
+      const { loadConfig } = require('../lib/config');
+      const floor = { PORT: '7777', HOST: '127.0.0.1', DB_PATH: ':memory:', SCRYPT_N: '16384', FEED_PROVIDER: 'http', FEED_HTTP_URL: base };
+      for (const [key, value] of [
+        ['FEED_HTTP_BOARD_PATH', '@evil.example.net/collect'],
+        ['FEED_HTTP_CATALOGUE_PATH', 'https://evil.example.net/collect'],
+        ['FEED_HTTP_HEALTH_PATH', 'https://user:pass@evil.example.net/collect'],
+        ['FEED_HTTP_MARKET_PATH', 'https://legit-feed.example.com.au.evil.example.net/m'],
+      ]) {
+        assert.throws(() => loadConfig(null, Object.assign({}, floor, { [key]: value })),
+          /changes the host of FEED_HTTP_URL/,
+          `${key}=${value} must abort the launch`);
+      }
+      assert.throws(() => loadConfig(null, Object.assign({}, floor, { FEED_HTTP_URL: 'https://key@legit-feed.example.com.au' })),
+        /must not carry credentials/,
+        'a base carrying a credential is still refused — the origin rule does not catch it, because WHATWG strips userinfo before comparing origins');
+
+      // …and the paths that are NOT an attack must still work, or the check is
+      // simply "refuse everything".
+      for (const [key, value] of [
+        ['FEED_HTTP_BOARD_PATH', '/board'],
+        ['FEED_HTTP_BOARD_PATH', '/v2/feed/board?x=1'],
+        ['FEED_HTTP_MARKET_PATH', '/market/{id}'],
+        ['FEED_HTTP_BOARD_PATH', '//evil.example.net/collect'],
+        ['FEED_HTTP_URL', 'https://legit-feed.example.com.au/v2/feed'],
+      ]) {
+        assert.doesNotThrow(() => loadConfig(null, Object.assign({}, floor, { [key]: value })),
+          `${key}=${value} is a legitimate configuration and must be accepted`);
+      }
+
+      // And the SAME rule at REQUEST time, which is the layer that holds for a
+      // provider built without going through the loader.
+      assert.strictEqual(composeTarget({ FEED_HTTP_URL: base }, '/board', undefined), 'https://legit-feed.example.com.au/board');
+      // `//evil.example.net/c` is deliberately NOT in this list, and the reason is
+      // worth stating: composition is a STRING JOIN, so it becomes
+      // `https://host//evil.example.net/c` — a path with a doubled slash on the
+      // configured host. It would only be protocol-relative if it were resolved
+      // against a base the WHATWG way, which is exactly why this module does not.
+      for (const path of ['@evil.example.net/collect', 'https://evil.example.net/collect']) {
+        assert.throws(() => composeTarget({ FEED_HTTP_URL: base }, path, undefined),
+          /changes the host of FEED_HTTP_URL/,
+          `a request-time composition of "${path}" must be refused`);
+      }
+      // …and the refusal must not quote the COMPOSED URL. Naming the offending
+      // path is correct and useful — it is the key an operator has to go and fix —
+      // but the base is the operator's own host and does not belong in a string
+      // that four call sites in server.js write to a log.
+      try {
+        composeTarget({ FEED_HTTP_URL: base }, '@evil.example.net/collect', undefined);
+        throw new Error('expected a refusal');
+      } catch (e) {
+        assert.ok(!/legit-feed\.example\.com\.au|https:\/\//.test(e.message),
+          `the refusal must not quote the composed URL or the configured base; got ${JSON.stringify(e.message)}`);
+        assert.ok(e.message.includes('@evil.example.net/collect'),
+          `but it must name the offending path, which is the key the operator has to fix; got ${JSON.stringify(e.message)}`);
+      }
     });
 
     console.log(`\nfeedprovider-conformance.test.js: ${passed} checks passed, ${failures.length} failed`);

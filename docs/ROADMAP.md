@@ -560,7 +560,7 @@ conversation.
 ## 6. Immediate next actions
 
 Reassessed after Phases 1–4, the follow-on work, and the first outside
-review of the money path. The suite is now **1015 checks across 72 suites**,
+review of the money path. The suite is now **1023 checks across 72 suites**,
 plus a live smoke script and a 217-check browser suite, all green.
 ### Recently completed
 

@@ -357,6 +357,8 @@ must be an `http(s)://` base URL with no credentials in it, or the launch aborts
 | `FEED_HTTP_TOKEN` | unset | bearer token. Sent on the wire and **nowhere else**: not in an error, not in a log, not in a body |
 | `FEED_HTTP_HEADER_NAME` / `FEED_HTTP_HEADER_VALUE` | `''` | one static header, for vendors that use `X-Api-Key` and friends |
 | `FEED_HTTP_TIMEOUT_MS` | `10000` | one attempt, then this timeout. There is **no retry loop** |
+| `FEED_HTTP_MAX_CONCURRENCY` | `4` | requests in flight at once. Mirrors the collector's `Pool({ max: 4 })`, which is what bounded the Postgres path until the HTTP provider removed it. Range 1–512; **cannot be 0** |
+| `FEED_HTTP_MAX_QUEUE` | `16` | callers waiting for a slot. Past this they are **refused immediately** with the provider's normal generic 503. Range 1–4096 |
 | `FEED_HTTP_PRICED` | `true` | does this feed carry prices at all? `false` is a fixtures-only catalogue — the HTTP analogue of `FEED_NUMBER=1` |
 | `FEED_HTTP_SIZE_SCALE` | `1` | multiplied into every ladder size. The canonical unit is **pounds**, so a vendor publishing cents sets `0.01`. Getting this wrong is a 100x error on every stake shown |
 | `FEED_HTTP_MAP_BOARD` / `_NAV` / `_HEALTH` | identity | `key=path,key=path`; a bare `key` means `key=key`. See below |
@@ -371,10 +373,20 @@ misconfiguration. `back`/`lay` are read from *inside* the odds object and
 `prices: {bets, offers}` maps as `odds=prices, back=bets, lay=offers`.
 
 **Every provider must pass `tests/feedprovider-conformance.test.js`.** It is a
-reusable battery, run here against both shipped providers against a real
-`node:http` server serving vendor-shaped JSON. `lib/feed/provider.js` refuses to
-register a provider whose `name` is not in its own capability table, so the
-battery is a gate rather than a suggestion.
+reusable battery, run against both shipped providers — the HTTP one against a
+real `node:http` server serving vendor-shaped JSON — and it includes a
+deliberately broken MUTANT provider asserted to fail it, so it cannot go
+vacuously green.
+
+`lib/feed/provider.js` refuses to register a provider whose `name` is not in its
+own capability table. That is a **review gate, not a runtime one**, and the
+distinction matters because the other reading is wrong: registering a provider
+does **not** cause the battery to run. Running an offline fixture suite at
+production startup would turn a boot into a test run, and make the venue refuse to
+start because an assertion about a synthetic fixture drifted. What declaring a
+name does is put a line in a diff a reviewer reads, in the one file whose header
+explains what the battery is for. So the battery is enforced by CI and by review,
+not by `register()`.
 
 Two of these are worth their own paragraph because a wrong value is worse than a
 missing one.

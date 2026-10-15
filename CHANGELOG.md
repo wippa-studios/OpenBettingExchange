@@ -43,8 +43,10 @@ must agree with the highest released heading.
   it includes a deliberately broken MUTANT provider asserted to **fail** it, so
   the battery cannot go vacuously green. `lib/feed/provider.js` refuses to
   register a provider whose name is not in its own capability table, which is
-  what makes "pass the suite before you can be used" a gate rather than a
-  sentence.
+  what puts a new adapter in front of a reviewer who runs the battery. Stated
+  precisely, because the other reading is wrong: declaring a provider in
+  `lib/feed/provider.js` does not run the suite — the registry cannot, and a boot
+  is the wrong place for an offline fixture test.
 
   There is **one shaper** (`lib/feed/shape.js`), shared by both providers: a
   second one beside the original is a wrong-price bug in the making, because the
