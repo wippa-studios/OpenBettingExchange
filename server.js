@@ -71,6 +71,11 @@ const CASHOUTRISK = require('./lib/cashoutrisk');
 // version on a book, the version on a placement response. The comparison itself
 // happens inside the engine, never here.
 const BOOKVERSION = require('./lib/bookversion');
+// Matched volume per price level, the price-history series, the board's mover
+// view and the trade tape's retention policy (#93). The ladder's matched
+// column comes from here, and the mover view is built from the SAME query the
+// column uses rather than a second one that could disagree with it.
+const MARKETDATA = require('./lib/marketdata');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
 // DELIBERATE demo choice (documented in .github/SECURITY.md): this app is
@@ -1654,6 +1659,17 @@ app.get('/api/events', limit('read'), (req, res) => {
       )
       .all();
   }
+  // MATCHED VOLUME PER PRICE LEVEL (#93) — the column Betfair shows at every
+  // level and this board had no query for at all.
+  //
+  // ONE aggregate for the WHOLE board, after every market's book exists, not
+  // one query per market: node:sqlite is synchronous, so a per-market read
+  // would multiply the single-threaded server's blocking work by the size of the
+  // catalogue on every 15-second poll. The rows are bucketed per market here and
+  // merged by MARKETDATA.attachRows, which is the same merge the single-market
+  // book route uses — so the board's column and the trading desk's column are
+  // the same code, not two that agree today.
+  const books = [];
   const events = rows.map((e) => {
     const markets = db
       .prepare("SELECT id, name, status, total_matched_cents FROM markets WHERE event_id = ? AND status IN ('open','suspended') ORDER BY id")
@@ -1665,19 +1681,38 @@ app.get('/api/events', limit('read'), (req, res) => {
       competition: e.competition_name,
       starts_at: e.starts_at,
       status: e.status,
-      markets: markets.map((m) => ({
-        id: m.id,
-        name: m.name,
-        status: m.status,
-        total_matched_cents: m.total_matched_cents,
-        // The market's book version (#92), so a client reading the BOARD can
-        // claim it back on a placement without a second request. Each runner's
-        // own version rides inside `selections[].version`.
-        market_version: BOOKVERSION.marketVersion(db, m.id),
-        selections: M.bookFor(db, m.id, 3),
-      })),
+      markets: markets.map((m) => {
+        const book = M.bookFor(db, m.id, 3);
+        books.push({ market_id: m.id, book });
+        return {
+          id: m.id,
+          name: m.name,
+          status: m.status,
+          total_matched_cents: m.total_matched_cents,
+          // The market's book version (#92), so a client reading the BOARD can
+          // claim it back on a placement without a second request. Each runner's
+          // own version rides inside `selections[].version`.
+          market_version: BOOKVERSION.marketVersion(db, m.id),
+          selections: book,
+        };
+      }),
     };
   });
+  if (books.length) {
+    // The window is passed to BOTH calls, because `matched_window_minutes` is
+    // what the ladder's runner badge prints in its tooltip. Pinning the badge to
+    // the default while querying some other window would make the caption lie,
+    // and no test would see it: both values would still be internally consistent.
+    const matched = MARKETDATA.matchedByLevel(db, {
+      marketIds: books.map((b) => b.market_id),
+      window: MARKETDATA.DEFAULT_WINDOW_MINUTES,
+    });
+    for (const b of books) {
+      MARKETDATA.attachRows(b.book, matched.filter((r) => r.market_id === b.market_id), {
+        window: MARKETDATA.DEFAULT_WINDOW_MINUTES,
+      });
+    }
+  }
   res.json({ events });
 });
 
@@ -1688,7 +1723,46 @@ app.get('/api/markets/:id/book', limit('read'), (req, res) => {
   // `market_version` is repeated at the top level under the name the placement
   // route and the board use, so a client reads one field name in all three
   // places instead of learning that this one endpoint calls it something else.
-  res.json({ market: m, book: M.bookFor(db, m.id, 5), market_version: BOOKVERSION.marketVersion(db, m.id) });
+  //
+  // Each level carries `matched_cents` / `matched_fills` (#93) as well as its
+  // unmatched `size_cents`, and they come from MARKETDATA — the same reader the
+  // board and the mover view use, so the desk's 5-level book and the board's
+  // 3-level ladder cannot report different volume for the same price.
+  const book = MARKETDATA.attachMatchedLevels(db, M.bookFor(db, m.id, 5), { marketId: m.id });
+  res.json({ market: m, book, market_version: BOOKVERSION.marketVersion(db, m.id) });
+});
+
+// ── Matched volume, price history and movers (#93) ───────────────────────
+//
+// Three readers of the trade tape, and all three are BOUNDED rather than
+// scans — see lib/marketdata.js's header for why that is the design constraint
+// rather than a preference. `price_history` was written on every fill and read
+// by nothing in production until this block; the retention policy that governs
+// it is `MARKETDATA.retentionPolicy()`, served by the admin route below.
+app.get('/api/selections/:id/price-history', limit('read'), (req, res) => {
+  // intId() THROWS on a non-integer, which the error handler turns into the
+  // documented 400 — so there is no second, redundant check here to drift.
+  const id = intId(req.params.id);
+  // windowMinutes() REFUSES a window wider than the retention policy rather
+  // than clamping it: a chart silently cut short by a prune looks like a quiet
+  // market instead of a deleted one, which is the worst kind of wrong answer.
+  res.json(MARKETDATA.priceSeries(db, id, { window: req.query.window, points: req.query.points }));
+});
+
+// The board's mover view. Built on MARKETDATA.movers, which is the SAME query
+// the ladder's matched column is rendered from — the acceptance criterion for
+// #93 is that a second mover query was not written, and it was not.
+app.get('/api/movers', limit('read'), (req, res) => {
+  res.json(MARKETDATA.movers(db, { window: req.query.window, limit: req.query.limit }));
+});
+
+// Retention is a decision an operator makes and re-makes, so the pruner is an
+// explicit admin action rather than a timer: a background job that deletes rows
+// nobody agreed to delete is not a policy. Bounded per call (see
+// prunePriceHistory) and it reports `more_remaining` rather than implying it
+// finished.
+app.post('/api/admin/maintenance/price-history', requireAdmin, limit('admin'), (req, res) => {
+  res.json(MARKETDATA.prunePriceHistory(db, { retentionDays: (req.body || {}).retention_days }));
 });
 
 // Price formats for the trading desk: the same pure functions the engine uses,

@@ -227,11 +227,52 @@
           const matched = m.total_matched_cents
             ? `<span class="muted tn">${OB.fmt(m.total_matched_cents)} matched</span>`
             : '';
-          html += `<div class="mkt">
+          // WINDOWED MATCHED VOLUME FOR THE MARKET (#93), beside the lifetime
+      // figure already in this header.
+      //
+      // IT IS HERE AND NOT IN THE RUNNER CELL, and that is a measured decision
+      // rather than a preference. The first version of #93 added a `MATCHED`
+      // badge to `.lmid`, beside the existing `LTP` one. `.lrow`'s runner column
+      // is `minmax(150px, 1.6fr)`, which at the documented 570px floor is exactly
+      // 150px; with 24px of padding that leaves 126px. Measured at 570px on the
+      // seeded board: the LTP badge is 51px and the MATCHED badge 102px, and
+      // `.nm` — the RUNNER'S NAME — was squeezed to 0px wide and did not render
+      // at all. A ladder that trades normally has an LTP badge on most rows, so
+      // this was not an edge case: it hid the name of every runner that had
+      // traded. The screenshot of it is the reason this is a comment.
+      //
+      // The per-LEVEL matched figures and their bars — the acceptance item — are
+      // inside the price cells and cost no width at all, because a cell has
+      // vertical room to spare and the grid has no eighth track to give (#136).
+      // The windowed TOTAL needs a line of its own, and the market header is
+      // where the lifetime total already lives, so both figures now sit together
+      // and can be read against each other.
+      //
+      // Summed in the client from the per-selection figures `/api/events` already
+      // returns, so it is the same number the ladder's runner rows carry and
+      // needs no second server read.
+      const windowed = (m.selections || []).reduce((a, s) => a + (Number(s.matched_cents) || 0), 0);
+      // Every runner in this market was merged with the SAME window (one
+      // `matchedByLevel` call covers the whole board), so the first runner that
+      // traded states it. Reading it from the payload rather than from a client
+      // constant is the same rule the movers strip follows: `?window=` is a
+      // parameter, and a caption asserting a window it did not ask for is a lie.
+      const windowedMinutes =
+        (m.selections || []).find((s) => s.matched_cents)?.matched_window_minutes ||
+        OB.Ladder.MATCHED_WINDOW_MINUTES;
+      const matchedShown = windowed
+        ? `<span class="muted tn matched-win" title="${OB.fmt(windowed)} matched in the last ${windowedMinutes} minute${
+            windowedMinutes === 1 ? '' : 's'
+          } of trading in this market, across every runner and price">${OB.fmt(windowed)} in ${
+            windowedMinutes
+          }m</span>`
+        : '';
+      html += `<div class="mkt">
             <div class="mkthead">
               <span>${OB.esc(m.name)}</span>
               ${marketStatus}
               ${matched}
+              ${matchedShown}
             </div>
             ${ladderHtml(m, e)}
           </div>`;
@@ -240,8 +281,144 @@
       }
       html += '</div>';
     }
+    // The mover strip's mount (#93). Rendered as its own asynchronous fill
+    // BELOW the ladders, so it can never delay or fail the board itself.
+    html += '<div id="movers"></div>';
     page.innerHTML = html;
+    renderMovers(page);
     bindLadder();
+  }
+
+  // ── the board's mover view (#93) ──────────────────────────────────────────
+  //
+  // ONE strip above the ladders, ranked by what actually traded. It was a
+  // roadmap item with no implementation, and it could not have one: with no
+  // reader on the trade tape there was no number to rank by.
+  //
+  // It is a SEPARATE FETCH rather than a field on /api/events, and that is a
+  // deliberate cost: the board already re-reads every market's book on its
+  // 15-second poll, and adding a ranked view of the whole venue to that same
+  // response would make a poll that most clients never look at do work for all
+  // of them. It shares the ladder's matched column server-side — one query,
+  // two readers (lib/marketdata.js movers() and matchedByLevel()).
+  //
+  // The window label is rendered from the RESPONSE, not from a client constant.
+  // `?window=` is a parameter, so a strip captioned "10 min" beside a figure
+  // computed over 60 would be the UI asserting something it does not know.
+  async function renderMovers(page) {
+    const host = page.querySelector('#movers');
+    if (!host) return;
+    try {
+      const r = await OB.api('GET', '/api/movers?limit=6');
+      const rows = r && r.movers ? r.movers : [];
+      const windowLabel = `${r.window_minutes} min`;
+      const scopeNote = r.markets_available != null && r.markets_available > r.markets_considered
+        ? `<span class="muted movers-scope" title="The busiest ${r.markets_considered} of ${r.markets_available} open markets">top ${r.markets_considered} of ${r.markets_available} markets</span>`
+        : '';
+      if (!rows.length) {
+        host.innerHTML = `<div class="movers"><span class="muted movers-title">Movers</span>`
+          + `<span class="muted">Nothing has traded in the last ${OB.esc(windowLabel)}</span></div>`;
+        return;
+      }
+      host.innerHTML = `<div class="movers">`
+        + `<span class="muted movers-title">Movers <span class="muted movers-win">last ${OB.esc(windowLabel)}</span></span>`
+        + rows
+          .map(
+            (m) => `<span class="mover tn" title="${OB.esc(m.name || '')} — ${OB.fmt(m.matched_cents)} matched across ${
+              m.fills
+            } fill${m.fills === 1 ? '' : 's'} at ${m.levels} price level${m.levels === 1 ? '' : 's'}${
+              m.lowest_price != null && m.top_price !== m.lowest_price
+                ? `, ${OB.price2(m.lowest_price)}–${OB.price2(m.top_price)}`
+                : ''
+            }">`
+              + `<span class="mover-name">${OB.esc(m.name || `Selection ${m.selection_id}`)}</span>`
+              + `<span class="mover-vol">${OB.fmt(m.matched_cents)}</span></span>`
+          )
+          .join('')
+        + scopeNote
+        + `</div>`;
+    } catch {
+      // A failed movers strip must not take the board with it: the ladders are
+      // the product and this is a summary of them. Say so and stop.
+      host.innerHTML = '<div class="movers"><span class="muted movers-title">Movers</span>'
+        + '<span class="muted">unavailable</span></div>';
+    }
+  }
+
+  // ── the runner price chart (#93) ─────────────────────────────────────────
+  //
+  // THE THIRD THING THE ISSUE SAID WAS MISSING, and the reason the trade tape was
+  // write-only in the first place: there was a series endpoint and nothing that
+  // read it. `priceSeries` is one index range over ONE runner's fills, so a chart
+  // costs one request — but only if something asks for it.
+  //
+  // ON DEMAND, NEVER ON THE POLL. The board re-reads every market's book every
+  // 15 seconds; adding one request per runner per poll would be ~33 extra
+  // synchronous reads per repaint for a chart most of the time nobody looks at,
+  // and node:sqlite is single-threaded. So the chart is loaded when a runner is
+  // ASKED for it, cached per (selection, window) until the next board repaint
+  // clears it, and never fetched speculatively.
+  //
+  // A failure is silent but visible: the button says "unavailable" and the ladder
+  // keeps working. A chart is not worth taking a board down for.
+  const CHART_WINDOW_MINUTES = 60;
+  const chartCache = new Map();
+
+  function chartKey(selectionId, window) {
+    return `${selectionId}:${window}`;
+  }
+
+  async function toggleChart(btn) {
+    const id = btn.getAttribute('data-sel');
+    if (!id) return;
+    const sel = Number(id);
+    // The host is the NEXT `.spark-row` after the price row this button is in —
+    // a sibling of `.lrow`, never a child of it. See the note where the row is
+    // built: a fourth child of `.lrow` would auto-place onto a second implicit
+    // row and push every label in the ladder out of alignment (#136's geometry).
+    const priceRow = btn.closest('.lrow');
+    const hostRow = priceRow && priceRow.nextElementSibling && priceRow.nextElementSibling.classList.contains('spark-row')
+      ? priceRow.nextElementSibling
+      : null;
+    const host = hostRow && hostRow.querySelector('.spark-host');
+    if (!host) return;
+    const shown = btn.getAttribute('aria-expanded') === 'true';
+    if (shown) {
+      btn.setAttribute('aria-expanded', 'false');
+      hostRow.hidden = true;
+      host.innerHTML = '';
+      return;
+    }
+    btn.setAttribute('aria-expanded', 'true');
+    hostRow.hidden = false;
+    const key = chartKey(sel, CHART_WINDOW_MINUTES);
+    const cached = chartCache.get(key);
+    if (cached !== undefined) {
+      host.innerHTML = cached;
+      return;
+    }
+    host.innerHTML = '<span class="spark-wait muted">loading…</span>';
+    try {
+      const r = await OB.api('GET', `/api/selections/${sel}/price-history?window=${CHART_WINDOW_MINUTES}`);
+      const series = (r && r.series) || [];
+      // `sparkline()` returns '' for a series that cannot make a line, and that
+      // empty string is CACHED with the rest: a runner with one fill would
+      // otherwise re-fetch on every click for the rest of the session.
+      // `OB.price2`, NOT `OB.fmt`. The series' `price` is a decimal odds value (2.00),
+      // and `OB.fmt` formats CENTS as money — it rendered a price of 2.00 as
+      // "$0.02" in the chart's accessible label. Caught by looking at the
+      // rendered aria-label, which is the only place the number appears.
+      const svg = OB.Ladder.sparkline(series, { fmt: OB.price2 });
+      const html = svg || `<span class="muted">no price history in the last ${r.window_minutes}m</span>`;
+      chartCache.set(key, html);
+      // Only paint if this row is still on screen and still open: the poll can
+      // have replaced the whole board while the request was in flight.
+      if (!host.isConnected || btn.getAttribute('aria-expanded') !== 'true') return;
+      host.innerHTML = html;
+    } catch {
+      if (!host.isConnected) return;
+      host.innerHTML = '<span class="muted">chart unavailable</span>';
+    }
   }
 
   // Betfair look: the best back price sits nearest the runner (rightmost of
@@ -349,13 +526,57 @@
           ? `<div class="ltp tn" title="Last traded price — not currently on the ladder">` +
             `<span class="ltplab">LTP</span>${OB.price2(sel.ltp)}</div>`
           : '';
+      // THE RUNNER'S WINDOWED MATCHED TOTAL (#93) IS NOT A BADGE HERE.
+      //
+      // It was, and it cost the runner its name. `.lmid` is a flex line holding
+      // the name plus up to two badges; at the 570px floor the column is 150px
+      // wide (`.lrow`: `minmax(150px, 1.6fr)`), so 126px of usable width had a
+      // 51px `LTP` badge and a 102px `MATCHED` badge in it, and `.nm` was
+      // measured at 0px — the name did not render on any row that had traded.
+      // A ladder without visible runners is not a column with a crowding
+      // problem, it is a broken ladder.
+      //
+      // So the windowed total went to the market header, beside the lifetime
+      // total already there (see renderMarkets), and the per-LEVEL figures and
+      // bars stayed in the price cells where they cost no width. What remains
+      // here is the name and the pre-existing LTP badge, unchanged.
+      //
+      // The runner total is still reachable without spending width: it is the
+      // runner cell's `title`, so hovering the name answers "what traded on this
+      // runner lately" — and the movers strip lists the same figure for the
+      // runners that moved most.
+      const matchedTitle = sel.matched_cents
+        ? ` title="${OB.esc(
+            `${sel.name} — ${OB.fmt(sel.matched_cents)} matched across ${sel.matched_fills} fill${
+              sel.matched_fills === 1 ? '' : 's'
+            } in the last ${sel.matched_window_minutes || OB.Ladder.MATCHED_WINDOW_MINUTES} minute${
+              (sel.matched_window_minutes || OB.Ladder.MATCHED_WINDOW_MINUTES) === 1 ? '' : 's'
+            }, across every price on this runner`
+          )}"`
+        : '';
       rows +=
         `<div class="lrow">` +
-        `<div class="lmid"><div class="nm" title="${OB.esc(sel.name)}">${OB.esc(sel.name)}</div>` +
+        `<div class="lmid"${matchedTitle}><div class="nm" title="${OB.esc(sel.name)}">${OB.esc(sel.name)}</div>` +
         ltpShown +
+        // THE CHART BUTTON (#93), the only new element inside the runner cell and
+        // deliberately small: see the note above on why that column has no room.
+        `<button type="button" class="spark-btn" data-sel="${OB.attr(sel.selection_id)}" ` +
+        `aria-expanded="false" aria-label="Price history for ${OB.esc(sel.name)}" ` +
+        `title="Traded price over the last ${CHART_WINDOW_MINUTES} minutes">▁▂▃</button>` +
         `</div>` +
         `<div class="${b.cls}">${b.html}</div>` +
-        `<div class="${l.cls}">${l.html}</div></div>`;
+        `<div class="${l.cls}">${l.html}</div></div>` +
+        // THE CHART'S OWN ROW — a SIBLING of the price row, never a child of it.
+        //
+        // This is the geometry constraint stated as code. `.lrow` is an exact
+        // seven-track grid and the comment in public/style.css says both the
+        // header row and every price row must consume all seven or the labels
+        // drift out of alignment. A fourth child would auto-place onto a second
+        // implicit row: the runner cell would then stretch across both rows and
+        // every label in the ladder would shift. So the chart gets its own row
+        // whose single child spans `1 / -1` — it consumes seven tracks too, it
+        // just has nothing else in them.
+        `<div class="lrow spark-row" hidden><div class="spark-host"></div></div>`;
     }
     return `<div class="ladder">${rows}</div>`;
   }
@@ -377,9 +598,26 @@
     const flash = prev === undefined || prev === lv.price ? '' : lv.price > prev ? ' flash-up' : ' flash-down';
     const carried = lv.carried ? ' carried' : '';
     const depth = isDepth ? ' depth' : '';
+    // THE MATCHED COLUMN (#93). `matchedCellParts` lives in ladder.js, not here,
+    // so tests/ladder_parity.test.js can assert the exact markup under Node. A
+    // column that can only be verified in a browser is a column nobody verifies.
+    //
+    // It rides INSIDE the cell — under the two numbers that were already there,
+    // as a figure and a proportional bar — and NOT as an eighth grid column.
+    // A new column would break the 7-column row geometry the ladder is built on
+    // (public/ladder.js states it as LADDER_COLUMNS), and at the 570px floor
+    // (#136) there is no width to spare. A bar costs none, and "how much of this
+    // price is done" is what a trader's eye reads first.
+    const cell = OB.Ladder.matchedCellParts(lv, OB.fmt);
+    const f = cell.figures;
     // W7: real buttons — keyboard users can bet (Enter/Space come free), and
     // the price reads out to screen readers through the aria-label.
-    const label = `${side === 'back' ? 'Back' : 'Lay'} ${sel.name} at ${OB.price2(lv.price)}, ${OB.fmt(lv.size_cents)} available`;
+    const label = `${side === 'back' ? 'Back' : 'Lay'} ${sel.name} at ${OB.price2(lv.price)}, ${OB.fmt(f.unmatched_cents)} available`;
+    // MATCHED VOLUME IN THE LABEL TOO. The unmatched size is what the button
+    // ACTS on, so it leads; the matched figure follows, because a keyboard or
+    // screen-reader user must get the same depth information the bar gives
+    // everyone else. It was not in the label before #93.
+    const labelFull = label + cell.labelSuffix;
     // FEED GATE (removable): feed prices build orders the exchange can never
     // accept (feed ids are not in the catalogue), so in feed mode the cells are
     // disabled buttons — focusable neither by pointer-trap nor tab, and
@@ -391,8 +629,9 @@
       `data-sname="${OB.esc(sel.name)}" data-mkt="${OB.attr(mktId)}" ` +
       `data-mname="${OB.esc(market.market_name || market.name)}" ` +
       `data-evt="${OB.esc((event && (event.event_name || event.name)) || '')}" ` +
-      `data-side="${OB.esc(side)}" data-price="${OB.attr(lv.price)}" aria-label="${OB.esc(label)}" title="${OB.esc(label)}">` +
-      `<span class="p tn">${OB.price2(lv.price)}</span><span class="s tn">${OB.fmt(lv.size_cents)}</span></button>`
+      `data-side="${OB.esc(side)}" data-price="${OB.attr(lv.price)}" aria-label="${OB.esc(labelFull)}" title="${OB.esc(labelFull)}">` +
+      `<span class="p tn">${OB.price2(lv.price)}</span><span class="s tn">${OB.fmt(f.unmatched_cents)}</span>` +
+      `${cell.matchedRow}${cell.bar}</button>`
     );
   }
 
@@ -509,6 +748,14 @@
         });
       };
     });
+    // THE CHART BUTTON (#93). Bound here, INSIDE the non-feed path, because a feed
+    // selection id is not in this venue's catalogue — `price-history` would 404
+    // for every one of them, so in feed mode the button is simply not offered
+    // rather than offered and always failing. The chart is READ-ONLY, so unlike
+    // the bet cells it needs no session, no slip and no balance check.
+    OB.qa('#page .spark-btn').forEach((b) => {
+      b.onclick = () => toggleChart(b);
+    });
     // Price flashes decay on their own so a fresh board keeps the tint brief.
     clearTimeout(OB.state.flashTimer);
     OB.state.flashTimer = setTimeout(() => {
@@ -517,5 +764,5 @@
   }
 
 
-  Object.assign(OB, { bindLadder, cellHtml, doCashOut, findMarket, ladderHtml, lastPrices, loadFeedMarkets, loadNav, loadSelectedMarket, renderMarkets, renderRaces, whenText });
+  Object.assign(OB, { bindLadder, cellHtml, doCashOut, findMarket, ladderHtml, lastPrices, loadFeedMarkets, loadNav, loadSelectedMarket, renderMarkets, renderMovers, renderRaces, toggleChart, whenText });
 })();

@@ -1031,6 +1031,59 @@ language, and the continuous/cool-down/fire-count semantics of #77. There is no
 rule management API yet either — #78 owns the surface, so a player cannot
 currently author a rule over HTTP.
 
+## The trade tape and its retention
+
+`price_history` is one row per fill: the selection, the price and when. It is the
+shape of a price over time, and it exists because
+`GET /api/selections/:id/price-history` reads it. Before that endpoint it was
+written on every fill and read by **nothing** in production — a complete,
+indexed table consulted by no code path, which is the same defect as a control
+that reports nothing.
+
+**It is derived data, and that is what makes it safe to delete.** A `matches` row
+already carries `selection_id`, `price` and `at`, one row per fill; the tape adds
+no fact `matches` does not have. So pruning it discards nothing that cannot be
+recomputed from the executed trade. `tests/marketdata.test.js` (M9) asserts the
+two agree exactly, per selection and per price, so the claim stays checkable
+rather than being a comment.
+
+**Which reader sets the window.** Every reader of this venue's tape, and what it
+actually needs:
+
+| Reader | Needs | Served by |
+| --- | --- | --- |
+| The ladder's matched column | a **window** — 10 minutes by default, the same default `lib/inplay.js` uses for windowed traded volume | `price_matched_levels` |
+| The board's mover view | the same window, rolled up by runner | `price_matched_levels`, **the same query** |
+| The price series (chart) | up to **30 days**, bucketed | `price_history` |
+| An audit | **nothing from this table.** `matches` is the executed tape settlement reads and is never pruned; `audit_log` is the audit trail with its own retention | `matches` |
+
+**The policy: keep 30 days, prune beyond, prune the rollup on the same
+schedule.** 30 days is a judgement call and both sides of it are real: a chart
+of a market's price shape is only interesting while somebody is still looking at
+it, and an audit that needs a price older than that needs `matches`, not this.
+It is a constant in `lib/marketdata.js` rather than a config key, for the same
+reason `API_VERSION` is: it is the contract of a reader, and an operator who
+could shorten it from a `.env` could silently start answering `400` to a window
+that worked yesterday.
+
+Three consequences are enforced rather than hoped for:
+
+- **A chart can never be silently truncated.** `priceSeries()` refuses a window
+  wider than the retention window with `400 window_too_wide`. Returning a short
+  series instead would be worse than the outage it would hide: it looks like a
+  quiet market, not a deleted one.
+- **The ladder's matched column does not depend on it.** Matched volume comes
+  from the `matches`-backed rollup, so pruning the tape changes no money figure
+  and no report. A money figure that can be changed by a maintenance job is not
+  a money figure.
+- **Pruning is bounded and explicit.** `POST /api/admin/maintenance/price-history`
+  deletes at most `prune_batch_rows × prune_max_batches` rows of each table per
+  call and reports `more_remaining`. `node:sqlite` is synchronous and a single
+  connection: an unbounded `DELETE` would hold the single writer for as long as a
+  huge tape took, which is the same class of problem as an unbounded read. It is
+  an admin action and not a timer, because a background job that deletes rows
+  nobody agreed to delete is not a policy.
+
 ## What is deliberately not implemented
 
 Listed so nobody mistakes a scope decision for a bug:

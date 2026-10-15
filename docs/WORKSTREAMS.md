@@ -216,7 +216,7 @@ convention enforced by something other than a code comment.
 
 **Today:** `server.js` (**2,367 lines, 87 routes** — origin guard, sessions,
 SSE broadcaster, rate limiter, static, error handler), `lib/store.js` (1,073
-lines, **27 tables**, pragmas, idempotent migration), `lib/feed.js` (778, the
+lines, **28 tables**, pragmas, idempotent migration), `lib/feed.js` (778, the
 Postgres feed client), `lib/auth.js` (639, scrypt + opaque tokens),
 `lib/config.js` (389, validated at boot, aborts on a bad value),
 `lib/payments/` (319 in the provider-facing index), `lib/tenants.js` (243).

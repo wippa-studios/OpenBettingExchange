@@ -40,7 +40,7 @@ server    server.js  2,560 lines, 87 routes
 engine    lib/       31 modules + lib/payments/ — see the table below
    │
    ▼
-storage   data/openbettingexchange.db   SQLite (WAL), 27 tables, created on first run
+storage   data/openbettingexchange.db   SQLite (WAL), 28 tables, created on first run
 ```
 
 There is no ORM, no migration framework and no service layer beyond `lib/`. The
@@ -125,7 +125,7 @@ that once made the automated results poll settle nothing while reporting success
 
 ## Why these choices
 
-- **No ORM, no migrations.** The schema is 27 tables of plain SQL with `CHECK`
+- **No ORM, no migrations.** The schema is 28 tables of plain SQL with `CHECK`
   constraints on the money columns. A contributor can read the whole data model
   in one file, and the database itself refuses an invalid cent. `docs:check`
   verifies the table count against the code, so the figure above cannot rot.
@@ -173,6 +173,8 @@ users ──< orders >───────────────────�
   │        └──< transactions                                 │
   └──< sessions                                              │
                                     price_history, settlements, settings
+                                    price_matched_levels (#93 — rolled-up
+                                    matched volume per price, per minute)
 ```
 
 `orders` is the book *and* the user's history in one table (`status` is
@@ -183,6 +185,45 @@ outcome so history is a single indexed read.
 Index notes: `orders(selection_id, side, price, id)` serves the book sweep
 directly (including the FIFO tiebreak), `orders(user_id, status)` serves the open
 orders list, and `matches(market_id)` serves settlement.
+
+### Matched volume, and why there is a rollup
+
+`matches` is one row per fill, forever. The ladder wants matched volume *at each
+price* for a *window*, so reading it per board frame would be a scan of the fill
+history — and `node:sqlite` is synchronous, so that blocks the whole
+single-threaded server for the duration of every poll. `MAX_SSE_CLIENTS` bounds
+long-lived streams; it bounds nothing here.
+
+`price_matched_levels` is a minute-bucketed rollup of `matches`, one row per
+`(selection_id, price_cents, minute)`, maintained by an `AFTER INSERT` **trigger**
+rather than by application code: every fill path belongs to the matching engine,
+and a rollup that some code path forgets to update is a rollup that reads zero
+while the tape says otherwise. The trigger's cost is that its cost is now part of
+a fill, which is a trade this repository has made explicitly.
+
+The read that serves the board and the mover view is a single windowed aggregate
+whose cost depends on how many distinct `(selection, price, minute)` combinations
+traded — not on how many fills occurred. Two details of its shape are measured
+rather than assumed, because both were wrong in the first draft and neither was
+visible in the results:
+
+- the market scope is an always-concrete `IN (?, ?, …)` list. The
+  `(? IS NULL OR market_id IN (…))` form that would have let one statement answer
+  both "these markets" and "every market" makes SQLite plan a **covering-index
+  scan** of the rollup. Same rows, same answer, unbounded read.
+- the scope is resolved in JS (`openMarketScope()`), not in SQL, so "no markets
+  in scope" can mean *nothing* rather than *everything*. `market_id IN (NULL)`
+  plans as an index search and matches nothing — a very quiet way to serve an
+  empty board.
+
+`price_history` is a different table with the opposite profile: one row per fill
+at no aggregation, kept because its job is a *shape* over time rather than a
+per-frame figure. It is read by `GET /api/selections/:id/price-history` through
+`idx_price_history_selection (selection_id, at)` — an index range over **one
+runner's** fills inside the window, bucketed in SQL so the rows crossing into
+the process are bounded by the point count asked for. See
+[`EXCHANGE_RULES.md`](EXCHANGE_RULES.md#the-trade-tape-and-its-retention) for
+what it is kept for and for how long.
 
 ## Security model
 

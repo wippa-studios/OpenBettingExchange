@@ -119,6 +119,7 @@ in place.
 | Capability | Status |
 | --- | --- |
 | Back/lay order book, aggregated depth, last traded price | Available |
+| Matched volume at every price level, windowed; board mover view; price-history series | Available (`lib/marketdata.js`; the tape is kept 30 days — [`EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#the-trade-tape-and-its-retention)) |
 | Matching engine: best-for-taker sweeps, resting-price execution, partial fills, FIFO, self-match guard | Available |
 | Escrow wallet: available vs frozen, full transaction ledger, faucet | Available |
 | Settlement: pot distribution, void refunds, commission on net winnings, auto-cancel, double-settle protection | Available |
@@ -202,7 +203,7 @@ layered on `match`.
 | `lib/feed`, `lib/feedcreds`, `lib/feedrunner` | Odds feed reader, encrypted credentials, collector supervisor |
 | `lib/bots`, `lib/drift` | Market-maker ladders and fair-price drift |
 | `lib/userrules` | Player-authored betting rules, evaluated on the price stream |
-| `lib/store`, `lib/seed` | Schema (27 tables) and fixtures |
+| `lib/store`, `lib/seed` | Schema (28 tables) and fixtures |
 
 The frontend (`public/js/`) is split into seven modules (`core`, `shell`, `nav`,
 `board`, `slip`, `views`, `boot`) under the `window.OB` namespace.
@@ -274,7 +275,9 @@ scripts. The complete reference, including every parameter, is in
 | --- | --- |
 | `POST /api/auth/register`, `/login`, `/logout` | Account and session |
 | `GET /api/me` | Current user, balance and escrow |
-| `GET /api/sports`, `/api/events`, `/api/markets/:id/book` | Board and order book |
+| `GET /api/sports`, `/api/events`, `/api/markets/:id/book` | Board and order book, with matched volume at every price level |
+| `GET /api/selections/:id/price-history` | A runner's traded price over a window, bucketed (the trade tape's one reader) |
+| `GET /api/movers` | Board ranked by what traded in the window — the same query as the ladder's matched column |
 | `GET /api/feed/board`, `/api/feed/health` | Board from the odds feed (when `FEED_ENABLED=true`) |
 | `POST /api/orders`, `GET /api/orders`, `POST /api/orders/:id/cancel` | Place, list and cancel orders |
 | `GET /api/positions` | Exposure, if-win P&L, cash-out quote |
@@ -289,6 +292,7 @@ scripts. The complete reference, including every parameter, is in
 | `POST /api/admin/markets/:id/settle` | Settle with a winner or `void: true` (admin) |
 | `POST /api/admin/markets/:id/selections/:selectionId/void` | Remove one runner before the off: `{ reason }`, ≥5 chars (admin) |
 | `GET /api/admin/stats` | Matched volume, open orders, overround (admin) |
+| `POST /api/admin/maintenance/price-history` | Apply the documented trade-tape retention policy, one bounded pass (admin) |
 
 ## Configuration
 
