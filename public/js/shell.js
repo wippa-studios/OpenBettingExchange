@@ -339,6 +339,27 @@
     }
     applyFavicon(b.favicon);
     if (b.tenant && b.tenant.slug) root.setAttribute('data-tenant', b.tenant.slug);
+    // THE CURRENCY (#104). The last thing branding sets, because it is the one
+    // that has to be right before anything renders an amount: fmt() in core.js
+    // reads it and used to hard-code '$', so a white-label venue showed every
+    // price in another currency's symbol.
+    //
+    // Only a well-formed code is accepted. A missing or malformed one leaves the
+    // previous value alone rather than clearing it to null, because a stale
+    // correct code beats no code — and an unrecognised-but-shaped code is a
+    // DISPLAY question, which moneySymbol() answers by rendering the code
+    // itself. lib/tenants.js is what refuses a bad currency on the money side.
+    if (typeof b.currency === 'string' && /^[A-Z]{3}$/.test(b.currency)) {
+      // Re-render only on a real change. The session change that brings us
+      // here can swap tenants, and a tenant is a currency — so figures already
+      // on screen would otherwise keep the previous tenant's symbol. At boot
+      // the currency has never been set, so the header is not re-rendered for
+      // nothing on the common path.
+      if (OB.state.currency !== b.currency) {
+        OB.state.currency = b.currency;
+        OB.renderHeader();
+      }
+    }
     syncThemeColor();
   }
 

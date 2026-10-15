@@ -145,6 +145,16 @@ const server = spawn(process.execPath, ['--no-warnings', 'server.js'], {
     DB_PATH: path.join(TMP, 'ui.db'),
     PORT: String(PORT),
     DRIFT_ENABLED: 'false',
+    // The venue currency is PINNED here, not inherited (#104). The deployment
+    // default is AUD, and the assertions below are written against the dollar
+    // sign — the browser suite states the configuration it asserts on rather
+    // than depending on whatever the default happens to be. The dollar path is
+    // the one with a symbol of length 1, so these assertions stay exact.
+    //
+    // The other currency is covered deliberately, further down, by driving
+    // OB.fmt directly: pinning one currency for the whole suite would otherwise
+    // leave the formatter's only new behaviour untested.
+    VENUE_CURRENCY: 'USD',
     ADMIN_PASSWORD: 'ui-admin-password',
     DEMO_PASSWORD: 'ui-demo-password',
     RATE_LIMIT_AUTH: '600',
@@ -1639,6 +1649,65 @@ try {
       '#68 the player-facing signed format is the minus-sign one',
       (await page.evaluate(() => window.OB.signed(-14043))) === '−$140.43',
       `(signed(-14043) = ${await page.evaluate(() => window.OB.signed(-14043))})`
+    );
+
+    // #104: the money formatter follows the currency /api/branding published.
+    // Before this, core.js hard-coded '$', so every amount on every screen was
+    // a dollar sign regardless of the venue — the symptom the issue led with.
+    //
+    // Driven through the REAL loaded module and the REAL published state, not
+    // a reimplementation: the pre-state is read first, so a check that passed
+    // because the page had no currency would be caught here rather than
+    // congratulating itself.
+    const branding = await (await fetch(`${BASE}/api/branding`)).json();
+    check(
+      '#104 /api/branding publishes the venue currency',
+      branding.currency === 'USD',
+      `(branding.currency = ${JSON.stringify(branding.currency)})`
+    );
+    check(
+      '#104 the page formatted money in the currency branding published',
+      (await page.evaluate(() => window.OB.state.currency)) === branding.currency,
+      `(page = ${await page.evaluate(() => window.OB.state.currency)})`
+    );
+    const rendered = await page.evaluate(async () => {
+      const before = window.OB.fmt(100);
+      const real = window.OB.state.currency;
+      window.OB.state.currency = 'AUD';
+      const aud = window.OB.fmt(100);
+      window.OB.state.currency = 'BRL';
+      const brl = window.OB.fmt(100);
+      window.OB.state.currency = null;
+      const none = window.OB.fmt(100);
+      window.OB.state.currency = real;
+      return { before, aud, brl, none, restored: window.OB.state.currency };
+    });
+    check(
+      '#104 the symbol is the currency\'s, and an unknown code renders as itself',
+      rendered.before === '$1.00' && rendered.aud === 'A$1.00' && rendered.brl === 'BRL 1.00' && rendered.none === '1.00',
+      `(USD ${rendered.before} / AUD ${rendered.aud} / BRL ${rendered.brl} / none ${rendered.none})`
+    );
+    check(
+      '#104 the probe left the page on the currency branding published',
+      rendered.restored === branding.currency,
+      `(state.currency = ${rendered.restored})`
+    );
+    // The formatter really is what paints the header: a tenant swap changes
+    // the header, not just the helper.
+    const headerSwaps = await page.evaluate(async () => {
+      const el = window.OB.$('balance');
+      const real = window.OB.state.currency;
+      window.OB.state.currency = 'GBP';
+      window.OB.renderHeader();
+      const during = el.textContent;
+      window.OB.state.currency = real;
+      window.OB.renderHeader();
+      return { during, after: el.textContent };
+    });
+    check(
+      '#104 the balance chip re-renders in the tenant\'s currency',
+      headerSwaps.during.includes('£') && !headerSwaps.during.includes('$') && headerSwaps.after.includes('$'),
+      `(during ${headerSwaps.during.trim()} / after ${headerSwaps.after.trim()})`
     );
     //
     // A loss is MADE, not hoped for: `daily_pnl_cents` is the bot's balance
