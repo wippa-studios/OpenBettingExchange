@@ -171,6 +171,78 @@ const check = async (name, fn) => {
       assert.strictEqual(low.status, 400);
     });
 
+    // ── market-version handshake over HTTP (#92) ──────────────────────────
+    //
+    // The unit suite (tests/marketversion.test.js) proves the comparison and the
+    // concurrency. What it cannot prove is the thing this check exists for: that
+    // the refusal reaches a client as a TOP-LEVEL machine-readable `code`
+    // through the single apiError() shaper #83 introduced, rather than as prose
+    // a client has to pattern-match.
+    await check('POST /api/orders refuses a stale version with the code a client can branch on', async () => {
+      const threshold = require('../lib/config').MARKET_VERSION_MATERIAL_THRESHOLD;
+
+      // Move the book past the threshold using CANCELS, not fills. A cancel
+      // bumps the version but returns the escrow, so this leaves alice's
+      // balance and frozen_cents exactly where the settlement check below
+      // expects to find them — a fill here would change the number it asserts.
+      for (let i = 0; i <= threshold; i++) {
+        const o = await j('POST', '/api/orders', {
+          body: { selection_id: selId, side: 'back', price: 4.0, stake_cents: 1000 }, cookie: alice,
+        });
+        assert.strictEqual(o.status, 201, `fixture order ${i} must place`);
+        const c = await j('POST', `/api/orders/${o.json.order.id}/cancel`, { cookie: alice });
+        assert.strictEqual(c.status, 200, `fixture cancel ${i} must succeed`);
+      }
+
+      // The book a client reads now carries the versions, at both scopes.
+      const book = await j('GET', `/api/markets/${marketId}/book`);
+      assert.strictEqual(book.status, 200);
+      const version = book.json.book.find((s) => s.selection_id === selId).version;
+      assert.ok(Number.isInteger(version), `the book must carry a per-selection version, got ${JSON.stringify(version)}`);
+      assert.ok(Number.isInteger(book.json.market_version), 'and a market version');
+      assert.ok(version > threshold, `precondition: the version must be past the threshold, it is ${version}`);
+
+      const ordersBefore = (await j('GET', '/api/orders', { cookie: alice })).json.orders.length;
+
+      const stale = await j('POST', '/api/orders', {
+        body: { selection_id: selId, side: 'back', price: 2.5, stake_cents: 1000, selection_version: 0 }, cookie: alice,
+      });
+      assert.strictEqual(stale.status, 409, `expected 409 Conflict, got ${stale.status} ${JSON.stringify(stale.json)}`);
+      assert.strictEqual(
+        stale.json.code, 'market_version_stale',
+        `the code must be at the TOP LEVEL so a client can branch on it without knowing about details; got ${JSON.stringify(stale.json)}`
+      );
+      assert.ok(stale.json.error, 'the human-readable message must still be there');
+      assert.strictEqual(stale.json.details.code, 'market_version_stale', 'and promoted into details too');
+      assert.strictEqual(stale.json.details.scope, 'selection');
+      assert.strictEqual(stale.json.details.current_version, version, 'the refusal must say what the version is NOW');
+      assert.strictEqual(stale.json.details.threshold, threshold, 'and which threshold decided it');
+      assert.ok(stale.json.details.drift > threshold, 'and by how much it moved');
+
+      // A refused placement must leave NOTHING — not even a resting order for
+      // alice to find and cancel. This is the assertion that would catch a
+      // rollback which still committed the insert.
+      const ordersAfter = (await j('GET', '/api/orders', { cookie: alice })).json.orders.length;
+      assert.strictEqual(ordersAfter, ordersBefore, 'a stale refusal must not create an order');
+      const me = await j('GET', '/api/me', { cookie: alice });
+      assert.strictEqual(me.json.user.frozen_cents, 10000, 'and must not touch the escrow from the earlier trade');
+
+      // OMITTING THE VERSION IS STILL FINE, over HTTP. This is the compatibility
+      // half and it is the one an existing client depends on.
+      const plain = await j('POST', '/api/orders', {
+        body: { selection_id: selId, side: 'back', price: 2.5, stake_cents: 1000 }, cookie: alice,
+      });
+      assert.strictEqual(plain.status, 201, 'a request with no version must place exactly as it did before');
+      assert.ok(plain.json.order.id);
+      assert.strictEqual(
+        plain.json.market_version, book.json.market_version,
+        'the response carries the market version so the next order can claim it without a refetch'
+      );
+      // Leave the book as we found it, so the settlement arithmetic below holds.
+      const undo = await j('POST', `/api/orders/${plain.json.order.id}/cancel`, { cookie: alice });
+      assert.strictEqual(undo.status, 200);
+    });
+
     // ── admin: settle → wallet reflects credit net of commission ────────
     await check('admin settle → settlement credit net of commission', async () => {
       const adminLogin = await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } });

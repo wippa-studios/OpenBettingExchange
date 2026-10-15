@@ -67,6 +67,10 @@ const INPLAY = require('./lib/inplay');
 // so two processes sharing the database cannot lose a strike between them.
 const { transaction } = require('./lib/tx');
 const CASHOUTRISK = require('./lib/cashoutrisk');
+// Book version (#92). Required for the READS the API owes a client — the
+// version on a book, the version on a placement response. The comparison itself
+// happens inside the engine, never here.
+const BOOKVERSION = require('./lib/bookversion');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
 // DELIBERATE demo choice (documented in .github/SECURITY.md): this app is
@@ -1613,6 +1617,10 @@ app.get('/api/events', limit('read'), (req, res) => {
         name: m.name,
         status: m.status,
         total_matched_cents: m.total_matched_cents,
+        // The market's book version (#92), so a client reading the BOARD can
+        // claim it back on a placement without a second request. Each runner's
+        // own version rides inside `selections[].version`.
+        market_version: BOOKVERSION.marketVersion(db, m.id),
         selections: M.bookFor(db, m.id, 3),
       })),
     };
@@ -1623,7 +1631,11 @@ app.get('/api/events', limit('read'), (req, res) => {
 app.get('/api/markets/:id/book', limit('read'), (req, res) => {
   const m = db.prepare('SELECT * FROM markets WHERE id = ?').get(intId(req.params.id));
   if (!m) return apiError(res, 404, 'Market not found');
-  res.json({ market: m, book: M.bookFor(db, m.id, 5) });
+  // `market` is the whole row, so it already carries `book_version` (#92).
+  // `market_version` is repeated at the top level under the name the placement
+  // route and the board use, so a client reads one field name in all three
+  // places instead of learning that this one endpoint calls it something else.
+  res.json({ market: m, book: M.bookFor(db, m.id, 5), market_version: BOOKVERSION.marketVersion(db, m.id) });
 });
 
 // Price formats for the trading desk: the same pure functions the engine uses,
@@ -1659,9 +1671,23 @@ app.get('/api/format/:price', limit('read'), (req, res) => {
 });
 
 // ── Trading ────────────────────────────────────────────────────────────────
+//
+// `selection_version` and `market_version` are OPTIONAL and are passed through
+// UNVALIDATED — the engine validates them (lib/bookversion.js readClaim) inside
+// the placement transaction.
+//
+// NOTHING IS COMPARED HERE, deliberately. A route that read the version and
+// compared it itself, then handed `placeOrder` a yes/no, would be the exact
+// check-then-act the transaction exists to prevent: between the route's read and
+// the engine's insert, another placement could commit its own bump, and the
+// check would have passed against a value nobody traded on. There is no
+// comparison in this handler for there to be raced. See lib/bookversion.js for
+// the rest.
 app.post('/api/orders', requireAuth, limit('trade'), (req, res) => {
-  const { selection_id, side, price, stake_cents, client_order_id } = req.body || {};
-  const result = M.placeOrder(db, req.user, { selection_id, side, price, stake_cents, client_order_id });
+  const { selection_id, side, price, stake_cents, client_order_id, selection_version, market_version } = req.body || {};
+  const result = M.placeOrder(db, req.user, {
+    selection_id, side, price, stake_cents, client_order_id, selection_version, market_version,
+  });
   // A replay created nothing, so it must not broadcast as though it did —
   // otherwise a retried request makes every other client's board flicker for a
   // state change that did not happen.
@@ -1673,7 +1699,14 @@ app.post('/api/orders', requireAuth, limit('trade'), (req, res) => {
   // 200 rather than 201 on a replay: the resource already existed. A client
   // retrying after a timeout can tell "I created this" from "this was already
   // mine" without inspecting the body.
-  res.status(result.idempotent_replay ? 200 : 201).json(result);
+  //
+  // `market_version` rides on the response so a client running the handshake
+  // does not have to make a second request to learn the version its NEXT order
+  // should claim. The per-selection versions are already in `book`.
+  res.status(result.idempotent_replay ? 200 : 201).json({
+    ...result,
+    market_version: BOOKVERSION.marketVersion(db, result.order.market_id),
+  });
 });
 
 app.get('/api/orders', requireAuth, limit('read'), (req, res) => {

@@ -28,6 +28,26 @@
 //      with rule 1, an empty file fails with 58 named missing keys, and a
 //      source that fails to parse fails loudly. Neither can be green.
 //
+// COMMENTS ARE STRIPPED BEFORE THE SURFACE IS SCANNED, and that is not a
+// refinement — it is the difference between a check that is right and one that
+// reports a confident falsehood. `lib/config.js` explains at length why
+// `API_VERSION` is deliberately NOT read from the environment, and the sentence
+// doing the explaining contains the literal text `raw.API_VERSION`. The regex
+// below matched that PROSE, put a constant into the "keys the code reads"
+// surface, and then failed every run with:
+//
+//     MISSING  API_VERSION  read by the code but absent from .env.example
+//
+// — for a key the same file insists must not be in `.env.example`, because
+// adding it would document a knob that does not exist and invite an operator to
+// set it. Satisfying the check the honest way was impossible: the two rules
+// contradict each other and the checker did not know which one it was in.
+//
+// The same class of bug applies to `process.env.X`, which is read out of
+// server.js and lib/. A comment that NAMES a key it does not read is the normal
+// way to explain why a key is deliberately absent, so scanning prose is not a
+// theoretical risk here — it is how this file was already wrong.
+//
 // WHAT IS ASSERTED, AND WHAT IS NOT. Said plainly because a guard that overstates
 // itself is the failure this repo keeps paying for:
 //
@@ -63,6 +83,24 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const require = createRequire(import.meta.url);
 
 // ── Extracting the real surface ───────────────────────────────────────────
+
+/**
+ * Remove comments from JS source, so a scan for `raw.X` / `process.env.X` reads
+ * CODE and not the prose describing it.
+ *
+ * The same trim `scripts/check-docs.mjs` and `tests/guard.test.js` already use,
+ * for the same reason — both of those hit a check that fired for the wrong
+ * reason because a comment named the very thing being checked.
+ *
+ * Not string-aware, deliberately: a `//` inside a string literal would truncate
+ * the rest of that line, which can only ever REMOVE a candidate key, never
+ * invent one. Losing a key makes the checker report a MISSING that is not
+ * there, which is loud and fixable; inventing one is what produced the
+ * API_VERSION false positive. `lib/config.js` has no `//` inside a string.
+ */
+function stripComments(src) {
+  return src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^\s*\/\/.*$/gm, ' ');
+}
 
 /**
  * Slice the `DEFAULTS` object literal out of lib/config.js and evaluate it.
@@ -115,7 +153,9 @@ try {
   // Keys the loader reads off the merged env object. One of them,
   // PAYMENTS_WEBHOOK_SECRET, has NO entry in DEFAULTS at all — which is itself a
   // gap in lib/config.js, and is why the surface cannot be DEFAULTS alone.
-  RAW_READS = [...configSrc.matchAll(/\braw\.([A-Z][A-Z0-9_]*)/g)].map((m) => m[1]);
+  // COMMENTS REMOVED FIRST — see stripComments() and the header note on why a
+  // sentence explaining that API_VERSION is not read was being read as a read.
+  RAW_READS = [...stripComments(configSrc).matchAll(/\braw\.([A-Z][A-Z0-9_]*)/g)].map((m) => m[1]);
 } catch (e) {
   // A check that cannot read its source must fail LOUDLY and say why. Left
   // unhandled this surfaced as a raw stack trace, which is technically a
@@ -147,7 +187,10 @@ const appFiles = execSync("git ls-files '*.js'", { cwd: ROOT, encoding: 'utf8' }
 const DIRECT_READS = new Set();
 const INLINE_DEFAULTS = new Map(); // key -> default literal, from `process.env.K || <lit>`
 for (const file of appFiles) {
-  const src = readFileSync(join(ROOT, file), 'utf8');
+  // Comments stripped for the same reason as RAW_READS: an explanatory sentence
+  // naming a key it does NOT read is not a read, and treating it as one is how
+  // this check comes to demand a `.env.example` entry for a constant.
+  const src = stripComments(readFileSync(join(ROOT, file), 'utf8'));
   for (const m of src.matchAll(/process\.env\.([A-Z][A-Z0-9_]*)/g)) {
     if (!INDIRECT_EXCLUDE.has(m[1])) DIRECT_READS.add(m[1]);
   }
