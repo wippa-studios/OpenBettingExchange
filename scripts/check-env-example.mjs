@@ -25,14 +25,23 @@
 //      A check that cannot parse its input fails instead of passing empty.
 //   3. THE OTHER DIRECTION IS ASSERTED TOO (see MUST_REMAIN_TRACKABLE). The
 //      same parse is required to return a NON-trivial .env.example. Combined
-//      with rule 1, an empty file fails with 58 named missing keys, and a
-//      source that fails to parse fails loudly. Neither can be green.
+//      with rule 1, an empty file fails with every surface key named as missing,
+//      and a source that fails to parse fails loudly. Neither can be green.
+//
+// THE COUNTS IN THIS HEADER ARE NOT THE SOURCE OF TRUTH. No number of config
+// keys is written here, deliberately. `README.md` said 61, `docs/ROADMAP.md` said
+// 58, and `.env.example` had 61 assignments — three documents, three numbers,
+// and the two that disagreed were both "right" the day they were written (#103).
+// The count is printed by this script's own PASS line, which is derived from
+// `lib/config.js`, and the guarantee that actually matters — every key the code
+// reads is documented, with the right default — is what the rules below enforce.
+// A hand-maintained figure in a comment is precisely the kind of claim that
+// rots in silence, so there is not one.
 //
 // WHAT IS ASSERTED, AND WHAT IS NOT. Said plainly because a guard that overstates
 // itself is the failure this repo keeps paying for:
 //
 //   - COVERAGE: every key the code reads is present as a real assignment.
-//     Enforced for all 58 keys.
 //   - NO PHANTOMS: every key in .env.example is one the code actually reads, so
 //     a renamed or deleted key cannot linger as documentation of nothing.
 //   - DEFAULTS MATCH: where the code has a concrete default, the example states
@@ -107,6 +116,42 @@ function extractDefaults(src) {
   return out;
 }
 
+/**
+ * Remove comments, so a PROSE mention of a key cannot be read as a code read.
+ *
+ * WHY, WITH THE FALSE POSITIVE THAT PROVED IT. This extraction ran over the raw
+ * source of lib/config.js, and `#83` put a comment in that file which
+ * necessarily NAMES the thing it is describing:
+ *
+ *   lib/config.js:18   "So there is no raw.API_VERSION read anywhere …"
+ *
+ * `\braw\.([A-Z][A-Z0-9_]*)` matched that sentence, `API_VERSION` joined the
+ * surface, and the completeness rule then demanded a line in `.env.example` for
+ * a key that is DELIBERATELY NOT deployment config — a key `tests/apicontract.test.js`
+ * V4 asserts cannot be set from the environment at all. So `npm run
+ * check:env-example` was RED on `main` at `f49450b` with:
+ *
+ *   MISSING  API_VERSION  read by the code but absent from .env.example
+ *
+ * The gate was not wrong to be red. It was red because the SURFACE it derived
+ * was wrong — it invented a 62nd key out of a sentence explaining that no such
+ * key exists. Documenting `API_VERSION` in `.env.example` would have "fixed" it
+ * by shipping exactly the operator-override the API contract forbids.
+ *
+ * This is the same bug `scripts/check-docs.mjs` §7 already found and fixed in
+ * its own extractor, for the same reason and with the same two-line remedy —
+ * which is the argument for stripping here too rather than narrowing the regex.
+ *
+ * Measured before the change: the raw scan finds 55 `raw.X` names, the stripped
+ * scan finds 54, and the single difference is `API_VERSION`. Stripping loses no
+ * real read.
+ */
+function stripComments(src) {
+  // Line comments must be anchored to the start of a line so that a `//` inside
+  // a string — a URL, say — is not treated as the beginning of a comment.
+  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+}
+
 let DEFAULTS;
 let RAW_READS;
 try {
@@ -115,7 +160,7 @@ try {
   // Keys the loader reads off the merged env object. One of them,
   // PAYMENTS_WEBHOOK_SECRET, has NO entry in DEFAULTS at all — which is itself a
   // gap in lib/config.js, and is why the surface cannot be DEFAULTS alone.
-  RAW_READS = [...configSrc.matchAll(/\braw\.([A-Z][A-Z0-9_]*)/g)].map((m) => m[1]);
+  RAW_READS = [...stripComments(configSrc).matchAll(/\braw\.([A-Z][A-Z0-9_]*)/g)].map((m) => m[1]);
 } catch (e) {
   // A check that cannot read its source must fail LOUDLY and say why. Left
   // unhandled this surfaced as a raw stack trace, which is technically a
@@ -147,7 +192,15 @@ const appFiles = execSync("git ls-files '*.js'", { cwd: ROOT, encoding: 'utf8' }
 const DIRECT_READS = new Set();
 const INLINE_DEFAULTS = new Map(); // key -> default literal, from `process.env.K || <lit>`
 for (const file of appFiles) {
-  const src = readFileSync(join(ROOT, file), 'utf8');
+  const src = stripComments(readFileSync(join(ROOT, file), 'utf8'));
+  // Comments are stripped here too, for the reason given on `stripComments`. This
+  // particular scan was measured and found CLEAN first — it derives the same 7
+  // keys with and without stripping (BACKUP_INTERVAL_MS, DELAY_RELEASE_INTERVAL_MS,
+  // FEED_COLLECTOR_VERBOSE, LOG_LEVEL, MAINTENANCE_INTERVAL_MS,
+  // RECONCILE_INTERVAL_MS, RESULTS_POLL_INTERVAL_MS) — so nothing was lost. It is
+  // done anyway because leaving one of two adjacent extractions able to invent a
+  // key from a comment is the same defect waiting for the next comment that
+  // mentions an env var by name.
   for (const m of src.matchAll(/process\.env\.([A-Z][A-Z0-9_]*)/g)) {
     if (!INDIRECT_EXCLUDE.has(m[1])) DIRECT_READS.add(m[1]);
   }
@@ -176,7 +229,7 @@ function assertSurfaceIsReal(surface) {
     problems.push('no `raw.<KEY>` reads found in lib/config.js — the loader shape changed');
   }
   if (surface.size < 45) {
-    problems.push(`surface is only ${surface.size} keys (expected ~58) — extraction regressed`);
+    problems.push(`surface is only ${surface.size} keys (expected ~61) — extraction regressed`);
   }
   // Sentinels spanning the classes: a scalar server key, a security control, a
   // null-default secret, and a knob read straight off process.env.
