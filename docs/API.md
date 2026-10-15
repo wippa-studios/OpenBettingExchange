@@ -532,12 +532,25 @@ fields *exist*. Storing and deleting are audited.
 | Route | What |
 | --- | --- |
 | `GET /api/admin/feed/credentials` | `{ tenants: [ status ] }` for **the caller's own tenant only**. There is no venue-wide feed inventory; `statusAll()` was removed (issue #43) |
-| `GET /api/admin/feed/credentials/:id?` | One tenant's status, same scope |
-| `PUT /api/admin/feed/credentials/:id?` | `{ app_key, username, password }`. Restarts a supervised collector |
-| `DELETE /api/admin/feed/credentials/:id?` | Removes them and stops a supervised collector |
-| `GET /api/admin/feed/runner/:id?` | Supervisor state, restarts, exit codes, scrubbed log tail |
+| `GET /api/admin/feed/credentials/:id` | One tenant's status, same scope |
+| `PUT /api/admin/feed/credentials` **or** `PUT /api/admin/feed/credentials/:id` | `{ app_key, username, password }`. Restarts a supervised collector |
+| `DELETE /api/admin/feed/credentials` **or** `DELETE /api/admin/feed/credentials/:id` | Removes them and stops a supervised collector |
+| `GET /api/admin/feed/runner/:id` **or** `GET /api/admin/feed/runner` | Supervisor state, restarts, exit codes, scrubbed log tail |
 | `POST /api/admin/feed/runner/start` | Start the collector |
 | `POST /api/admin/feed/runner/stop` | Stop the collector |
+
+> **Why two spellings rather than `:id?`.** These routes were written with an
+> optional `:id?`, which **path-to-regexp v8 removed** — the router Express 5
+> uses throws at registration (`Unexpected ? at index 31`), and these are
+> top-level registrations, so the server did not start at all (issue #74). Each
+> is now registered twice, with and without `:id`, reaching the same handler.
+>
+> The `?` was decorative: no handler ever read `req.params.id`. The tenant
+> always came from `feedTenantId(req)`, which is the caller's **own** tenant and
+> refuses any other. So the two forms behave identically — with the single
+> difference that the `:id` form validates the id as a tenant reference first,
+> answering `404` for an unknown tenant and `403` for someone else's. Both forms
+> are admin-only, and `tests/express5.test.js` pins all of that.
 
 Errors: `400` a malformed app key, username or a missing password; `403` a foreign
 tenant, or an account that belongs to no tenant; `404` an unknown tenant, or

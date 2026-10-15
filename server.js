@@ -1,5 +1,5 @@
 'use strict';
-// server.js — OpenBettingExchange exchange server (Express ^4, node:sqlite).
+// server.js — OpenBettingExchange exchange server (Express ^5, node:sqlite).
 const express = require('express');
 const path = require('path');
 const config = require('./lib/config');
@@ -81,6 +81,40 @@ process.on('uncaughtException', (err) => console.error('[uncaughtException]', er
 
 const app = express();
 app.disable('x-powered-by');
+
+// ── Query parser: PINNED, and the audit that justifies it ───────────────────
+//
+// Express 5 changed this default from `extended` (qs) to `simple` (node's
+// querystring). That is not a cosmetic framework change: `extended` expands
+// `?filter[a]=1` into a nested object and `simple` leaves it the literal key
+// `"filter[a]"`. Any route that read a nested query parameter would silently
+// start reading `undefined`.
+//
+// THE AUDIT (server.js, the only file that reads a query string — nothing in
+// lib/ or public/ does). Every read is a flat, single-level key:
+//
+//   ?limit ?offset ?from ?to ?format ?window ?sport ?sport_id ?id ?q ?role
+//   ?status ?target ?action ?actor_id ?tenant_id
+//
+// and the only query-string BUILDER in the codebase (public/admin.js, two
+// `new URLSearchParams(...)` calls) emits flat keys from a literal object. A
+// repository-wide search for bracket syntax in a query string
+// (`[?&]name[...]=`) across server.js, lib/, public/, docs/ and scripts/ finds
+// none, so nothing here can observe the change. That search is re-run
+// mechanically by tests/express5.test.js E4, so the audit cannot rot.
+//
+// WHY `simple` AND NOT `extended`, then: preserving the old default would mean
+// depending on `qs` for parsing this app never uses, and `qs` is the package
+// that carries the CVE history in this tree (CVE-2026-2391 / -82417 / -82562,
+// per issue #74). `simple` keeps that dependency off the query path entirely.
+//
+// THE POINT IS NOT THE VALUE, IT IS THAT IT IS WRITTEN DOWN. An unset
+// `query parser` means the behaviour of every query-string read in the app is
+// decided by whichever framework version happens to be installed — exactly the
+// class of drift this repository keeps auditing and keeps finding. If a future
+// route needs nested syntax it must change this line and say why, rather than
+// arriving with a query parameter nobody can read.
+app.set('query parser', 'simple');
 // Baseline hardening headers (cheap, local-demo appropriate).
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -424,11 +458,22 @@ function requireAdmin(req, res, next) {
 }
 
 // ── Route helpers ──────────────────────────────────────────────────────────
-// Express 4 does NOT forward async rejections to the error middleware: an
-// `await` that throws inside a route handler leaves the request hung until
-// the client gives up (no 500, no timeout — just a dangling socket). Every
-// async handler is wrapped so rejections become next(err). Express 5
-// removes the need for this; until then, aw() is the band-aid.
+//
+// Forward an async handler's rejection to the error middleware.
+//
+// Express 5 does this ITSELF for a handler that returns a promise, so this
+// wrapper is no longer the only thing standing between a rejected `await` and a
+// dangling socket. It is KEPT rather than deleted, for one reason: it does not
+// depend on the router noticing a thenable return value, so it still holds if
+// a handler is ever registered through a path that does not. It also keeps
+// working for the handlers that take `(req, res)` and no `next`.
+//
+// The important thing for the money path is that this is NOT the only defence.
+// It never was: every async handler in this file also catches its own rejection
+// explicitly (see tests/express5.test.js E7, which asserts that mechanically).
+// The two are redundant on purpose — belt and braces, with the explicit catch
+// being the one that also carries handler-specific policy (a failed login
+// records a strike; a feed outage answers 503 rather than 500).
 const aw = (h) => (req, res, next) => Promise.resolve(h(req, res, next)).catch(next);
 
 // :id params arrive as URL strings. Number('12.5'), Number('abc') and
@@ -1362,7 +1407,30 @@ app.get('/api/admin/feed/credentials/:id', requireAdmin, limit('admin'), (req, r
 // Betfair's Delay key authenticates with a username and password, and there is
 // no certificate on it. Offering a cert upload would imply support that a Delay
 // key cannot use.
-app.put('/api/admin/feed/credentials/:id?', requireAdmin, limit('admin'), (req, res) => {
+//
+// THE `:id?` THIS ROUTE USED TO HAVE IS GONE, and it is registered twice
+// instead — once with `:id` and once without.
+//
+// WHY, MECHANICALLY: Express 5 compiles routes with path-to-regexp v8, which
+// REMOVED optional parameters. `'/api/admin/feed/credentials/:id?'` does not
+// merely fail to match, it THROWS at registration:
+//
+//   TypeError: Unexpected ? at index 31: /api/admin/feed/credentials/:id?
+//
+// and these are TOP-LEVEL registrations, so the throw happens while server.js is
+// being required. The venue did not lose three admin routes; it did not start.
+//
+// WHY REGISTERING TWICE AND NOT SIMPLY DELETING THE `:id?` FORMS: the optional
+// form was a DOCUMENTED endpoint (docs/API.md) and a client may already call
+// it. Dropping it would turn a dependency bump into an API break. The `:id`
+// form is kept alongside it, so both spellings reach the same handler.
+//
+// The `?` was decorative in any case: NOTHING in any of the three handlers read
+// `req.params.id`. The tenant always came from `feedTenantId(req)`, which is the
+// caller's own tenant and refuses a tenant id that is not it. So the two
+// registrations are the same handler with the same behaviour, and the pair
+// differs only in whether an id is validated as a tenant reference first.
+function putFeedCredentials(req, res) {
   const b = req.body || {};
   const result = FCREDS.setCredentials(db, {
     actor: req.user,
@@ -1397,9 +1465,13 @@ app.put('/api/admin/feed/credentials/:id?', requireAdmin, limit('admin'), (req, 
     collector_restarted: !!collector.restarted,
     collector_restart_pending: !!collector.pending,
   });
-});
+}
 
-app.delete('/api/admin/feed/credentials/:id?', requireAdmin, limit('admin'), (req, res) => {
+app.put('/api/admin/feed/credentials', requireAdmin, limit('admin'), putFeedCredentials);
+app.put('/api/admin/feed/credentials/:id', requireAdmin, limit('admin'), putFeedCredentials);
+
+// Same pair, same reason, for the delete.
+function deleteFeedCredentials(req, res) {
   const tenantId = feedTenantId(req);
   const result = FCREDS.clearCredentials(db, { actor: req.user, tenantId });
   // A collector holding credentials that no longer exist should stop, not keep
@@ -1410,14 +1482,29 @@ app.delete('/api/admin/feed/credentials/:id?', requireAdmin, limit('admin'), (re
     stopped = true;
   }
   res.json({ ...result, collector_stopped: stopped });
-});
+}
+
+app.delete('/api/admin/feed/credentials', requireAdmin, limit('admin'), deleteFeedCredentials);
+app.delete('/api/admin/feed/credentials/:id', requireAdmin, limit('admin'), deleteFeedCredentials);
 
 // Supervision. The readiness reason comes back verbatim rather than as a bool,
 // because "the runner will not start" is useless to an operator who is not told
 // which of four conditions is missing.
-app.get('/api/admin/feed/runner/:id?', requireAdmin, limit('admin'), (req, res) => {
+function getFeedRunner(req, res) {
   res.json(FRUN.health(feedTenantId(req)));
-});
+}
+
+// And again for the runner status, which was the third `:id?`.
+//
+// THE ORDERING IS NOT COSMETIC. `GET /api/admin/feed/runner/start` and
+// `/stop` are POST, so a GET `/runner/start` can never reach this pair — but
+// the no-id form is registered FIRST, and if a future sibling route is added
+// under `/runner/` as a GET it would be shadowed by this handler rather than
+// reaching its own. Registering the parameterised form first costs nothing and
+// leaves the shorter path as the fallback, which is the safe direction for a
+// prefix this short.
+app.get('/api/admin/feed/runner/:id', requireAdmin, limit('admin'), getFeedRunner);
+app.get('/api/admin/feed/runner', requireAdmin, limit('admin'), getFeedRunner);
 
 app.post('/api/admin/feed/runner/start', requireAdmin, limit('admin'), (req, res) => {
   const result = FRUN.start(feedTenantId(req), { actor: req.user });
@@ -2652,6 +2739,25 @@ app.get('/api/admin/competitions', requireAdmin, limit('admin'), (req, res) => {
 
 // ── Static frontend + error handler ────────────────────────────────────────
 // Unknown API paths must answer JSON, not Express's HTML 404 page.
+//
+// THIS IS ALSO WHAT KEEPS EXPRESS 5's AUTOMATIC `OPTIONS` RESPONSE SWITCHED OFF,
+// and that is not obvious. Express 5 answers an `OPTIONS` request with a
+// generated `Allow: GET, HEAD` listing the matched route's methods — and the
+// router produces it BEFORE the route's middleware runs, so `requireAdmin`
+// never gets a say. Measured: with this handler removed,
+//
+//   OPTIONS /api/admin/users  ->  200, Allow: GET, HEAD
+//
+// which tells an unauthenticated caller that the route exists and which methods
+// it accepts, past the admin gate.
+//
+// It stays off here because this handler RESPONDS and never calls next(): the
+// router therefore never reaches the point where it would emit the automatic
+// response. That makes this registration load-bearing for authorisation, not
+// just for the error shape — so it must remain the last thing registered before
+// `express.static`. A route added BELOW it, or a rewrite that lets it fall
+// through, re-opens the enumeration. `tests/express5.test.js` E9 asserts the
+// behaviour rather than trusting this paragraph.
 app.use('/api', (req, res) => {
   res.status(404).json({ error: 'Unknown endpoint' });
 });
@@ -2677,8 +2783,31 @@ app.use(express.static(path.join(__dirname, 'public')));
 //
 // Exported so the behaviour is unit-testable from both sides: a real fault, and
 // an opted-in 503.
+//
+// THE `res.headersSent` GUARD IS NEW IN THE EXPRESS 5 MIGRATION, and it is
+// there for a reason that did not exist before. Express 5 forwards a rejected
+// promise from an ASYNC handler into this function automatically. Before this
+// migration an error could only arrive here from a SYNCHRONOUS throw — a narrow
+// window in which no handler here had ever thrown after writing its response.
+// Auto-forwarding widens it: a handler that writes a response and then has an
+// `await` reject would land here with the status line already gone.
+//
+// What this function would then do is `res.status(500).json(...)` on a finished
+// response, which throws ERR_HTTP_HEADERS_SENT, which Express catches and
+// escalates to the default handler. The client keeps the body it already had —
+// so the answer is the right one — but the server logs a spurious internal
+// error on top of a request that succeeded, which is precisely the noise that
+// trains an operator to ignore the log. Handing a post-response error to
+// `next(err)` instead is what Express documents, and it lets the default
+// handler destroy the socket rather than manufacture a second response.
+//
+// No handler in this file exercises the guard today (E7 in
+// tests/express5.test.js asserts that mechanically, by requiring every async
+// handler to catch its own rejection). It is here because the first one that
+// does not should log the error it actually threw, not ERR_HTTP_HEADERS_SENT.
 // eslint-disable-next-line no-unused-vars
 function errorHandler(err, req, res, next) {
+  if (res.headersSent) return next(err);
   const raw = Number(err.status) || 500;
   const expose = raw >= 500 && err.expose === true;
   const status = raw >= 500 && !expose ? 500 : raw;

@@ -61,10 +61,23 @@ const check = async (name, fn) => {
   }
 };
 
-/** Every { method, path, bucket } in the live router. */
+/**
+ * Every { method, path, bucket } in the live router.
+ *
+ * `app.router` is Express 5's PUBLIC accessor for the router; Express 4 kept
+ * the same object on the private `app._router`, which 5 removed. Reading it
+ * through the public name is what keeps C1 — the check that every route carries
+ * a volume bucket or a stated exemption — able to see the routes at all. A
+ * silent fallback to an empty stack here would turn the whole control into a
+ * tautology that passes on no routes, so it asserts instead.
+ */
 function routes() {
+  const r = srv.app.router || srv.app._router;
+  assert.ok(r && Array.isArray(r.stack),
+    `neither app.router nor app._router exposes a stack (app.router=${typeof srv.app.router}); ` +
+    'C1 cannot enumerate the routes, so it would pass without checking anything');
   const out = [];
-  for (const layer of srv.app._router.stack) {
+  for (const layer of r.stack) {
     if (!layer.route) continue;
     const buckets = layer.route.stack
       .map((l) => l.handle && l.handle.volumeBucket)
