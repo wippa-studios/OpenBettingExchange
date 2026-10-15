@@ -508,6 +508,8 @@
         <input id="tBrandName" value="${esc(brand.name || '')}">
         <label>Logo (a path on this venue, e.g. /assets/logo.png)</label>
         <input id="tBrandLogo" value="${esc(brand.logo || '')}">
+        <label>Favicon (tab and home-screen icon; a path on this venue, e.g. /assets/favicon.png)</label>
+        <input id="tBrandFavicon" value="${esc(brand.favicon || '')}">
         <label>Terms URL (shown in the player's Account panel)</label>
         <input id="tBrandTerms" value="${esc(brand.terms_url || '')}">
         <label>Palette — hex colours, empty = the house default</label>
@@ -540,10 +542,19 @@
       if (logo && !/^\/(?!\/)/.test(logo)) {
         return toast('The logo must be a path on this venue, e.g. /assets/logo.png', 'err');
       }
+      // The same rule as the logo, and for the same reason: the venue's CSP is
+      // `img-src 'self' data:`, so a remote icon is a refused fetch and a tab
+      // pointing at a third-party host. Refused HERE rather than written and
+      // left broken.
+      const favicon = out.querySelector('#tBrandFavicon').value.trim();
+      if (favicon && !/^\/(?!\/)/.test(favicon)) {
+        return toast('The favicon must be a path on this venue, e.g. /assets/favicon.png', 'err');
+      }
       const termsUrl = out.querySelector('#tBrandTerms').value.trim();
       const nextBrand = {
         name: out.querySelector('#tBrandName').value.trim(),
         logo: logo || '/assets/logo.png',
+        favicon: favicon || '/assets/favicon.png',
         terms_url: termsUrl || null,
         palette,
       };

@@ -122,7 +122,7 @@ navigation of the ladder (a price is a button and must be reachable), live
 regions for price changes so a screen reader announces fills, and
 `prefers-reduced-motion` on the flash animations.
 
-**g. Test coverage.** `test:ui` has 142 checks and asserts ladder *geometry*.
+**g. Test coverage.** `test:ui` has 150 checks and asserts ladder *geometry*.
 Add: slip arithmetic (stake/price/liability preview matches what the server
 will escrow), refusal rendering, and a viewport pass at mobile width — the
 board is a three-column layout that almost certainly breaks on phone.

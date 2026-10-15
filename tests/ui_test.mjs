@@ -1463,6 +1463,121 @@ try {
     );
   });
 
+  // ── #65: the favicon is the last unbranded asset in the shell ─────────────
+  //
+  // Name, palette, logo and data-tenant all reach the browser (#52). The
+  // favicon did not: index.html hard-codes three icon links and nothing read
+  // them, so every tenant's browser tab showed the house mark.
+  //
+  // ASSERTED ON THE DOM, NOT ON A FETCH. The claim is "the tab icon is the
+  // tenant's", and a test that only checked /api/branding returned a
+  // `favicon` key would pass with the apply side entirely absent — exactly how
+  // the /api/branding route itself shipped with zero callers.
+  const iconHref = (sel) =>
+    page.evaluate((s) => {
+      const n = document.querySelector(s);
+      return n ? n.getAttribute('href') : null;
+    }, sel);
+  const iconHrefs = async () => ({
+    icon: await iconHref('link[rel="icon"]'),
+    apple: await iconHref('link[rel="apple-touch-icon"]'),
+    ico: await iconHref('link[rel="alternate icon"]'),
+  });
+  // `content` rather than a computed style: this is what the browser actually
+  // paints into the tab and the mobile URL bar.
+  const themeColor = () =>
+    page.evaluate(() => {
+      const m = document.querySelector('meta[name="theme-color"]');
+      return m ? m.getAttribute('content') : null;
+    });
+  // The RESOLVED background, which is what theme-color is compared against:
+  // a custom property computes to the literal that was declared (`#ffffff`)
+  // while backgroundColor is the rgb the browser actually paints.
+  const resolvedBg = () =>
+    page.evaluate(() => getComputedStyle(document.documentElement).backgroundColor);
+
+  await scenario('#65 the favicon follows the tenant, and only when it can load', async () => {
+    const before = await branding();
+    if (!before || !before.tenant) {
+      check('#65 fixture: a tenant to brand', false, '(no tenant served)');
+      return;
+    }
+    const tid = before.tenant.id;
+    const house = await iconHrefs();
+
+    check(
+      '#65 /api/branding serves a favicon',
+      typeof before.favicon === 'string' && before.favicon.length > 0,
+      `(favicon=${JSON.stringify(before.favicon)})`
+    );
+
+    // A path that EXISTS on the venue, and differs from every bundled default,
+    // so a change cannot be confused with the house mark already being there.
+    await writeBrand(tid, { name: '', logo: '', favicon: '/assets/apple-touch-icon.png', terms_url: null, palette: {} });
+    await reload();
+    const branded = await iconHrefs();
+    check(
+      '#65 the tenant favicon reaches the icon links',
+      branded.icon === '/assets/apple-touch-icon.png' && branded.apple === '/assets/apple-touch-icon.png',
+      `(icon=${branded.icon}, apple=${branded.apple})`
+    );
+    check(
+      '#65 the favicon changed from what the shell ships',
+      branded.icon !== house.icon || branded.apple !== house.apple,
+      `(house icon=${house.icon} apple=${house.apple})`
+    );
+
+    // THE CSP HALF. The venue's policy is `img-src 'self' data:`, so a remote
+    // favicon is refused by the browser whatever the page asks for — exactly
+    // why applyBranding already guards the logo. The href is asserted here, not
+    // the rendered image: a refused fetch leaves the link in place, and the
+    // thing a tenant gets wrong is the link pointing at someone else's server.
+    await writeBrand(tid, { name: '', logo: '', favicon: 'https://cdn.example.com/f.png', terms_url: null, palette: {} });
+    await reload();
+    const remote = await iconHrefs();
+    check(
+      '#65 a remote favicon is refused, not written into the page',
+      remote.icon !== 'https://cdn.example.com/f.png' && remote.apple !== 'https://cdn.example.com/f.png',
+      `(icon=${remote.icon}, apple=${remote.apple})`
+    );
+    check(
+      '#65 a protocol-relative favicon is refused too',
+      !String(remote.icon || '').startsWith('//'),
+      `(icon=${remote.icon})`
+    );
+
+    await writeBrand(tid, { name: '', logo: '', favicon: '/assets/favicon.png', terms_url: null, palette: {} });
+    await reload();
+    const fallback = await iconHrefs();
+    check(
+      '#65 clearing the favicon falls back to the bundled icon',
+      fallback.icon === '/assets/favicon.png' && fallback.apple === '/assets/apple-touch-icon.png',
+      `(icon=${fallback.icon}, apple=${fallback.apple})`
+    );
+
+    // ── theme-color ────────────────────────────────────────────────────────
+    // index.html hard-codes #ffffff, which paints a white bar in the browser
+    // chrome above a venue whose own background is whatever the tenant set.
+    // It has to track the RESOLVED background, so branding and a dark theme
+    // cannot both own it.
+    const houseBg = await resolvedBg();
+    check(
+      '#65 the meta theme-color follows the resolved background',
+      (await themeColor()) === houseBg,
+      `(meta=${await themeColor()}, background=${houseBg})`
+    );
+    await writeBrand(tid, { name: '', logo: '', favicon: '/assets/favicon.png', terms_url: null, palette: { bg: '#101014' } });
+    await reload();
+    check(
+      '#65 a tenant background repaints the browser chrome',
+      (await resolvedBg()) === 'rgb(16, 16, 20)' && (await themeColor()) === 'rgb(16, 16, 20)',
+      `(background=${await resolvedBg()}, meta=${await themeColor()})`
+    );
+
+    await writeBrand(tid, { name: '', logo: '', favicon: '/assets/favicon.png', terms_url: null, palette: {} });
+    await reload();
+  });
+
   await scenario('#52 the desk can set the brand it serves', async () => {
     await page.click('#nav button[data-page="admin"]');
     await page.waitForSelector('[data-view="tenants"]', { timeout: 10000 });

@@ -249,6 +249,75 @@
   // palette in :root stands for whatever is refused.
   const HEX = /^#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
   const PROP_NAME = /^[a-z][a-z0-9-]{0,30}$/i;
+  // A path ON THIS VENUE. The CSP is `img-src 'self' data:`, so anything with
+  // a scheme or a leading `//` is refused by the browser; written in as an href
+  // it is a tab icon pointing at a third-party host, which is both broken and a
+  // disclosure. Same rule as the logo, and for the same reason.
+  const LOCAL_PATH = /^\/(?!\/)/;
+
+  /**
+   * Repaint the browser chrome from whatever background is ACTUALLY resolved.
+   *
+   * index.html shipped `content="#ffffff"` as a literal, which painted a white
+   * bar above a venue whose own background is whatever the tenant set (or, once
+   * there is a dark theme, whatever the theme resolved to). Two features were
+   * about to write one hard-coded value.
+   *
+   * Read from the computed backgroundColor rather than re-deriving a hex, so
+   * there is exactly ONE place that knows what the page ground is: whatever
+   * `--bg` computes to, after the cascade, after the theme, after the tenant.
+   */
+  function syncThemeColor() {
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (!meta) return;
+    const bg = getComputedStyle(document.documentElement).backgroundColor;
+    if (bg) meta.setAttribute('content', bg);
+  }
+
+  /**
+   * Swap the favicon links for a tenant's icon (#65).
+   *
+   * Three links, because three surfaces consume one field: `rel=icon` is the
+   * tab and the desktop bookmark, `rel=apple-touch-icon` is the iOS home-screen
+   * icon, and `rel=alternate icon` is the legacy .ico.
+   *
+   * The shell's OWN hrefs are snapshotted first and restored whenever the
+   * tenant's icon is unusable or is simply the bundled default. Restoring
+   * matters: pointing `apple-touch-icon` at /assets/favicon.png would replace a
+   * 180px home-screen icon with the 32px tab one, so "no tenant icon" has to
+   * mean "exactly what index.html ships", not "the first href everywhere".
+   */
+  const SHELL_ICONS = (() => {
+    const read = (sel) => {
+      const n = document.querySelector(sel);
+      return n ? n.getAttribute('href') : null;
+    };
+    return {
+      icon: read('link[rel="icon"]'),
+      apple: read('link[rel="apple-touch-icon"]'),
+      ico: read('link[rel="alternate icon"]'),
+    };
+  })();
+
+  function applyFavicon(url) {
+    const set = (sel, href) => {
+      const n = document.querySelector(sel);
+      if (n && href) n.setAttribute('href', href);
+    };
+    // Unusable, or the bundled default: the shell's own links, untouched. A
+    // tenant with a half-configured brand renders the default venue.
+    if (typeof url !== 'string' || !LOCAL_PATH.test(url) || url === SHELL_ICONS.icon) {
+      set('link[rel="icon"]', SHELL_ICONS.icon);
+      set('link[rel="apple-touch-icon"]', SHELL_ICONS.apple);
+      set('link[rel="alternate icon"]', SHELL_ICONS.ico);
+      return;
+    }
+    set('link[rel="icon"]', url);
+    set('link[rel="apple-touch-icon"]', url);
+    // Only when the tenant really supplies one: pointing the legacy link at a
+    // PNG makes browsers that honour it fetch it under the wrong declared type.
+    if (/\.ico$/i.test(url)) set('link[rel="alternate icon"]', url);
+  }
 
   function applyBranding(b) {
     if (!b) return;
@@ -264,11 +333,13 @@
     // The venue's own CSP is `img-src 'self' data:`, so a remote logo URL is
     // refused by the browser whatever we do here. A path that would be blocked
     // is left alone rather than swapped for a broken image.
-    if (logo && typeof b.logo === 'string' && /^\/(?!\/)/.test(b.logo)) {
+    if (logo && typeof b.logo === 'string' && LOCAL_PATH.test(b.logo)) {
       logo.src = b.logo;
       logo.alt = b.name || 'Exchange';
     }
+    applyFavicon(b.favicon);
     if (b.tenant && b.tenant.slug) root.setAttribute('data-tenant', b.tenant.slug);
+    syncThemeColor();
   }
 
   // Called at boot and again whenever the SESSION changes, because the tenant
@@ -410,5 +481,5 @@
   }
 
 
-  Object.assign(OB, { applyBranding, closeAuth, closeNavRail, detectFeed, goTo, loadBranding, loadEvents, loadSports, openAccount, openAuth, openNavRail, refreshAll, refreshMarkets, renderPage, renderSessions, route, submitAuth, submitPasswordChange });
+  Object.assign(OB, { applyBranding, applyFavicon, closeAuth, closeNavRail, detectFeed, goTo, loadBranding, loadEvents, loadSports, openAccount, openAuth, openNavRail, refreshAll, refreshMarkets, renderPage, renderSessions, route, submitAuth, submitPasswordChange, syncThemeColor });
 })();
