@@ -1266,7 +1266,48 @@ app.get('/api/sports', limit('read'), (req, res) => {
 // Feed-backed board: markets and prices come from the betfair-market-snapshots
 // recorder's Postgres, so there is no matching book here — the ladder IS the
 // observed exchange. Shape matches /api/events so the frontend is unchanged.
-app.get('/api/feed/board', aw(async (req, res) => {
+//
+// `limit('read')`, which this route did not carry for its whole life. The four
+// feed routes sat on the exemption list in tests/ratelimit-coverage.test.js with
+// the reason "odds-feed mode: a different data source in a different mode, 409
+// before any work when the feed is off" — which is true about a DEPLOYMENT and
+// says nothing about the DEPLOYMENT WITH THE FEED ON, which is the only one where
+// this route does any work at all. An exemption justified by "there is nothing to
+// protect here" was being read on a deployment where there is.
+//
+// What the exemption left unbounded, and it is worse than merely a slow route:
+// under FEED_PROVIDER=postgres this was implicitly bounded by `new Pool({ max:
+// 4 })` — four sockets, everything else queued inside the driver. Under
+// FEED_PROVIDER=http there is nothing at all, so `for i in $(seq 1 5000); do
+// curl -s http://venue/api/feed/board & done` — no cookie, no token — opened 5000
+// sockets to the OPERATOR'S OWN licensed feed API, each of which could buffer up
+// to 8 MiB. That is a venue socket/heap exhaustion AND an unauthenticated
+// amplification against a third party who never agreed to be one, with the venue
+// as the weapon.
+//
+// `requireAuth` is deliberately NOT here. The feed board is public by design: the
+// browser probes /api/feed/nav at boot with no session to decide which board to
+// render, and tests/ui_test.mjs fails a run on any console error. Rate limiting
+// is the control that fits an open route; authentication is not, and adding it
+// would break the product rather than protect it.
+//
+// The rate limit and the provider's in-flight cap are DIFFERENT controls and
+// neither replaces the other. This one bounds how many requests can ARRIVE;
+// lib/feed/http.js's FEED_HTTP_MAX_CONCURRENCY bounds how many are OPEN AT ONCE.
+// With only the cap, 5000 requests still arrive and 4996 fail fast for no better
+// reason than "the venue is full"; with only this, one caller inside its budget
+// still opens RATE_LIMIT_READ sockets at once.
+//
+// RATE_LIMIT_READ (600/min) is generous against the real client: the browser
+// reads /api/feed/nav once at boot and /api/feed/board on a board load, so a
+// busy desk is tens of requests a minute. The honest cost is the one
+// volumeKey() already has: an UNAUTHENTICATED route keys on the address, so a
+// venue behind a reverse proxy shares one budget across every caller. That is
+// the same trade every other public read here makes (/api/sports, /api/events),
+// and making the feed alone an exception would be a special case with no stated
+// reason. A venue that needs per-caller read budgets puts one in front of the
+// proxy.
+app.get('/api/feed/board', limit('read'), aw(async (req, res) => {
   if (!config.FEED_ENABLED) return apiError(res, 409, 'Feed is disabled (set FEED_ENABLED=true)');
   try {
     const markets = await FEED.fetchBoard({ limit: clampFeedLimit(req.query.limit, config.FEED_MARKET_LIMIT) });
@@ -1332,9 +1373,16 @@ function feedBootStatus(h, staleSeconds) {
   // that can go stale. "newest frame unknown" there is a warning about a number
   // this deployment was never going to publish.
   if (c.kind === 'unpriced') {
+    // `feed null` would be a confident falsehood in an operator's boot log. The
+    // field names the Betfair VIEW this answered from, and a provider behind
+    // FEED_PROVIDER=http has no view — healthPayload publishes `feed: null`
+    // rather than inventing one, which is the right call and needs a sentence
+    // here that does not contradict it. For every collector deployment `c.feed`
+    // is 1 or 2 and the line is unchanged.
+    const which = c.feed == null ? 'this feed API' : `feed ${c.feed}`;
     return {
       level: 'log',
-      message: `odds feed connected — feed ${c.feed}: ${h.markets || 0} fixtures, no prices on this feed`,
+      message: `odds feed connected — ${which}: ${h.markets || 0} fixtures, no prices on this feed`,
     };
   }
   return {
@@ -1351,11 +1399,13 @@ function feedBootStatus(h, staleSeconds) {
 // from it anyway made a pick outside the cap render a DIFFERENT market's
 // prices, which is worse than an honest empty state.
 //
-// An id that resolves to nothing open answers 200 with `market: null`. That is
-// not a client error: the feed rotates markets away constantly, so "the race
-// you picked has closed" is an ordinary outcome the page renders as such, and
-// only a missing `id` parameter is a 400.
-app.get('/api/feed/market', aw(async (req, res) => {
+// One market's ladder, by id, for the race a bettor picked from the tree.
+// `limit('read')` for the reason the board route carries: a single-market read is
+// one upstream request, and without a bucket a script could ask for 5000 of them
+// in a minute and open 5000 sockets to the operator's feed API. Same bucket as
+// the board because it is the same route family, the same data and the same
+// provider — a separate bucket would be an exemption with a made-up reason.
+app.get('/api/feed/market', limit('read'), aw(async (req, res) => {
   if (!config.FEED_ENABLED) return apiError(res, 409, 'Feed is disabled (set FEED_ENABLED=true)');
   const id = req.query.id;
   if (!id || !String(id).trim()) {
@@ -1373,7 +1423,15 @@ app.get('/api/feed/market', aw(async (req, res) => {
 // Always 200, including when the feed is off: the browser probes this at boot to
 // decide which board to render, and a 409 there logs a console error on every
 // non-feed deployment (the browser suite fails a run on any console error).
-app.get('/api/feed/nav', aw(async (req, res) => {
+//
+// `limit('read')` — and note what "always 200, including when the feed is off"
+// does NOT now mean. It means 200 with `enabled:false` when the feed is OFF. When
+// the feed is ON and the caller is past its budget, this answers 429 with
+// Retry-After, which is a different answer on purpose: a venue with the feed on
+// has spent real money on a feed API, and a 429 is how it learns to stop asking.
+// The browser probes once at boot and the board is refreshed on interaction, so
+// the budget is not a UX constraint at any plausible polling rate.
+app.get('/api/feed/nav', limit('read'), aw(async (req, res) => {
   if (!config.FEED_ENABLED) return res.json({ enabled: false, sports: [] });
   try {
     res.json({ enabled: true, sports: await FEED.fetchNav() });
@@ -1443,7 +1501,25 @@ function feedHealthFailure(res, c) {
 // of this payload cannot drift (see `feedBootStatus` for how the last time they
 // did). What a stale feed publishes is a feed-derived age and the configured
 // window, not internals.
-app.get('/api/feed/health', aw(async (req, res) => {
+// `limit('read')` HERE TOO, and this is the judgement call in the change, so it is
+// worth spelling out rather than leaving to be discovered. /healthz and /readyz
+// are exempt from the limiter because a throttled supervisor probe kills the
+// venue. /api/feed/health is NOT a supervisor probe — it is an operator and
+// operator-dashboard probe — and there is a real argument for exempting it for
+// the same reason.
+//
+// That argument loses on one fact: this route is UNAUTHENTICATED and it reaches
+// the provider. An exempt route here is an open route that costs the operator's
+// feed API one upstream request per call, which is the amplification this change
+// exists to stop — and the exemption would bite hardest on exactly the deployment
+// where the feed is ON, which is the only one where the route does any work. At
+// RATE_LIMIT_READ (600/min) an operator dashboard polling every few seconds is
+// nowhere near the ceiling.
+//
+// So it is limited, and the cost of being wrong is a 429 on a dashboard, which is
+// visible and costs nothing. The cost of the alternative is invisible and costs
+// somebody else's API.
+app.get('/api/feed/health', limit('read'), aw(async (req, res) => {
   if (!config.FEED_ENABLED) return apiError(res, 409, 'Feed is disabled');
   let h;
   try {

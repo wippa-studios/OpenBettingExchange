@@ -18,6 +18,50 @@ must agree with the highest released heading.
 
 ### Added
 
+- **A feed provider seam, and the conformance suite that makes it safe**
+  (STATE.md §2.7, docs/ROADMAP.md §Phase 5). `lib/feed.js` read the Betfair
+  collector's PostgreSQL views and nothing else — its SQL was hard-wired to
+  `v_feed1`/`v_feed2` — so an Australian operator holding a betting-exchange
+  licence who has **their own data-feed API** could use this venue only if their
+  feed happened to be Betfair's Postgres views. The alternative was forking
+  `lib/feed.js`.
+
+  `FEED_PROVIDER` now selects the implementation behind a contract
+  (`lib/feed/provider.js`): `postgres` (the collector, unchanged) or `http` (a
+  generic JSON-over-HTTP provider, `lib/feed/http.js`, driven entirely by
+  `FEED_HTTP_*` configuration — base URL, resource paths, bearer token or static
+  header, timeout, and per-resource field maps that rename a vendor's JSON onto
+  the canonical feed shape). `FEED_PROVIDER=postgres` is byte-for-byte the
+  previous behaviour; nothing changes for the default deployment.
+
+  **The suite is the deliverable, not an afterthought.** STATE.md §2.7 is the
+  design brief: *"an adapter that half-works does not crash, it produces wrong
+  prices or wrong market state, which the engine cannot detect."* So
+  `tests/feedprovider-conformance.test.js` is a reusable, provider-agnostic
+  battery run against **both** providers — the HTTP one against a real
+  `node:http` server serving vendor-shaped JSON through a real field map — and
+  it includes a deliberately broken MUTANT provider asserted to **fail** it, so
+  the battery cannot go vacuously green. `lib/feed/provider.js` refuses to
+  register a provider whose name is not in its own capability table, which is
+  what puts a new adapter in front of a reviewer who runs the battery. Stated
+  precisely, because the other reading is wrong: declaring a provider in
+  `lib/feed/provider.js` does not run the suite — the registry cannot, and a boot
+  is the wrong place for an offline fixture test.
+
+  There is **one shaper** (`lib/feed/shape.js`), shared by both providers: a
+  second one beside the original is a wrong-price bug in the making, because the
+  ladder bounds, the pounds→cents conversion and the book-percentage
+  completeness rule have each already been got wrong once here. The conformance
+  suite asserts the two providers produce **byte-identical** boards and nav trees
+  from the same underlying data, and caught two real divergences while it was
+  being written.
+
+  A misconfigured field map is a **boot error**, not a warning: an empty map, an
+  unknown canonical field, an empty entry, a duplicate or a missing required
+  field all abort the launch. A half-mapped feed would otherwise serve markets
+  with no id, no name and no runners — an empty board, which reads as a quiet
+  Tuesday rather than as a misconfiguration.
+
 - **Order lifecycle beyond place/fill/cancel** (#97). `PATCH /api/orders/:id`
   amends the price, the size, or both of a resting order **in one transaction**,
   and `POST /api/orders/bulk-cancel` cancels a **list**. `POST /api/orders` and

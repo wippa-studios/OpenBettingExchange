@@ -95,6 +95,22 @@ function routes() {
 // a list, so it is a place to forget — so it is a list of ROUTES WITH REASONS
 // and the check below fails on any entry that no longer exists (a stale
 // exemption hides a route that has since been given a bucket).
+//
+// THE FOUR `/api/feed/*` ENTRIES WERE REMOVED HERE, and that is a HARDENING of
+// C1 rather than an edit made to let it pass. They were exempted for being "a
+// different data source in a different mode, 409 before any work when the feed
+// is off" — a statement about a DEPLOYMENT WITH THE FEED OFF, which is the only
+// deployment in which those routes do nothing at all. On the deployment they were
+// actually meant to describe, the one with the feed ON, they were four
+// unauthenticated routes reaching the provider with no bucket: implicitly bounded
+// by `new Pool({ max: 4 })` under the collector, and not bounded at all under
+// FEED_PROVIDER=http. The entries were removed rather than reworded, because a
+// reworded exemption is still an exemption.
+//
+// Note what is deliberately still absent: no `/api/feed/*` route is
+// `requireAuth`-gated, and that is right — the browser probes /api/feed/nav at
+// boot with no session and tests/ui_test.mjs fails a run on any console error. A
+// bucket, not a login.
 const EXEMPT = {
   'GET /api/stream': 'a long-held connection, not a request; MAX_SSE_CLIENTS governs it',
   'GET /api/branding': 'one row, no query worth bounding, and it is what a locked account\'s page load reads',
@@ -104,10 +120,6 @@ const EXEMPT = {
   'POST /api/auth/logout': 'one session delete; cheap, and the caller is already spending a session',
   'POST /api/auth/change-password': 'one key derivation, already behind a session and the setup allowlist',
   'DELETE /api/auth/sessions/:id': 'one row delete, same argument as logout',
-  'GET /api/feed/board': 'odds-feed mode: a different data source in a different mode, 409 before any work when the feed is off',
-  'GET /api/feed/market': 'odds-feed mode: one market, and the feed board is the request that carries the volume',
-  'GET /api/feed/nav': 'odds-feed mode: the sport rail, read once per board load',
-  'GET /api/feed/health': 'odds-feed mode: an operator probe of the collector, not a player read',
 };
 
 (async () => {
@@ -308,8 +320,106 @@ const EXEMPT = {
     }
   });
 
+  // ── C8 ────────────────────────────────────────────────────────────────────
+  // C1 says the four /api/feed/* routes CARRY a bucket. C8 says the bucket
+  // BITES, which C1 cannot see: a limiter attached to a route that is never
+  // reached satisfies C1 perfectly.
+  //
+  // The feed is DISABLED in this suite, which is what makes this possible without
+  // a provider, and it is worth being precise about what the test then proves.
+  // Each route's own answer when the feed is off is recorded in the table below —
+  // 409 for three of them, and 200 {enabled:false} for /api/feed/nav, which is
+  // the one the browser probes at boot. Those are REAL responses from the REAL
+  // handlers, so a 429 in their place can only have come from the limiter in
+  // front of them. The limiter, not the handler, is what changed.
+  const FEED_ROUTES = [
+    ['GET', '/api/feed/board', 409],
+    ['GET', '/api/feed/market?id=1.1', 409],
+    ['GET', '/api/feed/nav', 200],
+    ['GET', '/api/feed/health', 409],
+  ];
+
+  await check('C8 the /api/feed/* routes are actually throttled, not merely bucketed', async () => {
+    for (const [method, path, served] of FEED_ROUTES) {
+      srv.resetVolumeLimits();
+      const first = await j(method, path);
+      // Asserted, not assumed: if the feed were enabled in this suite these
+      // answers would change and this check would be measuring something else.
+      assert.strictEqual(first.status, served, `${path} must reach its own handler first; got ${first.status}`);
+      assert.ok(!first.retryAfter, `${path} is inside the budget, so there is nothing to back off from`);
+      // Reset again so the budget below is spent by the loop ALONE, and the
+      // arithmetic in this check is about the loop's requests and nothing else.
+      // Without this the `first` probe above silently eats one of the five.
+      srv.resetVolumeLimits();
+
+      const statuses = [];
+      for (let i = 0; i < READ_LIMIT + 2; i++) statuses.push((await j(method, path)).status);
+      // Same rule as C2: the first READ_LIMIT must be SERVED. A route that 429s
+      // everyone would satisfy "past the budget it is 429" perfectly and be
+      // completely broken.
+      assert.deepStrictEqual(
+        statuses.slice(0, READ_LIMIT),
+        Array(READ_LIMIT).fill(served),
+        `${path} must keep answering its own way inside the budget; got ${statuses.join(',')}`
+      );
+      assert.deepStrictEqual(
+        statuses.slice(READ_LIMIT),
+        [429, 429],
+        `${path} past the budget must be refused; got ${statuses.join(',')}`
+      );
+
+      const refused = await j(method, path);
+      assert.strictEqual(refused.status, 429, `${path} must stay refused once the budget is spent`);
+      assert.ok(Number(refused.retryAfter) > 0, `${path} must say when to come back; got Retry-After=${refused.retryAfter}`);
+      assert.ok(refused.json && /too many requests/i.test(refused.json.error),
+        `${path} must say what happened: ${JSON.stringify(refused.json)}`);
+      // …and the refusal is the LIMITER's body, unchanged and feed-agnostic: an
+      // anonymous caller reading it learns which bucket they spent, which is the
+      // only thing they are entitled to, and nothing about the feed's provider,
+      // its paths or its configuration.
+      assert.deepStrictEqual(Object.keys(refused.json).sort(), ['code', 'details', 'error', 'retry_after_seconds'],
+        `${path} 429 body carried something beyond the limiter's own fields: ${JSON.stringify(refused.json)}`);
+      assert.strictEqual(refused.json.code, 'rate_limited');
+      assert.deepStrictEqual(refused.json.details, { code: 'rate_limited' });
+      assert.ok(!/feed|board|market|nav|health|http/i.test(JSON.stringify(refused.json)),
+        `${path} 429 body mentioned the feed: ${JSON.stringify(refused.json)}`);
+    }
+  });
+
+  // ── C9 ────────────────────────────────────────────────────────────────────
+  // The other half, and the one that is easy to break while adding a bucket: a
+  // feed-OFF deployment's browser must still get its answer. public/js/shell.js
+  // fetches /api/feed/nav once at boot to decide which board to render, and
+  // tests/ui_test.mjs fails an entire run on ANY console error — so a nav route
+  // that 429s, or 4xxes, on a non-feed deployment is a regression in the product
+  // rather than a tightening of a control.
+  await check('C9 a spent feed budget is per-caller, and does not outlive the process', async () => {
+    srv.resetVolumeLimits();
+    // Drain the budget from the anonymous address. volumeKey() keys on the
+    // address when there is no user, which is what an unauthenticated route
+    // means — and C4 already established that both accounts here share it.
+    for (let i = 0; i < READ_LIMIT + 2; i++) await j('GET', '/api/feed/nav');
+    assert.strictEqual((await j('GET', '/api/feed/nav')).status, 429, 'the flooder is throttled');
+
+    // A signed-in caller keys on the USER, so the anonymous flood above does not
+    // spend a player's budget. That is the fairness property C3 asserts for
+    // /api/positions, and it has to hold for the feed routes too — otherwise
+    // adding a bucket has introduced a lock-out, which is a worse defect than
+    // the one it fixed.
+    const login = await j('POST', '/api/auth/login', { body: { username: 'demo', password: 'demo123' } });
+    const cookie = (login.setCookie[0] || '').split(';')[0];
+    assert.ok(cookie, 'the sign-in must have worked, or this check is vacuous');
+    assert.strictEqual((await j('GET', '/api/feed/nav', { cookie })).status, 200,
+      'a player must reach the handler while an anonymous flooder is refused');
+
+    // And a fresh process is not still throttled by its own history.
+    srv.resetVolumeLimits();
+    assert.strictEqual((await j('GET', '/api/feed/nav')).status, 200,
+      'a spent budget must not outlive the process that spent it');
+  });
+
   console.log(`\nratelimit-coverage.test.js: ${passed} checks passed, ${failures.length} failed`);
   server.close();
   if (failures.length) process.exit(1);
-  if (passed !== 7) { console.error(`expected 7 checks, ran ${passed}`); process.exit(1); }
+  if (passed !== 9) { console.error(`expected 9 checks, ran ${passed}`); process.exit(1); }
 })();
