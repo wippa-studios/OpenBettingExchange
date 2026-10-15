@@ -204,13 +204,8 @@ a status that elsewhere in this API means "slow down, retry", yet it carries no
 
 | Route | Request | Success | Errors |
 | --- | --- | --- | --- |
-<<<<<<< HEAD
-| `POST /api/auth/register` | `{ username, password, email? }` | `201 { user }` + session cookie. `username` 3–32 chars `[A-Za-z0-9_-]`; `password` 6–128 chars; `email` lowercased and unique | `400` invalid username, non-string or wrong-length password, malformed email; `409` username or email taken; `429` abuse counter |
-| `POST /api/auth/login` | `{ username \| email \| identifier, password }` | `200 { user, rg }` + session cookie. Starts the responsible-gambling session clock | `401` unknown user, wrong password or bot account (one message, constant-time); `403 Account is suspended`; `403` jurisdiction; `403` suspended tenant; `429` abuse counter |
-=======
 | `POST /api/auth/register` | `{ username, password, email? }` | `201 { user }` + session cookie. `username` 3–32 chars `[A-Za-z0-9_-]`, matched **case-insensitively** (see [Username identity](#username-identity)); `password` 6–128 chars; `email` lowercased and unique | `400` invalid username, non-string or wrong-length password, malformed email; `409` username or email taken; `429` abuse counter |
 | `POST /api/auth/login` | `{ username \| email \| identifier, password }` | `200 { user, rg }` + session cookie. `username` is matched case-insensitively. Starts the responsible-gambling session clock | `401` unknown user, wrong password or bot account (one message, constant-time); `403 Account is suspended`; `403` jurisdiction; `429` abuse counter |
->>>>>>> 61d793f (fix(#8): username uniqueness was case-sensitive while the lockout was not)
 | `POST /api/auth/logout` | — | `200 { ok: true }`, cookie cleared. It stamps activity on the responsible-gambling state **for the token presented** (not every session) | — |
 
 Logout does **not** clear the session clock. `lib/rg.js`'s `endSession` only

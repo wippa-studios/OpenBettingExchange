@@ -204,6 +204,13 @@ jobs:
         # configured to update both together. #10.
         run: node scripts/check-action-pins.mjs
 
+      - name: No committed merge conflict
+        # Commit 0597862 shipped `<<<<<<< HEAD` inside the route table of
+        # docs/API.md and every other job stayed green, because a conflict marker
+        # is not a wrong CLAIM about the code — it is the absence of a file's
+        # intended content, which no count, link or contradiction check can see.
+        run: node scripts/check-conflict-markers.mjs
+
   # A capacity smoke, not a benchmark: it asserts the system survives concurrent
   # writes with the books still balanced, which is a correctness property and
   # belongs in CI. Absolute rps is machine-dependent and is NOT asserted —
