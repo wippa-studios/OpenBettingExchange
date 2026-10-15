@@ -1737,9 +1737,9 @@ app.get('/api/format/:price', limit('read'), (req, res) => {
 // comparison in this handler for there to be raced. See lib/bookversion.js for
 // the rest.
 app.post('/api/orders', requireAuth, limit('trade'), (req, res) => {
-  const { selection_id, side, price, stake_cents, client_order_id, selection_version, market_version } = req.body || {};
+  const { selection_id, side, price, stake_cents, client_order_id, selection_version, market_version, persistence } = req.body || {};
   const result = M.placeOrder(db, req.user, {
-    selection_id, side, price, stake_cents, client_order_id, selection_version, market_version,
+    selection_id, side, price, stake_cents, client_order_id, selection_version, market_version, persistence,
   });
   // A replay created nothing, so it must not broadcast as though it did —
   // otherwise a retried request makes every other client's board flicker for a
@@ -1766,12 +1766,67 @@ app.get('/api/orders', requireAuth, limit('read'), (req, res) => {
   res.json({ orders: M.openOrdersFor(db, req.user.id) });
 });
 
+// ── Order lifecycle: amend, and cancel in bulk (#97) ────────────────────────
+//
+// Before this, the only way to change a resting order was cancel-then-replace,
+// which loses the queue position (FIFO within a level is `ORDER BY price, id`),
+// churns the ledger through a release and a fresh escrow where one delta would
+// do, and is two round trips whose worst split leaves a trader flat when they
+// meant to be hedged. `PATCH` below does it in one transaction and keeps the
+// order's id, which IS its queue position.
+//
+// Nothing is compared here, for the same reason nothing is compared in
+// `POST /api/orders`: a route that read the book version and decided here would
+// be the check-then-act the transaction exists to prevent. `selection_version`
+// and `market_version` are passed through UNVALIDATED and the engine compares
+// them inside the amend.
+app.patch('/api/orders/:id', requireAuth, limit('trade'), (req, res) => {
+  const { price, stake_cents, persistence, selection_version, market_version } = req.body || {};
+  const result = M.amendOrder(db, req.user, intId(req.params.id), {
+    price, stake_cents, persistence, selection_version, market_version,
+  });
+  // An amend changes the book for EVERYBODY, so this broadcasts unconditionally:
+  // unlike a placement there is no "replay created nothing" case, because an
+  // amend that changed nothing still means the client's own order list is
+  // current. `market_version` rides along for the same reason it does on
+  // placement — a client running the handshake must not need a second request to
+  // learn the version its next order should claim.
+  broadcast('book', { market_id: result.order.market_id });
+  broadcast('orders', {}, req.user.id);
+  broadcast('balance', {}, req.user.id);
+  res.json({ ...result, market_version: BOOKVERSION.marketVersion(db, result.order.market_id) });
+});
+
 app.post('/api/orders/:id/cancel', requireAuth, limit('trade'), (req, res) => {
   const order = M.cancelOrder(db, req.user, intId(req.params.id));
   broadcast('book', { market_id: order.market_id });
   broadcast('orders', {}, req.user.id);
   broadcast('balance', {}, req.user.id);
   res.json({ order });
+});
+
+// Bulk cancel. Registered BEFORE nothing in particular and AFTER the
+// single-order route above on purpose: the paths cannot collide
+// (`/api/orders/:id/cancel` is two segments deeper), and putting it directly
+// beside the route it generalises is what a reader needs to see.
+//
+// 200 for every well-formed request, whatever the per-order outcomes. That is
+// the PARTIAL RESULT the issue asks for, not a shortcut: a batch of forty
+// cancels in which thirty-nine worked is a success that happened, and answering
+// 409 or 500 for it would leave the client unable to tell which thirty-nine —
+// which is the situation a bulk endpoint exists to remove. Only a malformed LIST
+// is a 400, and at that point nothing has been read or written.
+//
+// The per-id authorisation is the single-order rule, unchanged, applied
+// independently to each id: an order that is not yours is reported `not_found`
+// and is NOT cancelled, which is the same answer the single-order route gives so
+// that neither endpoint is an oracle for which ids exist.
+app.post('/api/orders/bulk-cancel', requireAuth, limit('trade'), (req, res) => {
+  const result = M.cancelOrders(db, req.user, (req.body || {}).order_ids);
+  for (const marketId of result.market_ids) broadcast('book', { market_id: marketId });
+  broadcast('orders', {}, req.user.id);
+  broadcast('balance', {}, req.user.id);
+  res.json(result);
 });
 
 app.get('/api/positions', requireAuth, limit('read'), (req, res) => {
@@ -2598,6 +2653,17 @@ if (JOBS_INTERVALS.delayReleaseMs > 0) {
       const r = MATCH.releaseEligibleOrders(db);
       if (r.filled > 0) {
         console.log(`[inplay] released ${r.released} delayed order(s), ${r.filled} cents filled`);
+      }
+      // THE LAPSE SWEEP (#97) RIDES THIS TIMER, deliberately rather than
+      // declaring a second one. Both are the same job wearing different hats —
+      // "an OPEN order on this venue needs attention right now" — and both scan
+      // the same predicate, so a second interval would be a second thing to
+      // tune, shut down and remember. (This block is the one edit in #97 that
+      // falls outside the /api/orders region it belongs to; it is four lines and
+      // adding it inside the existing `if` keeps it a pure addition.)
+      const lapsed = MATCH.lapseOrders(db);
+      if (lapsed.lapsed > 0) {
+        console.log(`[lapse] cancelled ${lapsed.lapsed} unmatched order(s) on the turn in-play, ${lapsed.released_cents} cents released`);
       }
     })
   );
