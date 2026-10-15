@@ -2668,19 +2668,37 @@ if (JOBS_INTERVALS.delayReleaseMs > 0) {
       if (r.filled > 0) {
         console.log(`[inplay] released ${r.released} delayed order(s), ${r.filled} cents filled`);
       }
-      // THE LAPSE SWEEP (#97) RIDES THIS TIMER, deliberately rather than
-      // declaring a second one. Both are the same job wearing different hats —
-      // "an OPEN order on this venue needs attention right now" — and both scan
-      // the same predicate, so a second interval would be a second thing to
-      // tune, shut down and remember. (This block is the one edit in #97 that
-      // falls outside the /api/orders region it belongs to; it is four lines and
-      // adding it inside the existing `if` keeps it a pure addition.)
+    })
+  );
+}
+
+// THE LAPSE SWEEP (#97), on its own timer and its own guard.
+//
+// It used to sit inside the block above, which read well — both are "an OPEN
+// order needs attention right now", both are cheap scans — and was wrong. The
+// block above is gated on DELAY_RELEASE_INTERVAL_MS, so an operator who turned
+// the delay-release pass off also turned LAPSE off without being told, and every
+// order they had marked "do not carry me past the off" simply rested forever.
+// A trader who believes an order is time-limited and is not is worse off than
+// one who never asked: the promise was made and nothing kept it.
+//
+// Separate `if`, separate knob, same cadence — and it warns at boot when
+// disabled, because a silent 0 here is the same class of bug.
+if (JOBS_INTERVALS.lapseMs > 0) {
+  jobTimers.push(
+    JOBS.every(JOBS_INTERVALS.lapseMs, async () => {
       const lapsed = MATCH.lapseOrders(db);
       if (lapsed.lapsed > 0) {
-        console.log(`[lapse] cancelled ${lapsed.lapsed} unmatched order(s) on the turn in-play, ${lapsed.released_cents} cents released`);
+        console.log(`[lapse] cancelled ${lapsed.lapsed} unmatched LAPSE order(s) on the turn in-play, ${lapsed.released_cents} cents released`);
       }
     })
   );
+} else {
+  // Said out loud, because the failure this replaces was silent. An operator who
+  // sets this to 0 has just left every trader with a LAPSE order on the venue
+  // believing their order is time-limited when it is not, and nothing about the
+  // running process would otherwise say so.
+  console.warn('[lapse] LAPSE_INTERVAL_MS=0 — the lapse sweep is OFF. Orders marked LAPSE will rest past the turn in-play.');
 }
 
 // The results poll. This job did not exist even though

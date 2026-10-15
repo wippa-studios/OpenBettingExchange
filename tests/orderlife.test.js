@@ -27,6 +27,8 @@ process.env.DRIFT_ENABLED = 'false';
 process.env.BOT_ENABLED = 'false';
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const srv = require('../server');
 
 let passed = 0;
@@ -314,7 +316,52 @@ const check = async (name, fn) => {
     assert.deepStrictEqual(acc.assertUserAgrees(srv.db), [], 'a wallet disagrees with its postings');
   });
 
+  // R9: THE LAPSE SWEEP IS NOT RIDING THE DELAY-RELEASE KNOB.
+  //
+  // A structural check, and deliberately so — the same shape guard.test.js uses
+  // for `orders.frozen_cents`. What is pinned here is a WIRING fact that no
+  // behavioural test of the engine can see: `lapseOrders` is reached from
+  // server.js, and the only question is which guard reaches it.
+  //
+  // It shipped nested inside `if (JOBS_INTERVALS.delayReleaseMs > 0)`, so an
+  // operator setting DELAY_RELEASE_INTERVAL_MS=0 — a documented, supported value,
+  // and the natural one for a venue that has withdrawn in-play — silently got no
+  // lapse sweep at all. Every order marked LAPSE then rested forever, no log line
+  // said so, and every engine test passed because they call `lapseOrders`
+  // directly. A control that only runs when an unrelated toggle is on is the
+  // dead-control shape this repository keeps finding; this check is what makes
+  // the decoupling a fact rather than a comment.
+  await check('R9 the lapse sweep has its own timer and does not ride the delay-release knob', async () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+    assert.match(src, /lapseMs: Number\(process\.env\.LAPSE_INTERVAL_MS/, 'LAPSE_INTERVAL_MS is its own knob');
+    assert.match(
+      src,
+      /if \(JOBS_INTERVALS\.lapseMs > 0\) \{[\s\S]*?JOBS\.every\(JOBS_INTERVALS\.lapseMs[\s\S]*?MATCH\.lapseOrders\(db\)/,
+      'the sweep is registered under the lapse guard'
+    );
+
+    // The specific coupling that shipped: the sweep must NOT be reachable from
+    // the delay-release block. Bounded slice, so this cannot drift onto an
+    // unrelated later `if` when the file grows.
+    const guardAt = src.indexOf('if (JOBS_INTERVALS.delayReleaseMs > 0) {');
+    assert.ok(guardAt > -1, 'the delay-release guard still exists — this file changed shape, re-pin it');
+    const delayBlock = src.slice(guardAt, src.indexOf('\n}\n', guardAt));
+    assert.ok(
+      !/lapseOrders/.test(delayBlock),
+      'lapseOrders is reachable from the delay-release block again — DELAY_RELEASE_INTERVAL_MS=0 would kill it silently'
+    );
+
+    // Disabling it is loud rather than silent, because the failure this fixes
+    // produced no log line at all. Anchored on the `else` arm, so this cannot be
+    // satisfied by an unrelated warning elsewhere in the file.
+    assert.match(
+      src,
+      /if \(JOBS_INTERVALS\.lapseMs > 0\) \{[\s\S]*?\} else \{[\s\S]*?console\.warn\('\[lapse\] LAPSE_INTERVAL_MS=0/,
+      'turning it off warns at boot'
+    );
+  });
+
   server.close();
   console.log(`\norderlife.test.js: ${passed} checks passed`);
-  if (passed < 8) { console.error('expected 8 checks'); process.exit(1); }
+  if (passed < 9) { console.error('expected 9 checks'); process.exit(1); }
 })();

@@ -18,6 +18,53 @@ must agree with the highest released heading.
 
 ### Added
 
+- **Order lifecycle beyond place/fill/cancel** (#97). `PATCH /api/orders/:id`
+  amends the price, the size, or both of a resting order **in one transaction**,
+  and `POST /api/orders/bulk-cancel` cancels a **list**. `POST /api/orders` and
+  the amend now accept a `persistence` — `LAPSE` or `PERSIST` — and a scheduled
+  sweep cancels unmatched `LAPSE` orders when their market turns in-play.
+
+  The amend keeps the order's `id`, and that is the point rather than a detail:
+  `id` **is** the queue position, because FIFO inside a price level is
+  `ORDER BY price, id`. The only previous way to resize a resting order was
+  cancel-then-replace, which moves the order to the **back** of its level —
+  silently demoting a market maker behind everyone who arrived after them — while
+  also churning the ledger through a release and a fresh escrow, in two round
+  trips whose worst split leaves a trader flat when they meant to be hedged.
+
+  Escrow moves by **exactly the delta, in both directions, both sides**,
+  through `holdRemainderEscrow` — the same helper the partial-fill path uses, so
+  the E14–E18 one-cent rounding cases survive an amend rather than being solved a
+  second time. Only the **unmatched remainder** moves; an already-matched
+  liability is untouched. The abuse limits apply to the delta rather than to the
+  whole order, so an amend that *reduces* a trader's exposure is never refused.
+
+  Bulk cancel validates the whole list before it reads or writes anything (the
+  `#29` lesson: no element is ever interpolated into SQL), authorises **every id
+  independently**, and returns a **partial result** with one outcome per id —
+  cancelling 39 of your own and naming a stranger's id cancels 39 and reports
+  that one as `not_found`, identically to an id that does not exist. It is
+  `200` whatever the per-order outcomes, because a batch in which most of it
+  worked is a success that happened.
+
+  `persistence` defaults to `PERSIST`, which is the venue's **entire previous
+  behaviour**: an order that says nothing rests until it matches or is
+  cancelled, including across the turn in-play, and a database upgrading into
+  this feature has every pre-existing row already correct. `MARKET_ON_CLOSE` is
+  deliberately refused, by the API *and* by a database `CHECK` — it means "into
+  the starting-price auction", and this engine has no auction and no
+  `starting_price` field, so accepting it would store a promise with nothing
+  behind it.
+
+  The sweep runs on its **own** timer (`LAPSE_INTERVAL_MS`, default 5s, `0`
+  disables with a boot warning) rather than on the in-play delay-release pass:
+  shipping it nested inside `DELAY_RELEASE_INTERVAL_MS` made an order's
+  time-in-force depend on an unrelated operational toggle, silently, which is a
+  worse state for a trader than never having had the feature. It re-reads the
+  order and the market's in-play flag inside the write transaction, so an order
+  is **either matched or cancelled, never both** — proven under concurrency with
+  two OS processes released from one barrier, not single-threaded.
+
 - **A market version on placement** (#92). Every runner and every market now
   carries a monotone `book_version`, exposed on every book the venue serves
   (`GET /api/markets/:id/book`, `GET /api/events`, and the placement response).

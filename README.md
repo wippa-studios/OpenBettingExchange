@@ -261,6 +261,10 @@ full specification, with worked examples, is in
 | Self-exclusion **fails closed** on any stored end date it cannot parse | A player's request to stop must never be silently lifted | `rg` (G15, G17) |
 | A disputed outcome is **held**, never settled or voided | Settling picks a side; voiding may give away money the venue owes | `results` (V3, R3) |
 | `orders.frozen_cents` is written only by three named modules | The escrow invariant rests on it, and a convention is not a type | `guard` (G2) |
+| An amend **keeps the order's `id`**, and `id` *is* the queue position | A cancel-and-replace at the same price silently demotes a trader behind everyone who arrived after them | `amend` (A6, and A7 as the control) |
+| Escrow moves on an amend **only by the delta**, through the same helper the partial-fill path uses | Two copies of a sign convention on a money path is a cent released when it should have been frozen | `amend` (A1–A5), `guard` (G2) |
+| The lapse sweep re-reads the order and the market **inside** the write transaction | A `matches` row against an order whose collateral was already released leaves a market unsettleable *and* un-voidable | `amend` (C5, two processes, one barrier) |
+| The lapse sweep has **its own timer**, not the delay-release knob | A money-affecting promise that dies with an unrelated operational toggle | `orderlife` (R9) |
 
 ## API
 
@@ -276,7 +280,7 @@ scripts. The complete reference, including every parameter, is in
 | `GET /api/me` | Current user, balance and escrow |
 | `GET /api/sports`, `/api/events`, `/api/markets/:id/book` | Board and order book |
 | `GET /api/feed/board`, `/api/feed/health` | Board from the odds feed (when `FEED_ENABLED=true`) |
-| `POST /api/orders`, `GET /api/orders`, `POST /api/orders/:id/cancel` | Place, list and cancel orders |
+| `POST /api/orders`, `GET /api/orders`, `PATCH /api/orders/:id`, `POST /api/orders/:id/cancel`, `POST /api/orders/bulk-cancel` | Place, list, **amend in place** (keeps your queue position), cancel one or a list |
 | `GET /api/positions` | Exposure, if-win P&L, cash-out quote |
 | `POST /api/markets/:id/cashout` | Close a position |
 | `GET /api/wallet`, `POST /api/wallet/deposit` | Balances and ledger |
@@ -428,7 +432,7 @@ weight.
 ```bash
 
 
-npm test            # 868 checks: unit and API integration, fully offline
+npm test            # 908 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 215 checks: real Chromium via Playwright (board and admin desk)

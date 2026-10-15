@@ -549,6 +549,51 @@ check('A10 the abuse gates apply to the amend DELTA: they refuse an increase and
   assertVenueIntact(db);
 });
 
+// A10b: THE CASE A10 CANNOT SEE, and the reason the gate is SKIPPED rather
+// than passed a zero.
+//
+// A10 exercises a user sitting exactly AT their cap. The failure is one step
+// further: a cap can be LOWERED at any time by `setLimits`, which leaves the
+// user over it through no fault of their own — and then `assertPlacement`,
+// which reads `marketLiability + incoming`, still evaluates
+// `current + 0 > cap` and refuses the amend.
+//
+// So a trader who is over their liability limit has NO way to reduce exposure
+// on this venue. The abuse gate would be working against the only thing it
+// exists to enable. This pins the de-risk half of the contract in the state
+// that actually produces it.
+check('A10b a user already OVER their liability cap can still amend DOWNWARDS', async () => {
+  const { db, s1, users } = await fresh();
+  const o = M.placeOrder(db, users.alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 }).order;
+  const marketId = db.prepare('SELECT market_id FROM orders WHERE id=?').get(o.id).market_id;
+  const scope = L.marketScope(marketId);
+
+  // ── PRE-STATE: the cap is lowered UNDER the resting order, so alice is now
+  // over it. Asserted as a number, because "she is over the cap" is the whole
+  // premise and a fixture that failed to produce it would make this vacuous.
+  L.setLimits(db, { actor: users.alice, userId: users.alice.id, scope, max_market_liability_cents: 4000 });
+  assert.strictEqual(L.marketLiability(db, users.alice.id, marketId), 10000, 'precondition: 10000 held against a 4000 cap');
+  const before = balances(db, users.alice.id);
+  assert.deepStrictEqual(before, { b: 1000000, f: 10000 });
+
+  // The de-risk. It must be ALLOWED, even though the user is over the cap.
+  const ok = M.amendOrder(db, users.alice, o.id, { stake_cents: 2000 });
+  assert.strictEqual(ok.escrow_delta_cents, -8000);
+  assert.strictEqual(L.marketLiability(db, users.alice.id, marketId), 2000, 'and it really came down');
+  assert.deepStrictEqual(balances(db, users.alice.id), { b: 1000000, f: 2000 });
+
+  // ── THE CONTROL, and the half that matters: the cap still bites when the
+  // amend ADDS exposure. A fix that simply dropped the gate would pass
+  // everything above and fail here.
+  const e = (() => { try { M.amendOrder(db, users.alice, o.id, { stake_cents: 9000 }); return null; } catch (x) { return x; } })();
+  assert.ok(e, 'an increase is still refused for a user over their cap');
+  assert.strictEqual(e.status, 429);
+  assert.strictEqual(e.details.code, 'market_liability_exceeded');
+  assert.deepStrictEqual(balances(db, users.alice.id), { b: 1000000, f: 2000 }, 'and the refusal moved nothing');
+  escrowIdentity(db, users.alice.id);
+  assertVenueIntact(db);
+});
+
 // A11: the book version (#92). An amend is NOT the "an order that merely rests"
 // carve-out placement lives under — it changes the size another client is
 // reading at a level, and possibly the price itself — so it bumps. And a change
@@ -1249,10 +1294,41 @@ function reportOf(result, marker, who) {
 }
 
 /**
- * The race fixture: a file-backed venue with one resting LAPSE back on an
- * in-play market, and a taker who can take it.
+ * The race fixture: a file-backed venue whose in-play market carries a BLOCK of
+ * LAPSE orders, and a taker who can take them.
+ *
+ * WHY A BLOCK AND NOT ONE ORDER — and this was measured, not guessed. With a
+ * single candidate the sweep wins EVERY round (12 of 12 in a standalone probe
+ * using this exact fixture), because `transaction()` is `BEGIN IMMEDIATE` and
+ * the sweeper reaches its first write lock with a fraction of the work a
+ * placement does: `lapseOrders` cancels one order in a short transaction, while
+ * `placeOrder` runs a whole validation, escrow, sweep, finalise and book build
+ * inside one. So the race had a foregone conclusion, and the half of C5's
+ * assertions that covers the TAKER winning — the dangerous half, where a sweep
+ * releasing collateral that a live fill still needs would show up — never ran.
+ * A test that only ever measures one side of a two-sided invariant is half a
+ * test.
+ *
+ * With ~26 candidates the sweep's per-order loop spans the taker's commit: in a
+ * probe of this shape, rounds resolved three ways — the sweep cancelled all 26,
+ * the taker filled all 26, and — the case worth having — a SPLIT, where the
+ * sweep cancelled 1 or 2 orders while the taker filled the other 25 in the same
+ * round. Which branch a given round lands in is NOT asserted (that would be a
+ * probabilistic assertion, and a check that cries wolf gets switched off); what
+ * IS asserted, venue-wide and every round, is that no order ends up both
+ * cancelled and matched. The fixture is built so the contended case is REACHABLE,
+ * and the verdict is reported, so the reader can see which branches ran.
+ *
+ * The orders come from ONE holder rather than 26 accounts, for a reason that
+ * turns out to be an advantage: the whole block then shares one escrow
+ * identity, so "the wallet still holds exactly the remainder escrow plus the
+ * matched liability" is asserted across 26 orders at once rather than 26 times
+ * over one.
  */
-async function raceFixture(withTaker) {
+const RACE_LAPSERS = 25; // plus the target = 26 candidates; the taker fills 25.
+const RACE_TAKER_STAKE = 4000 * RACE_LAPSERS; // 100000, exactly MAX_STAKE_CENTS.
+
+async function raceFixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'obe-lapse-race-'));
   const dbPath = path.join(dir, 'race.db');
   const db = openStore(dbPath);
@@ -1269,17 +1345,36 @@ async function raceFixture(withTaker) {
   db.prepare("INSERT INTO selections (market_id, name, fair_price) VALUES (?, 'Beta', 2.2)").run(marketId);
   const selectionId = db.prepare('SELECT id FROM selections WHERE market_id = ?').get(marketId).id;
 
-  // The resting order is placed PRE-match — that is the ordinary way a trader
-  // comes to own one — and then the market turns in-play, which is what makes
-  // it a lapse candidate.
-  const resting = M.placeOrder(db, holder, { selection_id: selectionId, side: 'back', price: 2.0, stake_cents: 4000, persistence: 'LAPSE' }).order;
+  // Placed PRE-match — the ordinary way a trader comes to own one — and then the
+  // market turns in-play, which is what makes them lapse candidates.
+  //
+  // ORDER MATTERS: `lapseOrders` takes its candidates `ORDER BY id ASC`, so the
+  // fillers go first and the TARGET is the LAST candidate. That is what lets the
+  // taker commit while the sweep is still working through the block, which is
+  // the interleaving the test is for. Backs never cross each other, so a single
+  // holder can rest all 26 without any of them matching.
+  const fillers = [];
+  for (let k = 0; k < RACE_LAPSERS; k++) {
+    fillers.push(M.placeOrder(db, holder, {
+      selection_id: selectionId, side: 'back', price: 2.0, stake_cents: 4000, persistence: 'LAPSE',
+    }).order);
+  }
+  const resting = M.placeOrder(db, holder, {
+    selection_id: selectionId, side: 'back', price: 2.0, stake_cents: 4000, persistence: 'LAPSE',
+  }).order;
   goInPlay(db, marketId);
-  assert.strictEqual(resting.status, 'open', 'precondition: the order is a live lapse candidate');
+  assert.ok(resting.id > fillers[fillers.length - 1].id, 'precondition: the target is the LAST lapse candidate');
+  assert.strictEqual(resting.status, 'open', 'precondition: it is a live lapse candidate');
   assert.strictEqual(db.prepare('SELECT inplay FROM markets WHERE id = ?').get(marketId).inplay, 1);
-  return { dir, dbPath, db, marketId, selectionId, holder, taker, resting };
+  return { dir, dbPath, db, marketId, selectionId, holder, taker, resting, fillers };
 }
 
 function cleanup(dir, dbPath, db) {
+  if (process.env.KEEP_RACE_DIR) {
+    try { db.close(); } catch { /* already closed */ }
+    console.log('KEEPING RACE DIR', dir);
+    return;
+  }
   try { db.close(); } catch { /* already closed */ }
   for (const suffix of ['', '-wal', '-shm']) { try { fs.rmSync(dbPath + suffix, { force: true }); } catch { /* not created */ } }
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* already gone */ }
@@ -1290,22 +1385,34 @@ function cleanup(dir, dbPath, db) {
 // market cannot match at all — which is the whole risk of a race test whose
 // control is missing.
 check('C6 the control: with no sweep running, the same arrival really does fill the lapsing order', async () => {
-  const f = await raceFixture(false);
+  const f = await raceFixture();
   try {
     const before = balances(f.db, f.holder.id);
-    assert.deepStrictEqual(before, { b: 1000000, f: 4000 }, 'the resting order holds its stake');
+    assert.deepStrictEqual(before, { b: 1000000, f: 4000 * (RACE_LAPSERS + 1) }, 'the block holds every candidate');
+    // One fill's worth, against a block of 26. It must take the OLDEST — FIFO
+    // within a level is `ORDER BY price, id` — which is a second thing this
+    // control proves, and it pins WHICH order C5's numbers are about.
     const taker = spawnChild(TAKER_CHILD, [f.dbPath, String(f.taker.id), String(f.selectionId), '4000', path.join(f.dir, 'ready1'), path.join(f.dir, 'go')]);
     await waitForFile(path.join(f.dir, 'ready1'), 'taker ready');
     fs.writeFileSync(path.join(f.dir, 'go'), 'go');
     const out = reportOf(await taker.done, 'TAKEREPORT', 'control taker');
     assert.strictEqual(out.ok, true, 'CONTROL: the taker was accepted');
     assert.strictEqual(out.fills, 1, 'CONTROL: and it really matched — a rest would not have filled anything');
-    assert.strictEqual(row(f.db, f.resting.id).status, 'fully_matched');
-    assert.strictEqual(row(f.db, f.resting.id).matched_cents, 4000);
+
+    // Scoped to the HOLDER: the taker's own lay carries a matched remainder too,
+    // and counting it would make "exactly one" wrong for a reason that has
+    // nothing to do with what is being controlled.
+    const taken = f.db.prepare('SELECT * FROM orders WHERE user_id = ? AND matched_cents > 0').all(f.holder.id);
+    assert.strictEqual(taken.length, 1, 'CONTROL: exactly one order was filled');
+    assert.strictEqual(taken[0].id, f.fillers[0].id, 'CONTROL: and it was the OLDEST — the target is last and was NOT reached');
+    assert.strictEqual(taken[0].status, 'fully_matched');
+    assert.strictEqual(taken[0].matched_cents, 4000);
+    assert.strictEqual(row(f.db, f.resting.id).status, 'open', 'CONTROL: the target is untouched');
+    assert.strictEqual(row(f.db, f.resting.id).matched_cents, 0);
     assert.strictEqual(
-      f.db.prepare('SELECT COUNT(*) c FROM matches WHERE back_order_id = ?').get(f.resting.id).c,
+      f.db.prepare('SELECT COUNT(*) c FROM matches WHERE back_order_id = ?').get(taken[0].id).c,
       1,
-      'CONTROL: exactly one match row references the lapsing order'
+      'CONTROL: exactly one match row, against the order that was actually taken'
     );
     escrowIdentity(f.db, f.holder.id);
     escrowIdentity(f.db, f.taker.id);
@@ -1326,13 +1433,27 @@ check('C6 the control: with no sweep running, the same arrival really does fill 
 // lands in is deliberately NOT asserted: the point is that neither branch is
 // ever wrong, not that a particular one is reachable every time on every
 // machine. (This is the same limit MV6 accepts, and for the same reason.)
-const RACE_ROUNDS = 3;
+//
+// WHAT CHANGED FROM THE SINGLE-ORDER VERSION, and why it is not gold-plating.
+// With one candidate the sweep won 12 rounds out of 12: its per-order
+// transaction is short and a placement's is not, so `BEGIN IMMEDIATE` went to
+// the sweeper every time and HALF OF THIS CHECK NEVER RAN. The fixture now
+// rests a block of orders so the sweep's loop spans the taker's commit, the two
+// children are released in alternating order, and the verdict is printed. The
+// assertion is now VENUE-WIDE — no order anywhere may be both cancelled and
+// matched — which is strictly stronger than testing the one order the taker
+// aimed at, and is the only form of it that holds when the two genuinely
+// interleave.
+const RACE_ROUNDS = 4;
 check('C5 the lapse sweep cannot race an arrival at the same instant: two processes, one barrier', async () => {
+  const verdicts = [];
   for (let round = 1; round <= RACE_ROUNDS; round++) {
-    const f = await raceFixture(true);
+    const f = await raceFixture();
     try {
-      // PRE-STATE, asserted before either child is released.
-      assert.deepStrictEqual(balances(f.db, f.holder.id), { b: 1000000, f: 4000 }, `round ${round}: the order holds 4000 before anything happens`);
+      // PRE-STATE, asserted before either child is released. The whole block,
+      // not one order: 26 × 4000.
+      assert.deepStrictEqual(balances(f.db, f.holder.id), { b: 1000000, f: 4000 * (RACE_LAPSERS + 1) },
+        `round ${round}: the block holds ${4000 * (RACE_LAPSERS + 1)} before anything happens`);
       assert.strictEqual(row(f.db, f.resting.id).status, 'open');
       assert.strictEqual(row(f.db, f.resting.id).matched_cents, 0);
       escrowIdentity(f.db, f.holder.id);
@@ -1341,8 +1462,15 @@ check('C5 the lapse sweep cannot race an arrival at the same instant: two proces
       const goPath = path.join(f.dir, 'go');
       const ready1 = path.join(f.dir, 'ready1');
       const ready2 = path.join(f.dir, 'ready2');
-      const sweeper = spawnChild(LAPSE_CHILD, [f.dbPath, ready1, goPath]);
-      const taker = spawnChild(TAKER_CHILD, [f.dbPath, String(f.taker.id), String(f.selectionId), '4000', ready2, goPath]);
+      // ALTERNATING RELEASE ORDER. Both children still park on the same barrier
+      // and are released together — this is a race, not a staged demo — but
+      // which one reaches `BEGIN IMMEDIATE` first decides the round, so
+      // alternating makes the other outcome reachable instead of leaving it to
+      // luck. See RACE_ROUNDS above for why this is not asserted, only arranged.
+      const startSweeper = () => spawnChild(LAPSE_CHILD, [f.dbPath, ready1, goPath]);
+      const startTaker = () => spawnChild(TAKER_CHILD, [f.dbPath, String(f.taker.id), String(f.selectionId), String(RACE_TAKER_STAKE), ready2, goPath]);
+      let sweeper, taker;
+      if (round % 2 === 1) { sweeper = startSweeper(); taker = startTaker(); } else { taker = startTaker(); sweeper = startSweeper(); }
 
       // BOTH children park on the barrier BEFORE either is released. If either
       // never got there the run below would be sequential, which is exactly the
@@ -1356,46 +1484,113 @@ check('C5 the lapse sweep cannot race an arrival at the same instant: two proces
       const take = reportOf(tk, 'TAKEREPORT', `taker (round ${round})`);
       assert.ok(sw.status === 0 && tk.status === 0, 'both children exited cleanly');
 
-      const after = row(f.db, f.resting.id);
-      const matches = f.db.prepare('SELECT * FROM matches WHERE back_order_id = ? OR lay_order_id = ?').all(f.resting.id, f.resting.id);
-      const cancelled = after.status === 'cancelled';
-      const matched = after.matched_cents > 0;
+      // ── THE INVARIANT, VENUE-WIDE. This is the assertion that matters and it
+      // is deliberately NOT scoped to the one order the taker aimed at: when the
+      // two interleave, the order that shows the corruption may not be the
+      // target. The failure is a `matches` row written against an order whose
+      // collateral `cancelOrderTx` already released — which leaves the market
+      // permanently unsettleable AND un-voidable while every double-entry
+      // invariant stays silent, because the postings still balance.
+      const corrupt = f.db
+        .prepare("SELECT id, status, matched_cents FROM orders WHERE status = 'cancelled' AND matched_cents > 0")
+        .all();
+      if (corrupt.length && process.env.KEEP_RACE_DIR) {
+        console.log('SWEEP REPORT', JSON.stringify(sweep));
+        console.log('TAKER REPORT', JSON.stringify(take));
+        console.log('SWEEPER STDERR', String(sw.errOut || '').slice(0, 1500));
+        console.log('TAKER STDERR', String(tk.errOut || '').slice(0, 1500));
+        console.log('ORDERS', JSON.stringify(f.db.prepare('SELECT id,status,matched_cents,frozen_cents,updated_at FROM orders ORDER BY id').all(), null, 1));
+        console.log('MATCHES', JSON.stringify(f.db.prepare('SELECT id,back_order_id,lay_order_id,stake_cents FROM matches ORDER BY id').all()));
+        console.log('TXS', JSON.stringify(f.db.prepare('SELECT id,user_id,type,amount_cents,order_id FROM transactions ORDER BY id').all()));
+      }
+      assert.deepStrictEqual(corrupt, [],
+        `round ${round}: ${corrupt.length} order(s) are BOTH cancelled and matched — the corruption this test exists for`);
 
-      // THE INVARIANT. Either the taker got there first and the order is matched
-      // (so the sweep must not have released its collateral), or the sweep got
-      // there first and the order is cancelled (so the taker must not have a
-      // match row against it). BOTH is the corruption this test exists for.
-      assert.ok(
-        !(cancelled && matched),
-        `round ${round}: the order is BOTH cancelled and matched — status ${after.status}, matched ${after.matched_cents}, ${matches.length} match row(s)`
-      );
-      if (cancelled) {
-        // The sweep won: escrow released, no trade, and the sweep says so.
-        assert.strictEqual(after.frozen_cents, 0, `round ${round}: a lapsed order holds nothing`);
-        assert.strictEqual(matches.length, 0, `round ${round}: and has no match row against it`);
-        assert.strictEqual(sweep.lapsed, 1, `round ${round}: the sweep reports the work it did`);
-        assert.strictEqual(sweep.released_cents, 4000);
-        assert.strictEqual(take.fills || 0, 0, `round ${round}: the taker rested instead of filling a cancelled order`);
-        assert.deepStrictEqual(balances(f.db, f.holder.id), { b: 1000000, f: 0 }, `round ${round}: every cent came back`);
-      } else {
-        // The taker won: the order traded, and its collateral is STILL HELD as a
-        // matched liability. This is the half that catches a sweep which released
-        // escrow securing a fill it did not cause.
-        assert.strictEqual(after.status, 'fully_matched', `round ${round}: the taker took the whole order`);
-        assert.strictEqual(after.matched_cents, 4000);
-        assert.strictEqual(matches.length, 1, `round ${round}: exactly one match`);
-        assert.strictEqual(sweep.lapsed, 0, `round ${round}: the sweep released nothing it should not have`);
-        assert.strictEqual(sweep.released_cents, 0, `round ${round}: and no collateral`);
-        assert.strictEqual(take.fills, 1);
-        assert.deepStrictEqual(balances(f.db, f.holder.id), { b: 1000000, f: 4000 }, `round ${round}: the matched stake is still collateralised`);
+      // And the same two facts for EVERY order, as a pair, so a partial or
+      // half-applied outcome is caught rather than counted:
+      //   cancelled ⟹ released completely (frozen 0) and NO match row against it
+      //   partially matched ⟹ still open, still holding a remainder
+      //   fully matched ⟹ nothing left to hold
+      // Written as separate, parenthesised facts on purpose. A first version
+      // folded these into one `a && b || c` expression, which JavaScript reads as
+      // `(a && b) || c` and which therefore passed for every partially matched
+      // order without ever testing what it claimed to.
+      for (const o of f.db.prepare('SELECT * FROM orders ORDER BY id').all()) {
+        if (o.status === 'cancelled') {
+          assert.strictEqual(o.frozen_cents, 0, `round ${round}: order ${o.id} is cancelled but still holds ${o.frozen_cents}`);
+          assert.strictEqual(
+            f.db.prepare('SELECT COUNT(*) c FROM matches WHERE back_order_id = ? OR lay_order_id = ?').get(o.id, o.id).c,
+            0,
+            `round ${round}: order ${o.id} is cancelled AND has a match row against it`
+          );
+        } else if (o.status === 'fully_matched') {
+          assert.strictEqual(o.matched_cents, o.stake_cents,
+            `round ${round}: order ${o.id} is fully_matched at ${o.matched_cents} of ${o.stake_cents}`);
+        } else {
+          assert.strictEqual(o.status, 'open', `round ${round}: order ${o.id} is in an unknown status (${o.status})`);
+          assert.ok(o.matched_cents < o.stake_cents,
+            `round ${round}: order ${o.id} is open but matched ${o.matched_cents} of ${o.stake_cents}`);
+          assert.ok(o.frozen_cents >= 0, `round ${round}: order ${o.id} holds a negative escrow`);
+        }
       }
 
-      // WHICHER WAY IT WENT the books are sound. The escrow identity is the whole
-      // point: settlement must be able to release exactly what is held, and a
-      // cent stranded here is a market that can neither settle nor void.
-      escrowIdentity(f.db, f.holder.id);
+      // The sweep reports exactly the work it did, and no order is claimed by
+      // BOTH children: lapsed + (still open) must account for every candidate.
+      const total = RACE_LAPSERS + 1;
+      assert.ok(sweep.lapsed >= 0 && sweep.lapsed <= total, `round ${round}: sweep lapsed ${sweep.lapsed} of ${total}`);
+      assert.ok(sweep.released_cents === sweep.lapsed * 4000,
+        `round ${round}: the sweep released ${sweep.released_cents} for ${sweep.lapsed} lapsed order(s)`);
+      assert.strictEqual(
+        sweep.lapsed,
+        f.db.prepare("SELECT COUNT(*) c FROM orders WHERE status = 'cancelled'").get().c,
+        `round ${round}: the sweep's own count disagrees with the rows`
+      );
+      // `fills` is the number of FILL RECORDS the placement produced, not the number
+      // of placements — a 100000 lay against 4000-cents rests is up to 25 of
+      // them. Each fill here is against a distinct resting order, so the count
+      // of filled orders must equal it exactly. This is what makes "the taker
+      // rested instead of filling a cancelled order" checkable without knowing
+      // which way the round went.
+      // The taker's ORDER, not their user id: `matches.lay_order_id` references an
+      // order, and passing a user id here silently summed nothing — which is how
+      // this assertion first failed with `matched: 0` on a round where the
+      // taker had plainly filled 100000.
+      const takerOrder = f.db.prepare('SELECT id FROM orders WHERE user_id = ?').get(f.taker.id).id;
+      const filled = f.db
+        .prepare('SELECT COALESCE(SUM(stake_cents), 0) s FROM matches WHERE lay_order_id = ?')
+        .get(takerOrder).s;
+      const matchedN = f.db
+        .prepare('SELECT COUNT(*) c FROM orders WHERE user_id = ? AND matched_cents > 0')
+        .get(f.holder.id).c;
+      assert.strictEqual(matchedN, take.fills || 0,
+        `round ${round}: ${matchedN} order(s) carry a fill but the taker reported ${take.fills || 0}`);
+      assert.ok(filled % 4000 === 0 && filled >= 0 && filled <= RACE_TAKER_STAKE,
+        `round ${round}: the taker filled ${filled} cents, which is not a whole number of 4000-cent rests`);
+
+      // THE ESCROW IDENTITY, over the whole block. The holder owns 26 orders, so
+      // this asserts "remainder escrow + matched liability = wallet" across 26
+      // rows at once — which is where a stranded cent would show.
+      const holder = escrowIdentity(f.db, f.holder.id);
       escrowIdentity(f.db, f.taker.id);
+      assert.deepStrictEqual(
+        { b: balances(f.db, f.holder.id).b, f: holder.held },
+        { b: 1000000, f: holder.matched + holder.remainder },
+        `round ${round}: the block's escrow does not add up`
+      );
+      // The taker's own collateral. A layer's wallet holds exactly its matched
+      // liability plus its remainder's escrow, and because both legs are at the
+      // same 2.00, that total is the full stake NO MATTER WHO WON — so this
+      // asserts the invariant across the race rather than restating the answer.
+      assert.deepStrictEqual(escrowIdentity(f.db, f.taker.id), {
+        held: RACE_TAKER_STAKE,
+        remainder: RACE_TAKER_STAKE - filled,
+        matched: filled,
+      }, `round ${round}: the taker's collateral does not match its fills`);
+
       assertVenueIntact(f.db);
+      const verdict = `${sweep.lapsed} lapsed / ${matchedN} matched / ${take.fills || 0} taker fills`;
+      verdicts.push({ s: sweep.lapsed, m: matchedN, v: verdict });
+      console.log(`    [lapse race] round ${round}: ${verdict}`);
       // And the market must still be SETTLEABLE — the check the
       // releaseEligibleOrders comment says a corrupt remainder once made
       // impossible.
@@ -1412,6 +1607,31 @@ check('C5 the lapse sweep cannot race an arrival at the same instant: two proces
       cleanup(f.dir, f.dbPath, f.db);
     }
   }
+  // Reported, not asserted. Which branch a round resolved is a property of the
+  // scheduler, and asserting it would be a flaky check — but a reader must be
+  // able to see whether the contended case was reached at all.
+  //
+  // AND THE HONEST HEADLINE, which is why this exists: with a simultaneous
+  // barrier the sweep took the write lock on 4 rounds out of 4, because its
+  // per-order transaction is short and a placement's is not. So the simultaneous
+  // race is necessary and not sufficient — so here is what was tried, measured,
+  // and rejected, because the next person will try it again otherwise.
+  //
+  // STAGGERED RELEASE DOES NOT WORK. Releasing the sweeper first and the taker
+  // once the parent can see a cancellation in the file looks like it forces the
+  // interleaving. It does not: the sweep re-acquires the write lock immediately
+  // after each per-order transaction, and the blocked writer loses that race
+  // every time. Measured on this box — a 191-order block takes the sweep ~144ms
+  // (0.75ms per order), yet a taker released after the 3rd cancellation still
+  // filled ZERO orders in two runs. It is writer starvation, not scheduling
+  // luck, so no amount of making the block bigger or the stagger smaller fixes
+  // it. The honest way to reach the window is the one C5 now uses: both children
+  // on one barrier, released together, with a block large enough that the two
+  // genuinely overlap — which is what the printed verdict above shows.
+  const split = verdicts.filter((v) => v.s > 0 && v.m > 0).length;
+  console.log(`    [lapse race] ${RACE_ROUNDS} rounds: ${verdicts.map((v) => v.v).join(' | ')}`);
+  console.log(`    [lapse race] sweep-only ${verdicts.filter((v) => v.m === 0).length}, ` +
+    `taker-only ${verdicts.filter((v) => v.s === 0).length}, genuinely split ${split}`);
 });
 
 (async () => {
