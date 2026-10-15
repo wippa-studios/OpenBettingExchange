@@ -46,7 +46,7 @@ delay, per-user abuse limits, responsible-gambling controls, and an operator des
 
 | | |
 |---|---|
-| Tests | **799 checks / 63 suites**, plus a **212-check** Playwright browser suite |
+| Tests | **817 checks / 64 suites**, plus a **212-check** Playwright browser suite |
 | CI | 8 jobs: node 22 + 24, browser, guards, load smoke, dependency audit, and two secret scans |
 | Supply chain | every action pinned to a full commit SHA, dependabot configured |
 | Docs | `check-docs.mjs` **fails the build** when documentation contradicts the code |
@@ -107,8 +107,8 @@ As measured on `main` before the work started:
 | Machine-readable error codes | partial — some routes carried `details.code`, most carried nothing |
 | Stability promise | none |
 
-**Status: in flight on `feat/api-contract`, not yet merged.** What it builds, and
-what is deliberately odd about it:
+**Status: MERGED at `8fe1ee9`.** What it builds, and what is deliberately odd
+about it:
 
 - `X-API-Version` on **every** `/api` response including errors, because a client
   most needs to know what it is talking to when it is failing. It is a
@@ -127,8 +127,9 @@ what is deliberately odd about it:
 - A machine-readable `code` on every error, via a single `apiError()` shaper all
   44 error responses now route through, so the two response paths cannot drift.
 
-Still to land in that branch: the SSE stream as a documented subscription with
-reconnect semantics.
+Still open in that area, and it is not small: the SSE stream as a documented
+subscription with reconnect semantics. What exists is an *invalidation ping*, not
+a market data feed — see `#90`, filed during the Betfair-parity deep dive.
 
 ### 2.2 A first release — and a changelog that invents two
 
@@ -144,7 +145,7 @@ Measured, not remembered:
 So the changelog documents **two releases that never happened**, on the repo's
 first two days, with no tags and no version bump behind them. `[0.2.0]` describes
 "a real-browser Playwright suite (24 checks)" — that was day 2 of a 166-commit
-repo. It is 212 browser checks and 63 suites now.
+repo. It is 212 browser checks and 64 suites now.
 
 For an open-source project this is worse than an absent changelog, because it
 answers "is this maintained?" wrongly. A reader concludes there is a release
@@ -255,9 +256,14 @@ a conformance suite before it needs adapters.
 
 ## 4. How to read the issue tracker
 
-**81 filed, 75 closed, 6 open.** Measured with `search_issues`, not counted by
-hand — the closed list alone is longer than one page of `list_issues`, which is
-how an earlier count of this file came to be wrong.
+**105 filed, 75 closed, 30 open** — and `#106` exists, so the true count is at
+least 106. Measured with `search_issues`, not counted by hand.
+
+GitHub's issue-search index LAGS, repeatedly and in both directions. It reported
+`total: 105` while the highest issue number was `106`; earlier it reported 8 open
+when 10 existed, and `issue_write` returned `{}` for two creations that had
+succeeded. Never treat a count from this API as authoritative without also
+reading the highest issue number.
 
 | | |
 |---|---|
@@ -270,6 +276,29 @@ how an earlier count of this file came to be wrong.
 - **`#76` reports two things it did not build that are still open**: continuous
   semantics (`#77`, now deferred) and the house-participation gap, which it found
   by checking rather than by being told.
+
+## 4a. A second, concurrent line of work exists
+
+Issues `#88`–`#106` were filed on 2026-10-15, 17:04–17:07, during the window this
+work was fixing the API contract and the test harness. They are a **Betfair-parity
+deep dive**, and they are not mine: `#88` (`applyOutcome` settling a declared
+non-runner as a loser — a money-path defect, said to reproduce on `main` today),
+`#90` (the SSE stream is an invalidation ping, not a market data feed), `#95`
+(no market type; the engine models one shape), `#100` (operator surface), `#106`
+(no navigation read model — no `listEventTypes` equivalent).
+
+**Nothing in §2 was written with those in mind**, so this file understates the gap
+between this venue and Betfair considerably. Read it alongside the tracker, not
+instead of it. Three consequences worth acting on:
+
+- **`#88` claims a reproducible money-path defect on `main`.** If that holds it
+  outranks everything in §2 — it loses a bettor's stake rather than omitting a
+  feature. Verify before believing; check it first.
+- **`#90` makes §2.7's adapter seam bigger than its own plan estimated.** That
+  plan costed the streaming half as already-built. If the SSE side was never
+  built, stages 0–3 are larger than 13–17 days and the estimate is void.
+- **`#95` means §2.6's ladder work is scoped to one market shape.** Adding a
+  second shape invalidates assumptions a colour-separation decision rests on.
 
 ## 5. The failure modes worth remembering
 
