@@ -188,7 +188,16 @@ check('L8 the matched figure and bar are in the markup, and absent when unt trad
   assert.ok(traded.matchedRow.includes('$30.00'), 'the matched figure is rendered');
   assert.ok(traded.matchedRow.includes('class="mv'), 'in the element the stylesheet targets');
   assert.ok(traded.bar.includes('class="mbar"'), 'the bar track is rendered');
-  assert.ok(traded.bar.includes('width:86%'), `the bar is the matched share (got ${traded.bar})`);
+  // The bar's WIDTH is an SVG geometry attribute, not an inline style: the venue
+  // serves `style-src 'self'` with no 'unsafe-inline', so `style="width:N%"`
+  // was blocked by the browser and the bar never drew. What is asserted here is
+  // the VALUE — the matched share — and not the mechanism that carries it, so
+  // the check reads whichever attribute is present rather than pinning the
+  // markup. `tests/ui_test.mjs` is what pins the mechanism, by failing on an
+  // uncaught page error if a future change puts an inline style back.
+  const width = (traded.bar.match(/width[:=]\s*"?(\d+)/) || [])[1];
+  assert.strictEqual(width, '86', `the bar is the matched share (got ${traded.bar})`);
+  assert.ok(!/style="/.test(traded.bar), 'and the bar carries no inline style, which the CSP would block');
   assert.ok(traded.labelSuffix.includes('$30.00'), 'the accessible label carries it too');
 
   const quiet = client.matchedCellParts({ price: 2.5, size_cents: 500 }, money);
