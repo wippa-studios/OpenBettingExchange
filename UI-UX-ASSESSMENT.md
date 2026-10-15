@@ -8,6 +8,41 @@ was touched.
 
 ---
 
+## Status — re-verified against `main` @ `f49450b`, 2026-10-16
+
+This assessment was written against `ab16649` and then left unmerged while its findings
+were acted on elsewhere. `82528f5` — *"fix(#68): the account panel was not a modal, the
+operator console had no CSS, and a 500 rendered as an empty venue"* — landed **after**
+this document was written.
+
+So this file is a snapshot of a base it no longer describes, and merging it unedited
+would have asserted against the code several defects that no longer exist. That is the
+exact failure this repository treats as its worst one, so the table below is here rather
+than left implicit.
+
+**Every row was re-checked against the code. None of these statuses are taken from the
+prose below.**
+
+| § | Finding | Status | Evidence for the status |
+|---|---|---|---|
+| 2.1 | Ladder ramp: worst back price at the meeting point | **FIXED** | `public/js/board.js` now calls `cellsFor(sel, back, 'back', 'atright')`, and the comment above it records this exact defect |
+| 2.2 | Account panel is not a modal | **FIXED** | `82528f5`, by name |
+| 2.3 | Whole app renders at 52% on a phone; the lay side is off-screen | **OPEN** | `.lrow` `grid-template-columns` still floors at 150 + 6×70 = **570px**; `public/index.html:5` sets `width=device-width`; `public/style.css` still has exactly two breakpoints (1000px, 900px). A 570px floor in a 390px viewport is unchanged |
+| 2.4 | Operator console visual language does not exist | **MOSTLY FIXED** | `82528f5`. 29 of the 30 class tokens `public/admin-risk.js` emits now resolve in `public/style.css`; `.hoPick` still does not |
+| 2.5 | Slip sends two opposite orders on one runner | **OPEN, and deliberately excluded** | No netting logic exists in `public/js/slip.js`. `STATE.md` §3 records this as excluded **by decision, not by neglect** — netting changes what a position *is* |
+| 3.1 | A 500 and an empty venue render the same screen | **FIXED** | `82528f5`, by name |
+
+Two of the three still-open findings are **already tracked**: 2.3 by `#136`, and 2.5 by
+the explicit exclusion in `STATE.md` §3. So this document now contributes evidence and a
+falsified base rather than backlog.
+
+The line references throughout the body are stale for the same reason — `public/style.css`
+was rewritten after `ab16649`, so the `style.css:NNN` pointers no longer land where this
+report says they do. Findings 2.3 and 2.4 above were re-derived from the current files
+for exactly that reason.
+
+---
+
 ## 0. Method, and what it means for how much to trust this
 
 `scripts/shoot.mjs` carries a rule I inherited: *never save a screenshot you have not
