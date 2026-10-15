@@ -81,7 +81,19 @@ const FEED_ON = process.env.FEED_ENABLED === 'true';
       // Match the connection specifics, not the word "feed" (which legitimately
       // appears in the message "Odds feed unavailable").
       assert.ok(!/59999|ECONNREFUSED|postgres:\/\/|:feed@|nobody/i.test(body), `body was ${body}`);
-      assert.deepStrictEqual(sent.body, { error: 'Odds feed unavailable' });
+      // Key SET rather than whole-body equality, for the same reason as the other
+      // three sites that had to change (#83): `deepStrictEqual` on the whole
+      // body pins the absence of every field that does not exist yet, so adding
+      // the deliberate `code` broke it. The property this check actually cares
+      // about is "nothing beyond error+code escaped", which the key set states
+      // exactly — and the leak assertion above is the real content.
+      assert.deepStrictEqual(
+        Object.keys(sent.body).sort(),
+        ['code', 'error'],
+        `the 503 body carried a field beyond error+code: ${body}`,
+      );
+      assert.strictEqual(sent.body.error, 'Odds feed unavailable');
+      assert.strictEqual(sent.body.code, 'feed_unavailable', `unexpected code in ${body}`);
     });
 
     await check('enabled + healthy: nav answers 200 with the shaped sports tree', async () => {

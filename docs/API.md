@@ -13,6 +13,68 @@ tick ladder in [`lib/odds.js`](../lib/odds.js).
 
 ---
 
+## The API version, and what it promises
+
+Every `/api` response carries:
+
+```
+X-API-Version: 1
+```
+
+Read it once at startup and refuse to run against a version you were not built
+for. That is the entire point of the header: **the URL never changes**, so without
+it there is no signal at all that the contract has moved underneath you.
+
+The value is a **constant in the code**, not a configuration key. An operator
+cannot set it from the environment — deliberately, because an operator who could
+would be able to announce version 2 from a `.env` while still serving version 1,
+and a client that trusted the header would be wrong in a way nothing could
+detect. A contract version that lies is worse than no contract version at all.
+
+### What version 1 promises
+
+**Stable within v1, without exception:**
+
+| | |
+|---|---|
+| Route paths and HTTP methods | a route is not renamed or moved in v1 |
+| Field names | request and response field names do not change |
+| Integer cents | every `*_cents` stays an integer; never a float, never a string |
+| `code` on errors | present on every response that has one, and derived from status when a route does not set it explicitly |
+| Status codes | a documented status for a documented condition does not change |
+| `X-RateLimit-*` and `Retry-After` | emitted on the same routes as today |
+
+**Explicitly NOT promised in v1:**
+
+- **Field semantics.** A field will not be renamed or retyped, but a description
+  may be clarified, and a field may be *added*. Treat every field you do not
+  recognise as if it were not there.
+- **New routes, or new fields on existing routes.** These will be added, and a
+  strict client that rejects unknown fields will break.
+- **Rate limits.** The values are deployment config (`RATE_LIMIT_*`), so they
+  differ per venue and an operator may change them without a version bump. **Read
+  the headers; do not hard-code the numbers.**
+- **Ordering** of any array not documented as ordered.
+- **The `/api/stream` payload's internal shape.** The envelope is stable; the
+  event types are documented individually below and may be added to.
+
+### How it will change
+
+Additive first. A new version is cut only when a change **cannot** be made
+additively — a field must change type or meaning, or a route must change
+semantics. When that happens:
+
+1. The **old version keeps working** for at least one release cycle.
+2. The header moves to `2`. A client sending nothing, or sending `1`, is served
+   v1.
+3. The changelog records what changed and what to do about it.
+
+There is currently no request-header override, because a version you can only
+opt *out* of is not a promise. If a v2 is ever cut, a `X-API-Version: 1` request
+header will select v1 explicitly.
+
+---
+
 ## Conventions
 
 These hold for every route. They are stated once here rather than repeated per
@@ -28,6 +90,44 @@ endpoint.
 | Unknown `/api` path | `404 { "error": "Unknown endpoint" }`, never Express's HTML page |
 | Caching | **Every `/api` response carries `Cache-Control: no-store`**, including the money routes (`/api/me`, `/api/wallet`, `/api/positions`, `/api/settlements`, `/api/orders`) and the public catalogue. Those are cookie-authenticated GETs carrying balances and exposure — the shape a shared proxy caches and serves back to the wrong user. `no-store` rather than `no-cache`: the latter still permits storing a response and revalidating it. The rule is blanket because a per-route list is a list to forget, and the forgotten route is the one that leaks. `GET /api/stream` is the exception and keeps its own `no-cache` |
 | Scheduling | Reconciliation, the results poll, backups, the in-play delay release and WAL maintenance run on timers (`JOBS_INTERVALS` in `server.js`). Each is operator-triggerable through the routes below except maintenance |
+
+### Rate limits
+
+Every response that passes through a volume-limited route carries the caller's
+current budget, **whether or not the request succeeded**:
+
+```
+X-RateLimit-Limit: 600
+X-RateLimit-Remaining: 597
+X-RateLimit-Reset: 60
+```
+
+`X-RateLimit-Reset` is seconds until the oldest hit in the sliding window ages
+out — not a wall-clock timestamp, so you do not need to synchronise a clock to
+use it.
+
+**Read these and pace yourself.** A client that only learns the limit by hitting
+it has no way to back off before it does, and one that has to guess will
+eventually get it wrong. Backing off on your own reading of `Remaining` costs
+nothing; backing off after a `429` costs a refused request every time.
+
+Two things a client must not do:
+
+- **Do not hard-code the numbers.** They are deployment config (`RATE_LIMIT_*`)
+  and differ per venue. An operator may change them without a version bump,
+  which is why they are not part of what v1 promises.
+- **Do not treat a missing header as unlimited.** A route whose bucket is
+  disabled emits **no** `X-RateLimit-*` headers rather than `Limit: 0` — a
+  disabled limit is not a limit of zero, and announcing one would tell a pacing
+  client to back off against a ceiling that does not exist. Absent means "not
+  configured", which is not the same claim as "unlimited".
+
+When a request *is* refused, `Retry-After` carries the same value in seconds and
+the body is `429 { "error": "Too many requests", "code": "rate_limited",
+"retry_after_seconds": n }`. Note that only the volume limiter produces this
+shape — see [Error codes](#error-codes) for the other sources of a `429`, which
+are not rate limits and cannot be retried.
+
 
 ### Authentication
 
@@ -134,6 +234,56 @@ boot, naming them. Merging them is not automatic because each carries its own
 balance, orders and settlements; rename one of each and start again.
 
 ### Error codes
+
+Every response that carries an error also carries a **machine-readable `code`**
+alongside the human `error` string:
+
+```json
+{ "error": "Too many requests", "code": "rate_limited", "retry_after_seconds": 4 }
+```
+
+**Branch on `code`. Never on `error`.** `error` is prose and its wording is not
+promised; `code` is. This is the difference that lets a strategy react correctly
+to a refusal instead of pattern-matching an English sentence.
+
+A route that knows exactly what went wrong sets its own code. Every other route
+gets one **derived from the status**, so `code` is present on all of them rather
+than only the annotated few:
+
+| `code` | Derived from | Set explicitly for |
+| --- | --- | --- |
+| `bad_request` | `400` | — |
+| `unauthenticated` | `401` | — |
+| `forbidden` | `403` | — |
+| `not_found` | `404` | — |
+| `conflict` | `409` | — |
+| `payload_too_large` | `413` | — |
+| `unprocessable` | `422` | — |
+| `internal_error` | `500` | — |
+| `rate_limited` | `429` | the **request-volume** limiter only |
+
+Two deliberate choices in that table:
+
+**The 5xx entries are coarse.** The message is a generic `Internal error` and
+inventing a precise code would tell a client more than the venue actually knows
+about a fault it has only just detected.
+
+**A route-supplied `code` survives onto a 5xx, even though `details` does not.**
+This is the one asymmetry, and it is deliberate. `details` is the leak channel
+and is stripped from every 5xx. A `code` is a short machine token written by the
+venue's own routes, so it carries no user data — and stripping it would remove
+the only thing that tells a *deliberate* refusal apart from a *genuine* fault.
+Both are 5xx; today the venue answers `503 { "code": "feed_unavailable" }` when
+the price feed is down and `500 { "code": "internal_error" }` when something
+actually broke. A client that can only see the status cannot act on the
+difference; a client that can see the code can wait rather than retry.
+
+**`rate_limited` is explicit, not derived from the `429` status.** Two unrelated
+events in this API share that status — a caller exceeding a volume budget, and
+the venue being full — and a client that treats them alike will do the wrong
+thing for one of them. Conflating them is exactly what the 429 table below warns
+about, so the limiter names its own code. The other 429 sources are described
+below and currently fall through to the status-derived default.
 
 | Status | Meaning as the code actually uses it |
 | --- | --- |

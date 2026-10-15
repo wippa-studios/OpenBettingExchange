@@ -318,6 +318,19 @@ const check = async (name, fn) => {
     });
 
     // ── a 5xx must never leak internals to the client ───────────────────
+    //
+    // The security property this check exists for is "nothing but the generic
+    // message and the machine code escape". It used to assert that with a
+    // `deepStrictEqual` on the WHOLE body, which also pinned the absence of
+    // every field that does not exist yet — so adding the deliberate `code`
+    // broke it.
+    //
+    // Asserting the exact key SET is the right way round. It keeps the real
+    // guarantee (no extra key, ever, is how details leak) while leaving room
+    // for a field added on purpose. `code` is deliberately not a leak: it is a
+    // static token from a fixed table and carries nothing about the fault.
+    // Pinning the whole body instead would have made "no internals escape"
+    // depend on no contributor ever again wanting to add anything to it.
     await check('error handler hides 5xx detail but keeps 4xx messages', async () => {
       const sent = {};
       const res = {
@@ -329,12 +342,23 @@ const check = async (name, fn) => {
         {}, res, () => {}
       );
       assert.strictEqual(sent.code, 500);
-      assert.deepStrictEqual(sent.body, { error: 'Internal error' });
-      assert.ok(!JSON.stringify(sent.body).includes('UNIQUE'));
+      assert.strictEqual(sent.body.error, 'Internal error', 'the generic message must not carry the real one');
+      assert.strictEqual(sent.body.code, 'internal_error', 'a 5xx must still be machine-readable (#83)');
+      // The actual leak assertion: nothing beyond these two keys.
+      assert.deepStrictEqual(
+        Object.keys(sent.body).sort(),
+        ['code', 'error'],
+        'a 5xx body carried a field beyond error+code — that is how details leak',
+      );
+      assert.ok(!JSON.stringify(sent.body).includes('UNIQUE'), 'the SQL error reached the client');
+      assert.ok(!JSON.stringify(sent.body).includes('/srv/data/db'), 'the internal path reached the client');
 
       srv.errorHandler(Object.assign(new Error('Insufficient available balance'), { status: 400 }), {}, res, () => {});
       assert.strictEqual(sent.code, 400);
-      assert.deepStrictEqual(sent.body, { error: 'Insufficient available balance' });
+      // A 4xx keeps its REAL message — that is the behaviour the title claims,
+      // and precisely what a 5xx must not do.
+      assert.strictEqual(sent.body.error, 'Insufficient available balance', 'a 4xx must keep its own message');
+      assert.strictEqual(sent.body.code, 'bad_request', 'a 4xx must carry a derived code');
     });
 
     // ── SSE stream ──────────────────────────────────────────────────────

@@ -417,13 +417,19 @@ async function main() {
     const s2 = probe.listen(0, '127.0.0.1');
     await new Promise((r) => s2.on('listening', r));
     const b2 = `http://127.0.0.1:${s2.address().port}`;
-    const r = await fetch(b2 + '/probe', {
-      method: 'POST',
-      headers: { 'content-type': 'text/plain' },
-      body: 'this is not json',
-    });
-    await r.text();
-    s2.close();
+    // finally, for the same reason as E7b: a failed assertion between here and
+    // the close would leak the listener and hang the whole run instead of
+    // failing it.
+    try {
+      const r = await fetch(b2 + '/probe', {
+        method: 'POST',
+        headers: { 'content-type': 'text/plain' },
+        body: 'this is not json',
+      });
+      await r.text();
+    } finally {
+      s2.close();
+    }
     assert.strictEqual(seen, 'undefined',
       'Express 5 leaves req.body undefined when no parser matched — this is the behaviour E5b protects');
   });
@@ -599,6 +605,16 @@ async function main() {
     await new Promise((r) => ps.on('listening', r));
     const pb = `http://127.0.0.1:${ps.address().port}`;
 
+    // try/finally, and this is not decoration. A `listen()`ed server that is not
+    // closed keeps the process alive forever, so a FAILED ASSERTION ANYWHERE in
+    // this check used to turn into a HANG rather than a failure — and a hang in
+    // run_all.js wedges the remaining ~48 suites behind it, so one broken
+    // expectation silently suppressed the entire rest of the suite.
+    //
+    // That is strictly worse than failing: the run produces no summary at all,
+    // so the only evidence anything is wrong is that it stopped. It cost a full
+    // diagnostic cycle hunting a hang that was really an assertion failure.
+    try {
     // The status must SURVIVE auto-forwarding. If it did not, every 4xx thrown
     // from an async handler in this app would become a 500 — and the handlers
     // that matter here throw 400/403/409 for ordinary client mistakes
@@ -613,8 +629,17 @@ async function main() {
     const untyped = await fetch(pb + '/probe/untyped');
     const untypedBody = await untyped.text();
     assert.strictEqual(untyped.status, 500);
-    assert.strictEqual(untypedBody, JSON.stringify({ error: 'Internal error' }),
-      `an untyped async fault must not leak its message: ${untypedBody}`);
+    // The GENERICISING, not the exact byte string. This used to assert the body
+    // was exactly `{"error":"Internal error"}`, which also pinned the absence of
+    // every field not yet invented — so adding the deliberate `code` (#83) broke
+    // it. What this check is for is that the underlying message does not escape,
+    // and that is asserted directly below and is a stronger claim than the
+    // whole-body comparison was.
+    const untypedJson = JSON.parse(untypedBody);
+    assert.strictEqual(untypedJson.error, 'Internal error', `untyped fault leaked its own message: ${untypedBody}`);
+    assert.strictEqual(untypedJson.code, 'internal_error', 'a 5xx must still be machine-readable (#83)');
+    assert.ok(!untypedBody.includes('untyped async fault'), 'the error message reached the client');
+    assert.ok(!untypedBody.includes('detail a client must not see'), 'the detail string reached the client');
 
     // And the case E6's guard exists for: the response is already out, and the
     // rejection arrives anyway.
@@ -631,8 +656,9 @@ async function main() {
     const afterBody = await after.text();
     assert.strictEqual(after.status, 200, `the written response was disturbed: ${after.status}`);
     assert.strictEqual(afterBody, JSON.stringify({ delivered: true }), `body was ${afterBody}`);
-
-    ps.close();
+    } finally {
+      ps.close();
+    }
   });
 
   // ── E8: removed APIs ──────────────────────────────────────────────────────

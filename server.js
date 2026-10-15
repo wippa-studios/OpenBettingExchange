@@ -216,7 +216,7 @@ app.use((req, res, next) => {
     // thing against the authority the client addressed.
     if (u.host && req.headers.host && u.host === req.headers.host) return next();
   } catch {}
-  return res.status(403).json({ error: 'Forbidden origin' });
+  return apiError(res, 403, 'Forbidden origin');
 });
 
 app.use(
@@ -402,9 +402,7 @@ function firstRunLockResponse(req, res) {
   // The lock is a control, not a trap: it must block trading while leaving the
   // exit open.
   if (isSetupRoute(req)) return false;
-  res.status(403).json({
-    error: 'Change your password before using the exchange',
-    details: {
+  apiError(res, 403, 'Change your password before using the exchange', {
       code: 'password_change_required',
       username: req.user.username,
       // THE FIXTURE THIS REPLACED: `seeded_password: username === 'admin' ?
@@ -429,13 +427,12 @@ function firstRunLockResponse(req, res) {
       // client needs is the FLAG — which it already has, from
       // `user.must_change_password` on the login response — and a reason, which
       // is what this now says.
-    },
-  });
+    });
   return true;
 }
 
 function requireAuth(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+  if (!req.user) return apiError(res, 401, 'Authentication required');
   // Stamp RG activity on real use. The session clock is reset only after an
   // IDLE gap measured from this, so signing out cannot start a new session —
   // see lib/rg.js.
@@ -450,7 +447,7 @@ function requireAuth(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+  if (!req.user) return apiError(res, 401, 'Authentication required');
   try {
     if (Number(config.RG_SESSION_MINUTES || 0) > 0) RG.touch(db, req.user.id);
   } catch {
@@ -463,7 +460,7 @@ function requireAdmin(req, res, next) {
   // tolerance sanitizeUser applies: a session minted before the accounts
   // migration may carry a row whose role column has not been read yet.
   if (req.user.role !== 'admin' && !req.user.is_admin) {
-    return res.status(403).json({ error: 'Admin only' });
+    return apiError(res, 403, 'Admin only');
   }
   next();
 }
@@ -988,10 +985,8 @@ function limit(bucket) {
     }
     if (retryAfter > 0) {
       res.setHeader('Retry-After', String(retryAfter));
-      return res.status(429).json({
-        error: 'Too many requests',
-        code: 'rate_limited',
-        retry_after_seconds: retryAfter,
+      return apiError(res, 429, 'Too many requests', { code: 'rate_limited' }, {
+        extra: { retry_after_seconds: retryAfter },
       });
     }
     next();
@@ -1249,14 +1244,14 @@ app.get('/api/sports', limit('read'), (req, res) => {
 // recorder's Postgres, so there is no matching book here — the ladder IS the
 // observed exchange. Shape matches /api/events so the frontend is unchanged.
 app.get('/api/feed/board', aw(async (req, res) => {
-  if (!config.FEED_ENABLED) return res.status(409).json({ error: 'Feed is disabled (set FEED_ENABLED=true)' });
+  if (!config.FEED_ENABLED) return apiError(res, 409, 'Feed is disabled (set FEED_ENABLED=true)');
   try {
     const markets = await FEED.fetchBoard({ limit: clampFeedLimit(req.query.limit, config.FEED_MARKET_LIMIT) });
     res.json({ markets });
   } catch (e) {
     // A feed outage must not look like a 500 from the exchange itself.
     console.error('[feed] board read failed:', e.message);
-    res.status(503).json({ error: 'Odds feed unavailable' });
+    apiError(res, 503, 'Odds feed unavailable', { code: 'feed_unavailable' });
   }
 }));
 
@@ -1345,17 +1340,17 @@ function feedBootStatus(h, staleSeconds) {
 // you picked has closed" is an ordinary outcome the page renders as such, and
 // only a missing `id` parameter is a 400.
 app.get('/api/feed/market', aw(async (req, res) => {
-  if (!config.FEED_ENABLED) return res.status(409).json({ error: 'Feed is disabled (set FEED_ENABLED=true)' });
+  if (!config.FEED_ENABLED) return apiError(res, 409, 'Feed is disabled (set FEED_ENABLED=true)');
   const id = req.query.id;
   if (!id || !String(id).trim()) {
-    return res.status(400).json({ error: 'id is required' });
+    return apiError(res, 400, 'id is required');
   }
   try {
     const market = await FEED.fetchMarket(id);
     res.json({ market: market || null });
   } catch (e) {
     console.error('[feed] market read failed:', e.message);
-    res.status(503).json({ error: 'Odds feed unavailable' });
+    apiError(res, 503, 'Odds feed unavailable', { code: 'feed_unavailable' });
   }
 }));
 
@@ -1368,7 +1363,7 @@ app.get('/api/feed/nav', aw(async (req, res) => {
     res.json({ enabled: true, sports: await FEED.fetchNav() });
   } catch (e) {
     console.error('[feed] nav read failed:', e.message);
-    res.status(503).json({ error: 'Odds feed unavailable' });
+    apiError(res, 503, 'Odds feed unavailable', { code: 'feed_unavailable' });
   }
 }));
 
@@ -1378,17 +1373,17 @@ app.get('/api/feed/nav', aw(async (req, res) => {
 // uninformative but true. Resilient to whatever health() returns OR throws —
 // including a future detail field with driver messages in it.
 app.get('/api/feed/health', aw(async (req, res) => {
-  if (!config.FEED_ENABLED) return res.status(409).json({ error: 'Feed is disabled' });
+  if (!config.FEED_ENABLED) return apiError(res, 409, 'Feed is disabled');
   let h;
   try {
     h = await FEED.health();
   } catch (e) {
     console.error('[feed] health check failed:', e.message);
-    return res.status(503).json({ ok: false, error: 'Odds feed unavailable' });
+    return apiError(res, 503, 'Odds feed unavailable', { code: 'feed_unavailable' }, { extra: { ok: false } });
   }
   if (h && h.ok) return res.json(h);
   console.error('[feed] health check reported failure:', (h && (h.error || h.detail)) || '(no detail)');
-  res.status(503).json({ ok: false, error: 'Odds feed unavailable' });
+  apiError(res, 503, 'Odds feed unavailable', { code: 'feed_unavailable' }, { extra: { ok: false } });
 }));
 
 // ── Feed collector: operator surface ──────────────────────────────────────
@@ -1561,7 +1556,12 @@ app.post('/api/admin/feed/runner/start', requireAdmin, limit('admin'), (req, res
   const result = FRUN.start(feedTenantId(req), { actor: req.user });
   // A refusal is a 409 with the reason, not a 200 with started:false that a UI
   // renders as success.
-  if (!result.started) return res.status(409).json({ error: result.reason, ...result });
+  // `result` carries `reason` and `started`, both part of the response, so it
+  // goes in `extra` rather than being dropped. The spread used to follow `error`
+  // in the literal, which meant it could silently OVERRIDE the message if
+  // `result` ever grew an `error` key — now `error` and `code` are set first and
+  // nothing can displace them.
+  if (!result.started) return apiError(res, 409, result.reason, null, { extra: result });
   res.json(result);
 });
 
@@ -1574,7 +1574,7 @@ app.get('/api/events', limit('read'), (req, res) => {
   let rows;
   if (sportSlug) {
     const sport = db.prepare('SELECT id FROM sports WHERE slug = ?').get(sportSlug);
-    if (!sport) return res.status(404).json({ error: 'Unknown sport' });
+    if (!sport) return apiError(res, 404, 'Unknown sport');
     rows = db
       .prepare(
         `SELECT e.*, c.name AS competition_name, s.name AS sport_name
@@ -1622,7 +1622,7 @@ app.get('/api/events', limit('read'), (req, res) => {
 
 app.get('/api/markets/:id/book', limit('read'), (req, res) => {
   const m = db.prepare('SELECT * FROM markets WHERE id = ?').get(intId(req.params.id));
-  if (!m) return res.status(404).json({ error: 'Market not found' });
+  if (!m) return apiError(res, 404, 'Market not found');
   res.json({ market: m, book: M.bookFor(db, m.id, 5) });
 });
 
@@ -1630,7 +1630,7 @@ app.get('/api/markets/:id/book', limit('read'), (req, res) => {
 // so the UI never has to re-implement (or drift from) the conversion maths.
 app.get('/api/format/:price', limit('read'), (req, res) => {
   const raw = Number(req.params.price);
-  if (!Number.isFinite(raw)) return res.status(400).json({ error: 'Price must be a number' });
+  if (!Number.isFinite(raw)) return apiError(res, 400, 'Price must be a number');
   // THE RANGE IS CHECKED BEFORE THE SNAP, which is what makes the documented 400
   // reachable at all.
   //
@@ -1648,7 +1648,7 @@ app.get('/api/format/:price', limit('read'), (req, res) => {
   // renders "snaps to 2.76"). docs/EXCHANGE_RULES.md makes the same promise for
   // the trading path, where `POST /api/orders` documents the clamp. What is
   // refused here is a number that is not a price at all.
-  if (!ODDS.inLadderRange(raw)) return res.status(400).json({ error: 'Price is outside the 1.01-1000 ladder' });
+  if (!ODDS.inLadderRange(raw)) return apiError(res, 400, 'Price is outside the 1.01-1000 ladder');
   const p = ODDS.snapToTick(raw);
   res.json({
     decimal: p,
@@ -1983,13 +1983,13 @@ app.post('/api/wallet/deposit-intent', requireAuth, limit('wallet'), (req, res, 
 const crypto = require('crypto');
 const WEBHOOK_REPLAY_WINDOW_SECONDS = 300;
 app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
-  if (!config.PAYMENTS_WEBHOOK_SECRET) return res.status(404).json({ error: 'Not found' });
+  if (!config.PAYMENTS_WEBHOOK_SECRET) return apiError(res, 404, 'Not found');
 
   // Shape first: the timestamp is an input to the MAC, so a malformed one is a
   // protocol error and is reported as one rather than as a bad signature.
   const ts = String(req.headers['x-obx-timestamp'] || '');
   if (!/^\d{1,15}$/.test(ts)) {
-    return res.status(400).json({ error: 'x-obx-timestamp is required and must be unix seconds' });
+    return apiError(res, 400, 'x-obx-timestamp is required and must be unix seconds');
   }
 
   const sig = String(req.headers['x-obx-signature'] || '');
@@ -2003,7 +2003,7 @@ app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
   // timingSafeEqual throws on length mismatch, so check first. A plain ===
   // compare would leak the correct signature's length and early-exit timing.
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-    return res.status(401).json({ error: 'Bad signature' });
+    return apiError(res, 401, 'Bad signature');
   }
 
   // Authenticated, so the freshness of THIS request is a fact about the signed
@@ -2013,9 +2013,7 @@ app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
   // here with its signature still valid.
   const age = Math.abs(Math.floor(Date.now() / 1000) - Number(ts));
   if (age > WEBHOOK_REPLAY_WINDOW_SECONDS) {
-    return res.status(400).json({
-      error: `Webhook timestamp is outside the ${WEBHOOK_REPLAY_WINDOW_SECONDS}s replay window`,
-    });
+    return apiError(res, 400, `Webhook timestamp is outside the ${WEBHOOK_REPLAY_WINDOW_SECONDS}s replay window`);
   }
 
   const body = req.body || {};
@@ -2044,7 +2042,7 @@ app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
 // are audited with a written reason.
 app.post('/api/admin/payments/intents/:id/complete', requireAdmin, limit('admin'), (req, res) => {
   const reason = (req.body || {}).reason;
-  if (!reason || String(reason).trim().length < 5) return res.status(400).json({ error: 'A written reason is required' });
+  if (!reason || String(reason).trim().length < 5) return apiError(res, 400, 'A written reason is required');
   const r = PAY.completeWithdrawal(db, intId(req.params.id), String(reason).trim());
   AUDIT.record(db, req.user, AUDIT.ACTIONS.PAYMENT_INTENT_COMPLETED, 'payments:intent', r.intent_id, { status: r.status, amount_cents: r.amount_cents }, String(reason).trim());
   res.json(r);
@@ -2052,7 +2050,7 @@ app.post('/api/admin/payments/intents/:id/complete', requireAdmin, limit('admin'
 
 app.post('/api/admin/payments/intents/:id/fail', requireAdmin, limit('admin'), (req, res) => {
   const reason = (req.body || {}).reason;
-  if (!reason || String(reason).trim().length < 5) return res.status(400).json({ error: 'A written reason is required' });
+  if (!reason || String(reason).trim().length < 5) return apiError(res, 400, 'A written reason is required');
   const r = PAY.failWithdrawal(db, intId(req.params.id), String(reason).trim());
   AUDIT.record(db, req.user, AUDIT.ACTIONS.PAYMENT_INTENT_FAILED, 'payments:intent', r.intent_id, { status: r.status, refunded_cents: r.refunded_cents }, String(reason).trim());
   res.json(r);
@@ -2416,14 +2414,14 @@ function opsGuard(req, res, next) {
   //                       the check exactly when a token existed, so /metrics
   //                       and the backup control were open to anyone — and
   //                       `x-ops-token` was never read anywhere in the codebase.
-  if (!OPS_TOKEN) return res.status(404).json({ error: 'Not found' });
+  if (!OPS_TOKEN) return apiError(res, 404, 'Not found');
 
   const header = req.get('x-ops-token');
   const auth = req.get('authorization') || '';
   const bearer = /^Bearer\s+(.*)$/i.exec(auth);
   const presented = header || (bearer ? bearer[1].trim() : '');
   if (!tokenMatches(presented, OPS_TOKEN)) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    return apiError(res, 401, 'Unauthorized');
   }
   return next();
 }
@@ -2474,9 +2472,7 @@ const backupRetentionFrom = (raw) => {
 
 app.post('/api/admin/backup', requireAdmin, opsGuard, limit('admin'), (req, res) => {
   if (!config.BACKUP_DIR) {
-    return res.status(400).json({
-      error: 'No backup directory configured — set BACKUP_DIR and restart',
-    });
+    return apiError(res, 400, 'No backup directory configured — set BACKUP_DIR and restart');
   }
   const r = OPS.backup(db, {
     dir: config.BACKUP_DIR,
@@ -2584,7 +2580,7 @@ function isSqliteConstraint(e) {
 
 app.post('/api/admin/sports', requireAdmin, limit('admin'), (req, res, next) => {
   const name = String((req.body || {}).name || '').trim();
-  if (!name) return res.status(400).json({ error: 'name required' });
+  if (!name) return apiError(res, 400, 'name required');
   const slug = slugify(name);
   try {
     db.prepare('INSERT INTO sports (name, slug) VALUES (?, ?)').run(name, slug);
@@ -2592,7 +2588,7 @@ app.post('/api/admin/sports', requireAdmin, limit('admin'), (req, res, next) => 
     // Only schema constraints get a fabricated message; anything else is a
     // real fault and MUST surface as a 5xx, not a misleading 4xx.
     if (!isSqliteConstraint(e)) return next(e);
-    return res.status(409).json({ error: 'Sport slug already exists' });
+    return apiError(res, 409, 'Sport slug already exists');
   }
   res.status(201).json({ sport: db.prepare('SELECT * FROM sports WHERE slug = ?').get(slug) });
 });
@@ -2600,7 +2596,7 @@ app.post('/api/admin/sports', requireAdmin, limit('admin'), (req, res, next) => 
 app.post('/api/admin/competitions', requireAdmin, limit('admin'), (req, res, next) => {
   const { sport_id, name, country } = req.body || {};
   if (!Number.isInteger(Number(sport_id)) || !String(name || '').trim()) {
-    return res.status(400).json({ error: 'sport_id and name required' });
+    return apiError(res, 400, 'sport_id and name required');
   }
   try {
     db.prepare('INSERT INTO competitions (sport_id, name, country) VALUES (?, ?, ?)').run(Number(sport_id), String(name).trim(), country || null);
@@ -2608,7 +2604,7 @@ app.post('/api/admin/competitions', requireAdmin, limit('admin'), (req, res, nex
     if (!isSqliteConstraint(e)) return next(e);
     // sport_id is FK-checked by the schema; a constraint here means it does
     // not exist (name is pre-validated, so NOT NULL cannot fire).
-    return res.status(400).json({ error: 'Invalid sport_id' });
+    return apiError(res, 400, 'Invalid sport_id');
   }
   const comp = db.prepare('SELECT * FROM competitions WHERE sport_id = ? AND name = ?').get(Number(sport_id), String(name).trim());
   res.status(201).json({ competition: comp });
@@ -2618,21 +2614,21 @@ app.post('/api/admin/events', requireAdmin, limit('admin'), (req, res, next) => 
   const { sport_id, competition_id, name, starts_at } = req.body || {};
   const startsAt = String(starts_at || '').trim();
   if (!Number.isInteger(Number(sport_id)) || !String(name || '').trim() || !startsAt) {
-    return res.status(400).json({ error: 'sport_id, name and starts_at required' });
+    return apiError(res, 400, 'sport_id, name and starts_at required');
   }
   if (!isIsoDateTime(startsAt)) {
-    return res.status(400).json({ error: 'starts_at must be an ISO-8601 date or datetime (YYYY-MM-DD[ HH:MM[:SS]])' });
+    return apiError(res, 400, 'starts_at must be an ISO-8601 date or datetime (YYYY-MM-DD[ HH:MM[:SS]])');
   }
   const sportId = Number(sport_id);
   let compId = null;
   if (competition_id !== null && competition_id !== undefined && competition_id !== '') {
     compId = Number(competition_id);
-    if (!Number.isInteger(compId)) return res.status(400).json({ error: 'competition_id must be an integer' });
+    if (!Number.isInteger(compId)) return apiError(res, 400, 'competition_id must be an integer');
     // A competition from a DIFFERENT sport would create inconsistent catalogue
     // data (the board groups by competition but filters by sport).
     const comp = db.prepare('SELECT sport_id FROM competitions WHERE id = ?').get(compId);
     if (!comp || comp.sport_id !== sportId) {
-      return res.status(400).json({ error: 'competition_id does not belong to that sport' });
+      return apiError(res, 400, 'competition_id does not belong to that sport');
     }
   }
   try {
@@ -2645,7 +2641,7 @@ app.post('/api/admin/events', requireAdmin, limit('admin'), (req, res, next) => 
   } catch (e) {
     if (!isSqliteConstraint(e)) return next(e);
     // competition_id was verified above, so a constraint here is the sport FK.
-    return res.status(400).json({ error: 'Invalid sport_id' });
+    return apiError(res, 400, 'Invalid sport_id');
   }
   const ev = db.prepare('SELECT * FROM events WHERE sport_id = ? AND name = ? ORDER BY id DESC').get(sportId, String(name).trim());
   res.status(201).json({ event: ev });
@@ -2654,13 +2650,13 @@ app.post('/api/admin/events', requireAdmin, limit('admin'), (req, res, next) => 
 app.post('/api/admin/markets', requireAdmin, limit('admin'), (req, res, next) => {
   const { event_id, name } = req.body || {};
   if (!Number.isInteger(Number(event_id)) || !String(name || '').trim()) {
-    return res.status(400).json({ error: 'event_id and name required' });
+    return apiError(res, 400, 'event_id and name required');
   }
   try {
     db.prepare('INSERT INTO markets (event_id, name) VALUES (?, ?)').run(Number(event_id), String(name).trim());
   } catch (e) {
     if (!isSqliteConstraint(e)) return next(e);
-    return res.status(400).json({ error: 'Invalid event_id' });
+    return apiError(res, 400, 'Invalid event_id');
   }
   const m = db.prepare('SELECT * FROM markets WHERE event_id = ? ORDER BY id DESC').get(Number(event_id));
   res.status(201).json({ market: m });
@@ -2669,7 +2665,7 @@ app.post('/api/admin/markets', requireAdmin, limit('admin'), (req, res, next) =>
 app.post('/api/admin/selections', requireAdmin, limit('admin'), (req, res, next) => {
   const { market_id, name, fair_price } = req.body || {};
   if (!Number.isInteger(Number(market_id)) || !String(name || '').trim()) {
-    return res.status(400).json({ error: 'market_id and name required' });
+    return apiError(res, 400, 'market_id and name required');
   }
   let fair = null;
   if (fair_price !== undefined && fair_price !== null) {
@@ -2677,14 +2673,14 @@ app.post('/api/admin/selections', requireAdmin, limit('admin'), (req, res, next)
     // silently become a ladder end and publish a tradable market with a
     // meaningless price.
     const fp = Number(fair_price);
-    if (!Number.isFinite(fp)) return res.status(400).json({ error: 'fair_price must be a number' });
+    if (!Number.isFinite(fp)) return apiError(res, 400, 'fair_price must be a number');
     fair = ODDS.snapToTick(fp);
   }
   try {
     db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, ?)').run(Number(market_id), String(name).trim(), fair);
   } catch (e) {
     if (!isSqliteConstraint(e)) return next(e);
-    return res.status(400).json({ error: 'Invalid market_id' });
+    return apiError(res, 400, 'Invalid market_id');
   }
   const sel = db.prepare('SELECT * FROM selections WHERE market_id = ? AND name = ?').get(Number(market_id), String(name).trim());
   // A market created at runtime has no ladders until something quotes it —
@@ -2704,10 +2700,10 @@ app.post('/api/admin/selections', requireAdmin, limit('admin'), (req, res, next)
 
 app.patch('/api/admin/markets/:id', requireAdmin, limit('admin'), (req, res) => {
   const status = (req.body || {}).status;
-  if (!['open', 'suspended'].includes(status)) return res.status(400).json({ error: 'status must be open or suspended' });
+  if (!['open', 'suspended'].includes(status)) return apiError(res, 400, 'status must be open or suspended');
   const m = db.prepare('SELECT * FROM markets WHERE id = ?').get(intId(req.params.id));
-  if (!m) return res.status(404).json({ error: 'Market not found' });
-  if (m.status === 'settled') return res.status(409).json({ error: 'Market is settled' });
+  if (!m) return apiError(res, 404, 'Market not found');
+  if (m.status === 'settled') return apiError(res, 409, 'Market is settled');
   db.prepare('UPDATE markets SET status = ? WHERE id = ?').run(status, m.id);
   AUDIT.record(
     db, req.user,
@@ -2781,7 +2777,7 @@ app.get('/api/admin/stats', requireAdmin, limit('admin'), (req, res) => {
 // Competitions for a sport — the admin desk's create form needs the list.
 app.get('/api/admin/competitions', requireAdmin, limit('admin'), (req, res) => {
   const sportId = Number(req.query.sport_id);
-  if (!Number.isInteger(sportId)) return res.status(400).json({ error: 'sport_id required' });
+  if (!Number.isInteger(sportId)) return apiError(res, 400, 'sport_id required');
   const competitions = db
     .prepare('SELECT id, name, country FROM competitions WHERE sport_id = ? ORDER BY name')
     .all(sportId);
@@ -2810,7 +2806,7 @@ app.get('/api/admin/competitions', requireAdmin, limit('admin'), (req, res) => {
 // through, re-opens the enumeration. `tests/express5.test.js` E9 asserts the
 // behaviour rather than trusting this paragraph.
 app.use('/api', (req, res) => {
-  res.status(404).json({ error: 'Unknown endpoint' });
+  apiError(res, 404, 'Unknown endpoint');
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
@@ -2877,6 +2873,7 @@ const ERROR_CODES = {
   409: 'conflict',
   413: 'payload_too_large',
   422: 'unprocessable',
+  503: 'unavailable',
   500: 'internal_error',
 };
 
@@ -2886,29 +2883,62 @@ function errorHandler(err, req, res, next) {
   const expose = raw >= 500 && err.expose === true;
   const status = raw >= 500 && !expose ? 500 : raw;
   if (status >= 500 && !expose) console.error('[api]', err);
-  const body = { error: status >= 500 && !expose ? 'Internal error' : err.message || 'Request failed' };
-  // A MACHINE-READABLE CODE ON EVERY RESPONSE THAT HAS ONE.
-  //
-  // `error` is prose and is allowed to change wording without notice. A program
-  // cannot branch on it. So every response carries a stable `code`:
-  //
-  //   1. an explicit one the route set (details.code, already used by the tenant
-  //      and cash-out paths), promoted to the top level where a client can read
-  //      it without knowing where else to look;
-  //   2. otherwise one derived from the status, so a client can ALWAYS branch on
-  //      something — even on the hundreds of routes nobody has annotated.
-  //
-  // The derived fallback is the part that matters. A guarantee that depends on
-  // every future contributor remembering to add a code is not a guarantee; this
-  // one holds on the first request, and improves as routes annotate themselves.
-  body.code = (err.details && err.details.code) || ERROR_CODES[status] || 'unexpected_status';
+  return apiError(
+    res,
+    status,
+    status >= 500 && !expose ? 'Internal error' : err.message || 'Request failed',
+    err.details,
+    { expose },
+  );
+}
+
+/**
+ * The ONE way an error response is shaped, so the contract cannot drift between
+ * the routes that answer directly and the ones that throw.
+ *
+ * Every 4xx/5xx from an /api route carries a machine-readable `code`:
+ *
+ *   1. an explicit `details.code` the route set, promoted to the TOP level so a
+ *      client can read it without knowing that some codes live in `details` and
+ *      some do not;
+ *   2. otherwise one derived from the status, so there is always something to
+ *      branch on — including on the routes nobody has annotated.
+ *
+ * (2) is what earns the guarantee. A promise that depends on every future
+ * contributor remembering to add a code is not a promise; this one holds on the
+ * first request and improves as routes annotate themselves.
+ *
+ * `opts.expose` is threaded through for one reason: a 5xx must not leak
+ * `details`. The route chose its status and its details; the body a client sees
+ * is decided here, and for 5xx that decision is not the route's.
+ *
+ * `opts.extra` carries fields that are part of the response contract but are not
+ * the error — `retry_after_seconds` on a 429, `ok: false` on a 503. They are
+ * additive and placed before `details` so the three well-known keys
+ * (`error`, `code`, `details`) are in a predictable position in every body.
+ *
+ * NOTE FOR NEW ROUTES. Prefer `apiError(res, ...)` over `res.status().json()`.
+ * The 55 direct `res.status().json()` calls still work and are still correct —
+ * they just do not carry a top-level `code` unless they pass one. Converting one
+ * is a safe, behaviour-preserving cleanup; leaving one is not a bug, because a
+ * derived code is always present either way.
+ */
+function apiError(res, status, error, details, opts) {
+  const o = opts || {};
+  const body = { error };
+  // The ONE place a `code` is decided, so the two response paths cannot drift.
+  // A route that knows precisely what happened names it in `details.code`; every
+  // other route gets the status-derived default, which is what makes `code`
+  // present on ALL of them rather than only the annotated few.
+  body.code = (details && typeof details === 'object' && details.code) || ERROR_CODES[status] || 'unexpected_status';
+  if (o.extra) Object.assign(body, o.extra);
   // Structured context (which limit was breached, what it is) is a 4xx-only
   // affordance. It is deliberately absent from a 5xx even if present on the
   // error, so an internal failure cannot leak detail through it.
-  if (status < 500 && err.details && typeof err.details === 'object') {
-    body.details = err.details;
+  if (status < 500 && details && typeof details === 'object') {
+    body.details = details;
   }
-  res.status(status).json(body);
+  return res.status(status).json(body);
 }
 
 app.use(errorHandler);
@@ -3123,4 +3153,11 @@ if (require.main === module) {
 // `ready` is exported so anything that requires this module can await the
 // seed before assuming the catalogue exists. tests/api.test.js, feed.test.js,
 // feed_nav.test.js and feedadmin.test.js all listen on `app` themselves.
-module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, feedBootStatus, streamAdmission, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, ready, OPS };
+module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, feedBootStatus, streamAdmission, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, ready, OPS,
+  // The response shaper, exposed for tests. NOT for production callers: every
+  // route should reach the error contract by throwing (so status and details
+  // travel together) or by calling this directly with an explicit status, and
+  // the two are indistinguishable from here. It is exported rather than
+  // re-implemented in the test because a test that re-implements the thing it is
+  // testing proves nothing.
+  __apiErrorForTest: apiError };
