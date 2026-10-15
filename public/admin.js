@@ -567,9 +567,22 @@
 
       body.querySelectorAll('[data-toggle]').forEach((b) => {
         b.onclick = async () => {
+          // A reason, before anything is written. This route DOES audit
+          // `body.reason || null`, and it was always null in practice: the
+          // desk could suspend a USER with a justification and could not
+          // suspend a market with one. server.js enforces no minimum length
+          // here, so this prompt is the only place the requirement exists —
+          // which is why askReason refuses an empty answer rather than sending
+          // a blank and losing it again.
+          const suspending = b.dataset.status === 'suspended';
+          const reason = askReason(`${suspending ? 'Suspending' : 'Restoring'} this market`);
+          if (!reason) return;
           b.disabled = true;
           try {
-            await api('PATCH', `/api/admin/markets/${b.dataset.toggle}`, { status: b.dataset.status });
+            await api('PATCH', `/api/admin/markets/${b.dataset.toggle}`, {
+              status: b.dataset.status,
+              reason,
+            });
             toast('Market ' + b.dataset.status);
             renderMarketsView();
             refreshAll();
@@ -598,6 +611,13 @@
     if (v > 0.001) return `<span class="muted" title="margined">${pct}</span>`;
     return '<span class="muted" title="fair">0.00%</span>';
   }
+
+  // How long a settlement justification must be before the desk will settle
+  // anything. A DESK POLICY, not a server rule: the settle route records
+  // `body.reason || null` and enforces no length at all. It matches the
+  // held-release route, where lib/results.js does refuse under five — so the
+  // two operator actions that decide disputed money ask for the same thing.
+  const MIN_SETTLE_REASON = 5;
 
   async function settleDialog(marketId) {
     let book;
@@ -635,6 +655,8 @@
             .join('')}
         </div>
         <label class="optrow"><input type="checkbox" id="sdVoid" /> Void market (refund all stakes)</label>
+        <label class="fieldlabel" for="sdReason">Reason (recorded in the audit log)</label>
+        <input id="sdReason" type="text" autocomplete="off" placeholder="why this result, in one line" />
         <div class="row mt">
           <button class="btn primary grow" id="sdGo">Settle</button>
           <button class="btn" id="sdCancel">Cancel</button>
@@ -656,10 +678,28 @@
       const isVoid = overlay.querySelector('#sdVoid').checked;
       const winner = overlay.querySelector('input[name="winner"]:checked');
       if (!isVoid && !winner) return toast('Pick a winner or void the market', 'err');
+      // THE REASON. server.js calls settlement "moves the most money of any
+      // operator action" and audits `body.reason || null` — always absent in
+      // practice, because the dialog had nowhere to put one. A settlement later
+      // disputed therefore had a winner and no why. The route accepts the field
+      // and records it; it enforces no minimum length here, so this floor is a
+      // DESK POLICY mirroring the held-release route (lib/results.js refuses
+      // under five), not a control the server backstops. Read it here, send it,
+      // and the audit row carries it either way.
+      const reason = (overlay.querySelector('#sdReason').value || '').trim();
+      if (reason.length < MIN_SETTLE_REASON) {
+        return toast(`A reason of at least ${MIN_SETTLE_REASON} characters is required`, 'err');
+      }
       const go = overlay.querySelector('#sdGo');
       go.disabled = true;
       try {
-        const r = await api('POST', `/api/admin/markets/${marketId}/settle`, isVoid ? { void: true } : { winner_selection_id: Number(winner.value) });
+        const r = await api(
+          'POST',
+          `/api/admin/markets/${marketId}/settle`,
+          isVoid
+            ? { void: true, reason }
+            : { winner_selection_id: Number(winner.value), reason }
+        );
         const fees = r.per_user.reduce((a, u) => a + u.commission_cents, 0);
         toast(`Settled ${r.per_user.length} position(s) · commission ${fmt(fees)}`);
         close();

@@ -913,7 +913,7 @@ try {
       }
       return;
     }
-    if (r.method() === 'POST' || r.method() === 'PUT') {
+    if (r.method() === 'POST' || r.method() === 'PUT' || r.method() === 'PATCH') {
       if (!/^\/api\/admin\/(users\/\d+\/(limits|exclude)|markets\/\d+(\/settle)?)$/.test(p)) return;
       try {
         adminWrites[`${r.method()} ${p}`] = JSON.parse(r.postData() || 'null');
@@ -1154,6 +1154,153 @@ try {
         releasePayload.winner_selection_id === soloId &&
         (releasePayload.dead_heat === undefined || releasePayload.dead_heat === null),
       `(payload ${JSON.stringify(releasePayload)}, expected winner ${soloId})`
+    );
+  });
+
+  // ── #52 (2/3): settlement and suspend carry a written reason ─────────────
+  //
+  // admin.js's own header claims "Every mutating control below is gated
+  // server-side too (reason required, ...)". That holds for the user actions,
+  // where lib/admin.js's reasonOr400 refuses an empty one — but NOT for the two
+  // market actions. Both routes audit `body.reason || null`, which server.js
+  // describes as "always absent in practice": suspending a user could carry a
+  // justification, and settling one — "moves the most money of any operator
+  // action" — could not.
+  //
+  // Asserted on the wire and then in the audit trail, because the claim is
+  // about the RECORD: a reason typed into a dialog and dropped on the floor
+  // satisfies every DOM assertion there is.
+  await scenario('#52 settlement and suspend record a written reason', async () => {
+    await page.click('[data-view="markets"]');
+    await page.waitForSelector('#adminBody [data-settle], #adminBody [data-toggle]', { timeout: 10000 });
+
+    // ── suspend / restore ──────────────────────────────────────────────────
+    const suspendBtn = page.locator('#adminBody [data-toggle]').first();
+    if ((await suspendBtn.count()) === 0) {
+      check('#52 fixture: a market to suspend', false, '(every market already settled)');
+      return;
+    }
+    const mktId = Number(await suspendBtn.getAttribute('data-toggle'));
+    const willSuspend = (await suspendBtn.getAttribute('data-status')) === 'suspended';
+
+    // Cancelling the prompt must not suspend anything.
+    prompts.length = 0;
+    promptQueue = [];
+    delete adminWrites[`PATCH /api/admin/markets/${mktId}`];
+    await suspendBtn.click();
+    await page.waitForTimeout(600);
+    check(
+      '#52 suspending asks for a reason and sends nothing when cancelled',
+      adminWrites[`PATCH /api/admin/markets/${mktId}`] === undefined,
+      `(payload ${JSON.stringify(adminWrites[`PATCH /api/admin/markets/${mktId}`])})`
+    );
+    check('#52 the suspend prompt is about the reason', /reason/i.test(prompts[0] || ''), `("${(prompts[0] || '').slice(0, 60)}")`);
+
+    prompts.length = 0;
+    promptQueue = ['ui test: price feed disagreement, market withdrawn pending review'];
+    await suspendBtn.click();
+    await page.waitForFunction(
+      () => /^Market (suspended|open)$/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    const patch = adminWrites[`PATCH /api/admin/markets/${mktId}`] || null;
+    check(
+      '#52 suspend sends the operator\'s reason',
+      !!patch && typeof patch.reason === 'string' && patch.reason.length >= 5 && patch.status === 'suspended',
+      `(payload ${JSON.stringify(patch)})`
+    );
+
+    // Put it back, so the suite leaves the catalogue as it found it.
+    const restoreBtn = page.locator(`#adminBody [data-toggle="${mktId}"]`).first();
+    await restoreBtn.waitFor({ timeout: 10000 });
+    promptQueue = ['ui test: feed reconciled, market restored'];
+    await restoreBtn.click();
+    await page.waitForFunction(
+      (id) => document.querySelector(`#adminBody [data-toggle="${id}"]`)?.dataset.status === 'open',
+      mktId,
+      { timeout: 15000 }
+    );
+    const restore = adminWrites[`PATCH /api/admin/markets/${mktId}`] || null;
+    check(
+      '#52 restore sends the operator\'s reason too',
+      !!restore && restore.status === 'open' && typeof restore.reason === 'string' && restore.reason.length >= 5,
+      `(payload ${JSON.stringify(restore)})`
+    );
+
+    // ── settle ────────────────────────────────────────────────────────────
+    const settleBtn = page.locator('#adminBody [data-settle]').first();
+    if ((await settleBtn.count()) === 0) {
+      check('#52 fixture: a market to settle', false, '(none left open)');
+      return;
+    }
+    const settleId = Number(await settleBtn.getAttribute('data-settle'));
+    await settleBtn.click();
+    await page.waitForSelector('.modal[role="dialog"] #sdGo', { timeout: 10000 });
+    check(
+      '#52 the settle dialog carries a reason field',
+      (await page.locator('.modal[role="dialog"] #sdReason').count()) === 1
+    );
+
+    // No reason, no settlement.
+    await page.locator('.modal[role="dialog"] input[name="winner"]').first().check();
+    delete adminWrites[`POST /api/admin/markets/${settleId}/settle`];
+    await page.locator('.modal[role="dialog"] #sdGo').click();
+    // A bounded settle rather than a wait on the refusal toast. The refusal is
+    // synchronous; a real settlement is a round trip. Waiting on the toast
+    // alone HANGS when the control has no refusal at all — which is the state
+    // this check exists to catch — and then the scenario dies before the
+    // assertion that matters runs.
+    await page.waitForTimeout(1500);
+    check(
+      '#52 settling will not proceed without a written reason',
+      adminWrites[`POST /api/admin/markets/${settleId}/settle`] === undefined,
+      `(payload ${JSON.stringify(adminWrites[`POST /api/admin/markets/${settleId}/settle`])})`
+    );
+
+    await page.fill('.modal[role="dialog"] #sdReason', 'ui test: result confirmed against the official feed');
+    await page.locator('.modal[role="dialog"] #sdGo').click();
+    await page.waitForFunction(
+      () => /Settled \d+ position/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    const settle = adminWrites[`POST /api/admin/markets/${settleId}/settle`] || null;
+    check(
+      '#52 settle sends the operator\'s reason alongside the winner',
+      !!settle && typeof settle.reason === 'string' && settle.reason.length >= 5 && settle.winner_selection_id != null,
+      `(payload ${JSON.stringify(settle)})`
+    );
+
+    // And it is in the RECORD, which is the whole claim. Two filters: the
+    // settlement and the suspend/restore pair are different market ids.
+    const auditFor = async (target) => {
+      await page.click('[data-view="audit"]');
+      await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
+      await page.fill('#auditTarget', target);
+      await page.click('#auditGo');
+      await page.waitForFunction(
+        (t) => {
+          const tb = document.querySelector('#adminBody .adm-tbl tbody');
+          return !!tb && (tb.textContent || '').includes(t);
+        },
+        target,
+        { timeout: 10000 }
+      );
+      return (await page.locator('#adminBody .adm-tbl tbody').textContent()) || '';
+    };
+
+    const settleAudit = await auditFor(`market:${settleId}`);
+    check(
+      '#52 the settlement audit row carries the reason',
+      /market\.settled/.test(settleAudit) && settleAudit.includes('ui test: result confirmed against the official feed'),
+      `(${settleAudit.slice(0, 80)}…)`
+    );
+
+    const suspendAudit = await auditFor(`market:${mktId}`);
+    check(
+      '#52 the suspend and restore audit rows carry their reasons',
+      suspendAudit.includes('ui test: price feed disagreement, market withdrawn pending review') &&
+        suspendAudit.includes('ui test: feed reconciled, market restored'),
+      `(${suspendAudit.slice(0, 80)}…)`
     );
   });
 
