@@ -223,7 +223,7 @@ Deliberately narrow, and asserted by tests rather than assumed:
 
 ## Testing strategy
 
-868 checks across 66 suites, plus a 212-check browser suite and a live smoke script.
+868 checks across 67 suites, plus a 212-check browser suite and a live smoke script.
 
 | Layer | Where | What it proves |
 | --- | --- | --- |
