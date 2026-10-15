@@ -220,7 +220,7 @@ So the changelog documents **two releases that never happened**, on the repo's
 first two days, with no tags and no version bump behind them. `[0.2.0]` describes
 
 "a real-browser Playwright suite (24 checks)" — that was true on day 2, when the
-repository had **8 commits**. It is 212 browser checks and 67 suites now.
+repository had **8 commits**. It is 215 browser checks and 67 suites now.
 For an open-source project this is worse than an absent changelog, because it
 answers "is this maintained?" wrongly. A reader concludes there is a release
 history; there is none. `[0.2.0]` also contains **two separate `### Fixed`
