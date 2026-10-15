@@ -6,6 +6,57 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Player-authored betting rules** (`lib/userrules.js`, second piece of the
+  user-bots programme). A rule is a declarative record — *if this runner's price
+  goes below (or above) this threshold, place this side at this stake* — and it
+  places its order through the **same** `placeOrder` a person's click uses, so
+  every per-user abuse limit, the in-play bet delay and the escrow contract
+  apply unchanged. Three live rules per user, counted server-side.
+
+  Evaluation runs server-side in `lib/drift.js`, immediately after a selection's
+  fair price moves and before the bot requote, inside the drift transaction. That
+  is the only place in the codebase that moves a price, so there is no second
+  source to drift out of step with; it is not hooked to the SSE stream, because
+  an SSE client is a viewer and hooking there would make evaluation depend on
+  somebody having a tab open. Killing the process stops evaluation by
+  definition.
+
+  v1 is deliberately narrow and the narrowness is the safety property: no
+  expression column, no script, no `eval`, and no free-text column the engine
+  reads. Rules are one-shot per **crossing** and re-arm when the condition
+  lifts — narrower than the continuous semantics the product decision chose,
+  which is the next piece of work (it needs a cool-down and a fire count). A
+  rule created while its condition already holds starts disarmed, and a rule
+  that fires without the funds is refused, counted and **not retried**.
+
+- **`orders.rule_id` is now written by the INSERT** rather than left to the
+  caller, so an automated order is marked automated at the instant it starts
+  matching. It was not client-settable before this and is not now:
+  `POST /api/orders` builds its argument field by field, so a `rule_id` in a
+  request body never reaches the engine.
+
+- **The house no longer fills an automated order** (#67), in both directions.
+  The sweep refuses a crossing where exactly one side is the house *and* exactly
+  one side is automated; a rule taking the desk's resting quote is the same
+  conflict of interest with the words reversed. Two players, or the house
+  against a manual order, are untouched. This was not enforced by the
+  self-match work it shipped alongside.
+
+### Changed
+
+- **The two self-match properties that were pinned structurally are now
+  behavioural tests** (`tests/selfcross.test.js`). Automated-as-taker and
+  bot-vs-bot both needed an order that was automated *and* was the taker, which
+  was impossible while `rule_id` was written after placement; the source-level
+  regexes that stood in for them are deleted rather than left in place as
+  coverage that checks nothing.
+
+- `lib/odds.js` exports `priceToCents` / `centsToPrice`. A rule's condition is a
+  strict comparison against a threshold, and in doubles "is 2.00 strictly below
+  2.00" depends on which side of the representation boundary each value fell.
+
 ### Security
 
 Found by an adversarial pass against the running system. Two were critical.
