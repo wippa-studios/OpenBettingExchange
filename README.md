@@ -443,8 +443,8 @@ weight.
 npm test            # 1023 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
-npm run test:ui     # 217 checks: real Chromium via Playwright (board and admin desk)
-npm run test:ui:shuffle   # the same 217 checks in a seeded random order (#134)
+npm run test:ui     # 220 checks: real Chromium via Playwright (board and admin desk)
+npm run test:ui:shuffle   # the same 220 checks in a seeded random order (#134)
 npm run docs:check  # fail if the documentation contradicts the code
 ```
 
