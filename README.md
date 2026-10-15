@@ -197,7 +197,7 @@ layered on `match`.
 | `lib/auth` | scrypt password hashing, opaque session tokens |
 | `lib/feed`, `lib/feedcreds`, `lib/feedrunner` | Odds feed reader, encrypted credentials, collector supervisor |
 | `lib/bots`, `lib/drift` | Market-maker ladders and fair-price drift |
-| `lib/store`, `lib/seed` | Schema (25 tables) and fixtures |
+| `lib/store`, `lib/seed` | Schema (26 tables) and fixtures |
 
 The frontend (`public/js/`) is split into seven modules (`core`, `shell`, `nav`,
 `board`, `slip`, `views`, `boot`) under the `window.OB` namespace.
@@ -277,7 +277,7 @@ Configuration is read from `.env` (see [`.env.example`](.env.example)). Every
 value is validated at boot; an invalid value **aborts startup** rather than
 failing later.
 
-> **Note:** `.env.example` now documents all 58 of the keys the server reads.
+> **Note:** `.env.example` now documents all 61 of the keys the server reads.
 > `lib/config.js`'s `DEFAULTS`. Undocumented keys are listed in the tables below.
 > Closing that gap — and adding the same CI guard the feed collector has — is
 > tracked as a known issue.
@@ -294,6 +294,7 @@ failing later.
 | `SESSION_TTL_DAYS` | `30` | Session lifetime |
 | `SCRYPT_N` | `65536` | Password hashing cost; floored at 16384 |
 | `MAX_SSE_CLIENTS` | `2000` | Concurrent live streams; each holds a socket open |
+| `MAX_SSE_CLIENTS_PER_SOURCE` / `MAX_SSE_CLIENTS_PER_USER` | `20` / `8` | Per-address and per-account bounds on the same pool, so one script or one account cannot take it. A fifth of the pool is reserved for signed-in players |
 | `TRUST_PROXY_JURISDICTION` | `false` | Read the country header; enable only behind an edge that overwrites it |
 | `DELAY_RELEASE_INTERVAL_MS` | `5000` | Interval for releasing expired delays into the book; `0` disables |
 

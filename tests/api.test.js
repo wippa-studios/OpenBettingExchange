@@ -715,8 +715,20 @@ const check = async (name, fn) => {
     });
 
     // ── W3: login/register rate limiting (each check pins + resets) ──────
+    //
+    // BOTH limiters are reset at the top and bottom of every check here, not
+    // just the failure one. They are independent controls on the same route —
+    // the per-username/per-address FAILURE counters and the per-address VOLUME
+    // bucket — and each check below deliberately spends tens of requests from
+    // one address, which exhausts the volume budget whatever it does to the
+    // failure counters. A check about one control must isolate the other, or it
+    // measures which one happened to fire first. (This is why the volume
+    // limiter being ADDED to login was visible here at all: the "an unrelated
+    // account on the same address is unaffected" check was asserting 200 and
+    // getting the volume bucket's 429.)
     await check('ten consecutive login failures lock just that username', async () => {
       srv.resetLoginLimiter();
+      srv.resetVolumeLimits();
       await j('POST', '/api/auth/register', { body: { username: 'rl_target', password: 'secret1' } });
       for (let i = 0; i < 10; i++) {
         const r = await j('POST', '/api/auth/login', { body: { username: 'rl_target', password: 'wrong-pw' } });
@@ -736,6 +748,7 @@ const check = async (name, fn) => {
       const admin = await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } });
       assert.strictEqual(admin.status, 200);
       srv.resetLoginLimiter();
+      srv.resetVolumeLimits();
       // and the reset clears it: the correct password works again immediately
       const ok = await j('POST', '/api/auth/login', { body: { username: 'rl_target', password: 'secret1' } });
       assert.strictEqual(ok.status, 200);
@@ -749,6 +762,7 @@ const check = async (name, fn) => {
       // a ~460x amplification, with orders, matching, settlement and the admin
       // desk all stopping together.
       srv.resetLoginLimiter();
+      srv.resetVolumeLimits();
       let reached = 0;
       let rejected = 0;
       for (let i = 0; i < 40; i++) {
@@ -766,6 +780,7 @@ const check = async (name, fn) => {
       const alive = await j('GET', '/api/sports');
       assert.strictEqual(alive.status, 200, 'the server still answers after the flood');
       srv.resetLoginLimiter();
+      srv.resetVolumeLimits();
     });
 
     await check('the per-source lock does not fire on ordinary shared-IP use', async () => {
@@ -775,16 +790,19 @@ const check = async (name, fn) => {
       // shared connection for one person's typos. Caught by the API suite when
       // both counters shared a threshold.
       srv.resetLoginLimiter();
+      srv.resetVolumeLimits();
       for (let i = 0; i < 10; i++) {
         await j('POST', '/api/auth/login', { body: { username: 'nat_victim', password: 'wrong-pw' } });
       }
       const other = await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } });
       assert.strictEqual(other.status, 200, 'an unrelated account on the same address is unaffected');
       srv.resetLoginLimiter();
+      srv.resetVolumeLimits();
     });
 
     await check('interleaved successes reset the failure counter', async () => {
       srv.resetLoginLimiter();
+      srv.resetVolumeLimits();
       await j('POST', '/api/auth/register', { body: { username: 'rl_inter', password: 'secret1' } });
       for (let i = 0; i < 9; i++) {
         await j('POST', '/api/auth/login', { body: { username: 'rl_inter', password: 'nope' } });
@@ -799,10 +817,12 @@ const check = async (name, fn) => {
       const again = await j('POST', '/api/auth/login', { body: { username: 'rl_inter', password: 'secret1' } });
       assert.strictEqual(again.status, 200);
       srv.resetLoginLimiter();
+      srv.resetVolumeLimits();
     });
 
     await check('ten failed registrations lock the calling IP', async () => {
       srv.resetLoginLimiter();
+      srv.resetVolumeLimits();
       const create = await j('POST', '/api/auth/register', { body: { username: 'rl_dup', password: 'secret1' } });
       assert.strictEqual(create.status, 201); // creation is a success — resets the IP counter
       for (let i = 0; i < 10; i++) {
@@ -812,6 +832,7 @@ const check = async (name, fn) => {
       const locked = await j('POST', '/api/auth/register', { body: { username: 'rl_someone_else', password: 'secret9' } });
       assert.strictEqual(locked.status, 429); // the IP is locked, even for a fresh username
       srv.resetLoginLimiter();
+      srv.resetVolumeLimits();
       const fresh = await j('POST', '/api/auth/register', { body: { username: 'rl_after', password: 'secret9' } });
       assert.strictEqual(fresh.status, 201); // reset unblocks the shared-IP register path
     });

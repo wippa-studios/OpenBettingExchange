@@ -66,6 +66,11 @@ const server = spawn(process.execPath, ['--no-warnings', 'server.js'], {
     RATE_LIMIT_WALLET: '0',
     RATE_LIMIT_CASHOUT: '0',
     RATE_LIMIT_ADMIN: '0',
+    // …and auth, which bounds the two KDF routes the run registers and signs
+    // in through. It was added with those two routes and this list is the same
+    // list: a bucket left at its default here would silently cap the run and
+    // the numbers would describe the limiter instead of the engine.
+    RATE_LIMIT_AUTH: '0',
     ADMIN_PASSWORD: 'load-admin-password',
     DEMO_PASSWORD: 'load-demo-password',
     SCRYPT_N: '16384',

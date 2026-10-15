@@ -47,8 +47,11 @@ outside a five-route allowlist — `GET /api/me`, `POST /api/auth/change-passwor
 segment matches exactly one non-empty path segment, so `/api/auth/sessions/abc`
 is allowlisted while `/api/auth/sessions/a/b` is not, and the HTTP method is part
 of the match. The refusal carries
-`details.code = "password_change_required"`, `details.username` and
-`details.seeded_password`, so a fresh deployment can be unlocked from the UI.
+`details.code = "password_change_required"` and `details.username`, and nothing
+else: no password, seeded or otherwise. It does not need one — the refusal is
+only reachable by a caller who has already signed in with the very password it
+would otherwise disclose, and the client acts on `user.must_change_password`
+from the login response before it ever sees a `403`.
 The check lives inside `requireAuth`/`requireAdmin`, so a route's position in
 the file cannot exempt it.
 
@@ -81,6 +84,55 @@ the product rather than the trading, and a locked operator saw a JSON `403` in
 the address bar with no way to conclude anything except that the server was
 broken.
 
+### Credential-abuse state
+
+The login and registration failure counters are rows in `login_attempts`, not
+process memory. **A restart preserves them**: the lockout and the failure count
+both carry over, so the doubling window continues where it left off and a
+restarted venue does not hand a locked-out attacker a fresh allowance of ten
+guesses. That is a decision, not an accident — the alternative (clear on
+restart) shortens the wait for whoever is guessing at an account and for nobody
+else.
+
+The escape route is unchanged and needs no database edit: the window expires on
+its own, and a successful sign-in **deletes** the row. Rows are swept in the
+background by age, never because a lock expired — `fails` is meant to keep
+counting after a window lapses, because that is what doubles the next one.
+
+The keys are the source-level identifiers the counters have always used:
+`login:<username>`, `login-ip:<address>`, `register:<address>`.
+
+### Username identity
+
+A username is **case-insensitive**. `admin`, `Admin` and `ADMIN` are one account:
+registration refuses the second and later spellings with `409`, and login accepts
+any of them. The guarantee is a `UNIQUE INDEX` on `users (username COLLATE
+NOCASE)` in the database itself, not a service-layer check — so it cannot be
+bypassed by any writer that is not `lib/auth.js`.
+
+The stored **spelling** is preserved. `username` is displayed in the UI, in the
+admin desk and in audit targets, so identity is case-folded and display is not.
+
+Two paths that are not the login path — the boot sweep that flags seeded demo
+accounts and the one that warns about them — match the same way, so a seeded
+account spelled `ADMIN` is still locked and still warned about.
+
+The reason this is a rule and not a preference: the credential-abuse counters
+have always keyed on the **folded** name (so case variants cannot farm separate
+guessing windows), while the registry was case-**sensitive**. That combination is
+an unauthenticated denial of service against a name the README publishes —
+register `ADMIN`, spend ten wrong passwords on it, and the documented `admin`
+account is locked out of its own venue without the attacker ever touching it.
+
+`COLLATE NOCASE` folds ASCII only, and that is sufficient because the charset
+restriction above admits only `[A-Za-z0-9_-]`. Under a Unicode username policy
+this decision would have to be revisited: `İ` and `i` are two identities to
+`NOCASE`.
+
+A database that **already** holds two accounts differing only by case refuses to
+boot, naming them. Merging them is not automatic because each carries its own
+balance, orders and settlements; rename one of each and start again.
+
 ### Error codes
 
 | Status | Meaning as the code actually uses it |
@@ -102,7 +154,7 @@ fault cannot leak detail through it.
 | Source | Body | `Retry-After` |
 | --- | --- | --- |
 | Request-volume limiter (`limit('trade'\|'cashout'\|'admin'\|'wallet'\|'read')`, 60-second sliding window keyed on user or IP) | `{ "error": "Too many requests", "retry_after_seconds": N }` | set |
-| Credential-abuse counters on register/login (10 consecutive failures per username, escalating 30 s → 15 min; 30 per source IP, flat 60 s) | `{ "error": "Too many failed attempts; try again later" }` | set |
+| Credential-abuse counters on register/login (10 consecutive failures per username, escalating 30 s → 15 min; 30 per source IP, flat 60 s). **Stored in SQLite, so they survive a restart** — see [Credential-abuse state](#credential-abuse-state) | `{ "error": "Too many failed attempts; try again later" }` | set |
 | **Abuse limits** (`lib/limits.js`) — market liability and stake caps | `{ "error": "…", "details": { "code": "market_liability_exceeded" \| "stake_limit_exceeded", … } }` | **absent** |
 
 The last row is the divergence worth naming: an abuse-limit refusal uses `429`,
@@ -152,8 +204,13 @@ a status that elsewhere in this API means "slow down, retry", yet it carries no
 
 | Route | Request | Success | Errors |
 | --- | --- | --- | --- |
+<<<<<<< HEAD
 | `POST /api/auth/register` | `{ username, password, email? }` | `201 { user }` + session cookie. `username` 3–32 chars `[A-Za-z0-9_-]`; `password` 6–128 chars; `email` lowercased and unique | `400` invalid username, non-string or wrong-length password, malformed email; `409` username or email taken; `429` abuse counter |
 | `POST /api/auth/login` | `{ username \| email \| identifier, password }` | `200 { user, rg }` + session cookie. Starts the responsible-gambling session clock | `401` unknown user, wrong password or bot account (one message, constant-time); `403 Account is suspended`; `403` jurisdiction; `403` suspended tenant; `429` abuse counter |
+=======
+| `POST /api/auth/register` | `{ username, password, email? }` | `201 { user }` + session cookie. `username` 3–32 chars `[A-Za-z0-9_-]`, matched **case-insensitively** (see [Username identity](#username-identity)); `password` 6–128 chars; `email` lowercased and unique | `400` invalid username, non-string or wrong-length password, malformed email; `409` username or email taken; `429` abuse counter |
+| `POST /api/auth/login` | `{ username \| email \| identifier, password }` | `200 { user, rg }` + session cookie. `username` is matched case-insensitively. Starts the responsible-gambling session clock | `401` unknown user, wrong password or bot account (one message, constant-time); `403 Account is suspended`; `403` jurisdiction; `429` abuse counter |
+>>>>>>> 61d793f (fix(#8): username uniqueness was case-sensitive while the lockout was not)
 | `POST /api/auth/logout` | — | `200 { ok: true }`, cookie cleared. It stamps activity on the responsible-gambling state **for the token presented** (not every session) | — |
 
 Logout does **not** clear the session clock. `lib/rg.js`'s `endSession` only
@@ -166,7 +223,7 @@ session limit — the clock resets only after a real idle gap
 | `GET /api/markets/:id/book` | — | `200 { market, book }` at 5 levels | `400` non-integer id; `404` unknown market |
 | `GET /api/format/:price` | — | `200 { decimal, american, fractional, implied_prob }`. An off-tick price **inside** the ladder is snapped, so the desk can show a trader what the engine would make of a hand-typed `2.75` | `400 Price must be a number`; `400 Price is outside the 1.01-1000 ladder` |
 | `GET /api/branding` | — | `200 { tenant, name, logo, terms_url, palette }` — the caller's tenant, or the default when signed out | — |
-| `GET /api/stream` | — | `200 text/event-stream`; see the event table below | `503 Too many concurrent streams` at `MAX_SSE_CLIENTS`; `403` first-run lock |
+| `GET /api/stream` | — | `200 text/event-stream`; see the event table below | `403` first-run lock. Capacity: `503 Too many concurrent streams` at `MAX_SSE_CLIENTS`, `503` once anonymous streams hold their reserved share (a fifth of the pool), `429` for a caller over `MAX_SSE_CLIENTS_PER_SOURCE` (anonymous streams from one address) or `MAX_SSE_CLIENTS_PER_USER` (one account) |
 
 `user` is always `lib/auth.js`'s `sanitizeUser` shape:
 `{ id, username, email, role, is_admin, is_bot, status, must_change_password,

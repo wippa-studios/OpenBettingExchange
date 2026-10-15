@@ -63,6 +63,9 @@ const RESULTS = require('./lib/results');
 const VOIDRULES = require('./lib/voidrules');
 const OPS = require('./lib/ops');
 const INPLAY = require('./lib/inplay');
+// The credential-abuse counters do their read-modify-write inside a transaction,
+// so two processes sharing the database cannot lose a strike between them.
+const { transaction } = require('./lib/tx');
 const CASHOUTRISK = require('./lib/cashoutrisk');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
@@ -359,8 +362,28 @@ function firstRunLockResponse(req, res) {
     details: {
       code: 'password_change_required',
       username: req.user.username,
-      // Named so a fresh demo deployment shows the operator what to change.
-      seeded_password: req.user.username === 'admin' ? 'admin123' : 'demo123',
+      // THE FIXTURE THIS REPLACED: `seeded_password: username === 'admin' ?
+      // 'admin123' : 'demo123'`. A password value in an API response, which is
+      // the one thing this codebase does not otherwise do — lib/feedcreds has
+      // an explicit property that no function there returns a credential, and
+      // this line was the counterexample sitting in the same repository.
+      //
+      // It was not only a disclosure, it was a FALSE one. It answered from a
+      // literal rather than from the stored hash, so an operator who seeded
+      // ADMIN_PASSWORD (which lib/config.js has always supported) was told
+      // `admin123`, which does not open their account. And it answered
+      // `demo123` for EVERY other username, so any account that ended up
+      // flagged was handed the demo pattern on the strength of a ternary —
+      // a password oracle whose only claim to knowledge was "not named admin".
+      //
+      // The value was never needed to recover, which is what makes removing it
+      // cost nothing: this response is only reachable by a caller who has
+      // ALREADY proved knowledge of the password it discloses. You cannot be
+      // locked out of here without having signed in, and `POST
+      // /api/auth/change-password` verifies that same password. So what the
+      // client needs is the FLAG — which it already has, from
+      // `user.must_change_password` on the login response — and a reason, which
+      // is what this now says.
     },
   });
   return true;
@@ -435,6 +458,113 @@ const clients = new Set();
 // held socket and a periodic write, so this is a real memory ceiling, not free.
 const MAX_SSE_CLIENTS = Number(config.MAX_SSE_CLIENTS || 2000);
 
+// ── WHY THERE IS MORE THAN ONE CAP ──────────────────────────────────────────
+//
+// A single global cap is not a capacity control, it is a lottery. Every stream
+// in `clients` costs the venue exactly the same — a socket, a descriptor, a
+// write buffer, a slot in every broadcast fan-out — and every stream in it
+// returns the same, which is NOTHING to an unauthenticated caller: /api/stream
+// requires no session, and an anonymous stream receives only public `book`
+// frames. So one script could open all 2000 of them, and the cost to the
+// attacker was 2000 open TCP connections while the cost to the venue was its
+// live UX for every player who then got a 503 on the live-update channel.
+//
+// Three rules, and each one closes a different hole:
+//
+//   1. PER SOURCE, on ANONYMOUS streams. The described attack is one script,
+//      so the bound has to be on the source. It counts ANONYMOUS streams
+//      only, and that is deliberate: if it counted every stream from the
+//      address, a flood from a player's own NAT would lock that player out —
+//      which is the same unfairness, pointed the other way. An authenticated
+//      caller is bounded by rule 2 instead.
+//
+//   2. PER USER, on streams latched to an account. Without this the "per-user"
+//      half of the problem does not exist at all: one account, many tabs, is
+//      the same account as far as fairness is concerned, and 2000 tabs is a
+//      legitimate-looking way to take the whole pool.
+//
+//   3. A RESERVATION. Rules 1 and 2 bound one source and one account; neither
+//      bounds a flood spread across sources. So anonymous streams may occupy
+//      at most ANON_POOL_SHARE of the pool, and the rest is kept for
+//      authenticated players whatever else is happening. This is the property
+//      that makes "a player is never starved by anonymous traffic" true rather
+//      than merely likely.
+//
+// The session requirement the issue also suggests is NOT applied, and that is a
+// judgement rather than an omission: requiring one would mean a signed-out
+// viewer loses live prices on a venue whose front page IS the board, in
+// exchange for bounding a problem rules 1–3 already bound. The anonymous stream
+// is documented behaviour and it stays.
+const MAX_SSE_CLIENTS_PER_SOURCE = Number(config.MAX_SSE_CLIENTS_PER_SOURCE || 20);
+const MAX_SSE_CLIENTS_PER_USER = Number(config.MAX_SSE_CLIENTS_PER_USER || 8);
+// The share of the pool anonymous viewers may occupy. Four fifths is generous
+// to anonymous traffic and still leaves a fifth of the pool — 400 streams at
+// the default cap — for signed-in players under any flood shape.
+const ANON_POOL_SHARE = 0.8;
+// Ceil, not floor: a reservation that rounds DOWN to zero would leave no room
+// for authenticated players at all, which is the opposite of what it is for.
+const ANON_POOL_CAP = Math.max(1, Math.ceil(MAX_SSE_CLIENTS * ANON_POOL_SHARE));
+
+/**
+ * Whether a stream may be opened, as a PURE function of the pool's contents.
+ *
+ * `state` is a list of `{ remote, userId }` and is passed in rather than read
+ * from the module so the policy is assertable without opening 2000 sockets —
+ * which is the only reason the third rule above can be tested at all: every
+ * real connection from an offline test shares one loopback address, so a
+ * multi-source flood is not reproducible over HTTP. The route passes the live
+ * `clients` set; the tests pass a list they built.
+ *
+ * Returns null to admit, or the refusal the route should answer. 503 for a
+ * CAPACITY refusal (the venue is full) and 429 for a CALLER refusal (this
+ * caller is over its share) — a client that is over its own limit can fix that
+ * by closing a stream, and saying so with Retry-After is the useful answer.
+ *
+ * O(n) in the pool per connect. That is deliberate: a second map of per-source
+ * counters would be a second source of truth about who is connected, which is
+ * exactly the kind of bookkeeping that drifts. Connects are rare and the pool
+ * is bounded, so the scan is cheaper than the bookkeeping.
+ */
+function streamAdmission(state, who, limits) {
+  if (state.length >= limits.global) {
+    return { status: 503, error: 'Too many concurrent streams' };
+  }
+  // Counted before any refusal, so every caller learns the same thing about
+  // their own share of the pool.
+  let anonFromSource = 0;
+  let mine = 0;
+  for (const c of state) {
+    if (c.userId === null && c.remote === who.remote) anonFromSource++;
+    if (who.userId !== null && c.userId === who.userId) mine++;
+  }
+  if (who.userId === null) {
+    if (limits.perSource > 0 && anonFromSource >= limits.perSource) {
+      return {
+        status: 429,
+        error: 'Too many concurrent streams from this address',
+        retryAfter: 60,
+      };
+    }
+    // The reservation counts EVERY anonymous stream, not just this source's:
+    // it is a claim on the pool, and a rule that only applied per address
+    // would be defeated by spreading the flood across addresses — which is
+    // the one shape rules 1 and 2 cannot see.
+    let anonTotal = 0;
+    for (const c of state) if (c.userId === null) anonTotal++;
+    if (anonTotal >= limits.anonCap) {
+      return {
+        status: 503,
+        error: 'Live stream capacity is reserved for signed-in players; try again shortly',
+      };
+    }
+    return null;
+  }
+  if (limits.perUser > 0 && mine >= limits.perUser) {
+    return { status: 429, error: 'Too many concurrent streams for this account', retryAfter: 60 };
+  }
+  return null;
+}
+
 app.get('/api/stream', (req, res) => {
   // The first-run lock, explicitly. This route uses OPTIONAL auth — a signed-out
   // viewer gets an anonymous stream — so it never passes through requireAuth,
@@ -444,7 +574,21 @@ app.get('/api/stream', (req, res) => {
   // cannot matter, and this one route keeps an explicit call because optional
   // auth is genuinely a different case, not an oversight.
   if (req.user && firstRunLockResponse(req, res)) return;
-  if (clients.size >= MAX_SSE_CLIENTS) return res.status(503).json({ error: 'Too many concurrent streams' });
+  const remote = req.socket.remoteAddress || 'unknown';
+  const refusal = streamAdmission(
+    [...clients],
+    { remote, userId: req.user ? req.user.id : null },
+    {
+      global: MAX_SSE_CLIENTS,
+      perSource: MAX_SSE_CLIENTS_PER_SOURCE,
+      perUser: MAX_SSE_CLIENTS_PER_USER,
+      anonCap: ANON_POOL_CAP,
+    }
+  );
+  if (refusal) {
+    if (refusal.retryAfter) res.setHeader('Retry-After', String(refusal.retryAfter));
+    return res.status(refusal.status).json({ error: refusal.error });
+  }
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -458,7 +602,11 @@ app.get('/api/stream', (req, res) => {
   // Deliberate: per-frame re-auth would cost a DB hit per broadcast, and
   // the loopback demo accepts the stale stream. The browser tears it down on
   // its own logout/reload anyway.
-  const client = { res, userId: req.user ? req.user.id : null };
+  //
+  // `remote` is recorded because the admission rules above count by source:
+  // without it on the client there would be no way to answer "how many streams
+  // does this address already hold" without keeping a second map in step.
+  const client = { res, userId: req.user ? req.user.id : null, remote };
   clients.add(client);
   req.on('close', () => clients.delete(client));
 });
@@ -517,26 +665,62 @@ function broadcast(event, data, userId = null) {
 }
 
 // ── Auth ───────────────────────────────────────────────────────────────────
-// Brute-force guard for the two credential routes (W3). In-memory, no deps.
-// Counters are per key — the case-normalized username for login, the remote
-// IP for register — and count CONSECUTIVE FAILURES only: any success clears
-// the key, so a legitimate user who occasionally mistypes a password is
-// never locked out and successes can never accumulate toward a lock.
+// Brute-force guard for the two credential routes (W3). In SQLite, not a Map.
+// Counters are per key - the case-normalized username for login, the remote IP
+// for login-by-source and for register - and count CONSECUTIVE FAILURES only:
+// any success clears the key, so a legitimate user who occasionally mistypes a
+// password is never locked out and successes can never accumulate toward a lock.
 //
 // At RL_MAX_FAILURES consecutive misses the key is locked for RL_LOCK_BASE_MS,
 // doubling with each further failure and capped at RL_LOCK_MAX_MS. While
 // locked, every attempt answers 429 WITHOUT touching scrypt, so a locked
-// account is cheap to defend and expensive to keep guessing at. The map is
-// process-local (a restart clears it) — right for a single-node loopback
-// demo; a multi-node deployment would need a shared store instead.
+// account is cheap to defend and expensive to keep guessing at.
+//
+// WHY THIS IS A TABLE AND NOT A MAP
+// It was a module-level Map, with a comment that knew its own cost: "the map is
+// process-local (a restart clears it)". A restart handed every locked-out
+// attacker a fresh allowance of ten guesses on every account, indefinitely - so
+// the effective rate was ten guesses per RESTART CYCLE rather than ten per
+// escalating window. A control whose state lives in the process it is meant to
+// survive is not a control, and process managers restart on crash, which is
+// exactly when brute-force protection matters most.
+//
+// THE DECISION, stated: a restart now PRESERVES the lock, and the failure count
+// with it, so the escalation continues where it left off.
+//
+// The case for clearing is real - a user locked out by their own typos gets a
+// fresh start instead of waiting out a window. But they already get one: the
+// lock expires on its own, in 30 seconds rising to at most fifteen minutes. A
+// restart shortens that wait for whoever is guessing at the account and for
+// nobody else. The costs are not symmetric. Preserving costs a legitimate user
+// a wait they would have had to sit through anyway; clearing costs an account
+// ten more guesses every time the process cycles, which is the entire reason
+// the threshold exists. So it preserves.
+//
+// THE SWEEP IS A TIMER, not a read. The obvious design - sweep stale rows when
+// a key is read - puts a DELETE on the path of every login, which is the one
+// request class that already pays a key derivation. A boot pass plus an unref'd
+// minute timer costs the same and never sits inside a request.
+//
+// ROWS ARE SWEPT BY AGE, NEVER BECAUSE THEY EXPIRED: `fails` is meant to keep
+// counting after a window lapses, because that is what doubles the next one. The
+// TTL is the LONGEST LOCK WINDOW, so a row the sweep deletes is one the limiter
+// would have treated as unlocked anyway - and the escalation survives for every
+// attacker still trying, which is the only attacker it exists for.
 const RL_MAX_FAILURES = 10; // consecutive failures before lockout
 const RL_LOCK_BASE_MS = 30 * 1000; // first lockout window
 const RL_LOCK_MAX_MS = 15 * 60 * 1000; // cap: further doubling outlives interest
-const rlAttempts = new Map(); // key → { fails, lockedUntil }
 
-function rlLocked(key) {
-  const a = rlAttempts.get(key);
-  return !!a && a.lockedUntil > Date.now();
+// Read, write and clear are the whole interface, and there is deliberately no
+// in-memory cache in front of them: a cache would be a second source of truth
+// about whether an account is locked, which is the bug this move exists to fix.
+function rlRead(db, key) {
+  return db.prepare('SELECT fails, locked_until FROM login_attempts WHERE key = ?').get(key) || null;
+}
+
+function rlLocked(db, key) {
+  const a = rlRead(db, key);
+  return !!a && a.locked_until > Date.now();
 }
 
 // A per-SOURCE key is a different kind of control from a per-USERNAME key and
@@ -555,38 +739,64 @@ function rlLocked(key) {
 const RL_IP_MAX_FAILURES = 30;
 const RL_IP_LOCK_MS = 60 * 1000;
 
-function rlRecordFailure(key) {
+// The read-modify-write is inside a transaction so a SECOND process sharing the
+// database cannot interleave: without it two processes recording a failure for
+// one key could both read fails=9 and both write 10, losing a strike. SQLite is
+// single-writer, so BEGIN IMMEDIATE is what serialises them, and the same
+// property is what lets this table serve the multi-node case the in-memory Map
+// could not have.
+function rlRecordFailure(db, key) {
   const perIp = key.startsWith('login-ip:');
   const maxFails = perIp ? RL_IP_MAX_FAILURES : RL_MAX_FAILURES;
-  const a = rlAttempts.get(key) || { fails: 0, lockedUntil: 0 };
-  a.fails += 1;
-  if (a.fails >= maxFails) {
-    a.lockedUntil = perIp
-      ? Date.now() + RL_IP_LOCK_MS
-      : Date.now() + Math.min(RL_LOCK_BASE_MS * 2 ** (a.fails - RL_MAX_FAILURES), RL_LOCK_MAX_MS);
+  const now = Date.now();
+  transaction(db, () => {
+    const a = rlRead(db, key) || { fails: 0, locked_until: 0 };
+    const fails = a.fails + 1;
+    const locked_until = fails >= maxFails
+      ? (perIp
+        ? now + RL_IP_LOCK_MS
+        : now + Math.min(RL_LOCK_BASE_MS * 2 ** (fails - RL_MAX_FAILURES), RL_LOCK_MAX_MS))
+      : a.locked_until;
+    db.prepare(
+      `INSERT INTO login_attempts (key, fails, locked_until, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET fails = excluded.fails, locked_until = excluded.locked_until,
+                                     updated_at = excluded.updated_at`
+    ).run(key, fails, locked_until, now);
+  });
+}
+
+function rlRecordSuccess(db, key) {
+  db.prepare('DELETE FROM login_attempts WHERE key = ?').run(key);
+}
+
+function rlRetryAfterSeconds(db, key) {
+  const a = rlRead(db, key);
+  return a ? Math.max(1, Math.ceil((a.locked_until - Date.now()) / 1000)) : 0;
+}
+
+// Boot pass, then a minute timer. Both unref'd, so neither keeps a test run or
+// a shutting-down process alive on its own.
+function sweepLoginAttempts() {
+  try {
+    db.prepare('DELETE FROM login_attempts WHERE updated_at <= ?').run(Date.now() - RL_LOCK_MAX_MS);
+  } catch {
+    /* DB closed during shutdown - nothing left to sweep */
   }
-  rlAttempts.set(key, a);
 }
+sweepLoginAttempts();
+const loginAttemptSweeper = setInterval(sweepLoginAttempts, 60_000);
+if (loginAttemptSweeper.unref) loginAttemptSweeper.unref();
 
-function rlRecordSuccess(key) {
-  rlAttempts.delete(key);
-}
-
-function rlRetryAfterSeconds(key) {
-  const a = rlAttempts.get(key);
-  return a ? Math.max(1, Math.ceil((a.lockedUntil - Date.now()) / 1000)) : 0;
-}
-
-// Test seam: clears the in-memory counters so a suite can isolate the
-// limiter. Exported for tests ONLY — no production path calls this.
+// Test seam: clears the counters so a suite can isolate the limiter. Exported
+// for tests ONLY - no production path calls this.
 function resetLoginLimiter() {
-  rlAttempts.clear();
+  db.prepare('DELETE FROM login_attempts').run();
 }
 
 function rlTooManyAttempts(res, key) {
   return res
     .status(429)
-    .setHeader('Retry-After', String(rlRetryAfterSeconds(key)))
+    .setHeader('Retry-After', String(rlRetryAfterSeconds(db, key)))
     .json({ error: 'Too many failed attempts; try again later' });
 }
 
@@ -597,15 +807,45 @@ function rlTooManyAttempts(res, key) {
 // cash-out, walking the admin catalogue — never trips a failure counter.
 //
 // So a second, independent limiter counts requests in a sliding window.
-// Deliberately SEPARATE from rlAttempts rather than merged: a login failing
-// ten times and a burst of successful reads are different problems with
-// different remedies, and one counter serving both would let traffic of
-// either kind clear the other's budget.
+// Deliberately SEPARATE from the failure counters rather than merged: a login
+// failing ten times and a burst of successful reads are different problems with
+// different remedies, and one counter serving both would let traffic of either
+// kind clear the other's budget.
+//
+// COVERAGE, NOT JUST EXISTENCE. This bucket existed and was correctly
+// enforced, and it was on ONE of the player read routes. Every route added
+// after it inherited nothing: the limiter is an argument at the registration
+// site, so a route without that argument is not throttled at all, and nothing
+// failed when that happened. The cheap catalogue reads are now on it for the
+// same reason as the expensive ones — an unauthenticated caller reaching
+// /api/events gets a full board, with a book query per market, per request.
+//
+// EXEMPTIONS ARE DELIBERATE AND FEW:
+//   /api/stream       a long-held connection, not a request; it has its own cap
+//                     (MAX_SSE_CLIENTS) and is counted once per connect.
+//   /api/branding     one row, no query worth bounding, and it is what a
+//                     locked account's page load reads.
+//   /healthz /readyz /metrics   supervisor probes. A rate-limited readiness
+//                     probe is a venue that gets itself killed.
+//   /api/feed/*       the odds-feed board, which is a different data source in
+//                     a different mode; it answers 409 before doing any work
+//                     when FEED_ENABLED is off, and its cost is a Postgres
+//                     round trip the feed bucket does not govern.
 const VOLUME_BUCKETS = {
   // Trading is the money path. Generous per user — a scalper legitimately
   // fires many orders — but bounded, because unbounded order placement is a
   // self-DoS on the single-threaded engine.
   // Limits come from config so an operator can tune them; 0 disables a bucket.
+  //
+  // auth is keyed on the SOURCE, like the failure counters above, and bounds
+  // the two routes that pay a key derivation on every request. Registration was
+  // the one that had nothing at all: the per-address register counter counts
+  // FAILURES, so a flood of SUCCESSFUL registrations never tripped it, and each
+  // success cost a full scrypt — so unauthenticated registration was the
+  // cheapest CPU flood available. Login is bounded for the same reason: the
+  // username counter is cleared by every success, so 200 valid sign-ins in a
+  // minute from one address spent 200 derivations and recorded no failures.
+  auth: { limit: config.RATE_LIMIT_AUTH, windowMs: 60_000 },
   trade: { limit: config.RATE_LIMIT_TRADE, windowMs: 60_000 },
   cashout: { limit: config.RATE_LIMIT_CASHOUT, windowMs: 60_000 },
   admin: { limit: config.RATE_LIMIT_ADMIN, windowMs: 60_000 },
@@ -652,7 +892,7 @@ if (volumeSweeper.unref) volumeSweeper.unref();
 
 /** Rate-limit middleware factory: 429 with Retry-After once the budget is spent. */
 function limit(bucket) {
-  return (req, res, next) => {
+  const middleware = (req, res, next) => {
     const retryAfter = volumeExceeded(req, bucket);
     if (retryAfter > 0) {
       res.setHeader('Retry-After', String(retryAfter));
@@ -660,6 +900,13 @@ function limit(bucket) {
     }
     next();
   };
+  // The middleware is STAMPED with its bucket so the wiring can be asserted
+  // from the live router rather than by scraping the source for the string
+  // `limit(`. Coverage is the whole point of this control — the bug was a route
+  // registered without the argument, which no test could see — so the bucket a
+  // route was given has to be readable from the route itself.
+  middleware.volumeBucket = bucket;
+  return middleware;
 }
 
 function resetVolumeLimits() {
@@ -671,15 +918,15 @@ function resetVolumeLimits() {
 // await a handler, so every error must be caught INSIDE and re-thrown onto the
 // error handler explicitly — an async handler's rejection is an unhandled
 // promise rejection, not a 500.
-app.post('/api/auth/register', async (req, res, next) => {
+app.post('/api/auth/register', limit('auth'), async (req, res, next) => {
   const { username, password, email } = req.body || {};
   // Registration abuse is account-farming or identity enumeration from one
   // machine, so the counter keys on the caller's IP.
   const key = 'register:' + (req.socket.remoteAddress || 'unknown');
-  if (rlLocked(key)) return rlTooManyAttempts(res, key);
+  if (rlLocked(db, key)) return rlTooManyAttempts(res, key);
   try {
     const user = await A.registerUser(db, { username, password, email });
-    rlRecordSuccess(key);
+    rlRecordSuccess(db, key);
     // Jurisdiction gate at session mint, not at bet placement. The country is
     // read ONLY from a proxy-overwritten header, and only when the operator has
     // asserted that is true — see lib/tenants.js trustedCountry().
@@ -689,14 +936,25 @@ app.post('/api/auth/register', async (req, res, next) => {
   } catch (e) {
     // A refused registration (validation, duplicate username) is a failed
     // attempt; anything else (a server fault) is not.
-    if (e && (e.status === 400 || e.status === 409)) rlRecordFailure(key);
+    if (e && (e.status === 400 || e.status === 409)) rlRecordFailure(db, key);
     next(e);
   }
 });
 
-app.post('/api/auth/login', async (req, res, next) => {
-  // Case-normalized on purpose: 'Admin', 'ADMIN' and 'admin' share one
-  // counter, so case variants cannot farm fresh guessing windows.
+app.post('/api/auth/login', limit('auth'), async (req, res, next) => {
+  // Case-normalized on purpose, and it now AGREES with the rest of the system
+  // rather than disagreeing with it. It used to be the odd one out: usernames
+  // were case-sensitive in the registry (so `admin` and `ADMIN` were two
+  // accounts) while this key folded case (so they were one bucket) — and that
+  // pairing is an unauthenticated denial of service, because an attacker
+  // registers `ADMIN`, spends ten wrong passwords on it, and locks the
+  // documented `admin` account out of its own venue.
+  //
+  // A username is now case-insensitive IDENTITY, enforced by a unique index on
+  // users(username COLLATE NOCASE) and matched that way at registration and at
+  // login, so there is no second account to hide behind and the folded key is
+  // simply the name. It is still the right key to use: `AdMiN` and `admin`
+  // cannot farm separate guessing windows for the one person they are.
   const key = 'login:' + String((req.body || {}).username || '').trim().toLowerCase();
   // AND a per-SOURCE counter. The username key alone was trivially bypassed by
   // an attacker who simply used a fresh username per request. That counter
@@ -712,12 +970,12 @@ app.post('/api/auth/login', async (req, res, next) => {
   // concurrent guesses still occupy four pool slots. It is no longer the only
   // thing standing between the venue and that, though.
   const ipKey = 'login-ip:' + (req.socket.remoteAddress || 'unknown');
-  if (rlLocked(ipKey)) return rlTooManyAttempts(res, ipKey);
-  if (rlLocked(key)) return rlTooManyAttempts(res, key);
+  if (rlLocked(db, ipKey)) return rlTooManyAttempts(res, ipKey);
+  if (rlLocked(db, key)) return rlTooManyAttempts(res, key);
   try {
     const { user, token } = await A.loginUser(db, { ...(req.body || {}), country: TEN.trustedCountry(req) });
-    rlRecordSuccess(key); // a success proves the real user — clear the slate
-    rlRecordSuccess(ipKey);
+    rlRecordSuccess(db, key); // a success proves the real user — clear the slate
+    rlRecordSuccess(db, ipKey);
     // Sign-in starts the RG session clock, and does NOT restart a session
     // already running: a player who refreshes the page must not get a fresh
     // session limit, which is the easiest way to defeat one.
@@ -726,8 +984,8 @@ app.post('/api/auth/login', async (req, res, next) => {
     res.json({ user, rg });
   } catch (e) {
     if (e && e.status === 401) {
-      rlRecordFailure(key); // only auth misses count
-      rlRecordFailure(ipKey); // …and they count against the source too
+      rlRecordFailure(db, key); // only auth misses count
+      rlRecordFailure(db, ipKey); // …and they count against the source too
     }
     // Async handler: hand the error to Express explicitly. A throw here would
     // reject the handler's promise and Express 4 would never see it.
@@ -748,12 +1006,16 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/me', requireAuth, (req, res) => {
+app.get('/api/me', requireAuth, limit('read'), (req, res) => {
   // `tenant_status` is here because reads REMAIN AVAILABLE on a suspended
   // tenant (#32), and a player who is allowed to look at the book but refused
   // at the bet slip deserves to be told why without having to place an order to
   // find out. It is the only surface that reports it; the refusals carry it in
   // `details.code`.
+  //
+  // Both changes land on one line, which is why this was a real conflict and not
+  // an automatic merge: #32 added the field, #6 added the rate-limit bucket, and
+  // dropping either side silently reinstates the other's bug.
   const tenant = TEN.ofUser(db, req.user.id);
   res.json({
     user: {
@@ -791,7 +1053,7 @@ app.post('/api/auth/change-password', requireAuth, async (req, res, next) => {
   }
 });
 
-app.get('/api/auth/sessions', requireAuth, (req, res) => {
+app.get('/api/auth/sessions', requireAuth, limit('read'), (req, res) => {
   res.json({ sessions: A.listSessions(db, req.user.id, req.token) });
 });
 
@@ -843,7 +1105,13 @@ async function enforceFirstRunLock() {
   let flagged = 0;
   for (const name of ['admin', 'demo']) {
     if (!(await isDefaultCredential(name))) continue;
-    const r = db.prepare('UPDATE users SET must_change_password = 1 WHERE username = ? AND must_change_password = 0').run(name);
+    // COLLATE NOCASE, like every other identity lookup in the codebase. A
+    // seeded account whose stored spelling is 'ADMIN' is still the seeded
+    // account — the first-run lock has to reach it, and an exact match would
+    // have flagged nothing.
+    const r = db
+      .prepare('UPDATE users SET must_change_password = 1 WHERE username = ? COLLATE NOCASE AND must_change_password = 0')
+      .run(name);
     flagged += r.changes;
   }
   return flagged;
@@ -870,7 +1138,7 @@ app.use('/api', (req, res, next) => {
   firstRunLockResponse(req, res);
 });
 
-app.get('/api/sports', (req, res) => {
+app.get('/api/sports', limit('read'), (req, res) => {
   const sports = db
     .prepare(
       `SELECT s.id, s.name, s.slug,
@@ -904,6 +1172,68 @@ function clampFeedLimit(raw, fallback) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(500, Math.max(1, Math.floor(n)));
+}
+
+/**
+ * The one line an operator reads about the odds feed at BOOT, as a PURE
+ * function of what FEED.health() returned.
+ *
+ * Extracted (like clampFeedLimit) because the bug it replaces cannot be reached
+ * from the suite at all: the line was built inside a `.then()` on a live Postgres
+ * probe, so it only ever appeared by booting a server with FEED_ENABLED=true
+ * against a real database. Two independent reads were wrong —
+ *
+ *   h.age_seconds   health() returns `odds_age_seconds`. Both were `undefined`,
+ *                   so the ternary ALWAYS took the "unknown" branch, on a feed
+ *                   the server had just queried successfully.
+ *   h.stale         health() returns no such field, so "(STALE)" was dead text.
+ *
+ * — and the branch that mattered most never ran at all. `healthPayload` sets
+ * `ok: !!newest && age < FEED_STALE_SECONDS` and sets NO `error` field, so a
+ * STALE feed arrived as `{ok:false}` with `h.error === undefined` and the line
+ * printed `[feed] unreachable: undefined`: the one condition the line exists to
+ * report, reported as an unreachable feed with no reason attached.
+ *
+ * So staleness is derived HERE, from the two things health() actually returns —
+ * its `ok` verdict, which IS the staleness computation, and the frame age
+ * against the threshold the caller was configured with. Every field read below
+ * is a field health() returns; `tests/feedboot-line.test.js` pins that by
+ * feeding this function the REAL healthPayload rather than a hand-written
+ * fixture, so if the payload changes shape this file fails rather than quietly
+ * testing a shape that no longer occurs.
+ */
+function feedBootStatus(h, staleSeconds) {
+  if (!h || typeof h !== 'object') {
+    return { level: 'error', message: 'health check returned no payload' };
+  }
+  // health() returns `{ok:false, error}` ONLY when the probe itself threw;
+  // healthPayload sets `ok` and never sets `error`. So the PRESENCE of `error`
+  // is the discriminator between "could not ask" and "asked, and the answer is
+  // bad" — which is the distinction the old `if (h.ok)` threw away.
+  if (h.error) return { level: 'error', message: `unreachable: ${h.error}` };
+  // Feed 1 has no odds columns at all, so there is no frame to age and nothing
+  // that can go stale. "newest frame unknown" there is a warning about a number
+  // this deployment was never going to publish.
+  if (h.priced === false) {
+    return {
+      level: 'log',
+      message: `odds feed connected — feed ${h.feed}: ${h.markets || 0} fixtures, no prices on this feed`,
+    };
+  }
+  const age = typeof h.odds_age_seconds === 'number' ? h.odds_age_seconds : null;
+  // Compared exactly as healthPayload compares it, against the SAME configured
+  // threshold — a boot line that used its own copy of the limit could disagree
+  // with /api/feed/health about whether the feed is stale, which is the class of
+  // bug this function exists to end.
+  const stale = h.ok === false || (age !== null && age > staleSeconds);
+  // `ok === false` with no age at all means the collector has never captured an
+  // odds frame. "no odds frame recorded yet" says that; "unknown" claims a
+  // measurement was taken and could not be reported.
+  const frame = age === null ? 'no odds frame recorded yet' : `newest frame ${age}s old`;
+  return {
+    level: stale ? 'warn' : 'log',
+    message: `odds feed connected — ${h.markets || 0} markets, ${frame}${stale ? ' (STALE)' : ''}`,
+  };
 }
 
 // One market's ladder, by id. This is what the page prices when you pick a race
@@ -1084,7 +1414,7 @@ app.delete('/api/admin/feed/credentials/:id?', requireAdmin, limit('admin'), (re
 
 // Supervision. The readiness reason comes back verbatim rather than as a bool,
 // because "the runner will not start" is useless to an operator who is not told
-// which of five conditions is missing.
+// which of four conditions is missing.
 app.get('/api/admin/feed/runner/:id?', requireAdmin, limit('admin'), (req, res) => {
   res.json(FRUN.health(feedTenantId(req)));
 });
@@ -1101,7 +1431,7 @@ app.post('/api/admin/feed/runner/stop', requireAdmin, limit('admin'), (req, res)
   res.json(FRUN.stop(feedTenantId(req)));
 });
 
-app.get('/api/events', (req, res) => {
+app.get('/api/events', limit('read'), (req, res) => {
   const sportSlug = req.query.sport;
   let rows;
   if (sportSlug) {
@@ -1152,7 +1482,7 @@ app.get('/api/events', (req, res) => {
   res.json({ events });
 });
 
-app.get('/api/markets/:id/book', (req, res) => {
+app.get('/api/markets/:id/book', limit('read'), (req, res) => {
   const m = db.prepare('SELECT * FROM markets WHERE id = ?').get(intId(req.params.id));
   if (!m) return res.status(404).json({ error: 'Market not found' });
   res.json({ market: m, book: M.bookFor(db, m.id, 5) });
@@ -1160,7 +1490,7 @@ app.get('/api/markets/:id/book', (req, res) => {
 
 // Price formats for the trading desk: the same pure functions the engine uses,
 // so the UI never has to re-implement (or drift from) the conversion maths.
-app.get('/api/format/:price', (req, res) => {
+app.get('/api/format/:price', limit('read'), (req, res) => {
   const raw = Number(req.params.price);
   if (!Number.isFinite(raw)) return res.status(400).json({ error: 'Price must be a number' });
   // THE RANGE IS CHECKED BEFORE THE SNAP, which is what makes the documented 400
@@ -1208,7 +1538,7 @@ app.post('/api/orders', requireAuth, limit('trade'), (req, res) => {
   res.status(result.idempotent_replay ? 200 : 201).json(result);
 });
 
-app.get('/api/orders', requireAuth, (req, res) => {
+app.get('/api/orders', requireAuth, limit('read'), (req, res) => {
   res.json({ orders: M.openOrdersFor(db, req.user.id) });
 });
 
@@ -1220,7 +1550,7 @@ app.post('/api/orders/:id/cancel', requireAuth, limit('trade'), (req, res) => {
   res.json({ order });
 });
 
-app.get('/api/positions', requireAuth, (req, res) => {
+app.get('/api/positions', requireAuth, limit('read'), (req, res) => {
   const positions = M.positionsFor(db, req.user.id).map((p) => ({
     ...p,
     cashout: CASH.cashoutQuote(db, req.user, p.market_id),
@@ -1238,11 +1568,11 @@ app.post('/api/markets/:id/cashout', requireAuth, limit('cashout'), (req, res) =
 });
 
 // ── Wallet ─────────────────────────────────────────────────────────────────
-app.get('/api/wallet', requireAuth, (req, res) => {
+app.get('/api/wallet', requireAuth, limit('read'), (req, res) => {
   res.json(L.walletView(db, req.user.id));
 });
 
-app.get('/api/settlements', requireAuth, (req, res) => {
+app.get('/api/settlements', requireAuth, limit('read'), (req, res) => {
   res.json({ settlements: SET.settledFor(db, req.user.id) });
 });
 
@@ -2004,7 +2334,7 @@ const backupRetentionFrom = (raw) => {
   return Math.min(BACKUP_RETENTION_MAX, Math.max(BACKUP_RETENTION_MIN, Math.trunc(n)));
 };
 
-app.post('/api/admin/backup', requireAdmin, opsGuard, (req, res) => {
+app.post('/api/admin/backup', requireAdmin, opsGuard, limit('admin'), (req, res) => {
   if (!config.BACKUP_DIR) {
     return res.status(400).json({
       error: 'No backup directory configured — set BACKUP_DIR and restart',
@@ -2385,10 +2715,21 @@ async function warnDefaultCredentials() {
  * an operator who sets ADMIN_PASSWORD in .env gets a real account and this
  * returns false immediately, whereas comparing config would keep flagging an
  * account that is already safe and train the operator to ignore the warning.
+ *
+ * THE LITERAL IS DELIBERATELY NOT lib/seed.js's `config.ADMIN_PASSWORD ||
+ * 'admin123'`. It looks like the same value and it is not: this asks "does this
+ * account still accept the PUBLISHED demo password", which is the only question
+ * the warning and the lock are asking. Sourcing it from the seed would make this
+ * verify the OPERATOR's chosen password — which the seed used — so every
+ * properly-configured deployment would flag and lock its own admin for using a
+ * password nobody else knows. Verified here: the account really is unsafe, not
+ * merely un-defaulted.
  */
 async function isDefaultCredential(username) {
   const DEFAULTS = { admin: 'admin123', demo: 'demo123' };
-  const row = db.prepare('SELECT pass_hash FROM users WHERE username = ?').get(username);
+  // COLLATE NOCASE: a seeded account spelled 'ADMIN' is the same identity and
+  // must be recognised as one.
+  const row = db.prepare('SELECT pass_hash FROM users WHERE username = ? COLLATE NOCASE').get(username);
   return !!row && (await A.verifyPassword(DEFAULTS[username], row.pass_hash));
 }
 
@@ -2472,15 +2813,10 @@ async function main() {
   if (config.FEED_ENABLED) {
     FEED.health()
       .then((h) => {
-        if (h.ok) {
-          console.log(
-            `[feed] odds feed connected — ${h.markets} markets, newest frame ${
-              h.age_seconds == null ? 'unknown' : `${h.age_seconds}s old`
-            }${h.stale ? ' (STALE)' : ''}`
-          );
-        } else {
-          console.error(`[feed] unreachable: ${h.error}`);
-        }
+        const line = feedBootStatus(h, config.FEED_STALE_SECONDS);
+        if (line.level === 'error') console.error(`[feed] ${line.message}`);
+        else if (line.level === 'warn') console.warn(`[feed] ${line.message}`);
+        else console.log(`[feed] ${line.message}`);
       })
       .catch((e) => console.error('[feed] health check failed:', e.message));
   }
@@ -2569,4 +2905,4 @@ if (require.main === module) {
 // `ready` is exported so anything that requires this module can await the
 // seed before assuming the catalogue exists. tests/api.test.js, feed.test.js,
 // feed_nav.test.js and feedadmin.test.js all listen on `app` themselves.
-module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, ready, OPS };
+module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, feedBootStatus, streamAdmission, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, ready, OPS };

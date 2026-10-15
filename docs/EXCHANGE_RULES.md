@@ -608,6 +608,8 @@ were silent successes that settled nothing while reporting healthy forever.
 | `SESSION_TTL_DAYS` | 30 | session lifetime |
 | `SCRYPT_N` | 65536 | scrypt cost; floored at 16384 |
 | `MAX_SSE_CLIENTS` | 2000 | concurrent live streams |
+| `MAX_SSE_CLIENTS_PER_SOURCE` | 20 | concurrent **anonymous** streams from one address |
+| `MAX_SSE_CLIENTS_PER_USER` | 8 | concurrent streams bound to one account |
 | `CASHOUT_ENABLED` / `CASHOUT_MARGIN_BPS` | true / 200 | venue cash-out and its margin |
 | `RISK_MAX_LIABILITY_CENTS` | 5000000 | market-maker bot debt cap |
 | `RISK_MAX_DAILY_LOSS_CENTS` | 1000000 | bot realised daily loss cap |
