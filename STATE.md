@@ -212,7 +212,7 @@ A live Betfair app key, username and password were committed to this **public**
 repository (`9eac3a4`) and purged from HEAD only (`173a68b`), so the value is
 still readable with `git log -p`. Every piece of surrounding tooling is built and
 green. **Rotation and a history rewrite are the only remaining actions, and
-neither is a code change.**
+neither is a code change. Tracked in #128.**
 
 ### 2.6 Dark mode: colour-vision deficiency is weaker than it looks
 
@@ -269,8 +269,7 @@ reading the highest issue number.
 |---|---|
 | Open | `#67` (parent), `#77` (deferred by decision), `#78`–`#81` (specced, not built) |
 
-- **`[high]` / `[medium]` / `[low]`** prefixes are the only severity signal — the
-  repository has no labels, and there is no label-creation tool available.
+- **`[high]` / `[medium]` / `[low]`** title prefixes mirror the `priority:P0`, `priority:P1` and `priority:P2` labels. Labels are created on first use when attached to an issue, so the set is not fixed by the tooling. The launch backlog (#138) uses them.
 - **A closed issue means the change merged and CI was green**, not that it was
   written.
 - **`#76` reports two things it did not build that are still open**: continuous
@@ -287,6 +286,8 @@ non-runner as a loser — a money-path defect, said to reproduce on `main` today
 (no market type; the engine models one shape), `#100` (operator surface), `#106`
 (no navigation read model — no `listEventTypes` equivalent).
 
+The launch backlog built from this review is tracked in #138, with the decisions it depends on at #107–#112.
+
 **Nothing in §2 was written with those in mind**, so this file understates the gap
 between this venue and Betfair considerably. Read it alongside the tracker, not
 instead of it. Three consequences worth acting on:
@@ -294,11 +295,8 @@ instead of it. Three consequences worth acting on:
 - **`#88` claims a reproducible money-path defect on `main`.** If that holds it
   outranks everything in §2 — it loses a bettor's stake rather than omitting a
   feature. Verify before believing; check it first.
-- **`#90` makes §2.7's adapter seam bigger than its own plan estimated.** That
-  plan costed the streaming half as already-built. If the SSE side was never
-  built, stages 0–3 are larger than 13–17 days and the estimate is void.
-- **`#95` means §2.6's ladder work is scoped to one market shape.** Adding a
-  second shape invalidates assumptions a colour-separation decision rests on.
+- **`#90` is not in the feed plan's estimate.** The plan's stages do not mention the client-facing SSE stream, so its 13–17 day figure excludes it. An earlier version of this file said the plan had costed streaming as already built. That was wrong, and I made the claim without re-reading the plan.
+- **`#95` does not touch §2.6.** The colour-separation decision concerns the colour pair on the ladder, not the market model. An earlier version of this file said a second market shape would invalidate it. That claim was unsupported.
 
 ## 5. The failure modes worth remembering
 
