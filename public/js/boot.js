@@ -152,6 +152,10 @@
     if (co) co.onclick = OB.doCashOut;
 
     await OB.refreshMe();
+    // Before the first paint, and before the route: the tenant is part of who
+    // this session is, so a signed-in operator gets their tenant's palette on
+    // the board rather than the default one flashing first. (#52)
+    await OB.loadBranding();
     await OB.detectFeed();
     await OB.loadSports();
     // W2: single-pass boot. loadNav resolves the selection in state (it no

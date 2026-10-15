@@ -1304,6 +1304,265 @@ try {
     );
   });
 
+// ── #52 (3/3): tenant branding is served and never consumed ──────────────
+  //
+  // `grep -rn branding public/` returned zero hits before this: /api/branding
+  // has been served the whole time, no JS fetched it, no CSS variable was set,
+  // and editTenant could not even write the `brand` JSON. ROADMAP.md claimed
+  // per-tenant theming worked "through the frontend".
+  //
+  // Split into two halves that do not depend on each other, because they are
+  // two separate defects and one must not hide the other:
+  //   (a) the DESK can set the brand — the editor has no brand fields;
+  //   (b) the BROWSER consumes it — the response is never read at all.
+  // (b) is written through the API, not the desk, and asserted after a RELOAD.
+  // That matters twice over: the bug is precisely that nothing read the
+  // response, and asserting that a fetch happened would prove nothing about
+  // the UI — while reading a CSS variable that was never set returns the house
+  // palette, which is true whether or not the branding works. So the only
+  // honest assertion is a distinctive colour on :root after a fresh load.
+  const houseAccent = await page.evaluate(() => {
+    for (const sheet of document.styleSheets) {
+      let rules;
+      try {
+        rules = sheet.cssRules;
+      } catch {
+        continue;
+      }
+      for (const r of rules) {
+        if (r.selectorText === ':root') {
+          const m = /--accent:\s*([^;]+)/.exec(r.style.cssText);
+          if (m) return m[1].trim();
+        }
+      }
+    }
+    return null;
+  });
+
+  const branding = () =>
+    page.evaluate(async () => {
+      const b = await (await fetch('/api/branding')).json();
+      return b;
+    });
+  const rootVars = () =>
+    page.evaluate(() => {
+      const cs = getComputedStyle(document.documentElement);
+      return {
+        inline: document.documentElement.getAttribute('style') || '',
+        accent: cs.getPropertyValue('--accent').trim(),
+        pink: cs.getPropertyValue('--pink').trim(),
+        title: document.title,
+        slug: document.documentElement.getAttribute('data-tenant'),
+      };
+    });
+  const writeBrand = (id, brand) =>
+    page.evaluate(
+      async ([tid, b]) => {
+        await fetch(`/api/admin/tenants/${tid}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ brand: b }),
+        });
+      },
+      [id, brand]
+    );
+  const reload = async () => {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#balance:not([hidden])', { timeout: 15000 });
+  };
+
+  const brand = { name: 'UI Test Exchange', logo: '/assets/logo.png', terms_url: '/terms/ui-test', palette: { accent: '#ff6600', pink: '#00aa88' } };
+
+  await scenario('#52 the browser consumes /api/branding after a reload', async () => {
+    const before = await branding();
+    check(
+      '#52 /api/branding serves the caller\'s tenant',
+      !!before && !!before.tenant && !!before.tenant.id,
+      `(tenant ${before && JSON.stringify(before.tenant)})`
+    );
+    if (!before || !before.tenant) return;
+    const tid = before.tenant.id;
+
+    // Before anything: the house palette, whatever the response says.
+    const virgin = await rootVars();
+    check(
+      '#52 fixture: the house palette is what ships when no brand is set',
+      virgin.accent.toLowerCase() === (houseAccent || '').toLowerCase(),
+      `(accent=${virgin.accent}, house is ${houseAccent})`
+    );
+
+    await writeBrand(tid, brand);
+    await reload();
+    const after = await rootVars();
+    check(
+      '#52 the tenant palette reaches :root as a CSS custom property',
+      after.accent.toLowerCase() === '#ff6600' && after.pink.toLowerCase() === '#00aa88',
+      `(accent=${after.accent}, pink=${after.pink}, house is ${houseAccent})`
+    );
+    check(
+      '#52 the brand name reaches the page title',
+      /UI Test Exchange/.test(after.title),
+      `("${after.title}")`
+    );
+    check(
+      '#52 the tenant is marked on the document root',
+      typeof after.slug === 'string' && after.slug.length > 0,
+      `(data-tenant=${after.slug})`
+    );
+
+    // ── an UNUSABLE palette value must be IGNORED, not applied ──────────────
+    // A CSS custom property accepts nearly any token sequence, so applying
+    // garbage makes every rule using it fail at computed-value time: a blank
+    // venue, not a wrong accent. Written through the API on purpose — the desk
+    // refuses it, and the APPLY side is what is under test.
+    await writeBrand(tid, { ...brand, palette: { accent: 'not-a-colour', pink: '#00aa88', 'text;--x': '#000' } });
+    await reload();
+    const poisoned = await rootVars();
+    check(
+      '#52 a palette value that is not a colour is ignored, not applied',
+      poisoned.accent.toLowerCase() !== 'not-a-colour' &&
+        poisoned.accent.toLowerCase() === (houseAccent || '').toLowerCase(),
+      `(accent=${poisoned.accent}, house is ${houseAccent})`
+    );
+    check(
+      '#52 a valid palette key alongside an invalid one still applies',
+      poisoned.pink.toLowerCase() === '#00aa88',
+      `(pink=${poisoned.pink})`
+    );
+    check(
+      '#52 a palette key that is not a property name is refused',
+      !/--x/.test(poisoned.inline) && !/text;/.test(poisoned.inline),
+      `(inline=${poisoned.inline})`
+    );
+
+    // ── the terms URL needs a surface; the Account panel is the one there is ─
+    // COUNT first, then read: a missing element makes textContent() wait out
+    // the full 30s default, and the scenario must close the modal on BOTH
+    // paths — an overlay left open here breaks every scenario after this one
+    // and buries the real failure under four unrelated ones.
+    await page.click('#accountBtn');
+    await page.waitForSelector('#accountModal.show', { timeout: 5000 });
+    const hasTermsSlot = (await page.locator('#pwTerms').count()) === 1;
+    const termsText = hasTermsSlot ? ((await page.locator('#pwTerms').textContent()) || '').trim() : '';
+    check(
+      '#52 the tenant terms URL reaches the player',
+      hasTermsSlot && /\/terms\/ui-test/.test(termsText),
+      hasTermsSlot ? `("${termsText.slice(0, 60)}")` : '(the account panel has no terms slot at all)'
+    );
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 5000 });
+
+    // Back to the house palette, so the next scenario reads a clean venue.
+    await writeBrand(tid, { name: '', logo: '', terms_url: null, palette: {} });
+    await reload();
+    const reset = await rootVars();
+    check(
+      '#52 clearing the brand puts the house colours back',
+      reset.accent.toLowerCase() === (houseAccent || '').toLowerCase(),
+      `(accent=${reset.accent}, house is ${houseAccent})`
+    );
+  });
+
+  await scenario('#52 the desk can set the brand it serves', async () => {
+    await page.click('#nav button[data-page="admin"]');
+    await page.waitForSelector('[data-view="tenants"]', { timeout: 10000 });
+    await page.click('[data-view="tenants"]');
+    await page.waitForFunction(
+      () => /tenants/i.test((document.querySelector('#adminBody h4') || {}).textContent || ''),
+      null,
+      { timeout: 10000 }
+    );
+    const tid = await page.evaluate(() => {
+      const b = document.querySelector('#adminBody [data-tenant]');
+      return b ? Number(b.dataset.tenant) : null;
+    });
+    check('#52 fixture: the tenant view offers an edit control', tid !== null, `(tenant ${tid})`);
+    if (tid === null) return;
+
+    await page.locator(`#adminBody [data-tenant="${tid}"]`).click();
+    const hasName = (await page.locator('#tBrandName').count()) === 1;
+    check(
+      '#52 the tenant editor carries branding fields',
+      hasName,
+      '(the desk could not even SET the brand JSON before)'
+    );
+    if (!hasName) return;
+
+    await page.fill('#tBrandName', 'Desk Set Exchange');
+    await page.fill('#tBrandLogo', '/assets/logo.png');
+    await page.fill('#tBrandTerms', '/terms/from-the-desk');
+    await page.fill(`#tp_${tid}_accent`, '#123456');
+    await page.fill(`#tp_${tid}_pink`, '#654321');
+    await page.click('#tSave');
+    await page.waitForFunction(
+      () => /Tenant updated/.test((document.querySelector('#toast') || {}).textContent || ''),
+      null,
+      { timeout: 15000 }
+    );
+    const stored = await page.evaluate(async (id) => {
+      const d = await (await fetch('/api/admin/tenants')).json();
+      const t = d.tenants.find((x) => x.id === id);
+      try {
+        return JSON.parse(t.brand);
+      } catch {
+        return null;
+      }
+    }, tid);
+    check(
+      '#52 the desk writes the brand JSON the route already accepted',
+      !!stored &&
+        stored.name === 'Desk Set Exchange' &&
+        stored.palette.accent === '#123456' &&
+        stored.palette.pink === '#654321' &&
+        stored.terms_url === '/terms/from-the-desk',
+      `(brand ${JSON.stringify(stored)})`
+    );
+
+    // And the editor round-trips: reopening shows what was stored.
+    await page.locator(`#adminBody [data-tenant="${tid}"]`).click();
+    await page.waitForSelector('#tBrandName', { timeout: 10000 });
+    check(
+      '#52 the tenant editor reopens showing the brand it stored',
+      (await page.locator(`#tp_${tid}_pink`).inputValue()).toLowerCase() === '#654321' &&
+        (await page.locator('#tBrandTerms').inputValue()) === '/terms/from-the-desk',
+      `("${await page.locator(`#tp_${tid}_pink`).inputValue()}")`
+    );
+
+    // A palette value that is not a colour must never reach the venue: the
+    // apply side ignores it, but a blank page for every player is worse than a
+    // rejected form.
+    await page.fill(`#tp_${tid}_accent`, 'chartreuse');
+    delete adminWrites[`PUT /api/admin/tenants/${tid}`];
+    await page.click('#tSave');
+    await page.waitForTimeout(800);
+    check(
+      '#52 the desk refuses a palette value that is not a hex colour',
+      adminWrites[`PUT /api/admin/tenants/${tid}`] === undefined,
+      `(payload ${JSON.stringify(adminWrites[`PUT /api/admin/tenants/${tid}`])})`
+    );
+
+    // Restore, through the desk.
+    await page.fill('#tBrandName', '');
+    await page.fill('#tBrandTerms', '');
+    await page.fill('#tBrandLogo', '');
+    for (const k of ['accent', 'bg', 'text', 'blue', 'pink']) {
+      await page.fill(`#tp_${tid}_${k}`, '');
+    }
+    await page.click('#tSave');
+    await page.waitForFunction(
+      () => /Tenant updated/.test((document.querySelector('#toast') || {}).textContent || ''),
+      null,
+      { timeout: 15000 }
+    );
+    await reload();
+    const restored = await rootVars();
+    check(
+      '#52 clearing the palette from the desk puts the house colours back',
+      restored.accent.toLowerCase() === (houseAccent || '').toLowerCase(),
+      `(accent=${restored.accent}, house is ${houseAccent})`
+    );
+  });
+
   // ── #52 (1/3): per-user limits and self-exclusion ────────────────────────
   //
   // lib/limits.js enforces the stake cap, the market-liability cap and the
@@ -1319,6 +1578,12 @@ try {
   // before this control existed. So the checks read the caps back off the
   // server after changing one of them.
   await scenario('#52 per-user limits: reachable, and changing one axis keeps the others', async () => {
+    // Arrive at the desk explicitly: whatever scenario ran last may have left
+    // the browser on the board, and the tab strip only exists on #/admin.
+    if (!(await page.locator('[data-view="users"]').count())) {
+      await page.click('#nav button[data-page="admin"]');
+      await page.waitForSelector('[data-view="users"]', { timeout: 10000 });
+    }
     await page.click('[data-view="users"]');
     await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
     // uitester, not demo: the first-run-lock scenario below signs demo in and

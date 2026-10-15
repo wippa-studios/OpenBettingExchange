@@ -459,31 +459,105 @@
     });
   }
 
+  // ── Branding ────────────────────────────────────────────────────────────
+  // The keys the desk offers. The APPLY side (shell.js) accepts any property
+  // name a tenant row carries, so an operator who sets `red` or `card2` through
+  // the API gets it too; this is the curated subset worth surfacing, not a
+  // closed vocabulary.
+  const PALETTE_KEYS = [
+    ['accent', 'Accent'],
+    ['bg', 'Background'],
+    ['text', 'Text'],
+    ['blue', 'Back prices'],
+    ['pink', 'Lay prices'],
+  ];
+  const HEX_RE = /^#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+
+  function currentBrand(tenant) {
+    try {
+      const b = JSON.parse(tenant.brand || 'null');
+      return b && typeof b === 'object' ? b : {};
+    } catch {
+      return {};
+    }
+  }
+
+  // Prefixed so two tenants can be edited on one screen without their palettes
+  // bleeding into each other.
+  const pf = (tenantId, key) => `tp_${tenantId}_${key.replace(/[^a-z0-9]/gi, '')}`;
+
   function editTenant(body, tenant) {
     const out = body.querySelector('#tenantOut');
+    const brand = currentBrand(tenant);
+    const pal = brand.palette && typeof brand.palette === 'object' ? brand.palette : {};
     out.innerHTML = `
       <div class="card">
         <h4>Edit ${esc(tenant.name)}</h4>
         <label>Commission (bps)</label>
-        <input id="tBps" type="number" min="0" max="2000" value="${tenant.commission_bps}">
+        <input id="tBps" type="number" min="0" max="2000" value="${attr(tenant.commission_bps)}">
         <label>Jurisdictions (comma-separated ISO codes; empty = unrestricted)</label>
         <input id="tJuris" value="${esc(JSON.parse(tenant.jurisdictions || '[]').join(', '))}">
         <label>Status</label>
         <select id="tStatus"><option value="active" ${tenant.status === 'active' ? 'selected' : ''}>active</option>
           <option value="suspended" ${tenant.status === 'suspended' ? 'selected' : ''}>suspended</option></select>
+
+        <h4 class="fieldlabel adm-sub">Branding</h4>
+        <p class="muted fineprint">A config read, not a build step: these become CSS custom properties on
+          :root. Every player of this tenant sees them.</p>
+        <label>Brand name (page title, logo alt text)</label>
+        <input id="tBrandName" value="${esc(brand.name || '')}">
+        <label>Logo (a path on this venue, e.g. /assets/logo.png)</label>
+        <input id="tBrandLogo" value="${esc(brand.logo || '')}">
+        <label>Terms URL (shown in the player's Account panel)</label>
+        <input id="tBrandTerms" value="${esc(brand.terms_url || '')}">
+        <label>Palette — hex colours, empty = the house default</label>
+        ${PALETTE_KEYS.map(
+          ([k, label]) =>
+            `<div class="fieldrow">
+              <span class="muted tn palkey">${esc(label)}</span>
+              <input id="${pf(tenant.id, k)}" value="${esc(pal[k] || '')}" placeholder="unset" spellcheck="false" />
+            </div>`
+        ).join('')}
+
         <div class="row gap"><button class="btn primary" id="tSave">Save</button>
         <button class="btn" id="tCancel">Cancel</button></div>
       </div>`;
     out.querySelector('#tCancel').onclick = () => { out.innerHTML = ''; };
     out.querySelector('#tSave').onclick = async () => {
       const jurisRaw = out.querySelector('#tJuris').value.trim();
+      // Validate HERE, not server-side: lib/tenants.js stores `brand` as an
+      // opaque JSON.stringify with no inspection at all, so the desk is the
+      // only thing standing between a typo and a venue whose --text is not a
+      // colour and every rule using it fails at computed-value time.
+      const palette = {};
+      for (const [k] of PALETTE_KEYS) {
+        const raw = out.querySelector(`#${pf(tenant.id, k)}`).value.trim();
+        if (!raw) continue;
+        if (!HEX_RE.test(raw)) return toast(`Palette "${k}" must be a hex colour, e.g. #1b5fd9`, 'err');
+        palette[k] = raw;
+      }
+      const logo = out.querySelector('#tBrandLogo').value.trim();
+      if (logo && !/^\/(?!\/)/.test(logo)) {
+        return toast('The logo must be a path on this venue, e.g. /assets/logo.png', 'err');
+      }
+      const termsUrl = out.querySelector('#tBrandTerms').value.trim();
+      const nextBrand = {
+        name: out.querySelector('#tBrandName').value.trim(),
+        logo: logo || '/assets/logo.png',
+        terms_url: termsUrl || null,
+        palette,
+      };
       try {
         await api('PUT', `/api/admin/tenants/${tenant.id}`, {
           commission_bps: Number(out.querySelector('#tBps').value),
           status: out.querySelector('#tStatus').value,
           jurisdictions: jurisRaw ? jurisRaw.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean) : [],
+          brand: nextBrand,
         });
-        toast('Tenant updated');
+        // ONE toast, not two. toast() overwrites #toast in place, so a second
+        // call silently replaces the first: the "Tenant updated" confirmation
+        // this used to be followed by was never seen by anybody.
+        toast('Tenant updated · branding applies on the next page load');
         renderTenantsView(body);
       } catch (e) { toast(e.message); }
     };
