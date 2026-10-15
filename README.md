@@ -146,6 +146,8 @@ in place.
 | [![Positions](docs/shots/positions.png)](docs/shots/positions.png) | [![Wallet](docs/shots/wallet.png)](docs/shots/wallet.png) |
 | **Admin trading desk.** Live catalogue with matched volume and overround; suspend, restore and settle. | **User administration.** Status, limits, balance adjustment and self-exclusion, each action audited with a reason. |
 | [![Admin desk](docs/shots/admin-markets.png)](docs/shots/admin-markets.png) | [![Admin users](docs/shots/admin-users.png)](docs/shots/admin-users.png) |
+| **Account and security.** Active sessions with device and IP, and the password-change path. | |
+| [![Account and security](docs/shots/account.png)](docs/shots/account.png) | |
 
 Screenshots are regenerated with `node scripts/shoot.mjs`. The script refuses to
 save a capture it has not verified: each shot is preceded by DOM assertions that

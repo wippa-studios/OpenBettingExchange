@@ -160,8 +160,19 @@ jobs:
         run: |
           # node_modules, a database, or a screenshot dump would bloat history
           # irreversibly. 5MB is generous for source and assets in this repo.
-          big=$(git ls-files -z | xargs -0 -I{} sh -c 'test -f "{}" && stat -c%s "{}"' 2>/dev/null | awk '$1 > 5242880 {print}')
-          if [ -n "$big" ]; then echo "::error::files over 5MB tracked"; exit 1; fi
+          #
+          # The offender is NAMED. This step used to print only sizes — the awk was
+          # `$1 > LIMIT {print}`, which yields the first field — so a red build said
+          # "files over 5MB tracked" and left the reader to go hunting. A gate that
+          # cannot tell you what tripped it is a gate you disable the first time it
+          # fires for a reason you have forgotten.
+          big=$(git ls-files -z | xargs -0 -I{} sh -c 'test -f "{}" && stat -c"%s %n" "{}"' 2>/dev/null \
+                | awk '$1 > 5242880 { printf "%s (%.1f MB)\n", $2, $1/1048576 }')
+          if [ -n "$big" ]; then
+            echo "::error::$(echo "$big" | wc -l) tracked file(s) over 5MB:"
+            echo "$big" | sed 's/^/  - /'
+            exit 1
+          fi
 
       - name: Docs do not contradict the code
         # The review found the README claiming cash-out was a market hedge (it

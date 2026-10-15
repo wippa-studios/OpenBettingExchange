@@ -73,7 +73,7 @@ convention for the market. The engine is side-agnostic — a market type that is
 still one runner winning still settles through `lib/settle.js` unchanged.
 
 **A new price format or ladder band**: `lib/odds.js` is the single source of
-truth, including for the browser (`public/app.js` mirrors the ladder for the
+truth, including for the browser (`public/ladder.js` mirrors the ladder for the
 slip steppers; the server re-snaps everything it accepts, so the mirror can
 never corrupt a trade). Add the band to `LADDER` and to the browser mirror, and
 extend `tests/odds.test.js`.

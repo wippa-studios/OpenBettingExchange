@@ -114,5 +114,5 @@
   };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api; // Node: parity test
-  else root.OBLadder = api; // Browser: app.js reads window.OBLadder
+  else root.OBLadder = api; // Browser: js/core.js reads window.OBLadder
 })(typeof window !== 'undefined' ? window : globalThis);
