@@ -52,6 +52,28 @@ of the match. The refusal carries
 The check lives inside `requireAuth`/`requireAdmin`, so a route's position in
 the file cannot exempt it.
 
+**A suspended tenant.** `PUT /api/admin/tenants/:id { "status": "suspended" }`
+takes that venue off: it cancels the tenant's resting orders, releases their
+escrow, and refuses everything that moves money or creates liability —
+`POST /api/orders`, `POST /api/markets/:id/cashout`,
+`POST /api/wallet/deposit`, `POST /api/wallet/deposit-intent` — with
+`403` and `details.code = "tenant_suspended"`. New logins for that tenant's
+users are refused with the same code.
+
+**Reads are not suspended.** The board, the book, positions, balances, the
+ledger, `/api/me` (which reports `tenant_status`) and the whole admin desk —
+including settlement and the restore call — keep working, because a suspended
+tenant's players can hold matched positions that must still settle, and a venue
+that cannot be un-suspended from its own API is a trap. `GET /api/me` exists so
+a player who is allowed to look but not trade can be told why without having to
+place an order to find out.
+
+Both refusals sit **after** the password is proven: a wrong password on a
+suspended tenant is still `401 Invalid username or password`, byte-identical to
+the answer for an account that does not exist, so the login endpoint is not a
+probe for which usernames exist or which venue is suspended. See
+[EXCHANGE_RULES.md](EXCHANGE_RULES.md#tenants-and-suspension).
+
 The lock covers **`/api` only**. Static assets (`/`, `/style.css`, `/ladder.js`,
 `/js/*`) are served normally to a locked account, because the only route out of
 the lock is the UI that renders the change-password panel — a global lock blocked
@@ -131,14 +153,14 @@ a status that elsewhere in this API means "slow down, retry", yet it carries no
 | Route | Request | Success | Errors |
 | --- | --- | --- | --- |
 | `POST /api/auth/register` | `{ username, password, email? }` | `201 { user }` + session cookie. `username` 3–32 chars `[A-Za-z0-9_-]`; `password` 6–128 chars; `email` lowercased and unique | `400` invalid username, non-string or wrong-length password, malformed email; `409` username or email taken; `429` abuse counter |
-| `POST /api/auth/login` | `{ username \| email \| identifier, password }` | `200 { user, rg }` + session cookie. Starts the responsible-gambling session clock | `401` unknown user, wrong password or bot account (one message, constant-time); `403 Account is suspended`; `403` jurisdiction; `429` abuse counter |
+| `POST /api/auth/login` | `{ username \| email \| identifier, password }` | `200 { user, rg }` + session cookie. Starts the responsible-gambling session clock | `401` unknown user, wrong password or bot account (one message, constant-time); `403 Account is suspended`; `403` jurisdiction; `403` suspended tenant; `429` abuse counter |
 | `POST /api/auth/logout` | — | `200 { ok: true }`, cookie cleared. It stamps activity on the responsible-gambling state **for the token presented** (not every session) | — |
 
 Logout does **not** clear the session clock. `lib/rg.js`'s `endSession` only
 refreshes `last_active_at`, so signing out and straight back in buys no fresh
 session limit — the clock resets only after a real idle gap
 (`RG_SESSION_IDLE_RESET_MINUTES`, 15 minutes by default).
-| `GET /api/me` | — | `200 { user }` with `available_cents = balance_cents − frozen_cents` | `401`; `403` first-run lock |
+| `GET /api/me` | — | `200 { user }` with `available_cents = balance_cents − frozen_cents` and `tenant_status` (`'active'` \| `'suspended'`) | `401`; `403` first-run lock |
 | `GET /api/sports` | — | `200 { sports: [{ id, name, slug, event_count }] }`; `event_count` covers `upcoming` and `live` events | — |
 | `GET /api/events` | `?sport=<slug>` | `200 { events }`, 3-level book per runner | `404 Unknown sport` |
 | `GET /api/markets/:id/book` | — | `200 { market, book }` at 5 levels | `400` non-integer id; `404` unknown market |

@@ -13,6 +13,7 @@ each rule so you can check the arithmetic yourself.
 - [Commission](#commission)
 - [Voiding](#voiding)
 - [Cash-out](#cash-out)
+- [Tenants and suspension](#tenants-and-suspension)
 - [Markets, events and lifecycle](#markets-events-and-lifecycle)
 - [Limits and configuration](#limits-and-configuration)
 - [What is deliberately not implemented](#what-is-deliberately-not-implemented)
@@ -349,6 +350,42 @@ paid a quote for a position they no longer hold.
 *Tests:* `tests/cashout.test.js` (contract), `tests/cashout2.test.js`
 (valuation, multi-runner, no double settlement, counterparty safety).
 
+### Who funds a buyout
+
+A venue buyout has two costs, paid out of two different things, so "can the
+venue afford this?" has no single answer. Stating both is the point: a comment
+in `lib/cashout.js` once claimed a quote was checked for affordability against
+`availableOf()`, and no such check existed.
+
+| Cost | Paid from | Enforced |
+| --- | --- | --- |
+| **The payout** — what the player is paid | `house_float → player_funds`, a double-entry posting | `lib/cashoutrisk.js` caps, at **quote** time |
+| **The legs** — the collateral the venue inherits with the position | the house bot's own balance, as escrow | `ledger.escrow`, at **execution**, inside the transaction |
+
+The payout is deliberately **not** debited from the bot's `users.balance_cents`,
+so there is no balance to test it against — the bot's balance does not move when
+a buyout is paid. `house_float` stands at minus the cumulative unpaid buyout
+payouts: it is a flow account, not a budget. A `availableOf(house) >= payout`
+test written the way that comment described would therefore refuse every quote
+from the venue's first buyout onward. The bound is a **policy cap** instead:
+`CASHOUT_MAX_OUTSTANDING_CENTS` on unpaid exposure and
+`CASHOUT_MAX_DAILY_LOSS_CENTS` on the day's outlay, both read before a quote is
+offered.
+
+The legs are different, and are a real balance. `cashoutPosition` moves the
+player's collateral onto the house through `ledger.escrow`, which refuses when
+available funds cannot cover it. Because that happens **inside** the execution
+transaction, an unfundable buyout rolls the whole thing back — no match flagged,
+no settlement row, no payout. It is a refusal, not a half-close.
+
+The honest consequence: **a quote is not a promise the venue can always
+honour.** An underfunded house can be quoted and then decline at execution with
+a `400`. What bounds that is the exposure cap, which bounds how much the venue
+can be quoted for in the first place.
+
+*Tests:* `tests/cashout.test.js` (C9 no balance gate on the quote, C10 an
+unfundable house rolls the buyout back), `tests/cashoutrisk.test.js` (the caps).
+
 ## Pre-off only
 
 > **Bets may only be placed before an event's off time. Cash-out closes at off
@@ -415,6 +452,87 @@ revisited — but neither has a caller driving an in-play suspension now. See
 [ROADMAP.md](ROADMAP.md).
 
 ---
+
+## Tenants and suspension
+
+A tenant is a venue. `status = 'suspended'` is the operator taking that venue
+off, and it **blocks**: a suspended tenant's players are refused trading.
+
+It used to do nothing at all. The value was validated, stored, audited and
+rendered in the admin UI, and read by no code anywhere — so an operator who
+suspended a partner brand got a `200`, an audit row saying
+`{status: "suspended"}`, a dashboard showing the tenant as suspended, and a
+venue that carried on taking bets. That is the most dangerous shape a bug can
+take: every signal an operator would check to confirm the suspension took
+effect says it did.
+
+### What is refused
+
+| | |
+| --- | --- |
+| **Placing an order** | `403`, `details.code: "tenant_suspended"` |
+| **Cash-out** | `403` — it closes a position and pays the player |
+| **Deposits and deposit intents** | `403` — money in creates liability |
+| **Logging in, and minting a session** | `403` after the password is proven |
+| **The house quoting (bot ladders)** | skipped — a suspended venue does not make markets |
+
+### What is still available, and why
+
+**Reads.** The board and order book, positions, balances, the wallet ledger,
+settlement history, `/api/me` (which now reports `tenant_status`). **The admin
+desk**, including settlement and the restore call itself.
+
+A suspended tenant's players can be holding **matched** positions. Those are
+collateralised on both sides and must still settle, and a player who is not even
+shown what they hold, what they are owed, or what their balance is, on a venue
+the operator has taken off, produces a complaint the only answer to which is to
+un-suspend. That is the opposite of what a suspension is for. It is also the
+reasoning `lib/limits.js` already applies to self-exclusion: matched positions
+are left alone because releasing them, or refusing to serve them, would mean the
+venue chooses which side of a matched bet to honour.
+
+The admin desk stays for the same reason plus one more: **a lock that also
+blocks the operator holding the key is a trap, not a control.** The first-run
+credential lock in `server.js` already had to be repaired for exactly that, and
+a venue that cannot be un-suspended without a direct database edit is a venue
+somebody will reach for one.
+
+### Resting orders go with it
+
+Suspending a tenant **cancels its resting orders and releases their escrow**,
+inside the same transaction as the status change and its audit row.
+
+No gate can do this. A resting order is not a request, it is live liquidity, and
+after the gates it would keep matching: a suspended venue's players taking new
+matched positions is precisely what the suspension exists to prevent, and it
+re-opens the hole the jurisdiction gate at session creation was built to close.
+Matched positions are left alone.
+
+### Where the gates live, and why there
+
+| Gate | Where | Why there |
+| --- | --- | --- |
+| Session creation | `lib/auth.js` `createSession` | next to the jurisdiction gate, for the same reason: a player who cannot get in never holds a position |
+| Trading | `lib/limits.js` `assertTradeable` | the **one** function every money path already calls, so a route added later cannot forget it — and it stops an **already-signed-in** player, not only the next login |
+| Resting orders | `lib/tenants.js` `configure` | a status change is the only moment a gate cannot cover |
+
+Both gates run **after** authentication, never before. A refusal raised before
+the password check would turn `POST /api/auth/login` into a probe that tells an
+unauthenticated caller which usernames exist and which venue is suspended — the
+exact disclosure the single generic `401` exists to prevent, and the ordering
+`lib/auth.js` already documents for a suspended *account*. A wrong password on a
+suspended tenant is still `401 Invalid username or password`, byte-identical to
+the answer for an account that does not exist.
+
+A self-excluded player on a suspended tenant is told they are **excluded**, not
+that their venue is suspended: the exclusion message is the only answer to that
+question that is not an argument, and a suspension leads nowhere straight back
+in either.
+
+*Tests:* `tests/tenants.test.js` (T21 login gate and its ordering, T22 the
+already-signed-in player, T23 reads and the admin desk survive, T24 resting
+orders and escrow, T25 scoped to its own tenant, T26 restoring opens the gate
+again), `tests/api.test.js` (the whole surface over HTTP).
 
 ## Markets, events and lifecycle
 
@@ -527,7 +645,9 @@ Listed so nobody mistakes a scope decision for a bug:
   backward-looking, so by the time it is measurable the money is already gone,
   whereas outlay is known at decision time and genuinely bounds the worst case.
   The residual exposure is the venue's own account, which is why cash-out credits
-  `house_float → player_funds` rather than debiting the bot's balance.
+  `house_float → player_funds` rather than debiting the bot's balance — see
+  [Who funds a buyout](#who-funds-a-buyout) for why that leaves no balance a
+  quote could be tested against.
 - **Horizontal scale.** SQLite is single-writer and synchronous — which is *why*
   the sweep is atomic, and a genuine strength — but it is one process on one
   machine. `npm run load` measures that single node (~500 orders/sec placed);

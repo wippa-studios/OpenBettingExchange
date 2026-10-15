@@ -402,6 +402,24 @@ failure rather than a silent cross-tenant disclosure:
     changed, or the stored row does not match this tenant and field
 ```
 
+The binding holds for every shape a database edit can take, and each is asserted
+against the real store rather than against the cipher in isolation:
+
+| Edited in the database | Result |
+| --- | --- |
+| the whole row re-pointed at another tenant | `500` integrity failure |
+| a **single column** swapped between two tenants' rows | `500` integrity failure |
+| one tenant's `username` envelope dropped into another tenant's `password` column | `500` integrity failure |
+| the ciphertext truncated, or a segment dropped | `500` integrity failure |
+| the column emptied entirely | `500` integrity failure |
+
+That last row is the reason `open()` has **no absent answer**. It used to
+return `null` for an empty envelope, which meant `UPDATE feed_credentials SET
+password = ''` produced a credential with a null password, no error at all, and
+a `status()` that reported the field as simply never configured — a row that had
+been edited reading as one that was untouched. An integrity failure is never
+reported as an absent credential, anywhere in this module.
+
 `validateInput` is a **local shape check**, not a credential test: a 16-character
 app key, a plausible username, a non-empty password. The exchange cannot tell you
 whether a credential works; only the collector can, by trying it. A wrong

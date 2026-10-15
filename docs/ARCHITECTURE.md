@@ -74,7 +74,7 @@ The dependency direction is strictly one way: `match → ledger → tx`, with
 | `lib/reports.js` | reporting: aggregate, state definitions, render CSV | settle anything or write to the ledger |
 | `lib/bots.js` | MarketMakers ladders, requote, withdraw-all | match itself (the engine's self-match guard covers it) |
 | `lib/drift.js` | fair-price random walk | move LTP (only real trades do) |
-| `lib/tenants.js` | multi-tenancy, per-tenant commission, jurisdictions, trusted-country extraction | decide a bet's outcome |
+| `lib/tenants.js` | multi-tenancy, per-tenant commission, jurisdictions, **tenant suspension**, trusted-country extraction | decide a bet's outcome |
 | `lib/payments/` | provider interface, reference provider, withdrawal lifecycle, webhook confirmation | credit on initiation |
 | `lib/jobs.js` | scheduled reconciliation and maintenance timers | run inside a placement transaction |
 | `lib/ops.js` | health, readiness, metrics, backup, restore | write to balances |
@@ -138,7 +138,19 @@ that once made the automated results poll settle nothing while reporting success
 - **Credentials scoped by construction, not by convention.** Feed credentials
   are sealed with AES-256-GCM and bound to tenant and field as additional
   authenticated data, so a row moved in the database fails to decrypt rather than
-  becoming another tenant's credential.
+  becoming another tenant's credential. `open` has no absent answer at all, so an
+  edited row — moved, column-swapped, truncated, or emptied — is always a loud
+  integrity failure and never reads as an unconfigured field.
+- **A tenant that is suspended is off, and "off" is enforced in the engine.**
+  A stored status that nothing reads is worse than no status: it is recorded as a
+  control and obeyed by nothing. Suspension is gated at session creation
+  (`lib/auth.js`, beside the jurisdiction gate) and at
+  `lib/limits.js assertTradeable` — the one function every money path already
+  calls, so it also stops an *already-signed-in* player — and it cancels the
+  tenant's resting orders, which no per-request gate could reach. Reads and the
+  admin desk stay open: matched positions must still settle, and a lock that
+  blocks the operator holding the key is a trap rather than a control. See
+  [EXCHANGE_RULES.md](EXCHANGE_RULES.md#tenants-and-suspension).
 - **SSE plus a 15s poll fallback in the browser.** The stream is a nicety; the
   board must still move if a proxy drops it.
 

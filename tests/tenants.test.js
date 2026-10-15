@@ -17,6 +17,7 @@ const A = require('../lib/auth');
 const T = require('./../lib/tenants');
 const ADM = require('../lib/admin');
 const config = require('../lib/config');
+const acc = require('../lib/accounts');
 
 let passed = 0;
 // Checks here are async (lib/auth.js derives password hashes off the event
@@ -298,6 +299,261 @@ check('T20 a tenant change that cannot be audited does not stand', async () => {
   db.close();
 });
 
+// ── #32: tenant status 'suspended' must BLOCK ────────────────────────────────
+//
+// The value was validated, stored, audited and rendered in the admin UI, and
+// read by nothing. Every user of a suspended tenant could log in, deposit,
+// place bets and cash out. Everything below is about the four things the
+// control has to do that storing it never did: refuse a login, refuse a trade
+// by someone ALREADY signed in, leave the read side working, and stop being a
+// trap for the operator holding the key.
+
+const M = require('../lib/match');
+const LIM = require('../lib/limits');
+const LED = require('../lib/ledger');
+const SET = require('../lib/settle');
+
+let evN = 0;
+function mkMarket(db, fair = 2.0) {
+  db.prepare("INSERT OR IGNORE INTO sports (name, slug) VALUES ('Football', 'football')").run();
+  const sport = db.prepare("SELECT id FROM sports WHERE slug='football'").get();
+  evN++;
+  db.prepare("INSERT INTO events (sport_id, name, starts_at) VALUES (?, ?, datetime('now','+2 hours'))")
+    .run(sport.id, `S32 Event ${evN}`);
+  const ev = db.prepare('SELECT id FROM events WHERE name = ?').get(`S32 Event ${evN}`);
+  db.prepare("INSERT INTO markets (event_id, name) VALUES (?, 'Match Odds')").run(ev.id);
+  const mkt = db.prepare('SELECT id FROM markets WHERE event_id = ? ORDER BY id DESC').get(ev.id);
+  const sels = {};
+  for (const n of ['Red', 'Blue']) {
+    db.prepare('INSERT INTO selections (market_id, name, fair_price) VALUES (?, ?, ?)').run(mkt.id, n, fair);
+    sels[n] = db.prepare('SELECT id FROM selections WHERE market_id=? AND name=?').get(mkt.id, n).id;
+  }
+  return { marketId: mkt.id, s1: sels.Red, s2: sels.Blue };
+}
+
+const suspend = (db, actor, tenantId) =>
+  T.configure(db, { actor, tenantId, status: 'suspended' });
+
+// T21: THE LOGIN GATE, AND THE ORDERING. A suspension that refuses BEFORE the
+// password check turns /api/auth/login into a probe: anyone can learn that a
+// username exists AND that its venue is suspended, having proved nothing. The
+// same reasoning lib/auth.js already applies to a suspended ACCOUNT.
+check('T21 a suspended tenant refuses login, and only after the password is proven', async () => {
+  const { db, alice } = (await fixture());
+  const tid = T.defaultTenant(db).id;
+
+  // The control: while the tenant is ACTIVE the correct password gets a session.
+  const before = await A.loginUser(db, { username: 'alice', password: 'pw-alice-123' });
+  assert.ok(before && before.token, 'precondition: an active tenant logs in');
+
+  suspend(db, alice, tid);
+  assert.strictEqual(T.suspensionRefusal(db, tid), 'tenant_suspended', 'the tenant reads as suspended');
+
+  await assert.rejects(
+    () => A.loginUser(db, { username: 'alice', password: 'pw-alice-123' }),
+    (e) => e.status === 403 && e.details && e.details.code === 'tenant_suspended' && /suspended/i.test(e.message),
+    'the correct password is refused, with a reason that names the venue'
+  );
+
+  // NOT AN ORACLE. A wrong password on a suspended tenant is still the single
+  // generic 401, so nothing here distinguishes "exists and is suspended" from
+  // "does not exist" or "wrong password". Check the suspension BEFORE the
+  // password and this becomes a 403 that says exactly which it is.
+  await assert.rejects(
+    () => A.loginUser(db, { username: 'alice', password: 'wrong-password' }),
+    (e) => e.status === 401 && /Invalid username or password/.test(e.message),
+    'a wrong password is still the generic 401 — the gate is not an existence oracle'
+  );
+  await assert.rejects(
+    () => A.loginUser(db, { username: 'nobody-at-all', password: 'wrong-password' }),
+    (e) => e.status === 401,
+    'and an unknown username is indistinguishable from it'
+  );
+
+  // …and the same at the session factory, which is the other entry point.
+  assert.throws(
+    () => A.createSession(db, alice.id, {}),
+    (e) => e.status === 403 && e.details.code === 'tenant_suspended'
+  );
+
+  // RESTORING puts it back, which is the property that makes this a control
+  // rather than a one-way door.
+  T.configure(db, { actor: alice, tenantId: tid, status: 'active' });
+  const after = await A.loginUser(db, { username: 'alice', password: 'pw-alice-123' });
+  assert.ok(after && after.token, 'restoring the tenant restores trading');
+  assert.strictEqual(T.suspensionRefusal(db, tid), null);
+  db.close();
+});
+
+// T22: AN EXISTING SESSION MUST STOP WORKING. The session below is minted
+// BEFORE the suspension and is asserted to still resolve afterwards, so every
+// 403 here is a refusal of a live session and not of a dead one.
+check('T22 an already-signed-in player is stopped at the next money-moving act', async () => {
+  const { db, alice } = (await fixture());
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-1234', balance_cents: 100000 }));
+  const tid = T.defaultTenant(db).id;
+  const { marketId, s1 } = mkMarket(db);
+  M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
+  const positions = M.positionsFor(db, alice.id);
+  assert.strictEqual(positions.length, 1, 'precondition: alice holds a matched position');
+
+  const token = A.createSession(db, alice.id);
+  const me = () => A.sessionUser(db, token);
+  assert.ok(me(), 'precondition: a live session before the suspension');
+
+  suspend(db, alice, tid);
+  assert.ok(me(), 'the session itself still resolves — it is the ACTING that is refused');
+
+  // 1. The engine gate. Every money path already calls this one, which is why
+  //    the control lives here and not in a route a future caller can forget.
+  assert.throws(
+    () => LIM.assertTradeable(db, me()),
+    (e) => e.status === 403 && e.details.code === 'tenant_suspended' && /venue is suspended/i.test(e.message)
+  );
+
+  // 2. Placing an order.
+  assert.throws(
+    () => M.placeOrder(db, me(), { selection_id: s1, side: 'back', price: 2.0, stake_cents: 5000 }),
+    (e) => e.status === 403 && e.details.code === 'tenant_suspended'
+  );
+
+  // 3. Cashing out — the one path that walks out with the venue's money.
+  assert.throws(
+    () => require('../lib/cashout').cashoutMarket(db, me(), marketId),
+    (e) => e.status === 403 && e.details.code === 'tenant_suspended'
+  );
+
+  // 4. The position is UNTOUCHED. Refusing to serve a player who holds one
+  //    would mean the venue chooses which side of a matched bet to honour.
+  assert.strictEqual(M.positionsFor(db, alice.id).length, 1, 'the matched position is left alone');
+  assert.strictEqual(
+    db.prepare('SELECT frozen_cents f FROM users WHERE id=?').get(alice.id).f,
+    10000,
+    'and so is the collateral held against it'
+  );
+  assert.strictEqual(acc.assertConserved(db), 0, 'the books still balance');
+  db.close();
+});
+
+// T23: READS STAY AVAILABLE. This is the judgement call in #32, so it is
+// asserted rather than assumed: a player who can read but not trade is the
+// intended state, and the admin desk must not become a trap for the operator
+// who has to restore the tenant.
+check('T23 a suspended tenant keeps READS and the admin desk; only acting is refused', async () => {
+  const { db, alice } = (await fixture());
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-1234', balance_cents: 100000 }));
+  const tid = T.defaultTenant(db).id;
+  const { marketId, s1, s2 } = mkMarket(db);
+  M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
+  // A RESTING order, so the book has depth and there is something to read.
+  M.placeOrder(db, bob, { selection_id: s2, side: 'lay', price: 2.5, stake_cents: 5000 });
+
+  suspend(db, alice, tid);
+
+  // Reads: the position, the balance, the ledger, the book.
+  assert.strictEqual(M.positionsFor(db, alice.id).length, 1, 'the player can still see their position');
+  const wallet = LED.walletView(db, alice.id);
+  assert.strictEqual(wallet.balance_cents, 100000, 'and their balance');
+  assert.ok(Array.isArray(wallet.transactions), 'and their ledger');
+  assert.ok(M.bookFor(db, marketId).length > 0, 'and the order book');
+
+  // The admin desk still settles. Refusing to settle obligations that already
+  // exist is the one thing a suspension must never do.
+  const r = SET.settleMarket(db, marketId, { winner_selection_id: s1 });
+  assert.ok(r && r.status !== 'rejected', `settlement still works on a suspended tenant (got ${JSON.stringify(r && r.status)})`);
+  assert.strictEqual(
+    db.prepare('SELECT balance_cents b FROM users WHERE id=?').get(alice.id).b,
+    100000 + 10000 - 250,
+    'and the winner is paid in full'
+  );
+  assert.strictEqual(acc.assertConserved(db), 0);
+  db.close();
+});
+
+// T24: SUSPENSION TAKES THE RESTING ORDERS WITH IT. A gate cannot do this: a
+// resting order is not a request, it is live liquidity, and after the new gates
+// it would still be matchable — a suspended venue taking new matched positions
+// is exactly what the suspension exists to prevent.
+check('T24 suspending a tenant cancels its resting orders and releases the escrow', async () => {
+  const { db, alice } = (await fixture());
+  const bob = (await A.registerUser(db, { username: 'bob', password: 'pw-bob-1234', balance_cents: 100000 }));
+  const tid = T.defaultTenant(db).id;
+  const { marketId, s1, s2 } = mkMarket(db);
+  M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
+  M.placeOrder(db, bob, { selection_id: s1, side: 'lay', price: 2.0, stake_cents: 10000 });
+  // Two resting orders, one per player, so neither side is a special case.
+  M.placeOrder(db, alice, { selection_id: s2, side: 'back', price: 3.0, stake_cents: 5000 });
+  M.placeOrder(db, bob, { selection_id: s2, side: 'back', price: 4.0, stake_cents: 5000 });
+  const alice0 = db.prepare('SELECT balance_cents b, frozen_cents f FROM users WHERE id=?').get(alice.id);
+  assert.strictEqual(alice0.f, 15000, 'precondition: 10000 matched + 5000 resting is frozen');
+
+  const r = suspend(db, alice, tid);
+  assert.strictEqual(r.status, 'suspended');
+
+  assert.strictEqual(M.openOrdersFor(db, alice.id).length, 0, 'alice has no resting orders left');
+  assert.strictEqual(M.openOrdersFor(db, bob.id).length, 0, 'nor does bob');
+  const alice1 = db.prepare('SELECT balance_cents b, frozen_cents f FROM users WHERE id=?').get(alice.id);
+  assert.strictEqual(alice1.f, 10000, 'only the MATCHED collateral is still held');
+  assert.strictEqual(alice1.b, 100000, 'and the resting escrow came back in full');
+  const rows = db.prepare("SELECT frozen_cents f, status FROM orders WHERE status='cancelled'").all();
+  assert.strictEqual(rows.length, 2);
+  for (const o of rows) assert.strictEqual(o.f, 0, 'a cancelled order leaves no escrow on the row');
+  // The audit row records the same transaction, so "cancelled the book" is
+  // answerable from the same place as "suspended the tenant".
+  const A2 = require('../lib/audit');
+  const row = A2.list(db, { limit: 50 }).find((x) => x.action === 'tenant.configured' && x.after.status === 'suspended');
+  assert.ok(row, 'the suspension is audited');
+  assert.strictEqual(acc.assertConserved(db), 0);
+  db.close();
+});
+
+// T25: the control against the whole control being "refuse everything". Another
+// tenant — and a user outside the suspended one — is untouched by every gate.
+check('T25 suspension is scoped to its own tenant', async () => {
+  const { db, alice } = (await fixture());
+  const otherId = makeTenant(db, { slug: 'live', name: 'Live', commission_bps: 100 });
+  const other = (await A.registerUser(db, { username: 'other-player', password: 'pw-other-1234', balance_cents: 100000 }));
+  db.prepare('UPDATE users SET tenant_id=? WHERE id=?').run(otherId, other.id);
+  const { marketId, s1 } = mkMarket(db);
+
+  suspend(db, alice, T.defaultTenant(db).id);
+
+  assert.strictEqual(T.suspensionRefusal(db, otherId), null, 'the other tenant is not suspended');
+  assert.strictEqual(T.suspensionRefusalForUser(db, other.id), null);
+  assert.throws(
+    () => LIM.assertTradeable(db, alice),
+    (e) => e.details.code === 'tenant_suspended',
+    'alice is still refused'
+  );
+  assert.strictEqual(LIM.assertTradeable(db, other), undefined, 'and the other tenant still trades');
+  // Awaited, not floated: loginUser derives its hash off the event loop, so an
+  // unawaited call resolves after this check has closed the database and kills
+  // the process with "database is not open" — nondeterministically, which is
+  // worse than a failure.
+  const otherLogin = await A.loginUser(db, { username: 'other-player', password: 'pw-other-1234' });
+  assert.ok(otherLogin && otherLogin.token, 'and can still log in');
+  M.placeOrder(db, other, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
+  db.close();
+});
+
+// T26: a suspension that cannot be undone from the API would be a trap, and the
+// first-run credential lock in server.js already had to be repaired for exactly
+// that. Restoring is an ordinary configure call on a suspended tenant.
+check('T26 a suspended tenant can be restored, and the gate opens again', async () => {
+  const { db, alice } = (await fixture());
+  const tid = T.defaultTenant(db).id;
+  const { marketId, s1 } = mkMarket(db);
+  suspend(db, alice, tid);
+  assert.throws(() => M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 }), (e) => e.status === 403);
+  T.configure(db, { actor: alice, tenantId: tid, status: 'active' });
+  assert.strictEqual(LIM.assertTradeable(db, alice), undefined, 'the gate is open again');
+  const order = M.placeOrder(db, alice, { selection_id: s1, side: 'back', price: 2.0, stake_cents: 10000 });
+  assert.ok(order && order.order, 'and orders are accepted again');
+  db.close();
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -314,6 +570,6 @@ check('T20 a tenant change that cannot be audited does not stand', async () => {
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 20) { console.error("expected 20 checks"); process.exit(1); }
+  if (passed < 26) { console.error("expected 26 checks"); process.exit(1); }
   console.log(`\ntenants.test.js: ${passed} checks passed`);
 })();
