@@ -225,6 +225,53 @@ check('C6 a posting in ONE currency is still accepted — the guard is not "refu
   db.close();
 });
 
+// Two callers resolve a PLAYER bucket with three arguments — userBalance()
+// below, and the opening balance in lib/auth.js. Both are on the path a
+// registering player takes. Resolved from the TENANT rather than defaulted to
+// the venue's, because on a correctly configured venue those are the same value
+// and the difference is invisible until they are not.
+check('C6b a player bucket resolved without a currency follows the TENANT, not the venue', async () => {
+  const { db, alice } = (await fixture());
+  const bob = (await A.registerUser(db, { username: 'c6b', password: 'pw-c6b-1234', balance_cents: 0 }));
+  // Give bob a tenant whose currency is NOT the venue's. configure() refuses
+  // that through the API precisely because the ledger cannot hold it — so this
+  // is written directly, to reach a state the guards exist to detect.
+  const tid = Number(db.prepare("INSERT INTO tenants (slug, name, commission_bps, currency) VALUES ('c6b-other','C6b other',250,'GBP')").run().lastInsertRowid);
+  db.prepare('UPDATE users SET tenant_id=? WHERE id=?').run(tid, bob.id);
+  acc.ensureUserAccounts(db, bob.id, 'GBP');
+
+  // The three-argument call — what auth.js does. It must resolve the TENANT's
+  // currency, so it agrees with bob's GBP bucket and succeeds. The old
+  // `currency = config.VENUE_CURRENCY` default would have resolved AUD against
+  // a GBP row and thrown: that is the discriminating case.
+  assert.strictEqual(
+    db.prepare('SELECT currency FROM accounts WHERE id=?').get(acc.accountId(db, 'player_funds', bob.id)).currency,
+    'GBP',
+    'a player bucket resolved without a currency follows the TENANT'
+  );
+  // userBalance — the other three-argument caller — reads the same bucket, in
+  // the same currency, rather than reporting a balance in the venue's.
+  assert.strictEqual(acc.userBalance(db, bob.id, 'player_funds'), 0, 'and userBalance agrees');
+
+  // …and it still ASSERTS: a bucket that disagrees with its own tenant is
+  // refused, which is the guard that made the resolution worth doing.
+  db.prepare('UPDATE accounts SET currency = ? WHERE kind=? AND user_id=?').run('AUD', 'player_funds', bob.id);
+  assert.throws(
+    () => acc.accountId(db, 'player_funds', bob.id),
+    (e) => /is denominated in AUD/.test(e.message) && /not GBP/.test(e.message),
+    'a bucket disagreeing with its TENANT is refused, not silently resolved'
+  );
+  assert.throws(() => acc.userBalance(db, bob.id, 'player_funds'), /is denominated in AUD/);
+
+  // A venue singleton has no tenant, so it resolves to the venue's.
+  assert.strictEqual(
+    db.prepare('SELECT currency FROM accounts WHERE id=?').get(acc.accountId(db, 'house_float')).currency,
+    VENUE,
+    'a venue singleton is denominated in the venue currency'
+  );
+  db.close();
+});
+
 // ── C7: nothing in the source still hard-codes a currency ───────────────────
 //
 // The issue named eight sites. The regression guard is the thing that stops it
