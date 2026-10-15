@@ -55,6 +55,20 @@ const JOBS_INTERVALS = {
   // cadence: tight enough that a 6-second delay is honoured, loose enough
   // that the scan is trivial. 0 disables it.
   delayReleaseMs: Number(process.env.DELAY_RELEASE_INTERVAL_MS || 5000),
+  // The LAPSE sweep (#97) — its OWN knob, deliberately NOT delayReleaseMs.
+  //
+  // It shipped riding the delay-release timer, which meant LAPSE was dead on any
+  // venue that set DELAY_RELEASE_INTERVAL_MS=0 — a documented, supported value,
+  // and the natural setting for an operator who has withdrawn in-play (see
+  // docs/ROADMAP.md §5, which withdrew the feature but kept the mechanism).
+  // That coupling made a money-affecting promise — "this order will not carry
+  // past the off" — quietly depend on an unrelated operational toggle, with no
+  // log line anywhere saying the sweep was not running. It is the dead-control
+  // shape this repository keeps finding, and the reason it is a separate knob
+  // rather than a shared one: the two passes read different predicates and have
+  // different reasons to exist. Five seconds is the same cadence for the same
+  // reason as above. 0 disables it, loudly.
+  lapseMs: Number(process.env.LAPSE_INTERVAL_MS || 5000),
 };
 const PAY = require('./lib/payments');
 const TEN = require('./lib/tenants');
