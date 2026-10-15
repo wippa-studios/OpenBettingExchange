@@ -9,11 +9,24 @@ const { groupRows, ageSeconds, boardSql, healthSql, navSql, feedView } = require
 const NAV_SRC = require('fs').readFileSync(require('path').join(__dirname, '..', 'lib', 'feed.js'), 'utf8');
 
 // Pull the registered /api/feed/nav handler off the Express stack so it can be
-// called without binding a port. Express 4 stores routes in app._router.stack.
-// Shared with tests/feed_nav.test.js.
+// called without binding a port.
+// Shared with tests/feed_nav.test.js and tests/feed_outage.test.js.
+//
+// `app.router` is Express 5's PUBLIC accessor for the router (Express 4 kept
+// the same object on the private `app._router`, which 5 removed). Both are read
+// here so the helper names the change rather than silently finding an empty
+// stack — the caller's `assert.ok(handler, ...)` then reports "not registered"
+// instead of failing somewhere inside this function.
+function routerStack(app) {
+  const r = app.router || app._router;
+  assert.ok(r && Array.isArray(r.stack),
+    `neither app.router nor app._router exposes a stack (app.router=${typeof app.router}); ` +
+    'the Express introspection this helper relies on has changed again');
+  return r.stack;
+}
+
 function findNavHandler(app) {
-  const stack = (app._router && app._router.stack) || [];
-  for (const layer of stack) {
+  for (const layer of routerStack(app)) {
     if (layer.route && layer.route.path === '/api/feed/nav') {
       const handlers = layer.route.stack || [];
       const last = handlers[handlers.length - 1];

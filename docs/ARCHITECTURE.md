@@ -31,6 +31,10 @@ server    server.js  2,560 lines, 87 routes
              4. session middleware (cookie ob_session | Bearer)
              5. routes: auth · board · trading · wallet · admin · stream
              6. /api 404 (JSON) → static(public/) → errorHandler
+
+         Express 5. `query parser` is pinned to `simple` rather than left on the
+         framework default — see the comment at the top of server.js for the
+         audit behind that choice.
    │
    ▼
 engine    lib/       31 modules + lib/payments/ — see the table below
@@ -184,6 +188,12 @@ Deliberately narrow, and asserted by tests rather than assumed:
 - **Origin guard before parsing.** Mutating requests need no `Origin` (curl) or a
   loopback origin. Because it runs first, a malformed body from a foreign origin
   is still a `403`.
+- **The framework's defaults are pinned, not inherited.** `query parser` is set
+  explicitly to `simple`. Express 5 changed this default from `extended` to
+  `simple`, and an unset value would mean the behaviour of every query-string
+  read is decided by whichever framework version is installed. The audit that
+  justifies the value — no route reads nested bracket syntax anywhere — is in
+  `server.js` and re-run mechanically by `tests/express5.test.js`.
 - **Sessions** are opaque 32-byte tokens stored as SHA-256 digests, delivered in
   an `HttpOnly; SameSite=Lax` cookie. Passwords are scrypt compared with
   `timingSafeEqual`, a missing user still pays the KDF cost, and a non-string
@@ -208,7 +218,7 @@ Deliberately narrow, and asserted by tests rather than assumed:
 
 ## Testing strategy
 
-739 checks across 60 suites, plus a 142-check browser suite and a live smoke script.
+758 checks across 61 suites, plus a 142-check browser suite and a live smoke script.
 
 | Layer | Where | What it proves |
 | --- | --- | --- |

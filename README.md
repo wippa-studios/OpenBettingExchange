@@ -203,9 +203,19 @@ The frontend (`public/js/`) is split into seven modules (`core`, `shell`, `nav`,
 `board`, `slip`, `views`, `boot`) under the `window.OB` namespace.
 
 There is no ORM and no migration tool. The data model is a single readable SQL
-file. Runtime dependencies are Express and `pg` (the feed's Postgres client);
+file. Runtime dependencies are Express 5 and `pg` (the feed's Postgres client);
 Playwright is a development dependency used by the browser suite. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and its rationale.
+
+> **Express 5.** The upgrade from 4 was not a dependency bump: Express 5
+> compiles routes with path-to-regexp v8, which removed the optional-parameter
+> syntax `:id?`, and three routes used it. Because those are top-level
+> registrations, the router threw while `server.js` was being `require`d and the
+> venue did not start at all. They are now registered twice — with and without
+> `:id` — and `tests/express5.test.js` pins that, along with the pinned query
+> parser, the `req.body`-is-`undefined` change, the error handler's
+> post-response guard, and a version assertion so the migration cannot be
+> silently reverted behind a green suite.
 
 ## Financial invariants
 
@@ -407,7 +417,7 @@ weight.
 ```bash
 
 
-npm test            # 739 checks: unit and API integration, fully offline
+npm test            # 758 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 142 checks: real Chromium via Playwright (board and admin desk)

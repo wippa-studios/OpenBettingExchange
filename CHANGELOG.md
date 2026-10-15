@@ -256,6 +256,39 @@ against a real database with 9,456 books in it:
   instead of rendering an empty column.
 
 ### Changed
+- **Express 4 → 5** (issue #74). Dependabot's bump would not have booted: Express 5
+  compiles routes with path-to-regexp v8, which removed the optional-parameter
+  syntax `:id?`, and three routes used it —
+  `PUT`/`DELETE /api/admin/feed/credentials/:id?` and
+  `GET /api/admin/feed/runner/:id?`. Those are **top-level** registrations, so
+  the router threw `Unexpected ? at index 31` while `server.js` was being
+  `require`d and the venue did not start at all. Each is now registered twice,
+  with and without `:id`, reaching one handler; the `?` was decorative, as no
+  handler ever read `req.params.id` (the tenant always came from
+  `feedTenantId(req)`, which is the caller's own and refuses any other). The
+  documented id-less forms therefore keep working.
+
+  Three further Express 5 differences were audited rather than assumed, and none
+  required a behaviour change — the reasons are in the source and the checks:
+  `query parser` is now pinned explicitly to `simple` (no route reads nested
+  bracket syntax; the audit is re-run mechanically); every `req.body` read was
+  already guarded for `undefined`, which matters more now that Express 5 leaves
+  it `undefined` rather than `{}`; and every async handler already handles its own
+  rejection, so Express 5's automatic forwarding has nothing new to forward.
+
+  The one real behaviour change: `errorHandler` now hands a post-response error
+  to `next(err)` instead of writing a second response onto a finished one. Express
+  5 forwarding a rejected promise widens the window in which that can happen, and
+  the old behaviour logged `ERR_HTTP_HEADERS_SENT` on top of a request that had
+  already succeeded.
+
+  `playwright` moves 1.62 → 1.64 (dev-only). `tests/express5.test.js` adds 19
+  checks, including one that asserts the installed Express major version is 5 so
+  the migration cannot be reverted behind a green suite.
+
+  **Correction to issue #74:** `app.param()` was listed as one of the removed
+  APIs. It is not removed — it is still a function on an Express 5 application.
+  It is unused here, so nothing changes, but the claim was wrong.
 - Runner names in the ladder wrap instead of truncating; the selection column
   widened, so real names ("1. Blue and Gold") are readable.
 - The board query is set-based and resolves each `(runner, side)` to its newest
