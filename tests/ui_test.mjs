@@ -901,12 +901,24 @@ try {
   });
   // The release POST body, captured off the wire.
   let releasePayload = null;
+  // Admin writes captured the same way, for #52.
+  const adminWrites = {};
   page.on('request', (r) => {
-    if (/\/api\/admin\/results\/held\/\d+\/release$/.test(new URL(r.url()).pathname)) {
+    const p = new URL(r.url()).pathname;
+    if (/\/api\/admin\/results\/held\/\d+\/release$/.test(p)) {
       try {
         releasePayload = JSON.parse(r.postData() || 'null');
       } catch {
         releasePayload = { __unparseable: r.postData() };
+      }
+      return;
+    }
+    if (r.method() === 'POST' || r.method() === 'PUT') {
+      if (!/^\/api\/admin\/(users\/\d+\/(limits|exclude)|markets\/\d+(\/settle)?)$/.test(p)) return;
+      try {
+        adminWrites[`${r.method()} ${p}`] = JSON.parse(r.postData() || 'null');
+      } catch {
+        adminWrites[`${r.method()} ${p}`] = { __unparseable: r.postData() };
       }
     }
   });
@@ -1142,6 +1154,198 @@ try {
         releasePayload.winner_selection_id === soloId &&
         (releasePayload.dead_heat === undefined || releasePayload.dead_heat === null),
       `(payload ${JSON.stringify(releasePayload)}, expected winner ${soloId})`
+    );
+  });
+
+  // ── #52 (1/3): per-user limits and self-exclusion ────────────────────────
+  //
+  // lib/limits.js enforces the stake cap, the market-liability cap and the
+  // daily settled cap — and operator-recorded self-exclusion — on EVERY trade.
+  // Both were API routes with no control on the desk: `grep data-act` found
+  // balance, suspend/reinstate and promote/demote, and nothing else.
+  //
+  // The sharp assertion here is not "a dialog opens" — it is that raising ONE
+  // axis does not silently clear the others. The route's comment promises that
+  // an absent key leaves its axis untouched, and it does not: lib/limits.js's
+  // capOf() maps `undefined` to `null` and setLimits writes every axis on every
+  // call, so omitting a key CLEARS that cap. Measured against a running server
+  // before this control existed. So the checks read the caps back off the
+  // server after changing one of them.
+  await scenario('#52 per-user limits: reachable, and changing one axis keeps the others', async () => {
+    await page.click('[data-view="users"]');
+    await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
+    // uitester, not demo: the first-run-lock scenario below signs demo in and
+    // needs it tradeable enough to be refused by exactly one thing.
+    await page.fill('#userSearch', 'uitester');
+    await page.click('#userSearchGo');
+    await page.waitForFunction(
+      () => {
+        const rows = [...document.querySelectorAll('#adminBody .adm-tbl tbody tr')];
+        return rows.length === 1 && (rows[0].textContent || '').includes('uitester');
+      },
+      null,
+      { timeout: 10000 }
+    );
+    const row = page.locator('#adminBody .adm-tbl tbody tr').first();
+    const uid = Number(((await row.locator('td').first().textContent()) || '').trim());
+
+    const hasLimits = (await row.locator('[data-act="limits"]').count()) === 1;
+    const hasExclude = (await row.locator('[data-act="exclude"]').count()) === 1;
+    check('#52 fixture: the account row carries a limits control', hasLimits, `(user ${uid})`);
+    check('#52 fixture: the account row carries a self-exclusion control', hasExclude, `(user ${uid})`);
+    if (!hasLimits || !hasExclude) return;
+
+    const limitsOf = () =>
+      page.evaluate(async (id) => {
+        const r = await (await fetch(`/api/admin/users/${id}/limits`)).json();
+        return r.limits;
+      }, uid);
+    const globalRow = async () => (await limitsOf()).find((r) => r.scope === 'global') || null;
+
+    // ── open the limits control ────────────────────────────────────────────
+    await row.locator('[data-act="limits"]').click();
+    await page.waitForSelector('.modal[role="dialog"] #lmSave', { timeout: 10000 });
+    check(
+      '#52 the limits control opens on the account under edit',
+      /uitester/.test((await page.locator('.modal[role="dialog"] h3').textContent()) || ''),
+      `("${((await page.locator('.modal[role="dialog"] h3').textContent()) || '').trim()}")`
+    );
+    check(
+      '#52 the limits control offers the global scope and per-market scopes',
+      (await page.locator('.modal[role="dialog"] #lmScope option[value="global"]').count()) === 1 &&
+        (await page.locator('.modal[role="dialog"] #lmScope option[value^="market:"]').count()) >= 1
+    );
+
+    // Three axes: two capped in dollars, one explicitly uncapped.
+    await page.selectOption('.modal[role="dialog"] #lmScope', 'global');
+    await page.fill('.modal[role="dialog"] [data-cents="max_open_stake_cents"]', '25');
+    await page.fill('.modal[role="dialog"] [data-cents="max_daily_settled_cents"]', '500');
+    await page.locator('.modal[role="dialog"] [data-nocap="max_market_liability_cents"]').check();
+    delete adminWrites[`PUT /api/admin/users/${uid}/limits`];
+    await page.locator('.modal[role="dialog"] #lmSave').click();
+    await page.waitForFunction(
+      () => /Limits saved/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    const wrote = adminWrites[`PUT /api/admin/users/${uid}/limits`] || null;
+    check(
+      '#52 the limits control sends every axis, not only the changed ones',
+      !!wrote &&
+        ['max_open_stake_cents', 'max_market_liability_cents', 'max_daily_settled_cents'].every((k) =>
+          Object.prototype.hasOwnProperty.call(wrote, k)
+        ),
+      `(payload ${JSON.stringify(wrote)})`
+    );
+    check(
+      '#52 the limits control sends integer cents and an explicit null for "no cap"',
+      !!wrote &&
+        wrote.scope === 'global' &&
+        wrote.max_open_stake_cents === 2500 &&
+        wrote.max_daily_settled_cents === 50000 &&
+        wrote.max_market_liability_cents === null,
+      `(payload ${JSON.stringify(wrote)})`
+    );
+    let g = await globalRow();
+    check(
+      '#52 the caps are stored on the server',
+      !!g && g.max_open_stake_cents === 2500 && g.max_daily_settled_cents === 50000,
+      `(row ${JSON.stringify(g)})`
+    );
+
+    // ── THE SHARP ONE: raise ONE axis, keep the others ─────────────────────
+    await row.locator('[data-act="limits"]').click();
+    await page.waitForSelector('.modal[role="dialog"] #lmSave', { timeout: 10000 });
+    check(
+      '#52 reopening shows the stored caps rather than a blank form',
+      (await page.locator('.modal[role="dialog"] [data-cents="max_daily_settled_cents"]').inputValue()) === '500.00',
+      `("${await page.locator('.modal[role="dialog"] [data-cents="max_daily_settled_cents"]').inputValue()}")`
+    );
+    await page.fill('.modal[role="dialog"] [data-cents="max_open_stake_cents"]', '50');
+    await page.locator('.modal[role="dialog"] #lmSave').click();
+    await page.waitForFunction(
+      () => /Limits saved/.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    g = await globalRow();
+    check(
+      '#52 raising one cap does not clear the others',
+      !!g && g.max_open_stake_cents === 5000 && g.max_daily_settled_cents === 50000,
+      `(row ${JSON.stringify(g)} — a daily cap of null here is the server clearing an omitted axis)`
+    );
+    await page.locator('.modal[role="dialog"] #lmCancel').click().catch(() => {});
+
+    // ── self-exclusion, with a STRICT ISO end date ──────────────────────────
+    await row.locator('[data-act="exclude"]').click();
+    await page.waitForSelector('.modal[role="dialog"] #exGo', { timeout: 10000 });
+    check(
+      '#52 self-exclusion defaults to permanent',
+      await page.locator('.modal[role="dialog"] #exPermanent').isChecked() &&
+        (await page.locator('.modal[role="dialog"] #exUntil').isDisabled())
+    );
+    // An exclusion with no reason must not reach the server. The audit row is
+    // only as good as the reason in it, and this is the one action here with
+    // no inverse.
+    delete adminWrites[`POST /api/admin/users/${uid}/exclude`];
+    await page.locator('.modal[role="dialog"] #exGo').click();
+    await page.waitForFunction(
+      () => /reason is required/i.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 5000 }
+    );
+    check(
+      '#52 self-exclusion will not proceed without a written reason',
+      adminWrites[`POST /api/admin/users/${uid}/exclude`] === undefined,
+      `(payload ${JSON.stringify(adminWrites[`POST /api/admin/users/${uid}/exclude`])})`
+    );
+
+    await page.locator('.modal[role="dialog"] #exPermanent').uncheck();
+    const LOCAL = '2099-06-01T09:30';
+    await page.fill('.modal[role="dialog"] #exUntil', LOCAL);
+    await page.fill('.modal[role="dialog"] #exReason', 'ui test: exclusion recorded with a strict ISO end date');
+    delete adminWrites[`POST /api/admin/users/${uid}/exclude`];
+    await page.locator('.modal[role="dialog"] #exGo').click();
+    await page.waitForFunction(
+      () => /excluded/i.test((document.querySelector('#toast') || {}).textContent || ''),
+      { timeout: 15000 }
+    );
+    const ex = adminWrites[`POST /api/admin/users/${uid}/exclude`] || null;
+    check(
+      '#52 self-exclusion sends a strict ISO-8601 UTC instant, not a local wall clock',
+      !!ex && typeof ex.until === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(ex.until),
+      `(sent until=${JSON.stringify(ex && ex.until)}, field said "${LOCAL}")`
+    );
+    check(
+      '#52 self-exclusion sends the operator\'s reason',
+      !!ex && typeof ex.reason === 'string' && ex.reason.length >= 5,
+      `(${ex && ex.reason})`
+    );
+
+    // The only place the exclusion is visible afterwards: neither
+    // GET /api/admin/users nor GET /api/admin/users/:id returns self_excluded
+    // or excluded_until, so the audit trail is the record. Server-side read
+    // gap, reported rather than worked around.
+    await page.click('[data-view="audit"]');
+    await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
+    await page.fill('#auditTarget', `user:${uid}`);
+    await page.click('#auditGo');
+    await page.waitForFunction(
+      (id) => {
+        const tb = document.querySelector('#adminBody .adm-tbl tbody');
+        return !!tb && /user\.excluded/.test(tb.textContent || '') && (tb.textContent || '').includes(`user:${id}`);
+      },
+      uid,
+      { timeout: 10000 }
+    );
+    const auditText = (await page.locator('#adminBody .adm-tbl tbody').textContent()) || '';
+    // The end date reaches the trail in lib/util.js's normalised form — the same
+    // instant we sent, in SQLite's `YYYY-MM-DD HH:MM:SS` UTC. Asserting the
+    // ISO string verbatim here would fail while the trail was correct.
+    const inTrail = String(ex.until).replace('T', ' ').replace(/Z$/, '');
+    check(
+      '#52 the exclusion is audited with its reason and its end date',
+      /user\.excluded/.test(auditText) &&
+        auditText.includes(inTrail) &&
+        auditText.includes('ui test: exclusion recorded'),
+      `("${inTrail}" in: ${auditText.slice(0, 70)}…)`
     );
   });
 
