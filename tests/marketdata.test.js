@@ -36,6 +36,7 @@ const path = require('path');
 const { openStore } = require('../lib/store');
 const A = require('../lib/auth');
 const M = require('../lib/match');
+const INPLAY = require('../lib/inplay');
 const MD = require('../lib/marketdata');
 
 let passed = 0;
@@ -490,9 +491,179 @@ const tapeRows = (db, selectionId) => db.prepare('SELECT COUNT(*) c FROM price_h
     assert.strictEqual(MD.attachRows(bookOf(db, market_id), rows)[0].matched_window_minutes, MD.DEFAULT_WINDOW_MINUTES);
   });
 
-  // ── M11: the routes. #93's second acceptance item is an ENDPOINT, and an endpoint
+  // M12: THE LADDER ANSWERS THE SAME QUESTION lib/inplay.js ALREADY ASKED.
+  //
+  // The issue's instruction was to reuse the windowed-volume query in
+  // lib/inplay.js rather than write a second one. What that turned out to mean
+  // in practice is worth stating, because the literal reading is not buildable:
+  //
+  //   - `tradedVolume()`/`volumeBySelection()` group by MARKET and by SELECTION.
+  //     The ladder needs a group by PRICE, which neither of them produces. There
+  //     is no way to get a per-price column out of a per-selection aggregate.
+  //   - their statement plans as
+  //       SEARCH matches USING INDEX idx_matches_market (market_id=?)
+  //     with the window applied as a FILTER, not an index constraint (measured,
+  //     below). So reusing it verbatim would have put a per-frame walk over every
+  //     fill the market has ever recorded onto the board's 15-second poll —
+  //     precisely the unbounded synchronous read docs/ARCHITECTURE.md names.
+  //
+  // So this file derives from the SAME source table (`matches`), over the SAME
+  // default window (inplay's own 10), through a minute-bucketed rollup whose read
+  // is an index range. What must then hold — and what is asserted here — is that
+  // the two still AGREE, to the cent, for every selection and for the market as
+  // a whole. Two queries for one question are only a problem if they can
+  // disagree; this is the check that says they cannot.
+  await check('M12 the ladder column agrees, to the cent, with lib/inplay.js windowed volume', async () => {
+    const { db, market_id, alpha, beta, alice, bob } = await fixture();
+    // Two runners, three prices, and one DELIBERATELY EXHAUSTED level so the
+    // per-level grouping has a group the ladder cannot display.
+    const trades = [
+      [alpha, 2.0, 3000], [alpha, 2.02, 1100], [alpha, 2.02, 600], [beta, 3.0, 5000], [beta, 3.0, 250],
+    ];
+    for (const [sel, price, stake] of trades) {
+      restBack(db, alice, sel, price, stake + 2000);
+      M.placeOrder(db, bob, { selection_id: sel, side: 'lay', price, stake_cents: stake });
+    }
+
+    // PRE-STATE from inplay's own query, which is untouched by anything here.
+    const inplay = INPLAY.volumeBySelection(db, market_id, MD.DEFAULT_WINDOW_MINUTES);
+    assert.strictEqual(inplay.length, 2, 'inplay reports both runners');
+    const inplayBySel = new Map(inplay.map((r) => [r.selection_id, r]));
+    assert.strictEqual(inplayBySel.get(alpha).staked, 4700, 'pre-state: 3000 + 1100 + 600 on Alpha');
+    assert.strictEqual(inplayBySel.get(beta).staked, 5250, 'pre-state: 5000 + 250 on Beta');
+
+    const market = INPLAY.tradedVolume(db, market_id, MD.DEFAULT_WINDOW_MINUTES);
+    assert.strictEqual(market.staked_cents, 9950, 'and 9950 across the market');
+
+    // The ladder's own answer, per selection and per market.
+    const book = MD.attachMatchedLevels(db, bookOf(db, market_id), { marketId: market_id });
+    for (const sel of book) {
+      const theirs = inplayBySel.get(sel.selection_id);
+      assert.ok(theirs, `inplay knows selection ${sel.selection_id}`);
+      assert.strictEqual(sel.matched_cents, theirs.staked,
+        `selection ${sel.selection_id}: the ladder says ${sel.matched_cents}, inplay says ${theirs.staked}`);
+      assert.strictEqual(sel.matched_fills, theirs.fills, 'and the fill count agrees');
+    }
+    const ladderTotal = book.reduce((a, s) => a + s.matched_cents, 0);
+    assert.strictEqual(ladderTotal, market.staked_cents, 'and so does the market total');
+
+    // THE GROUPING IS THE PART inplay cannot do. inplay's rows carry no price
+    // breakdown, so the per-price figure is strictly new information on top of
+    // the same totals — asserted as "more rows, same money", which fails if the
+    // rollup ever starts reading a different table than the one inplay reads.
+    //
+    // TWO groups, not five trades' worth: a lay taker sweeps the resting book
+    // from the BEST price upward whatever limit price it sent, so every fill
+    // above landed at 2.00 on Alpha and 3.00 on Beta. That is also what makes
+    // the 2.00 level the interesting one: three fills landed on it and it is
+    // still on the ladder, so the acceptance item is visible in one row —
+    // $47.00 matched sitting NEXT TO $3.00 still available at 2.00, rather than
+    // replacing it.
+    const rows = MD.matchedByLevel(db, { marketIds: [market_id] });
+    const bySel = new Map();
+    for (const r of rows) bySel.set(r.selection_id, (bySel.get(r.selection_id) || 0) + r.matched_cents);
+    assert.deepStrictEqual([...bySel.entries()].sort((a, b) => a[0] - b[0]),
+      [...inplayBySel.entries()].map(([k, v]) => [k, v.staked]).sort((a, b) => a[0] - b[0]),
+      'the per-price rollup re-sums to inplay\'s per-selection figure, cent for cent');
+    assert.strictEqual(rows.length, 2, 'two (selection, price) groups — one price per runner traded');
+    assert.ok(rows.every((r) => typeof r.price === 'number' && r.price > 1),
+      'and every row carries a real price, which inplay\'s aggregate cannot give');
+    const alphaRow = rows.find((r) => r.selection_id === alpha);
+    assert.strictEqual(alphaRow.price, 2.0, 'Alpha traded at 2.00');
+    assert.strictEqual(alphaRow.matched_cents, 4700, 'for all of it');
+    // The ladder shows BOTH figures on that level: the matched volume and the
+    // unmatched size that is still available. A column that replaced the size
+    // would pass every money assertion in this suite and still be wrong.
+    const alphaSel = book.find((s) => s.selection_id === alpha);
+    const alphaLv = alphaSel.lay.find((l) => l.price === 2.0);
+    assert.ok(alphaLv, 'the level is still on the ladder');
+    assert.strictEqual(alphaLv.matched_cents, 4700, 'carrying what matched there');
+    assert.strictEqual(alphaLv.matched_fills, 3, 'across three fills');
+    assert.strictEqual(alphaLv.size_cents, 300, 'and the unmatched size beside it, not instead of it');
+
+    // AND THE PLAN, which is why the rollup exists rather than a reuse. Both
+    // measured on this database, so a planner change is caught here rather than
+    // as a stall on a busy board. The statement is inplay's own, alias and all,
+    // because the plan is the only thing that distinguishes the two approaches.
+    const plan = (sql, ...a) => db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...a).map((r) => r.detail).join(' | ');
+    const inplayPlan = plan(
+      'SELECT mt.selection_id, COUNT(*) FROM matches mt JOIN selections s ON s.id = mt.selection_id'
+      + " WHERE mt.market_id = ? AND mt.at >= datetime('now', ?) GROUP BY mt.selection_id",
+      market_id, '-10 minutes');
+    assert.match(inplayPlan, /USING INDEX idx_matches_market \(market_id=\?\)/,
+      `inplay's windowed read is an index search today; if this ever changes, revisit the rollup. Got: ${inplayPlan}`);
+    assert.ok(!/at>\?/.test(inplayPlan),
+      `but the WINDOW is not an index constraint there — it filters after the search, so the search walks every fill in the market. Got: ${inplayPlan}`);
+    const ours = plan(MD.MATCHED_BY_LEVEL_SQL.replace('{{MARKET_IDS}}', '?'), market_id, MD.bucketCutoff(10));
+    assert.match(ours, /market_id=\? AND bucket>\?/,
+      `ours constrains BOTH terms, so its cost is bounded by buckets in the window. Got: ${ours}`);
+  });
+
+  // M13: THE BOARD'S SCOPE IS DELIBERATELY NOT CAPPED, so no market on it can
+  // silently read zero volume.
+  //
+  // `matchedByLevel` takes an explicit market list and does not truncate it —
+  // unlike `openMarketScope()`, which caps the board-wide movers view and
+  // REPORTS the cap (`markets_available`). The temptation to cap here too is
+  // strong and wrong: the board already runs `bookFor()` per market on the same
+  // poll, so its own cost is already O(catalogue), and dropping the tail would
+  // show `$0.00 matched` on every runner past the limit while the tape said
+  // otherwise. That is the quiet-wrong failure this repo keeps auditing for, and
+  // it is worse than the read it avoids.
+  //
+  // What is asserted is the shape of that decision: a market beyond the cap still
+  // gets its own matched figure. A cap here would pass every other check in this
+  // file.
+  await check('M13 the board scope is not capped, so no market silently reads zero', async () => {
+    const { db, market_id, alpha, alice, bob } = await fixture();
+    restBack(db, alice, alpha, 2.0, 4000);
+    M.placeOrder(db, bob, { selection_id: alpha, side: 'lay', price: 2.0, stake_cents: 1800 });
+
+    // The scope below is built deliberately larger than the movers' own cap, so
+    // this cannot pass by accident on a small database. The cap is asserted
+    // where it is defined, and the scope is made larger than it either way.
+    const CAP = 250;
+    const marketIds = [market_id];
+    for (let i = 0; i < CAP; i++) {
+      db.prepare("INSERT INTO markets (event_id, name) VALUES ((SELECT id FROM events ORDER BY id LIMIT 1), ?)")
+        .run(`Scope ${i}`);
+      marketIds.push(db.prepare('SELECT id FROM markets ORDER BY id DESC LIMIT 1').get().id);
+    }
+    assert.strictEqual(marketIds.length, CAP + 1, 'a scope larger than the movers cap');
+
+    // PRE-STATE and outcome: the one market that traded reports its volume.
+    const rows = MD.matchedByLevel(db, { marketIds });
+    assert.strictEqual(rows.length, 1, 'one group — the empty markets contribute nothing');
+    assert.strictEqual(rows[0].market_id, market_id, 'and it is the one that traded');
+    assert.strictEqual(rows[0].matched_cents, 1800, 'with its volume intact');
+
+    // A market BEYOND the cap still gets its figure, because nothing truncates
+    // the list. The trade is in the LAST id of the scope, not the first — a cap
+    // that kept the head would drop exactly this one.
+    const far = marketIds[marketIds.length - 1];
+    db.prepare("INSERT INTO selections (market_id, name, fair_price) VALUES (?, 'Far', 2.0)").run(far);
+    const farSel = db.prepare("SELECT id FROM selections WHERE market_id = ? AND name='Far'").get(far).id;
+    restBack(db, alice, farSel, 2.0, 4000);
+    M.placeOrder(db, bob, { selection_id: farSel, side: 'lay', price: 2.0, stake_cents: 900 });
+
+    const after = MD.matchedByLevel(db, { marketIds });
+    assert.strictEqual(after.length, 2, 'the market at the far end of the scope traded too');
+    assert.strictEqual(after.find((r) => r.market_id === far).matched_cents, 900,
+      'and its volume is reported, not dropped: a cap here would read $0.00 on a market that traded');
+
+    // The MOVERS view is the opposite decision — and it REPORTS the cap rather
+    // than hiding it. Asserted together, because the point is that both were
+    // chosen rather than inherited.
+    const open = MD.openMarketScope(db);
+    assert.ok(open.ids.length <= CAP, `openMarketScope caps at ${CAP} (got ${open.ids.length})`);
+    assert.ok(open.available > open.ids.length,
+      'and says how many it did not reach, rather than implying it covered them all');
+    assert.strictEqual(typeof open.available, 'number', 'the cap is reported, never silent');
+  });
+
+  // ── M14: the routes. #93's second acceptance item is an ENDPOINT, and an endpoint
   // nobody called is how `price_history` became write-only in the first place.
-  await check('M11 the three routes answer, and the series is fed by the tape', async () => {
+  await check('M14 the three routes answer, and the series is fed by the tape', async () => {
     const srv = require('../server');
     const server = srv.app.listen(0, '127.0.0.1');
     await new Promise((r) => server.on('listening', r));
