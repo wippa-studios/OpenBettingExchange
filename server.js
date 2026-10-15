@@ -32,6 +32,7 @@ const ODDS = require('./lib/odds');
 const FEED = require('./lib/feed');
 const FCREDS = require('./lib/feedcreds');
 const FRUN = require('./lib/feedrunner');
+const FEEDCAT = require('./lib/feedcat');
 const ADM = require('./lib/admin');
 const AUDIT = require('./lib/audit');
 const LIMITS = require('./lib/limits');
@@ -285,12 +286,61 @@ const sessionSweeper = setInterval(() => {
 if (sessionSweeper.unref) sessionSweeper.unref();
 
 // ── Engine switches ────────────────────────────────────────────────────────
-// With the feed on, the recorder owns prices; bots and drift would requote
+// BOTS_ON is now the flag and nothing else.
+//
+// WHAT IT USED TO BE, AND WHY THE REASONING WAS RIGHT AND INCOMPLETE:
+//
+//   const BOTS_ON = config.BOT_ENABLED && !config.FEED_ENABLED;
+//   const DRIFT_ON = config.DRIFT_ENABLED && !config.FEED_ENABLED;
+//
+// "With the feed on, the recorder owns prices; bots and drift would requote
 // ladders straight over the observed Betfair book, so they are suppressed
-// regardless of their own flags. Hoisted ABOVE every use (the admin
-// selections route AND main()) so no code path can ever consult the raw
-// config flag and quote over a feed-owned market.
-const BOTS_ON = config.BOT_ENABLED && !config.FEED_ENABLED;
+// regardless of their own flags." That is CORRECT for the feed's own reference
+// board, and it stayed correct. What it also did — and this is the part that was
+// incomplete — was switch off the venue's OWN liquidity on a premise that does
+// not hold. A bot could not "requote over the observed Betfair book", because
+// the observed Betfair market has NO ROW in this venue's database:
+// lib/match.js resolves a selection through `selections → markets → events` here,
+// and lib/bots.js quotes by LOCAL market id. There was nothing for a bot to
+// quote over, so the two could not fight; the suppression was protecting a
+// conflict the schema made impossible, while its cost was immediate and total.
+// With the feed on, the venue showed real fixtures and had no source of
+// liquidity anywhere in it (#101): the bots are the venue's only counterparty and
+// they were the thing switched off. That is the "control that reports and does
+// not act" shape this codebase keeps finding, in its most expensive form — a
+// venue going live with a board nobody can bet.
+//
+// THE RESOLUTION IS NOT "TURN THE BOTS BACK ON FOR EVERYTHING". It is that the
+// two sets are DISJOINT, and that the disjointness is structural rather than a
+// flag:
+//
+//   the reference board   no local row → nothing for any bot, drift tick or
+//                         order to name → `POST /api/orders` still 404s it
+//   the venue's own book  local rows, quoted from the venue's OWN fair_price
+//
+// So the bots quote the venue's own book — which includes the markets
+// lib/feedcat.js materialises from the feed's catalogue, and every market an
+// operator created by hand — and the reference board stays unquoted and
+// untradeable because it has no row to be quoted. That is a STRONGER guarantee
+// than the flag it replaces: it holds with every config key set however an
+// operator likes, where the old one only held while FEED_ENABLED was true.
+//
+// A MATERIALISED market is the venue's own book and nothing to do with copying
+// prices: lib/feedcat.js seeds a new selection's fair_price with the venue's own
+// even money and NEVER writes a feed price into fair_price or ltp, so there is
+// no observed book anywhere near the number the bots quote around. See
+// docs/FEED.md.
+//
+// DRIFT IS UNCHANGED, and deliberately so. Drift is the venue's own price
+// MOVING; this change is about a price existing at all, and how a launch price
+// model is derived is a product decision the operator owns (#110/#108) rather
+// than a side effect of materialising a catalogue. lib/userrules.js's only
+// production caller sits behind DRIFT_ON and is inert in feed mode — #87, a
+// separate workstream, deliberately untouched here.
+//
+// Hoisted above every use (the admin selections route AND main()) so no code
+// path can consult the raw config flag and quote over a feed-owned market.
+const BOTS_ON = config.BOT_ENABLED;
 const DRIFT_ON = config.DRIFT_ENABLED && !config.FEED_ENABLED;
 
 // ── Session (httpOnly cookie + Bearer fallback) ───────────────────────────
@@ -1721,6 +1771,91 @@ app.post('/api/admin/feed/runner/stop', requireAdmin, limit('admin'), (req, res)
   res.json(FRUN.stop(feedTenantId(req)));
 });
 
+// ── Materialising the feed's catalogue into the venue's own book (#101) ──────
+// One operator action, and it is the only one: nothing here runs at boot, on a
+// timer, or on a feed event. That is deliberate on three separate grounds, each
+// of which has bitten a version of this codebase already.
+//
+//   1. It CREATES TRADEABLE MARKETS. Rows in `markets` and `selections` are the
+//      venue's own book, and a book that appears without anybody asking for it is
+//      the shape of defect this repository audits for.
+//   2. It PUTS LOAD ON A LICENSED PROVIDER. A run is bounded (the report says
+//      how much of the catalogue it did not read and resumes from there), and an
+//      operator who wants the next slice asks for it.
+//   3. IT IS A DECISION WITH A WRONG ANSWER. A feed's off time that does not
+//      parse is refused rather than guessed at, so somebody has to look at what
+//      the sync refused before the venue trades on what it accepted.
+//
+// `limit('admin')` because a sync is expensive and admin-bucketed like its
+// neighbours; `requireAdmin` because it writes the book.
+//
+// `?limit` and `?offset` are clamped HERE as well as inside lib/feedcat.js, for
+// the same reason POST /api/feed/board clamps its own: a value from a URL is
+// junk until it has been through a rule. The cap is FEED_BOOK_SYNC_LIMIT either
+// way, so a caller cannot ask for the whole catalogue in one request.
+//
+// A 409 when the feed is off, and NOT a silent success. The feed's display-only
+// surface is the same code path an operator would reach by habit, and a 200
+// reporting "0 markets" for a venue with no feed configured is a report nobody
+// can tell apart from a feed that has gone empty.
+app.post('/api/admin/feed/sync', requireAdmin, limit('admin'), aw(async (req, res) => {
+  if (!config.FEED_ENABLED) {
+    return apiError(res, 409, 'Feed is disabled (set FEED_ENABLED=true)', { code: 'feed_disabled' });
+  }
+  const asked = Number(req.query.limit);
+  const limit = Number.isFinite(asked) && asked >= 1 ? Math.min(Math.floor(asked), config.FEED_BOOK_SYNC_LIMIT) : config.FEED_BOOK_SYNC_LIMIT;
+  const offset = Number(req.query.offset);
+  let report;
+  try {
+    report = await FEEDCAT.sync(db, {
+      tenantId: feedTenantId(req),
+      limit,
+      offset: Number.isInteger(offset) && offset > 0 ? offset : 0,
+    });
+  } catch (e) {
+    // The FEED failed, not the venue. The same generic message the public feed
+    // routes answer with, for the same reason: a driver or transport error
+    // embeds a host, a token or a URL, and the operator gets a status they can
+    // act on while the detail goes to the log they can read.
+    console.error('[feed] catalogue sync failed:', e.message);
+    return apiError(res, 503, 'Odds feed unavailable', { code: 'feed_unavailable' });
+  }
+  // QUOTE WHAT IT WROTE, so a materialised market is tradeable from the moment
+  // this returns rather than from whenever the next boot happens to run. The
+  // quote is the venue's own (BOTS_ON, and its own fair_price), and a failure
+  // here is logged rather than raised: the catalogue is written either way, and
+  // an unquoted market is visible and recoverable where a 500 would throw away a
+  // successful sync.
+  const quoted = [];
+  for (const id of db
+    .prepare("SELECT DISTINCT fm.local_id FROM feed_map fm JOIN markets m ON m.id = fm.local_id WHERE fm.provider = ? AND fm.kind = 'market' AND m.status = 'open'")
+    .all(report.provider)) {
+    try {
+      bots.quoteMarket(db, id.local_id);
+      quoted.push(id.local_id);
+    } catch (e) {
+      console.error('[feed] quote-after-sync failed for market', id.local_id, ':', e.message);
+    }
+  }
+  report.quoted_markets = quoted.length;
+  AUDIT.record(
+    db, req.user, AUDIT.ACTIONS.FEED_CATALOGUE_SYNCED, 'feed:catalogue',
+    null,
+    {
+      provider: report.provider,
+      materialised: report.materialised,
+      created: report.created,
+      refused: report.refused.length,
+      deactivated: report.deactivated.length,
+      quoted: report.quoted_markets,
+      bounded: report.bounded,
+    },
+    (req.body || {}).reason || null
+  );
+  broadcast('book', {});
+  res.json(report);
+}));
+
 app.get('/api/events', limit('read'), (req, res) => {
   const sportSlug = req.query.sport;
   let rows;
@@ -3037,9 +3172,13 @@ app.post('/api/admin/selections', requireAdmin, limit('admin'), (req, res, next)
   const sel = db.prepare('SELECT * FROM selections WHERE market_id = ? AND name = ?').get(Number(market_id), String(name).trim());
   // A market created at runtime has no ladders until something quotes it —
   // quote immediately so new markets are tradeable (the bot's own two sides
-  // never cross, so a single runner is safe to quote). Gated on the
-  // EFFECTIVE switch: when the feed is on, the recorder owns prices and a
-  // bot requote would write straight over the observed book.
+  // never cross, so a single runner is safe to quote). Gated on the EFFECTIVE
+  // switch, which used to mean "and not while the feed is on": the recorder owns
+  // prices, and a bot requote would have written straight over the observed
+  // book. It no longer means that (#101) — a bot cannot requote a market this
+  // venue has no row for, and the switch now covers the venue's own book in feed
+  // mode too. The gate stays, because BOTS_ON is now exactly the operator's own
+  // "run the bots" decision; see the hoist at the top of this file.
   if (BOTS_ON) {
     try {
       bots.quoteMarket(db, Number(market_id));
@@ -3376,15 +3515,17 @@ async function main() {
   const rolled = rollForwardEvents(db);
   if (rolled) console.log(`[board] ${rolled} past-due event(s) moved to live`);
   startHeartbeat();
-  // With the feed on, the recorder owns prices. Bots and drift would requote
-  // ladders every DRIFT_INTERVAL_MS straight over the observed Betfair book and
-  // the two would fight, so they are forced off rather than left to config
-  // discipline. Order still matters: the feed is a price SOURCE, not a
-  // replacement for the exchange's own machinery. (BOTS_ON/DRIFT_ON are
-  // hoisted at module scope so every route shares this exact definition.)
+  // With the feed on, the REFERENCE board is the feed's own — it has no row in
+  // this venue's database, so there is nothing here for a bot or an order to
+  // name, and `/api/feed/*` keeps serving it read-only. The VENUE's own book is
+  // different: it is quoted, from the venue's own prices, including the markets
+  // materialised out of the feed's catalogue by POST /api/admin/feed/sync. The
+  // old line here said "bots suppressed (feed owns prices)", which described a
+  // price source the venue does not have — the feed publishes the venue's
+  // FIXTURES, and the venue quotes its own book.
   if (config.FEED_ENABLED) {
-    if (config.BOT_ENABLED) console.log('[feed] on — bots suppressed (feed owns prices)');
-    if (config.DRIFT_ENABLED) console.log('[feed] on — drift suppressed (feed owns prices)');
+    if (config.BOT_ENABLED) console.log('[feed] on — the venue book is quoted at its own prices; the reference board stays display-only');
+    if (config.DRIFT_ENABLED) console.log('[drift] suppressed while the feed is on — drift is a separate workstream (#87)');
   }
   if (BOTS_ON) {
     try {

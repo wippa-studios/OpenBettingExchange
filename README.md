@@ -38,7 +38,7 @@ bookmaker's margin.
 - [Financial invariants](#financial-invariants)
 - [API](#api)
 - [Configuration](#configuration)
-- [Odds feed (display only)](#odds-feed-display-only)
+- [Odds feed](#odds-feed)
 - [Development](#development)
 - [Known limitations](#known-limitations)
 - [Roadmap](#roadmap)
@@ -67,7 +67,9 @@ design follows from that distinction.
 Prices come from the built-in demo market-maker bots or, optionally, from a live
 Betfair feed ([`docs/FEED.md`](docs/FEED.md)) collected by
 [OpenBettingExchangeDataFeed](https://github.com/wippa-studios/OpenBettingExchangeDataFeed).
-Feed markets are display-only; see [Odds feed](#odds-feed-display-only).
+An unmaterialised feed market is display-only, and an operator can materialise the
+feed catalogue into their own book (at the venue own prices); see
+[Odds feed](#odds-feed).
 
 The frontend is plain HTML, CSS and classic JavaScript with no build step and no
 CDN. Fonts (self-hosted Inter), logo and favicon are all served from `public/`.
@@ -137,7 +139,7 @@ in place.
 | Tenant suspension: cancels resting orders, refuses betting, cash-out, deposits and login | Available (`PUT /api/admin/tenants/:id`; reads and the admin desk stay up — see [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#tenants-and-suspension)) |
 | Responsible gambling: session, reality check, deposit cap, self-exclusion | Available (`lib/rg.js`) |
 | Abuse controls: stake, market liability and daily settlement caps | Available (`lib/limits.js`) |
-| Odds feed ([OpenBettingExchangeDataFeed](https://github.com/wippa-studios/OpenBettingExchangeDataFeed)) | Display only; feed markets are not tradeable |
+| Odds feed ([OpenBettingExchangeDataFeed](https://github.com/wippa-studios/OpenBettingExchangeDataFeed)) | Reference board, plus `POST /api/admin/feed/sync` to materialise the catalogue into the venue own book. Never trades at a feed price |
 | In-play betting | Intentionally withdrawn; see [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#pre-off-only) |
 | Accumulators, each-way | Not implemented |
 | Real-money execution | Not implemented (no PSP integrated) |
@@ -146,7 +148,7 @@ in place.
 
 | | |
 |---|---|
-| **Board in feed mode.** Real fixtures and ladders from a live Betfair collector. Prices are a delayed reference book and display-only by engine rule. | **Bet slip.** Clicking a price opens the slip on that side; stake and price step along the ladder. |
+| **Board in feed mode.** Real fixtures and ladders from a live Betfair collector. Prices are a delayed reference book — a feed the venue has not materialised is display-only by engine rule. | **Bet slip.** Clicking a price opens the slip on that side; stake and price step along the ladder. |
 | [![Board in feed mode](docs/shots/feed-board.png)](docs/shots/feed-board.png) | [![Bet slip](docs/shots/betslip.png)](docs/shots/betslip.png) |
 | **Positions.** Per-runner backed and laid stakes, escrow held, and if-this-wins P&L. | **Wallet.** Available versus frozen, with a full ledger of deposits, escrow, releases, payouts and commission. |
 | [![Positions](docs/shots/positions.png)](docs/shots/positions.png) | [![Wallet](docs/shots/wallet.png)](docs/shots/wallet.png) |
@@ -200,10 +202,10 @@ layered on `match`.
 | `lib/ops` | Health, readiness, metrics, backup, restore |
 | `lib/audit` | Append-only operator action log |
 | `lib/auth` | scrypt password hashing, opaque session tokens |
-| `lib/feed`, `lib/feedcreds`, `lib/feedrunner` | Odds feed reader, encrypted credentials, collector supervisor |
+| `lib/feed`, `lib/feedcat`, `lib/feedcreds`, `lib/feedrunner` | Odds feed reader, catalogue materialiser (`feed_map`), encrypted credentials, collector supervisor |
 | `lib/bots`, `lib/drift` | Market-maker ladders and fair-price drift |
 | `lib/userrules` | Player-authored betting rules, evaluated on the price stream |
-| `lib/store`, `lib/seed` | Schema (28 tables) and fixtures |
+| `lib/store`, `lib/seed` | Schema (29 tables) and fixtures |
 
 The frontend (`public/js/`) is split into seven modules (`core`, `shell`, `nav`,
 `board`, `slip`, `views`, `boot`) under the `window.OB` namespace.
@@ -345,12 +347,15 @@ failing later.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `FEED_ENABLED` | `false` | Read fixtures and prices from the feed. Display only |
+| `FEED_ENABLED` | `false` | Read fixtures and prices from the feed. Display-only until an operator materialises the catalogue (`POST /api/admin/feed/sync`) |
 | `FEED_PROVIDER` | `postgres` | `postgres` reads the collector's views; `http` reads the operator's own JSON-over-HTTP feed API (`FEED_HTTP_*` below) |
 | `FEED_DATABASE_URL` | none | Collector's Postgres URL; required when the feed is on **and** `FEED_PROVIDER=postgres` |
 | `FEED_NUMBER` | `2` | Feed to read: `1` fixtures only, `2` fixtures, prices and results |
 | `FEED_STALE_SECONDS` | `300` | Frame age beyond which the board reports stale |
 | `FEED_MARKET_LIMIT` | `60` | Markets returned to the board |
+| `FEED_BOOK_SYNC_LIMIT` | `200` | Markets one `POST /api/admin/feed/sync` may materialise. The run reports `bounded.remaining` and `bounded.next_offset`, so a larger catalogue is resumed rather than truncated |
+| `FEED_BOOK_SYNC_CONCURRENCY` | `4` | Simultaneous `market()` calls during a sync — pressure on the provider's licensed API |
+| `FEED_BOOK_SEED_PRICE` | `2` | The price a newly materialised selection is seeded with. **The venue's own even money, never a feed price**; an existing selection's price is never rewritten by a re-sync |
 | `FEED_CREDENTIALS_KEY` | none | 64 hex characters (AES-256-GCM key); generate with `openssl rand -hex 32`. **If unset, credentials are refused and never stored in plaintext** |
 | `FEED_RUNNER_ENABLED` | `false` | Supervise the collector (spawn and restart) instead of running it separately |
 | `FEED_COLLECTOR_CMD` | `betfeed collect` | Collector command, split on whitespace; an absolute path or wrapper works |
@@ -382,28 +387,41 @@ failing later.
 | `RG_REALITY_CHECK_MINUTES` | `0` | Reality-check interval; `0` means not configured |
 | `RG_DEPOSIT_DAILY_CENTS` | `0` | Rolling 24-hour deposit limit; `0` means not configured |
 
-## Odds feed (display only)
+## Odds feed
 
 With `FEED_ENABLED=true`, the board shows real fixtures and prices from the
 [feed collector](https://github.com/wippa-studios/OpenBettingExchangeDataFeed).
-**Those markets cannot be traded.** This is enforced by the engine, not only by
-the client:
+**A feed market the venue has no row for cannot be traded**, and this is enforced
+by the engine, not only by the client:
 
 - A feed market has no row in this venue's database (the collector's catalogue
   lives in its own Postgres), so naming a feed selection id returns `404` before
   any collateral is taken.
 - The client also refuses, with the message "Feed markets are display-only".
 
-Enabling the feed force-disables the bots and the drift engine (`BOTS_ON` and
-`DRIFT_ON` in `server.js`), because a bot requoting a ladder over the observed
-Betfair book would have the venue fighting its own price source. In feed mode,
-the venue's own markets are therefore unquoted.
+**And an operator can now run their own book on those fixtures.** One audited
+action, `POST /api/admin/feed/sync`, materialises the feed's catalogue into local
+`sports` / `events` / `markets` / `selections`, records the id mapping, and the
+venue then quotes those markets **at its own prices**:
 
-This is a deliberate design: a price-observation tool attached to an engine, not
-a merged product. The behaviour is pinned by `tests/feed-display-only.test.js`.
-Making feed markets tradeable requires a market mapping and a liquidity source;
-[`docs/ROADMAP.md`](docs/ROADMAP.md) explains why, including why a staleness
-guard was built and then removed.
+```
+POST /api/admin/feed/sync          # 200, with a report of what it wrote and what it refused
+```
+
+A **feed price is never copied into `fair_price` or `ltp`**, on the first sync or
+any later one — the feed supplies fixtures, off times and results, and the venue
+quotes its own book. A market that leaves the feed is suspended, never deleted.
+Results are translated between the two id spaces in both directions, and an id
+that is in neither is **held**, never guessed at.
+
+The bots are no longer suppressed while the feed is on: a bot could never requote
+over the observed Betfair book anyway, because that book has no row here to name.
+Drift still is — see `DRIFT_ON` in `server.js` and issue #87.
+
+The behaviour is pinned by `tests/feed-display-only.test.js` (the boundary) and
+`tests/feedbook.test.js` (the materialised book and the id translation).
+[`docs/FEED.md`](docs/FEED.md) has the full account, including what the sync
+refuses and why.
 
 ### Betfair credentials
 
@@ -440,7 +458,7 @@ weight.
 ```bash
 
 
-npm test            # 1023 checks: unit and API integration, fully offline
+npm test            # 1028 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 220 checks: real Chromium via Playwright (board and admin desk)
@@ -502,6 +520,14 @@ outlay reaches `CASHOUT_MAX_DAILY_LOSS_CENTS`. The daily cap gates on **outlay**
 rather than realised loss deliberately: realised loss is backward-looking, so by
 the time it is measurable the money is gone, whereas outlay is known at decision
 time and genuinely bounds the worst case.
+
+**The launch price model for a materialised feed market is an operator decision,
+not this repository's.** `POST /api/admin/feed/sync` seeds each new selection at
+even money (`FEED_BOOK_SEED_PRICE`) so a materialised market is tradeable at all,
+and then **never touches `fair_price` again** — a feed price is never copied into
+it. What a real price should be derived from, and what drift should do about it,
+is tracked in issues #110 and #108. Relatedly, drift is suppressed while the feed
+is on and user rules are therefore inert in that mode (#87).
 
 **Single-node operation.** SQLite is single-writer and synchronous, which is why
 the match sweep is atomic, but it limits the system to one process on one

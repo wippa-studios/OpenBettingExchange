@@ -840,12 +840,14 @@ intent instead of the faucet.
 
 ---
 
-## Odds feed (read-only)
+## Odds feed
 
-Requires `FEED_ENABLED=true`. These serve a **reference board** from the
-collector's PostgreSQL. Feed markets are **display only** — they have no row in
-this venue's database, so naming a feed selection id on `POST /api/orders` is a
-`404` before any collateral is taken. See [`FEED.md`](FEED.md).
+Requires `FEED_ENABLED=true`. The routes below serve a **reference board** from
+the collector's PostgreSQL (or from an operator's own JSON-over-HTTP feed API).
+A feed market is **display only until an operator materialises it** — it has no
+row in this venue's database, so naming a feed selection id on `POST /api/orders`
+is a `404` before any collateral is taken. A market the venue *has* materialised
+is the venue's own, at the venue's own prices. See [`FEED.md`](FEED.md).
 
 | Route | Success | Errors |
 | --- | --- | --- |
@@ -937,6 +939,7 @@ fields *exist*. Storing and deleting are audited.
 | `GET /api/admin/feed/runner/:id` **or** `GET /api/admin/feed/runner` | Supervisor state, restarts, exit codes, scrubbed log tail |
 | `POST /api/admin/feed/runner/start` | Start the collector |
 | `POST /api/admin/feed/runner/stop` | Stop the collector |
+| `POST /api/admin/feed/sync?limit=&offset=` | **Materialise the feed's catalogue into this venue's book** — local `sports` / `competitions` / `events` / `markets` / `selections`, recorded in `feed_map` and quoted from the venue's own `fair_price`. No feed price is ever copied into `fair_price` or `ltp`. `limit` is capped at `FEED_BOOK_SYNC_LIMIT`; `offset` resumes a capped run from `bounded.next_offset`. Answers `409` when `FEED_ENABLED` is false, `503 Odds feed unavailable` when the feed cannot be read, and otherwise the report: `materialised`, `created`, `refused` (each with a name and a reason), `deactivated`, `bounded`. Audited as `feed.catalogue_synced` |
 
 > **Why two spellings rather than `:id?`.** These routes were written with an
 > optional `:id?`, which **path-to-regexp v8 removed** — the router Express 5

@@ -53,7 +53,7 @@ An inventory, so the plan is grounded rather than generic.
 | Cash-out | `lib/cashout.js` | venue buyout at `Σ pᵢ·Payoutᵢ` less a margin; held when the venue cannot price it fairly; risk-bounded by `lib/cashoutrisk.js` |
 | Tick ladder | `lib/odds.js` | Betfair increments, American/fractional/implied, overround |
 | Odds feed client | `lib/feed.js` + `lib/feed/` | board/nav contract behind a provider seam — Postgres collector **or** the operator's own HTTP feed API; every provider must pass `tests/feedprovider-conformance.test.js` |
-| Test suite | `tests/` | 72 suites, hand-computed money rules, smoke + Playwright |
+| Test suite | `tests/` | 73 suites, hand-computed money rules, smoke + Playwright |
 
 **The property worth protecting:** settlement solvency is structural, not
 defensive. Every match is collateralised on both sides, so there is no
@@ -415,7 +415,7 @@ book that has stopped moving. I built the control — a pass that suspends marke
 whose prices have gone stale — and then checked the premise before shipping it,
 which said no.
 
-**Feed markets are DISPLAY ONLY, end to end:**
+**Feed markets the venue has NOT materialised are display only:**
 
 1. A feed market has no local row. The recorder's catalogue lives in its own
    Postgres database; the venue's tradeable markets are rows in this one.
@@ -428,17 +428,25 @@ would protect nothing while introducing a real hazard: it would take FEED market
 ids and try to suspend LOCAL venue markets, closing the venue's real book
 because an unrelated market's prices were old. I deleted it.
 `tests/feed-display-only.test.js` pins the three facts so the reasoning survives
-whoever comes next, and F4 also asserts the hoist in `server.js` still suppresses
-the bots and drift when the feed is on — the one part here that IS load-bearing.
+whoever comes next.
 
-**What this actually leaves open** is a product decision rather than a control:
-with `FEED_ENABLED=true` the venue has no price source of its own, because the
-bots and drift are force-disabled so they cannot requote over the observed book.
-Feed mode is an observation tool attached to an engine, not a merged product,
-and in that mode the venue's own markets are unquoted. That is coherent — but it
-was written down nowhere, and "odds feed integration" does not describe it.
-Making feed markets tradeable needs a market mapping and a liquidity source, and
-that is a feature with a cost, not a control.
+**Superseded in #101, and the brief's own warning applies.** The paragraph below
+this one used to say the remaining gap was a product decision: with
+`FEED_ENABLED=true` the venue had no price source of its own, because the bots
+and drift were force-disabled "so they cannot requote over the observed book",
+and in that mode the venue's own markets were unquoted. It was written down
+nowhere, and "odds feed integration" did not describe it. **It is no longer
+true.** The bots are no longer suppressed (a bot cannot requote over a market
+this venue has no row for), and `POST /api/admin/feed/sync` materialises the
+feed's catalogue into the venue's own rows at the venue's own prices, so the feed
+finally drives a tradeable book. `tests/feedbook.test.js` covers it; the stale
+feed price is still never traded, because `fair_price` is the venue's own and a
+re-sync cannot move it.
+
+**What remains open is still a product decision**: what a materialised market's
+price should be *derived from*. The seed is even money (`FEED_BOOK_SEED_PRICE`),
+which is a neutral starting position and not a view. That model is #110/#108, and
+it belongs to the operator.
 
 **Persistence — a decision, not a task.** The engine is synchronous and
 `DatabaseSync` is single-threaded, which is *why* the sweep is inherently
@@ -560,7 +568,7 @@ conversation.
 ## 6. Immediate next actions
 
 Reassessed after Phases 1–4, the follow-on work, and the first outside
-review of the money path. The suite is now **1023 checks across 72 suites**,
+review of the money path. The suite is now **1028 checks across 73 suites**,
 plus a live smoke script and a 220-check browser suite, all green.
 ### Recently completed
 

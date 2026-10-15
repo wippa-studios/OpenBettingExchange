@@ -18,6 +18,72 @@ must agree with the highest released heading.
 
 ### Added
 
+- **The feed now drives a real, tradeable, venue-priced book** (#101). With
+  `FEED_ENABLED=true` the venue had a board of real fixtures and **not one
+  bettable market in it**: a feed market has no row in this venue's database, so
+  `POST /api/orders` answered `404 Selection not found` before any collateral was
+  taken — and the bots, the venue's only source of liquidity, were force-disabled
+  while the feed was on, "because a bot requoting over the observed Betfair book
+  would fight the price source". There was nothing to fight: the observed book
+  has no row here to name.
+
+  `POST /api/admin/feed/sync` (`requireAdmin`, `limit('admin')`, audited as
+  `feed.catalogue_synced`) materialises the feed's catalogue into local `sports` /
+  `competitions` / `events` / `markets` / `selections`. It reads the catalogue
+  from `nav()` — never from the `FEED_MARKET_LIMIT`-capped board — then fetches
+  each market's runners through the contract's existing `market(id)`, at most
+  `FEED_BOOK_SYNC_CONCURRENCY` at a time and at most `FEED_BOOK_SYNC_LIMIT`
+  markets per run, reporting `bounded.remaining` and `bounded.next_offset` so a
+  catalogue larger than the cap is **resumable**. No provider contract change was
+  needed, so the conformance suite is unchanged and still the gate.
+
+  **A feed price is never copied into `fair_price` or `ltp`.** A new selection is
+  seeded with the venue's own even money (`FEED_BOOK_SEED_PRICE`, default 2) and
+  an existing selection's `fair_price` is never written at all, so no re-sync can
+  move the venue's own price. `docs/FEED.md` has always named the hazard: *the
+  failure mode is not a bad price; it is a good price that a sharp client takes
+  from you.* What a real launch price should be derived from is the operator's
+  decision (#110/#108), not this repository's.
+
+  Other refusals, each with the failure it prevents: an off time the feed cannot
+  express is **refused and reported by name** (`lib/offtime.js` treats an
+  unreadable off time as CLOSED, so writing one would produce a market that is
+  permanently unbetable); `events.is_demo` is never set, so a real fixture's off
+  time is never rolled forward; a market that leaves the feed is **suspended,
+  never deleted** — and one that left *after* going off is left open, because
+  suspending a finished market would stop it being settled. A **capped** run
+  deactivates nothing at all, because "this market is gone" is a claim about the
+  absence of a row and the markets past the cap are unread rather than missing.
+
+- **Id translation on the results path, in both directions.** Materialising a
+  catalogue gives the venue two id spaces for one race, and the results protocol
+  speaks integers in both: `requestBody` POSTed local ids an operator's API had
+  never seen, and `normaliseSignal` carried winners and non-runners that
+  `applyOutcome`/`applyWithdrawal` filtered against local selection ids. Every
+  outcome the feed sent after a materialisation would name selections the market
+  did not have — fail-safe and operationally fatal at once, since
+  `applyWithdrawal` returns `hold('non_runner_foreign')` and `applyOutcome` takes
+  the empty-winner HOLD branch, so nothing settles while a withdrawn runner stays
+  quoted.
+
+  A new `feed_map` table stores the identity (a runner's feed id is the
+  composite `${market_id}:${selection_id}`, because Betfair reuses selection ids
+  across markets). The poll body now carries the feed's ids **alongside** the
+  venue's, and `lib/resultsfeed.js` `pollOnce` translates inbound ids through
+  `lib/feedcat.js` `admitSignal` before anything reads them, recording **which
+  space the feed used** in the `result_events` payload. An id in neither space is
+  **held** as `id_space_unmapped` with the market left open; one that reads as
+  two different runners across the two spaces is **held** as
+  `id_space_ambiguous` rather than settled on a coin flip. A materialised market's
+  provenance records the **feed's** market id, which is what finally gives
+  `idx_result_events_source` and `alreadyApplied` a re-delivery guard to fire on.
+
+  **Bots are no longer suppressed while the feed is on** (`BOTS_ON` is now
+  `config.BOT_ENABLED`): a bot cannot requote over a market this venue has no row
+  for, so the suppression protected a conflict the schema made impossible while
+  leaving a feed-running venue with no liquidity at all. Drift is still
+  suppressed, and #87 is untouched.
+
 - **A feed provider seam, and the conformance suite that makes it safe**
   (STATE.md §2.7, docs/ROADMAP.md §Phase 5). `lib/feed.js` read the Betfair
   collector's PostgreSQL views and nothing else — its SQL was hard-wired to
