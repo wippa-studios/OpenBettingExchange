@@ -219,7 +219,7 @@ Deliberately narrow, and asserted by tests rather than assumed:
 
 ## Testing strategy
 
-799 checks across 63 suites, plus a 212-check browser suite and a live smoke script.
+801 checks across 63 suites, plus a 212-check browser suite and a live smoke script.
 
 | Layer | Where | What it proves |
 | --- | --- | --- |

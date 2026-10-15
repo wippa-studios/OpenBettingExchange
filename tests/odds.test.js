@@ -131,6 +131,12 @@ check('T8 overround', async () => {
 });
 
 // T9: validTick discriminator.
+//
+// T9b below is the part this check was MISSING, and it is why the whole test
+// passed against a function that accepts 1,400 off-ladder prices. Every case
+// here is a two-decimal price, and at two decimals `priceToCents`' rounding is
+// a no-op — so the test exercised the function only where it cannot fail.
+// (#86)
 check('T9 validTick', async () => {
   assert.strictEqual(O.validTick(2.02), true);
   assert.strictEqual(O.validTick(1.01), true);
@@ -139,6 +145,59 @@ check('T9 validTick', async () => {
   assert.strictEqual(O.validTick(0.5), false);
   assert.strictEqual(O.validTick(1000.01), false);
   assert.strictEqual(O.validTick(1000), true);
+});
+
+// T9b: validTick must mean EXACTLY on the ladder, at any precision.
+//
+// The bug: validTick did `priceToCents(p)` and then a grid test. priceToCents
+// ROUNDS, so any price within half a cent of a tick satisfied the grid test and
+// was reported as an exact tick. The Python port in the datafeed repo fixed
+// precisely this and documented why — see
+// OpenBettingExchangeDataFeed/betfeed/odds.py:145 — naming 1.015, 2.015 and
+// 1.999 as the values that wrongly passed. These are those values.
+//
+// These are the three the Python docstring measured True for. If this check ever
+// passes without the epsilon fix, the JS and the Python have diverged again.
+check('T9b validTick is EXACT, not within-half-a-cent', async () => {
+  const notTicks = [1.015, 2.015, 1.999, 2.401, 2.4025, 1.011, 3.334];
+  for (const p of notTicks) {
+    assert.strictEqual(
+      O.validTick(p),
+      false,
+      `validTick(${p}) is true, but ${p} is not a price the ladder quotes — ` +
+        'it is within half a cent of one, and "exactly on the ladder" means exactly',
+    );
+  }
+  // The mirror: every REAL tick at three-decimal precision is still accepted, so
+  // the fix does not become "reject anything with a decimal in it".
+  for (const p of [1.01, 1.02, 2.02, 2.4, 3.0, 1000, 1.5]) {
+    assert.strictEqual(
+      O.validTick(p),
+      true,
+      `validTick(${p}) is false, but ${p} IS a ladder tick — the exactness fix over-rejected`,
+    );
+  }
+});
+
+// T9c: float noise must NOT be treated as inexactness.
+//
+// The fix rejects a price whose scaled value is not a whole number of cents.
+// But 2.3 * 100 is 229.99999999999997, so a naive `scaled % 1 === 0` would
+// reject a genuine tick. This is the reason the rule is "round, then require the
+// input to HAVE BEEN that whole number within an epsilon" rather than a
+// divisibility test. Without this case a correct fix reads as a broken one.
+check('T9c float noise on a real tick is still a tick', async () => {
+  for (const p of [2.3, 1.7, 0.1 + 1.01, 4.2, 2.1 + 0.2, 1.01 * 3]) {
+    // Only assert where the value IS a ladder tick, checked independently of
+    // validTick via snapToTick — otherwise this asserts validTick against itself.
+    const snapped = O.snapToTick(p);
+    if (Math.abs(snapped - p) > 1e-9) continue; // not a tick; T9b's business
+    assert.strictEqual(
+      O.validTick(p),
+      true,
+      `validTick(${p}) is false but it is a ladder tick — float noise was treated as inexactness`,
+    );
+  }
 });
 
 // T10: next/prev never leave the ladder range for arbitrary inputs.
