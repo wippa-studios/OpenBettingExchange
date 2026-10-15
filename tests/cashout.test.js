@@ -280,6 +280,79 @@ check('C7 the house account is not given a cash-out quote', async () => {
     'the house is refused by the is_bot guard specifically');
 });
 
+// #16: the "fundable NOW" check this function used to promise in a comment did
+// not exist. availableOf() was never called, and the check as described could
+// NOT have worked: a buyout payout posts `house_float -> player_funds`, so it
+// never debits the bot's users.balance_cents. This pins the behaviour the model
+// actually has — the quote is NOT gated on the house's balance — so that the
+// claim cannot be reinstated by accident and so a future reader who adds such a
+// gate sees exactly what it would do.
+check('C9 the quote is not gated on any house balance', async () => {
+  const { db, users } = (await fresh());
+  const bots = require('../lib/bots');
+  await bots.primeBotHash();
+  const bot = bots.ensureBot(db);
+  const market_id = inTheMoney(db, users);
+
+  // The control: a quote exists at all on this position.
+  const before = C.cashoutQuote(db, users.alice, market_id);
+  assert.ok(before, 'the position is quotable');
+
+  // Take the house to ZERO. It cannot fund a cent — not the payout, not the
+  // legs — so any affordability test written against its balance refuses here.
+  // The house also has no open liability in this fixture, so available is 0 and
+  // not merely negative.
+  db.prepare('UPDATE users SET balance_cents = 0, frozen_cents = 0 WHERE id = ?').run(bot.id);
+  const broke = db.prepare('SELECT balance_cents b, frozen_cents f FROM users WHERE id = ?').get(bot.id);
+  assert.strictEqual(broke.b - broke.f, 0, 'the house has nothing available');
+
+  const after = C.cashoutQuote(db, users.alice, market_id);
+  assert.ok(after, 'a quote with a house that cannot fund ANY of it — there is no balance gate');
+  assert.strictEqual(after.value_cents, before.value_cents, 'and it is the same quote');
+  db.close();
+});
+
+// #16, the other half. The venue's ability to fund the LEGS it inherits is a
+// real balance and IS enforced — but at execution, not at quote time, and
+// atomically. This pins that, because "execution is currently safe by accident
+// rather than by design" is the whole of what was wrong with the comment: an
+// accident that is now a test.
+check('C10 a house that cannot fund the legs refuses the buyout and writes nothing', async () => {
+  const { db, users } = (await fresh());
+  const bots = require('../lib/bots');
+  await bots.primeBotHash();
+  const bot = bots.ensureBot(db);
+  const market_id = inTheMoney(db, users);
+
+  const alice0 = balances(db, users.alice.id);
+  const bob0 = balances(db, users.bob.id);
+  const matches0 = db.prepare('SELECT COUNT(*) c FROM matches').get().c;
+  const tx0 = db.prepare('SELECT COUNT(*) c FROM transactions').get().c;
+
+  // The quote is offered — C9 shows why — and execution is where the house
+  // fails. ledger.escrow refuses when available funds cannot cover the legs it
+  // is inheriting.
+  db.prepare('UPDATE users SET balance_cents = 0, frozen_cents = 0 WHERE id = ?').run(bot.id);
+  assert.throws(
+    () => C.cashoutMarket(db, users.alice, market_id),
+    (e) => e.status === 400 && /Insufficient available balance/.test(e.message),
+    'the buyout is refused rather than half-closed'
+  );
+
+  // ATOMIC. Nothing at all was written: the position is intact and tradeable,
+  // no match was flagged, no settlement row exists, no money moved.
+  assert.deepStrictEqual(balances(db, users.alice.id), alice0, 'the player is untouched');
+  assert.deepStrictEqual(balances(db, users.bob.id), bob0, 'and so is the counterparty');
+  assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM matches').get().c, matches0, 'no takeover match was left behind');
+  assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM transactions').get().c, tx0, 'and no ledger row');
+  assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM settlements').get().c, 0, 'and no settlement');
+  assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM cashout_quotes').get().c, 0, 'and no executed-buyout record');
+  // The quote is still there afterwards: the refusal rolled back, it did not
+  // consume the position.
+  assert.ok(C.cashoutQuote(db, users.alice, market_id), 'the position survives the refusal');
+  db.close();
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
@@ -296,6 +369,6 @@ check('C7 the house account is not given a cash-out quote', async () => {
     passed++;
     console.log('  ok', name);
   }
-  if (passed < 8) { console.error("expected 8 checks"); process.exit(1); }
+  if (passed < 10) { console.error("expected 10 checks"); process.exit(1); }
   console.log(`\ncashout.test.js: ${passed} checks passed`);
 })();

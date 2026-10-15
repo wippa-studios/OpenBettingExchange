@@ -349,6 +349,42 @@ paid a quote for a position they no longer hold.
 *Tests:* `tests/cashout.test.js` (contract), `tests/cashout2.test.js`
 (valuation, multi-runner, no double settlement, counterparty safety).
 
+### Who funds a buyout
+
+A venue buyout has two costs, paid out of two different things, so "can the
+venue afford this?" has no single answer. Stating both is the point: a comment
+in `lib/cashout.js` once claimed a quote was checked for affordability against
+`availableOf()`, and no such check existed.
+
+| Cost | Paid from | Enforced |
+| --- | --- | --- |
+| **The payout** — what the player is paid | `house_float → player_funds`, a double-entry posting | `lib/cashoutrisk.js` caps, at **quote** time |
+| **The legs** — the collateral the venue inherits with the position | the house bot's own balance, as escrow | `ledger.escrow`, at **execution**, inside the transaction |
+
+The payout is deliberately **not** debited from the bot's `users.balance_cents`,
+so there is no balance to test it against — the bot's balance does not move when
+a buyout is paid. `house_float` stands at minus the cumulative unpaid buyout
+payouts: it is a flow account, not a budget. A `availableOf(house) >= payout`
+test written the way that comment described would therefore refuse every quote
+from the venue's first buyout onward. The bound is a **policy cap** instead:
+`CASHOUT_MAX_OUTSTANDING_CENTS` on unpaid exposure and
+`CASHOUT_MAX_DAILY_LOSS_CENTS` on the day's outlay, both read before a quote is
+offered.
+
+The legs are different, and are a real balance. `cashoutPosition` moves the
+player's collateral onto the house through `ledger.escrow`, which refuses when
+available funds cannot cover it. Because that happens **inside** the execution
+transaction, an unfundable buyout rolls the whole thing back — no match flagged,
+no settlement row, no payout. It is a refusal, not a half-close.
+
+The honest consequence: **a quote is not a promise the venue can always
+honour.** An underfunded house can be quoted and then decline at execution with
+a `400`. What bounds that is the exposure cap, which bounds how much the venue
+can be quoted for in the first place.
+
+*Tests:* `tests/cashout.test.js` (C9 no balance gate on the quote, C10 an
+unfundable house rolls the buyout back), `tests/cashoutrisk.test.js` (the caps).
+
 ## Pre-off only
 
 > **Bets may only be placed before an event's off time. Cash-out closes at off
@@ -527,7 +563,9 @@ Listed so nobody mistakes a scope decision for a bug:
   backward-looking, so by the time it is measurable the money is already gone,
   whereas outlay is known at decision time and genuinely bounds the worst case.
   The residual exposure is the venue's own account, which is why cash-out credits
-  `house_float → player_funds` rather than debiting the bot's balance.
+  `house_float → player_funds` rather than debiting the bot's balance — see
+  [Who funds a buyout](#who-funds-a-buyout) for why that leaves no balance a
+  quote could be tested against.
 - **Horizontal scale.** SQLite is single-writer and synchronous — which is *why*
   the sweep is atomic, and a genuine strength — but it is one process on one
   machine. `npm run load` measures that single node (~500 orders/sec placed);
