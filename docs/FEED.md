@@ -22,19 +22,26 @@ If the collector stops, the board goes stale. Nothing corrupts.
 **What this is: a price *observation* surface.** Real fixtures, real kick-off
 times, a reference ladder, and an operator panel that says how old the data is.
 
-**What this is not: a second book.** Nothing the feed shows can be bet. Turning
-it on does not merge a Betfair market into the exchange; it bolts a read-only
-view of one onto an engine that keeps trading its own catalogue. That boundary
-is enforced by the engine, not by the client, and it is deliberate — see
-[Feed markets are display only](#feed-markets-are-display-only).
+**And — since #101 — a way to run your book on those fixtures.** An operator can
+materialise the feed's catalogue into the venue's own `sports` / `events` /
+`markets` / `selections`, and the venue then quotes those markets **at its own
+prices**. The feed supplies fixtures, off times and results; the venue supplies
+the book. See [Materialising the feed's catalogue](#materialising-the-feeds-catalogue-into-the-venue-book).
+
+**What this is still not: a copied book.** Nothing the feed shows is traded at a
+feed price. A feed market that the operator has not materialised has no row in
+this venue's database and cannot be bet at all; a market it has materialised is
+the venue's own, priced by the venue. That boundary is enforced by the engine,
+not by the client — see
+[Feed markets that were not materialised are display only](#feed-markets-that-were-not-materialised-are-display-only).
 
 One more thing to say before the detail: this document is written from
-`lib/feed.js`, `lib/feedcreds.js`, `lib/feedrunner.js`, `lib/resultsfeed.js`,
-`lib/results.js`, `lib/config.js` and `server.js` in **this** repository.
-Claims about the collector — its views, its cadence, its Betfair settings — are
-checked against that project's `betfeed/schema.sql` and `betfeed/config.py`, and
-are marked as the collector's. Where this repository's code disagrees with one of
-them, that is called out rather than smoothed over.
+`lib/feed.js`, `lib/feedcat.js`, `lib/feedcreds.js`, `lib/feedrunner.js`,
+`lib/resultsfeed.js`, `lib/results.js`, `lib/config.js` and `server.js` in **this**
+repository. Claims about the collector — its views, its cadence, its Betfair
+settings — are checked against that project's `betfeed/schema.sql` and
+`betfeed/config.py`, and are marked as the collector's. Where this repository's
+code disagrees with one of them, that is called out rather than smoothed over.
 
 ---
 
@@ -42,11 +49,11 @@ them, that is called out rather than smoothed over.
 
 | | |
 | --- | --- |
-| Owned by | [`lib/feed.js`](../lib/feed.js) — read-only SQL and row shaping |
-| Data source | the collector's PostgreSQL, reached over `FEED_DATABASE_URL` |
+| Owned by | [`lib/feed.js`](../lib/feed.js) — read-only SQL and row shaping — and [`lib/feedcat.js`](../lib/feedcat.js), which materialises the catalogue into local rows on request |
+| Data source | the collector's PostgreSQL, reached over `FEED_DATABASE_URL`, or an operator's own JSON-over-HTTP API |
 | Direction | reads only; there is no code path that writes to the feed database |
-| Tradeable | **no.** A feed market has no row in this venue's database |
-| Side effects on the venue | bots and drift are force-disabled while the feed is on |
+| Tradeable | **only what has been materialised**, and only at the venue's own prices. A feed market with no local row is display-only |
+| Side effects on the venue | none at boot. Materialisation is `POST /api/admin/feed/sync`, an explicit, audited operator action |
 
 The read side is four routes, all public (no session required):
 
@@ -71,42 +78,128 @@ read perfectly well and what came back is out of date: `code: "feed_stale"`,
 you to different places, so they are not one answer — see
 [API.md](API.md#feed-health-says-which-of-two-things-went-wrong).
 
-### Feed markets are display only
+### Feed markets that were NOT materialised are display only
 
 This is the most important rule in this document.
 
-> **A feed market cannot be bet.** Naming a feed selection id on
-> `POST /api/orders` returns **404**, refused before any collateral is taken.
+> **A feed market the venue has no row for cannot be bet.** Naming its selection
+> id on `POST /api/orders` returns **404**, refused before any collateral is taken.
 
-The reason is structural. A feed market has **no row in this venue's database** —
-it lives only in the collector's Postgres. `lib/match.js` resolves a selection by
-joining `selections → markets → events` in the local store, so a feed selection
-id resolves to nothing and the engine raises `404 Selection not found`. That
-happens inside `validateOrder`, which runs before the escrow call, so nothing is
-frozen and no limit is consumed. To trade a feed market you would have to create
-a local market, copy prices onto it, and then the venue is betting at a price
-that is five minutes old and derived from someone else's book. The failure mode
-is not a bad price; it is a good price that a sharp client takes from you.
+The reason is structural. A feed market lives only in the feed's database, and
+`lib/match.js` resolves a selection by joining `selections → markets → events` in
+the local store, so its selection id resolves to nothing and the engine raises
+`404 Selection not found`. That happens inside `validateOrder`, which runs before
+the escrow call, so nothing is frozen and no limit is consumed.
+
+The same absence is what keeps the feed's **reference** book unquotable: there is
+no local market for a bot to name, whatever the config says.
 
 `tests/feed-display-only.test.js` asserts all three legs of this: the selection
 does not exist locally, the engine refuses the order, and the client refuses it
-too.
+too. `tests/feedbook.test.js` FB5 and FB6 assert the boundary from the other side
+— that a materialised neighbour of the same feed market *is* tradeable, so the
+line is a line and not a wall.
 
 So the feed is used for two things the venue genuinely needs:
 
 - **a real fixture list** — real competitions, real kick-off times
 - **a reference book** — what the market looks like elsewhere
 
-### Turning feed fixtures into tradeable markets
+### Materialising the feed's catalogue into the venue book
 
-Creating a local market that mirrors a feed fixture is supported and is the way
-to run your own book on real fixtures. It is a **deliberate, explicit act**: a
-local market is created with **no price**, and the venue quotes its own. The
-mapping from feed market to local market is 1:1 and is never inferred — see
-[EXCHANGE_RULES.md](EXCHANGE_RULES.md).
+Before #101, feed mode left a venue with a board of real fixtures and **no
+tradeable market anywhere in it**: a feed market had no local row, and the bots —
+the venue's only source of liquidity — were force-disabled while the feed was on,
+because a bot requoting over the observed book "would fight the price source".
+There was nothing to fight: the observed book has no row here.
 
-Read [What feed mode does NOT do](#what-feed-mode-does-not-do) before planning
-around that, because in feed mode the venue has no price source of its own.
+Materialising is the way out. `POST /api/admin/feed/sync` creates local
+`sports`, `competitions`, `events`, `markets` and `selections` for the fixtures
+the feed publishes, and records every id it maps in the `feed_map` table
+(`lib/store.js`). From then on those markets are the venue's own, the bots quote
+them from the venue's own `fair_price`, and `POST /api/orders` accepts them.
+
+```
+POST /api/admin/feed/sync?limit=200&offset=0
+```
+
+| | |
+| --- | --- |
+| Auth | `requireAdmin` + the `admin` volume bucket, audited as `feed.catalogue_synced` against target `feed:catalogue` |
+| When | never automatically. Not at boot, not on a timer, not on a feed event |
+| Cost | one `nav()` call, then one `market()` per market, at most `FEED_BOOK_SYNC_CONCURRENCY` at a time |
+| Answer | a report: what it wrote, what it **refused and why**, what it deactivated, and where the next run resumes |
+
+What it does:
+
+- reads the **catalogue** from `nav()` — never from `board()`, which is capped at
+  `FEED_MARKET_LIMIT` markets against a catalogue this document puts at 1400+;
+- fetches each market's runners with the existing `market(id)`, asked for
+  **unpriced** — no contract change was needed and
+  `tests/feedprovider-conformance.test.js` already proves both shipped providers
+  answer these two calls;
+- caps the run at `FEED_BOOK_SYNC_LIMIT` markets from `FEED_BOOK_SYNC_CONCURRENCY`
+  concurrent reads, and reports `bounded.remaining` plus `bounded.next_offset`, so
+  a catalogue larger than the cap is **resumable** rather than merely throttled.
+
+Four rules carry the whole design, and each is a rule because of a specific way of
+getting it wrong:
+
+1. **A feed price never becomes `fair_price` or `ltp`.** `fair_price` is the
+   *venue's* price — it is what `lib/bots.js` builds a ladder around and what
+   `lib/cashout.js` computes a buyout from. A new selection is seeded with
+   `FEED_BOOK_SEED_PRICE` (even money, a neutral position rather than a view), and
+   an **existing** selection's `fair_price` is never written at all, so a re-sync
+   cannot move the venue's own price. The hazard this exists for is not a bad
+   price: it is *a good price that a sharp client takes from you*.
+2. **`starts_at` must parse, or the row is refused and reported by name.**
+   `lib/offtime.js` deliberately treats an unreadable off time as **CLOSED**, so
+   writing one would produce a market that can never be bet and never settle. A
+   refused fixture appears in `report.refused` with its name — a silently skipped
+   one looks exactly like a feed with no fixtures.
+3. **`events.is_demo` is never set.** That column marks the seeded showcase book
+   and is the only thing whose off time is ever rolled forward. A feed event is
+   real.
+4. **Nothing is ever deleted.** A market that leaves the feed is **suspended**,
+   which stops new orders and leaves every order, match and settlement where it
+   is. A market that left *after* going off is left open on purpose, because
+   `pendingMarkets` asks about open markets only and suspending a finished race
+   would stop it being settled.
+
+Idempotent and bounded by construction; a second run of the same catalogue
+changes nothing and deactivates nothing.
+
+> **What the browser shows is a separate question, and this change did not move
+> it.** In feed mode the client renders `/api/feed/*` — the reference board — and
+> `OB.state.feedMode` blocks the bet slip there, which is correct: those markets
+> still have no local row. A materialised market is tradeable through the API and
+> appears on the venue's own board (`GET /api/events`) and the admin desk; making
+> the feed-mode UI show a board the venue can bet is a frontend decision, not a
+> consequence of this one. Nothing here is promised about it.
+
+The id map is the other half. Once a fixture exists here, the venue has two id
+spaces for one race — the feed's (`'1.234567890'`, `58805`) and its own
+(autoincrement integers) — and the results protocol speaks integers in both
+directions. See [Id spaces: the results protocol](#id-spaces-the-results-protocol).
+
+Two further consequences, stated rather than discovered:
+
+- **A fixture that is already off is refused**, as `off_time_past`, and reported.
+  The venue does not open a market it cannot accept an order on. A venue
+  restarting after a long outage should settle those by hand.
+- **Deactivation needs a whole-catalogue view.** "This market is gone" is a claim
+  about the *absence* of a row, so a capped run cannot make it: the markets past
+  the cap are not missing, they are unread. A truncated run deactivates nothing
+  and says so (`deactivation_skipped: "bounded"`).
+
+### Turning feed fixtures into tradeable markets, by hand
+
+Creating a local market that mirrors a feed fixture through
+`POST /api/admin/markets` is still supported, and is the way to run your own book
+on real fixtures without materialising the whole catalogue. It is a **deliberate,
+explicit act**: a local market is created with **no price**, and the venue quotes
+its own. The mapping from feed market to local market is 1:1 and is never inferred
+— see [EXCHANGE_RULES.md](EXCHANGE_RULES.md).
 
 ---
 
@@ -296,16 +389,42 @@ environment wins), but the exchange **never writes one**. Credentials are passed
 to the collector as environment variables, which is why the collector can boot
 with no configuration file at all.
 
-On boot with the feed on, the server logs what it suppressed and what it found:
+On boot with the feed on, the server logs what it found and what it is still
+holding back:
+
+```
+[feed] on — the venue book is quoted at its own prices; the reference board stays display-only
+[drift] suppressed while the feed is on — drift is a separate workstream (#87)
+[feed] odds feed connected — 9976 markets, newest frame 92s old
+```
+
+The first line prints only when `BOT_ENABLED` is on, the second only when
+`DRIFT_ENABLED` is on, since suppressing something already off is not news.
+
+**What changed, and why the old wording was wrong.** This used to read
 
 ```
 [feed] on — bots suppressed (feed owns prices)
 [feed] on — drift suppressed (feed owns prices)
-[feed] odds feed connected — 9976 markets, newest frame 92s old
 ```
 
-The two suppression lines print only when `BOT_ENABLED` / `DRIFT_ENABLED` were
-on, since suppressing something already off is not news.
+The bots are no longer suppressed, because "the feed owns prices" was never
+quite true of the venue's book: the feed publishes the venue's *fixtures*, and
+the venue quotes its own. What was actually true is that a bot cannot requote
+over the observed Betfair book — there is no local row for it to name — so
+suppressing the bots protected a conflict the schema made impossible, while
+leaving a venue running on a feed with **no source of liquidity at all**. The
+bots now quote the venue's own book, including the markets
+[`POST /api/admin/feed/sync`](#materialising-the-feed's-catalogue-into-the-venue-book)
+materialised, and the reference board is still unquotable because it still has no
+row. See the block comment at the `BOTS_ON` hoist in `server.js`, and F4 in
+`tests/feed-display-only.test.js`.
+
+**Drift is still suppressed**, and that is a separate decision rather than a
+leftover: drift is the venue's own price *moving*, which is a product decision
+(#110/#108), not a side effect of having a catalogue. `lib/userrules.js`'s only
+production caller sits behind `DRIFT_ON` and is inert in feed mode — #87, tracked
+and out of scope for this document.
 
 The connection line reads the age from `odds_age_seconds` and compares it with the
 **same** `FEED_STALE_SECONDS` `/api/feed/health` compares it with, appending
@@ -331,12 +450,15 @@ Every `FEED_*` key, with the default read from `lib/config.js`:
 
 | Key | Default | Effect |
 | --- | --- | --- |
-| `FEED_ENABLED` | `false` | read fixtures and prices from the feed. Display only |
+| `FEED_ENABLED` | `false` | read fixtures and prices from the feed. Display-only until an operator materialises it — see below |
 | `FEED_PROVIDER` | `'postgres'` | which implementation of the feed contract serves the board: `postgres` (the collector's views) or `http` (the operator's own JSON-over-HTTP feed API). Anything else aborts the launch |
 | `FEED_DATABASE_URL` | `''` | collector's Postgres URL. **Required** when the feed is on and `FEED_PROVIDER=postgres`, and must match `postgres://` or `postgresql://` |
 | `FEED_NUMBER` | `2` | which view to read: `1` fixtures only, `2` prices and results. Validated as the integer 1 or 2 |
 | `FEED_STALE_SECONDS` | `300` | age beyond which a price is reported stale. Range 30–86400 |
 | `FEED_MARKET_LIMIT` | `60` | markets returned to the board. Range 1–500 |
+| `FEED_BOOK_SYNC_LIMIT` | `200` | markets one `POST /api/admin/feed/sync` may materialise. Range 1–5000. Bounded on purpose: the catalogue is 1400+ markets and each one costs a `market()` round trip |
+| `FEED_BOOK_SYNC_CONCURRENCY` | `4` | simultaneous `market()` calls during a sync. Range 1–32. This is pressure on somebody else's licensed API |
+| `FEED_BOOK_SEED_PRICE` | `2` | the price a **newly** materialised selection is seeded with. Range 1.01–1000. Even money is a neutral starting position, not a view. **The venue's price, never the feed's** — see the materialisation section |
 | `FEED_CREDENTIALS_KEY` | unset | 64 hex characters, the AES-256-GCM key. Unset means credentials are **refused** |
 | `FEED_RUNNER_ENABLED` | `false` | supervise the collector as a child process instead of running it separately |
 | `FEED_COLLECTOR_CMD` | `betfeed collect` | split on whitespace, so an absolute path or a wrapper works |
@@ -704,6 +826,50 @@ transport POSTs, so the feed is asked for precisely what will be consumed.
 
 That set is **not capped**. See [Known gaps](#known-gaps).
 
+### Id spaces: the results protocol
+
+Since #101 a materialised market exists in **two** id spaces at once: the feed's
+(`'1.234567890'` for a market, `58805` for a runner) and this venue's
+(autoincrement integers). The results protocol speaks integers in **both**
+directions, and `lib/feedcat.js` `admitSignal` is the single place the two are
+translated.
+
+**Outbound** (`requestBody`): a materialised market is described by *both* ids —
+`id` and `external_id`, `event_id` and `event_external_id`, and per selection
+`id` plus `external_id`. Both, because the venue's own id is what an operator's
+API has always seen and the feed's is the only one it can recognise; sending
+either alone breaks one of the two integrations. A market with no materialisation
+is described exactly as it was before, byte for byte.
+
+A runner's `external_id` is the **composite** `` `${market_id}:${selection_id}` ``,
+because Betfair reuses selection ids across markets — `58805` is "The Draw" in
+every soccer 1X2 market — so the bare id is a label that repeats, not an
+identity.
+
+**Inbound** (`pollOnce`): a raw id is read in this order, and the answer is
+recorded in the `result_events` payload as `id_space`:
+
+| Where the raw id resolves | Result |
+| --- | --- |
+| the feed's space, within this market (`'1.100:32'`, or a bare `32` rebuilt from the market the feed named) | translated; `id_space: "feed"` |
+| this venue's own space, as a selection of **this** market | translated; `id_space: "local"` |
+| both, to **different** selections | **HELD**, `id_space_ambiguous` — settling it is a coin flip on somebody's money |
+| neither | **HELD**, `id_space_unmapped`, and the market stays OPEN because a player still holds a position in it |
+
+A held market names the raw id in `hold_reason`, and a provenance row records the
+ids **as sent**, because a row that could not say which space the feed used is a
+row that cannot be defended in a dispute.
+
+The recorded `source_event_id` for a materialised market is the **feed's id for
+that market** — not the feed's *event* id, which is coarser: one fixture has
+several markets (a Win and a To Be Placed are the same race), and a per-event id
+would make the second market's withdrawal read as a re-delivery of the first and
+return `already_applied` with the runner still quoted. The feed's event id is
+recorded alongside it, in the payload. This is what makes
+`idx_result_events_source` — unique on `(source, source_event_id)` — an actual
+re-delivery guard rather than a decorative index; before #101 `externalId` was
+null on every polled signal and the index never fired.
+
 ### A wrong-shaped response is a failure, not an empty poll
 
 `parseOutcomes` accepts a map keyed by market id, or an array of entries
@@ -931,17 +1097,23 @@ The things a reader is most likely to assume, and the code for each.
 
 | It does not | Because |
 | --- | --- |
-| make feed markets tradeable | they have no local row; `POST /api/orders` 404s on a feed selection id, before collateral is taken |
-| suspend markets when the feed goes stale | there is no local market to suspend. A guard doing that would close the venue's *real* book because an unrelated market's prices were old — see `tests/feed-display-only.test.js` |
+| make an unmaterialised feed market tradeable | it has no local row; `POST /api/orders` 404s on its selection id, before collateral is taken |
+| trade a materialised market at a feed price | `lib/feedcat.js` never writes a feed price into `fair_price` or `ltp`, on a first sync or any later one. A new selection is seeded with `FEED_BOOK_SEED_PRICE` |
+| requote the reference board | there is no local market for a bot, a drift tick or an order to name, whatever the config keys say |
+| suspend markets when the feed goes stale | a staleness guard would take FEED market ids and try to suspend LOCAL venue markets — a category error that could close the venue's *real* book because an unrelated market's prices were old. See `tests/feed-display-only.test.js` |
 | copy feed prices onto local markets | a local market is created with no price and the venue quotes its own |
-| give the venue a price source of its own | `BOTS_ON` and `DRIFT_ON` are `BOT_ENABLED && !FEED_ENABLED` and `DRIFT_ENABLED && !FEED_ENABLED`, hoisted above every use. **In feed mode the venue's own markets are unquoted**, whatever their flags say |
+| move a venue price | drift (`DRIFT_ON`) is still suppressed while the feed is on, and user rules are inert for the same reason — #87, a separate workstream |
+| delete a market the feed dropped | it is suspended, never deleted, and a market that left the feed after going off is left open so it can still settle |
 | settle anything from the collector's results | settlement runs through `lib/settle.js`, from an operator's intent or from the HTTP results transport |
 | write to the collector's database | `lib/feed.js` only ever reads |
-| merge into the existing board | `/api/feed/*` is a parallel surface; the demo board and the feed board are served by different routes |
+| run on its own | materialisation is an explicit, audited `POST /api/admin/feed/sync`. Nothing happens at boot or on a timer |
 
-That row about bots and drift is the honest summary of feed mode: **an
-observation tool attached to an engine, not a merged product.** The engine keeps
-trading its own catalogue, and in feed mode nothing is quoting it.
+The row about the launch price model is the one worth dwelling on: **what a
+materialised market's price should be is a product decision this repository has
+not made.** It seeds even money so that the market is tradeable at all, and the
+real model belongs to the operator (#110/#108). What it will never do is copy
+somebody else's book onto its own — that is the failure `docs/FEED.md` has always
+named: *not a bad price, a good price that a sharp client takes from you.*
 
 ---
 
@@ -994,6 +1166,10 @@ the boundary** rather than carried into the UI, where it would render as
 | `403` on a credential route naming another tenant | working as intended; cross-tenant administration is not available on this role |
 | `404` on a credential route | that tenant id does not exist — checked before the ownership rule so probing ids reveals nothing |
 | `409` from `/api/admin/feed/runner/start` | the readiness reason is in the response body: a missing flag, a missing `FEED_DATABASE_URL`, a missing `FEED_CREDENTIALS_KEY`, or no credential stored |
+| `409` from `POST /api/admin/feed/sync` | `FEED_ENABLED` is false. The feed's surfaces are the same code path an operator reaches by habit, and a 200 reporting "0 markets" for a venue with no feed configured is a report nobody can tell apart from a feed that has gone empty |
+| A sync refuses a fixture and names it | the off time the feed published is not a timestamp `lib/offtime.js` can read, or the fixture is already off. Both are refusals, not failures: nothing was written, and an unreadable off time is CLOSED, so the market would have been unbetable and unsettleable |
+| A sync's `bounded.remaining` is not 0 | the catalogue is larger than `FEED_BOOK_SYNC_LIMIT`. Re-run with `?offset=<bounded.next_offset>` until it is 0. **Until then nothing is deactivated**, because a capped run cannot tell a market that left the feed from one it did not read |
+| A materialised market is not in the board | `GET /api/events` filters on `status IN ('upcoming','live')`. A market the feed suspended stays in the database, in `result_events`, and in the pending set — it just accepts no orders |
 | `supervisor: "stopped"` but a `betfeed` process exists | an orphan from before the shutdown path existed. Check `ps` for a collector whose parent is gone |
 | `running: false`, `last_start_error: "… is not installed or not on PATH"` | `FEED_COLLECTOR_CMD`, or the service user's `PATH`. A spawn that never happened used to leave a handle that reported `running: true` with `pid: undefined`; liveness is now derived from the process itself |
 | Results feed green but nothing settles | check `dropped_entries` and `last_dropped`, then `last_error.reason`. `unrecognised_shape` means the provider's response changed |

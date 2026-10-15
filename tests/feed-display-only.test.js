@@ -1,5 +1,5 @@
-// feed-display-only.test.js — feed markets are DISPLAY ONLY, and the engine
-// enforces it rather than relying on the client.
+// feed-display-only.test.js — feed markets that have NOT been materialised are
+// DISPLAY ONLY, and the engine enforces it rather than relying on the client.
 // Run: node tests/feed-display-only.test.js   (plain assert, no deps)
 //
 // WHY THIS SUITE EXISTS. docs/ROADMAP.md lists "Feed resilience" as an open gap
@@ -12,7 +12,11 @@
 // test rather than a memory:
 //
 //   1. A feed market has NO local row. The recorder's catalogue lives in its own
-//      Postgres database; the venue's tradeable markets are rows in this one.
+//      Postgres database; the venue's tradeable markets are rows in this one —
+//      unless an operator has explicitly MATERIALISED it, which is a separate,
+//      opt-in, audited action (#101) that mints its OWN rows at the VENUE's own
+//      prices. A feed market this venue does not own is still only a row
+//      somewhere else.
 //   2. The engine refuses an order naming a feed selection id — 404, because
 //      that selection does not exist here.
 //   3. The client refuses as well, and says so ("Feed markets are display-only").
@@ -23,13 +27,21 @@
 // venue markets — a category error that could close the venue's real book
 // because an unrelated market's prices were old.
 //
-// The REAL consequence is the opposite one, and it is documented instead: with
-// FEED_ENABLED=true the venue has no price source of its own at all, because
-// bots and drift are force-disabled so they cannot requote over the observed
-// book (server.js, the BOTS_ON/DRIFT_ON hoists). Feed mode is an observation tool
-// attached to an engine, not a merged product — and the engine trades nothing in
-// that mode. That is coherent, but it was not written down anywhere, and an
-// operator reading "odds feed integration" would not expect it.
+// THE REAL CONSEQUENCE, CORRECTED (#101). The last paragraph of this header used
+// to say the consequence was that, with FEED_ENABLED=true, "the venue has no
+// price source of its own at all … the engine trades nothing in that mode".
+// That was TRUE and it was the #101 defect: the bots and the drift engine were
+// force-disabled so they could not requote over the observed book, so a venue
+// running on a feed had a board of real fixtures and not one bettable market in
+// it. It is no longer true. The bots now quote the VENUE's own book — including
+// the markets lib/feedcat.js materialises from the feed's catalogue — and the
+// feed's prices are still never copied into the venue's (see docs/FEED.md and
+// F4 below).
+//
+// What survives unchanged, and is what this suite now exists to prove, is the
+// boundary itself: a feed market that has NOT been materialised has no row here,
+// so it is untradeable and unquotable, and the feed stays a reference surface
+// rather than a merged product.
 'use strict';
 
 process.env.SCRYPT_N = '16384';
@@ -122,44 +134,102 @@ check('F3 the refusal is not id-shape dependent', async () => {
   );
 });
 
-// F4: THE CONSEQUENCE, STATED AS A TEST. With the feed enabled, bots and drift
-// are force-disabled so they cannot requote over the observed book, and feed
-// markets are not tradeable — so the venue has no price source of its own and
-// its own book is unquoted. This is the honest description of feed mode, and
-// asserting it here is what stops someone reading "odds feed integration" and
-// assuming the venue trades those markets.
-check('F4 feed mode leaves the venue own book unquoted', async () => {
+// F4: THE CONTAINMENT IS STILL THERE, AND IT IS NOW STRUCTURAL.
+//
+// WHAT THIS CHECK USED TO ASSERT, AND WHY IT HAD TO CHANGE (#101). It recomputed
+// the `BOTS_ON` hoist and then grepped server.js for the line
+//
+//   const BOTS_ON = config.BOT_ENABLED && !config.FEED_ENABLED;
+//
+// asserting that the feed suppresses the bots. That suppression is GONE, and it
+// is gone on purpose: it was protecting a conflict that could not happen (a bot
+// cannot requote a market this venue has no row for) at the cost of leaving the
+// venue with no counterparty at all — the board showed real fixtures and none of
+// them could be bet. lib/feedcat.js now materialises the feed's catalogue into
+// the venue's own book, which the venue then quotes at its OWN prices, so the
+// bots have to run for those markets to be tradeable. See the block comment at
+// the hoist in server.js for the full argument.
+//
+// THE PART OF THAT WHICH MATTERS MOST, AND WHICH NOBODY SHOULD SKIP: the old
+// assertion KEPT PASSING after the hoist changed, because the string it matched
+// now appears in the COMMENT that explains why the hoist changed. A source-level
+// regex standing in for a behavioural check, matching its own documentation —
+// which is STATE.md §5.1 and §5.6 in one green line, and the reason the check
+// below is behavioural rather than textual. If you change this hoist again, this
+// check must still be able to tell.
+//
+// WHAT REPLACES IT. The reference board is not quoted because it HAS NO LOCAL
+// ROW, so there is nothing for quoteAllMarkets to name — a stronger guarantee
+// than the flag, because it holds with every config key set however the operator
+// likes. The venue's own markets are quoted. Both are asserted by DOING them.
+check('F4 the reference board is never quoted, and the venue own book is', async () => {
   const config = require('../lib/config');
-  // The invariant that matters is the LOGIC of the hoist in server.js, not the
-  // value of FEED_ENABLED in this suite (which is false). Recomputed with the
-  // feed forced on: both must be off REGARDLESS of their own flags, because
-  // their own flags are exactly what the hoist exists to override — a bot
-  // requoting straight over the observed Betfair book would be the venue
-  // fighting its own price source.
-  const hoist = (feedEnabled) => ({
-    bots: config.BOT_ENABLED && !feedEnabled,
-    drift: config.DRIFT_ENABLED && !feedEnabled,
-  });
-  const feedOff = hoist(false);
-  assert.strictEqual(feedOff.bots, config.BOT_ENABLED, 'with no feed, the flag stands');
-  assert.strictEqual(feedOff.drift, config.DRIFT_ENABLED, 'with no feed, the flag stands');
-  const feedOn = hoist(true);
-  assert.strictEqual(feedOn.bots, false, 'the feed suppresses the bots');
-  assert.strictEqual(feedOn.drift, false, 'the feed suppresses the drift');
+  const bots = require('../lib/bots');
 
-  // Recomputing the expression is only meaningful while the CODE still has it,
-  // so assert that too. The failure this guards against is a well-meaning
-  // "fix" that makes the hoists respect their own flags again — which would
-  // reintroduce bots quoting over the observed book and is very hard to notice,
-  // because everything still works.
-  const src = require('fs').readFileSync(require.resolve('../server'), 'utf8');
+  // Drift is UNCHANGED: still force-disabled by the feed, and still a
+  // statement about a hoist rather than a behaviour, so it is asserted as one.
+  // (The bots are the opposite case — see above.)
+  const hoist = require('fs').readFileSync(require.resolve('../server'), 'utf8');
   assert.ok(
-    /const BOTS_ON = config\.BOT_ENABLED && !config\.FEED_ENABLED;/.test(src),
-    'server.js still suppresses the bots when the feed is on'
+    /const DRIFT_ON = config\.DRIFT_ENABLED && !config\.FEED_ENABLED;/.test(hoist),
+    'server.js still suppresses the drift when the feed is on'
+  );
+  assert.strictEqual(
+    config.DRIFT_ENABLED && !config.FEED_ENABLED, false,
+    'with the feed forced on, drift is off whatever its own flag says'
+  );
+
+  // AND THE BOTS' HOIST IS NOT FEED-GATED — read from the CODE, with comments
+  // STRIPPED. The comment this check sits under quotes the old expression
+  // verbatim, because explaining a removal means writing down what was removed,
+  // and an earlier version of this assertion matched that comment and kept
+  // reporting green against a hoist that no longer existed. tests/guard.test.js
+  // strips comments for the same reason and in the same way.
+  const code = hoist.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(
+    /const BOTS_ON = config\.BOT_ENABLED;/.test(code),
+    'server.js quotes the venue own book whenever BOT_ENABLED, feed or not'
   );
   assert.ok(
-    /const DRIFT_ON = config\.DRIFT_ENABLED && !config\.FEED_ENABLED;/.test(src),
-    'server.js still suppresses the drift when the feed is on'
+    !/const BOTS_ON = config\.BOT_ENABLED && !config\.FEED_ENABLED;/.test(code),
+    'and the feed no longer switches the venue own liquidity off'
+  );
+
+  // The behaviour. A venue whose only market is its own, with the feed on.
+  const f = (await venue());
+  await bots.primeBotHash();
+  bots.quoteAllMarkets(f.db);
+
+  // (a) the venue's own market is quoted — the thing that was impossible before
+  const quotes = f.db.prepare("SELECT COUNT(*) c FROM orders o JOIN users u ON u.id = o.user_id WHERE u.is_bot = 1").get().c;
+  assert.ok(quotes > 0, `the venue own market is quoted in feed mode (got ${quotes} bot orders)`);
+
+  // (b) and NOTHING was quoted against the reference board, whose market and
+  // selection ids have no row here at all. Counted over the whole venue, so a
+  // bot ladder that somehow named a feed id would show up in it.
+  const foreign = f.db
+    .prepare('SELECT COUNT(*) c FROM selections WHERE CAST(id AS TEXT) = ?')
+    .get(FEED_SELECTION_ID).c;
+  assert.strictEqual(foreign, 0, 'the reference board still has no rows, so there was nothing to quote');
+  const markets = f.db.prepare('SELECT COUNT(*) c FROM markets').get().c;
+  assert.strictEqual(markets, 1, 'and exactly one market exists — the venue own');
+
+  // (c) THE CONTROL, and the reason (a) means anything. A venue nobody quoted
+  // has none of those orders: without this, "orders exist" would also pass
+  // against a fixture that placed its own, and the count would be measuring the
+  // fixture rather than the bots.
+  const control = (await venue());
+  const controlQuotes = control.db
+    .prepare('SELECT COUNT(*) c FROM orders o JOIN users u ON u.id = o.user_id WHERE u.is_bot = 1')
+    .get().c;
+  assert.strictEqual(controlQuotes, 0, 'an unquoted venue has no bot orders, so the count above is the bots');
+
+  // And the reference board is still untradeable through the ENGINE, which is
+  // the half of the boundary F2 proves and the half no flag controls.
+  assert.throws(
+    () => M.placeOrder(control.db, control.alice, { selection_id: FEED_SELECTION_ID, side: 'back', price: 2.0, stake_cents: 1000 }),
+    (e) => e.status === 404,
+    'the reference board is still untradeable whatever the bots do'
   );
 });
 
