@@ -186,6 +186,53 @@ check('D7 a pre-idempotency database upgrades and keeps its orders', async () =>
   fs.rmSync(file, { force: true });
 });
 
+// D8: a pre-book-version database upgrades and GAINS BOTH COUNTERS (#92).
+//
+// The same trap as D7, on the two columns the market-version handshake reads.
+// It is easy to reintroduce here because a FRESH database cannot see it at all:
+// SCHEMA and the migrations agree on a fresh install, so the only environment
+// that catches a missing ALTER is one that was created before the columns
+// existed — which is every existing deployment and none of the other tests.
+//
+// `book_version` is read on every placement, so an install that upgraded without
+// it would not merely lose a feature: every order would fail with "no such
+// column: book_version" and the venue would take nothing at all.
+check('D8 a pre-book-version database upgrades and gains both counters at 0', async () => {
+  const file = path.join(os.tmpdir(), `ob_mig_bv_${process.pid}.db`);
+  fs.rmSync(file, { force: true });
+  // markets and selections in their PRE-#92 shape: no book_version at all.
+  const seed = new DatabaseSync(file);
+  seed.exec(`CREATE TABLE markets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL, name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open')`);
+  seed.exec(`CREATE TABLE selections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, market_id INTEGER NOT NULL, name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open', fair_price REAL, ltp REAL)`);
+  seed.prepare("INSERT INTO markets (event_id, name) VALUES (1,'Legacy')").run();
+  seed.prepare("INSERT INTO selections (market_id, name) VALUES (1,'Legacy Runner')").run();
+  seed.close();
+
+  const db = openStore(file); // must not throw
+  for (const t of ['markets', 'selections']) {
+    const col = db.prepare("SELECT name FROM pragma_table_info(?) WHERE name='book_version'").get(t);
+    assert.ok(col, `${t}.book_version must be added by the migration`);
+  }
+  // Backfilled to ZERO, and only zero: a database that has never been read by a
+  // version-aware client has no history to encode.
+  assert.strictEqual(db.prepare('SELECT book_version b FROM markets').get().b, 0, 'markets backfill to 0');
+  assert.strictEqual(db.prepare('SELECT book_version b FROM selections').get().b, 0, 'selections backfill to 0');
+  // The pre-existing rows survived — a migration that rebuilt the table and lost
+  // the catalogue would be a far worse failure than a missing column.
+  assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM markets').get().c, 1, 'the legacy market is preserved');
+  assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM selections').get().c, 1, 'the legacy runner is preserved');
+  db.close();
+  // Second open is a no-op, not a duplicate-ALTER failure.
+  const again = openStore(file);
+  assert.strictEqual(again.prepare('SELECT COUNT(*) c FROM markets').get().c, 1);
+  again.close();
+  for (const s of ['', '-wal', '-shm']) fs.rmSync(file + s, { force: true });
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops

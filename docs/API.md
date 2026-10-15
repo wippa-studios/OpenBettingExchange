@@ -263,6 +263,7 @@ than only the annotated few:
 | `rate_limited` | `429` | the **request-volume** limiter only |
 | `feed_unavailable` | `503` | the odds-feed reads, when the collector cannot be reached |
 | `feed_stale` | `503` | `GET /api/feed/health` only, when the collector answered and its prices are out of date |
+| `market_version_stale` | — | `POST /api/orders`, when a supplied book version is materially behind |
 
 The two feed codes are the reason the derived list cannot be the whole answer.
 Both are `503`, they mean opposite things operationally — go and look at the
@@ -302,7 +303,7 @@ below and currently fall through to the status-derived default.
 | `401` | No session, bad credentials, bad webhook signature, wrong ops token |
 | `403` | Wrong role, a foreign `Origin`, the first-run lock, a suspended or self-excluded account, or a jurisdiction refusal |
 | `404` | Unknown id — or, on `DELETE /api/orders/:id/cancel`, an order that is not yours |
-| `409` | State conflict: market not open, already settled, held, no cash-out available, intent already final |
+| `409` | State conflict: market not open, already settled, held, no cash-out available, intent already final, or a stale `market_version` on placement |
 | `413` | Body over 256 kB |
 | `429` | **Two different things** (see below) |
 | `500` | Every 5xx. Logged with the real error, reported as `{ "error": "Internal error" }` |
@@ -317,6 +318,7 @@ fault cannot leak detail through it.
 | Request-volume limiter (`limit('trade'\|'cashout'\|'admin'\|'wallet'\|'read')`, 60-second sliding window keyed on user or IP) | `{ "error": "Too many requests", "retry_after_seconds": N }` | set |
 | Credential-abuse counters on register/login (10 consecutive failures per username, escalating 30 s → 15 min; 30 per source IP, flat 60 s). **Stored in SQLite, so they survive a restart** — see [Credential-abuse state](#credential-abuse-state) | `{ "error": "Too many failed attempts; try again later" }` | set |
 | **Abuse limits** (`lib/limits.js`) — market liability and stake caps | `{ "error": "…", "details": { "code": "market_liability_exceeded" \| "stake_limit_exceeded", … } }` | **absent** |
+| **Stale market version** (`lib/bookversion.js`) — the book moved past `MARKET_VERSION_MATERIAL_THRESHOLD` since the client read it | `{ "error": "…", "code": "market_version_stale", "details": { "current_version": 15, "drift": 3, "threshold": 2, … } }` | **absent** |
 
 The last row is the divergence worth naming: an abuse-limit refusal uses `429`,
 a status that elsewhere in this API means "slow down, retry", yet it carries no
@@ -461,7 +463,7 @@ so a retried request does not flicker every other client's board. Connect with
 
 | Route | Request | Success | Errors |
 | --- | --- | --- | --- |
-| `POST /api/orders` | `{ selection_id, side, price, stake_cents, client_order_id? }` | `201 { order, fills, book }`; `200` with `idempotent_replay: true` when `client_order_id` has been seen | see below |
+| `POST /api/orders` | `{ selection_id, side, price, stake_cents, client_order_id?, selection_version?, market_version? }` | `201 { order, fills, book, market_version }`; `200` with `idempotent_replay: true` when `client_order_id` has been seen | see below |
 | `GET /api/orders` | — | `200 { orders }` — unmatched orders only, newest first | `401` |
 | `POST /api/orders/:id/cancel` | — | `200 { order }`; releases the escrow on the unmatched remainder | `400` non-integer id, already cancelled, or fully matched; `404` not your order |
 | `GET /api/positions` | — | `200 { positions }` — exposure, if-win P&L and a cash-out quote per market | `401` |
@@ -471,13 +473,15 @@ so a retried request does not flicker every other client's board. Connect with
 integer, a `stake_cents` that is not a number or falls outside
 `[MIN_STAKE_CENTS, MAX_STAKE_CENTS]`, a `price` that is not a finite JSON
 **number** (a quoted `"2.4"` is refused — the boundary is type-strict, not
-coerced), **insufficient available balance for the stake/liability**, or a
+coerced), **insufficient available balance for the stake/liability**, a
 `client_order_id` that is not a string / longer than 64 chars / contains
-anything but `[A-Za-z0-9._:-]`; `429` for a stake or market-liability cap breach;
-`403` for a session limit, an owed reality check or a self-exclusion; `404
-Selection not found` — which is also what a **feed** selection id gets, before
-any collateral is taken; `409` for market not open, selection not open, event
-completed, market suspended, or the event off.
+anything but `[A-Za-z0-9._:-]`, or a `selection_version` / `market_version`
+that is not a non-negative integer; `429` for a stake or market-liability cap
+breach; `403` for a session limit, an owed reality check or a self-exclusion;
+`404 Selection not found` — which is also what a **feed** selection id gets,
+before any collateral is taken; `409` for market not open, selection not open,
+event completed, market suspended, the event off, or a stale
+`market_version` (below).
 
 `validateOrder` also carries a `400 Price out of range` branch. It is a
 **redundant backstop**: `snapToTick` clamps to `[1.01, 1000]` first, and
@@ -490,6 +494,67 @@ than clamps, this one cannot make that branch the primary check.
 `fills` is `[{ price, stake_cents }]` at the **resting** order's price. An order
 placed on an in-play market is accepted and escrowed but carries
 `delayed: true` and an `eligible_at`; it does not match until the delay expires.
+
+### The market-version handshake: `selection_version` and `market_version`
+
+Every book this venue serves carries a **monotone book version** — per runner as
+`selections[].version`, per market as `market_version`. Read one, send it back
+with your order, and the venue refuses the order if the book has moved
+*materially* in between:
+
+```jsonc
+POST /api/orders
+{ "selection_id": 7, "side": "lay", "price": 2.00, "stake_cents": 5000,
+  "selection_version": 12, "market_version": 31 }
+```
+
+```jsonc
+409 {
+  "error": "The book has moved since you read it (selection version 12, now 15). Re-read the book and decide again.",
+  "code": "market_version_stale",
+  "details": { "code": "market_version_stale", "scope": "selection",
+               "supplied_version": 12, "current_version": 15,
+               "drift": 3, "threshold": 2 }
+}
+```
+
+Both fields are **optional**, and **omitting both preserves the behaviour this
+API had before they existed** — no check runs and no existing caller breaks.
+Neither is Betfair's opaque `marketVersion` string and neither should be parsed
+for meaning; the only question either answers is *has this book moved since I
+read it*.
+
+- `MARKET_VERSION_MATERIAL_THRESHOLD` (default **2**) is how many book-altering
+  events on that scope you may be behind and still be accepted: a drift of
+  exactly `T` places, a drift of `T + 1` is refused. The rationale for that
+  number, and what would make it wrong on a different venue, is in
+  [`EXCHANGE_RULES.md`](EXCHANGE_RULES.md#market-version).
+- The version advances on a **fill**, a **cancel**, and a **suspension or
+  resumption** (market scope only). An order that merely rests does not move it.
+- A version you could not have read — one **ahead** of the venue's counter — is
+  refused on the same branch. The counter is monotone, so a client cannot
+  legitimately hold a version this venue has never reached.
+- A **malformed** version is `400`, never a silent pass. The comparison is a
+  subtraction, and a string would make the drift `NaN` — which compares false
+  against every threshold and would disable the control for that client while
+  it believed it had run.
+- The comparison runs **inside** the placement transaction, so a refusal writes
+  no order, moves no money and freezes no escrow, and two concurrent placements
+  cannot both trade on one claim.
+- An **idempotent retry** is never refused. A known `client_order_id` returns
+  the order that already exists, which is the one case where your claim is
+  guaranteed to be stale.
+
+Where the versions come from, so a client never needs a second request:
+
+| Response | Field |
+| --- | --- |
+| `GET /api/markets/:id/book` | `market_version`, and `version` on each runner in `book` |
+| `GET /api/events` | `market_version` per market, `version` per runner in `selections` |
+| `POST /api/orders` | `market_version`; each runner's own `version` is inside `book` |
+
+Snapping is unchanged and is a **different** control: an off-ladder `price` is
+still corrected rather than refused, whether or not you send a version.
 
 ### Cash-out is a venue buyout, not a market hedge
 

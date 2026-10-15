@@ -302,6 +302,7 @@ failing later.
 | `COMMISSION_RATE` | `0.025` | Fee on net winnings |
 | `FAUCET_MAX_CENTS` | `100000` | Faucet cap per deposit |
 | `MIN_STAKE_CENTS` / `MAX_STAKE_CENTS` | `100` / `100000` | Order size bounds |
+| `MARKET_VERSION_MATERIAL_THRESHOLD` | `2` | How many book-altering events a client may be behind before `POST /api/orders` refuses its order as stale. **Only affects clients that send a version** — omit it and the behaviour is exactly what it was before. `0` refuses on any movement |
 | `SESSION_TTL_DAYS` | `30` | Session lifetime |
 | `SCRYPT_N` | `65536` | Password hashing cost; floored at 16384 |
 | `MAX_SSE_CLIENTS` | `2000` | Concurrent live streams; each holds a socket open |
@@ -418,7 +419,7 @@ weight.
 ```bash
 
 
-npm test            # 826 checks: unit and API integration, fully offline
+npm test            # 833 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 212 checks: real Chromium via Playwright (board and admin desk)

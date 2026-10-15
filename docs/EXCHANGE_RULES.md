@@ -67,9 +67,13 @@ returning the clamped bound as though it had been asked about.
    `[MIN_STAKE_CENTS, MAX_STAKE_CENTS]`. Strings and floats are rejected at the
    boundary (`Number("100")` and `Number(true)` are not stakes).
 3. The price is snapped to the ladder and must land in `[1.01, 1000]`.
-4. The required escrow must be available (see below). If it is not, **nothing is
+4. If a `selection_version` or `market_version` was supplied, it is checked
+   against the venue's current book version — see
+   [Market version](#market-version) below. **Omitting both preserves the
+   behaviour above exactly.**
+5. The required escrow must be available (see below). If it is not, **nothing is
    written** — no order, no match, no ledger row.
-5. The order is inserted first, then matched, then any remainder rests.
+6. The order is inserted first, then matched, then any remainder rests.
 
 An order is a **limit order**: it takes liquidity immediately at the resting
 prices, and the rest sits on the book until cancelled or settled. It is never
@@ -78,6 +82,175 @@ filled at your limit price if better resting liquidity exists.
 *Tests:* `tests/match.test.js` (E9 validation, E24 off-ladder snap,
 E25 stake bounds, E26 selection id + suspension), `tests/tx.test.js` (X6
 all-or-nothing).
+
+## Market version
+
+### The gap it closes
+
+Snapping a price is **not** the same problem as knowing which book you priced
+against, and this venue already solves the first one. Step 3 above corrects an
+off-ladder price rather than refusing it, `GET /api/format/:price` documents
+that, and the correction is deliberate (#37 fixed the validation branch around
+it). Do not read what follows as a criticism of it.
+
+The gap was narrower and quieter. A client that read a ladder, saw `2.00`
+available for `5000` cents and sent that order had it placed at whatever the
+ladder said by the time the request arrived. The answer was `201`, with `fills`
+showing the outcome, and **the client could not tell**:
+
+- *my order was accepted and did not match* — the market moved, which is normal
+- *my order was accepted at a price I did not intend* — the ladder moved under me
+
+Betfair solves this by making the client declare what it priced against
+(`marketVersion` on `placeOrders`), and the venue refusing the order when the
+book has **materially** changed. Without that declaration the venue is silently
+making a pricing decision on the client's behalf, and the client cannot audit it.
+
+### What the version is
+
+Two monotone integer counters — `selections.book_version` and
+`markets.book_version` — and nothing more. Betfair's is an opaque string; ours
+does not need to be, because it has to answer exactly one question: *has this
+book moved materially since the client read it?*
+
+They are **not** Betfair's string and must not be treated as one. A client must
+not be able to read meaning out of ours (a price, a timestamp, a hash), because
+the first thing that would follow is a client parsing it.
+
+Read them from any of: `GET /api/markets/:id/book` (`market_version`, and
+`version` on each runner), `GET /api/events` (`market_version` per market,
+`version` per runner), or the `POST /api/orders` response, which carries both so
+a client can chain its next order without a refetch.
+
+### What moves it
+
+| Event | Selection version | Market version |
+| --- | --- | --- |
+| A fill on that runner | +1 | +1 |
+| A cancel on that runner | +1 | +1 |
+| The market is suspended or resumed, or goes in-play or comes out of it | — | +1 |
+
+Bumped **once per placement**, not once per fill. A sweep can take five fills
+off five resting orders; what a client whose claim was refused learned is one
+thing — the ladder it read is no longer the ladder it saw.
+
+Three things deliberately do **not** bump it:
+
+- **An order that merely rests.** The reason is not that nothing changed — adding
+  size to a level does change the book. It is that the client causing it is the
+  client making the claim: this control reports what **someone else** did, and a
+  counter your own click moves is a counter that refuses your second order for
+  something you already know. **The limitation that follows, stated rather than
+  hidden:** another player merely *adding* size at a price is not counted, so a
+  client is told when a level was traded or cancelled, not when it grew.
+- **The cash-out house leg.** `lib/settle.js` inserts it with
+  `status = 'fully_matched'`, and the book is built from `status = 'open'`
+  orders, so it is invisible to every reader. The player's resting orders that
+  the same transaction cancels *do* bump.
+- **Settlement and void.** They set `markets.status = 'settled'` (and
+  `selections.status = 'void'`), after which every placement is refused with a
+  `409` — the client is told directly and cannot be racing anything.
+
+Cancels are bumped in `cancelOrderTx`, which is the single funnel every
+cancellation in this codebase passes through: the cancel route, the bots'
+requote, cash-out, self-exclusion, a tenant suspension and the admin desk all
+call it rather than writing `orders.status` themselves.
+
+### The materiality threshold, and where it sits
+
+`MARKET_VERSION_MATERIAL_THRESHOLD` is **how many book-altering events on that
+scope a client may be behind and still be accepted.** A drift of exactly `T` is
+accepted; a drift of `T + 1` is refused, with `409` and
+`code: "market_version_stale"`. It defaults to **2**, and the refusal carries
+`scope`, `supplied_version`, `current_version`, `drift` and `threshold` so a
+client can recover from the response alone rather than making a second request.
+
+**Betfair's threshold is not public.** So this is a judgement, and the judgement
+is the deliverable — here is the argument, so it can be argued with:
+
+- **Why not 0** (refuse on any movement at all). This venue's own market maker
+  cancels and requotes every `DRIFT_INTERVAL_MS` — 5 s by default. A book
+  therefore advances under a client's feet *whether or not anybody is trading*,
+  and a human's read-then-click latency spans at least one such cycle. A zero
+  tolerance does not protect a ladder client; it refuses the second click of
+  every ladder they look at, which is the failure mode the issue explicitly
+  warns about.
+- **Why not large.** The threshold is the whole control. Once it tolerates a
+  number of events at which a reader could not tell the book had changed, it is
+  decorative — a client would believe it had a staleness guarantee it did not
+  have, which is worse than no handshake at all because it suppresses the
+  re-read.
+- **Why 2 and not 1 or 3.** 2 is the smallest value that clears this venue's own
+  churn with a re-read window left over: one requote cycle is tolerated, so a
+  client that reads and clicks inside two drift intervals is not refused for the
+  venue's own quoting. 1 leaves nothing for a second legitimate event (a fill
+  and a cancel in the same window is ordinary on a liquid runner). 3 begins to
+  cover a window long enough for a top-of-book move the client would have wanted
+  to know about.
+- **What would make it wrong.** A venue with real market makers and no bot
+  requoting needs a much lower number — the entire argument for 2 is this
+  venue's own liquidity churn. Conversely a venue whose clients deliberately
+  re-read between every click should run 0. That is why it is a config key: the
+  right number is a property of the venue's liquidity, not a law.
+
+It is asserted **at its boundary**, not merely inside: a drift of exactly `T` is
+placed and a drift of exactly `T + 1` is refused (`tests/marketversion.test.js`
+MV4). A check that only asserted the refusal would also pass against an
+implementation that refused everything.
+
+### Where it runs, and why that is not portable
+
+The comparison runs **inside the placement transaction**, immediately after the
+selection is resolved and before any escrow, order row or ledger posting exists.
+A refusal therefore writes nothing at all.
+
+The reason is the same one `lib/limits.js` gives for enforcing its caps there:
+read the version outside the transaction and two concurrent placements both read
+the pre-bump value and both pass.
+
+**This is a control the synchronous engine makes easy and a Postgres rewrite
+makes subtle**, and it is worth stating exactly why rather than leaving it to be
+rediscovered:
+
+- `node:sqlite` is synchronous, so `placeOrderTx` is one transaction with no
+  `await` in it. The version read and the order insert are, structurally,
+  adjacent statements.
+- `transaction()` opens with **`BEGIN IMMEDIATE`**, so it takes the write lock at
+  the *start* of the transaction rather than on first write. Two placements
+  serialise at their boundary: the second waits (`busy_timeout`), then runs on a
+  fresh snapshot and reads the version the first one wrote. There is no window
+  between the read and the insert for another writer to enter.
+
+Under Postgres `READ COMMITTED` the same function has two statements and another
+session can commit a bump between them; under `REPEATABLE READ` the loser would
+instead fail at `COMMIT` with a serialization error — a *different* failure,
+which a client has to be taught about separately. Neither is obviously right
+until someone checks. **Do not "simplify" the read out of the transaction
+because it looks redundant** — that is the defect this note exists to prevent.
+
+### Omitting the version
+
+`selection_version` and `market_version` are both optional and both default to
+absent. With neither supplied the placement is byte-for-byte what it was before
+this existed: no check, no refusal, no new code path to fail in. Existing
+callers — the web client, the smoke test, any integration written against
+Betfair — need no change, and that is asserted rather than assumed
+(`tests/marketversion.test.js` MV5).
+
+Two edges worth stating:
+
+- **A malformed version is a `400`, never a silent pass.** The comparison is a
+  subtraction; a string would make the drift `NaN`, and `NaN > threshold` is
+  false — so a client sending `"5"` would be waved through forever while the
+  control believed it had run.
+- **An idempotent retry is never refused.** `placeOrderTx` answers a known
+  `client_order_id` with the order that already exists, before it validates
+  anything. That is the one case where the client's claim is *guaranteed* stale,
+  and refusing it would turn a retried request into a lost order.
+
+*Tests:* `tests/marketversion.test.js` (MV1–MV14, including the two-process
+concurrency race), `tests/store.test.js` (D8, the migration), `tests/api.test.js`
+(the refusal as a top-level `code` over HTTP).
 
 ## Matching
 
@@ -607,6 +780,7 @@ were silent successes that settled nothing while reporting healthy forever.
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `MIN_STAKE_CENTS` / `MAX_STAKE_CENTS` | 100 / 100000 | order size bounds, inclusive |
+| `MARKET_VERSION_MATERIAL_THRESHOLD` | 2 | book-altering events a client may be behind before its order is refused as stale; `0` refuses on any movement. Only affects clients that send a version |
 | `COMMISSION_RATE` | 0.025 | fee on net winnings, 0–0.2 |
 | `FAUCET_MAX_CENTS` | 100000 | cap per faucet deposit |
 | `DRIFT_INTERVAL_MS` | 5000 | how often a fair price moves |

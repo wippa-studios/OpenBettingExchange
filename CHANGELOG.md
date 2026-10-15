@@ -8,6 +8,30 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A market version on placement** (#92). Every runner and every market now
+  carries a monotone `book_version`, exposed on every book the venue serves
+  (`GET /api/markets/:id/book`, `GET /api/events`, and the placement response).
+  `POST /api/orders` accepts an **optional** `selection_version` /
+  `market_version` and refuses the order with a distinct
+  `409 { "code": "market_version_stale" }` when the book has moved past
+  `MARKET_VERSION_MATERIAL_THRESHOLD` (default 2) since the client read it.
+
+  This closes a correctness gap in the money path rather than a fidelity gap.
+  Snapping an off-ladder price is deliberate and unchanged — `snapToTick` still
+  corrects, and #37 fixed the validation branch around it. What was missing was
+  the version **handshake**: a client that read a ladder and sent an order had it
+  placed at whatever the ladder said by then, answered `201`, and could not tell
+  "accepted and did not match" from "accepted at a price I did not intend".
+
+  The version advances on a fill, a cancel and a suspension/resumption. Both
+  fields are optional and **omitting them preserves the previous behaviour
+  exactly**, so no existing caller breaks; a malformed version is a `400` rather
+  than a silent pass, a version ahead of the venue is refused, and an idempotent
+  retry is never refused. The comparison runs inside the placement transaction —
+  a control the synchronous engine makes easy, and one a Postgres rewrite would
+  make subtle. The rationale for the threshold, and what would make it wrong on
+  a different venue, is in `docs/EXCHANGE_RULES.md`.
+
 - **Player-authored betting rules** (`lib/userrules.js`, second piece of the
   user-bots programme). A rule is a declarative record — *if this runner's price
   goes below (or above) this threshold, place this side at this stake* — and it

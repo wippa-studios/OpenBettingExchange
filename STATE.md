@@ -46,7 +46,7 @@ delay, per-user abuse limits, responsible-gambling controls, and an operator des
 
 | | |
 |---|---|
-| Tests | **826 checks / 64 suites**, plus a **212-check** Playwright browser suite |
+| Tests | **833 checks / 65 suites**, plus a **212-check** Playwright browser suite |
 | CI | 8 jobs: node 22 + 24, browser, guards, load smoke, dependency audit, and two secret scans |
 | Supply chain | every action pinned to a full commit SHA, dependabot configured |
 | Docs | `check-docs.mjs` **fails the build** when documentation contradicts the code |
@@ -145,7 +145,7 @@ Measured, not remembered:
 So the changelog documents **two releases that never happened**, on the repo's
 first two days, with no tags and no version bump behind them. `[0.2.0]` describes
 "a real-browser Playwright suite (24 checks)" — that was day 2 of a 166-commit
-repo. It is 212 browser checks and 64 suites now.
+repo. It is 212 browser checks and 65 suites now.
 
 For an open-source project this is worse than an absent changelog, because it
 answers "is this maintained?" wrongly. A reader concludes there is a release
