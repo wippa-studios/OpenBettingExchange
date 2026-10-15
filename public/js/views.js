@@ -115,17 +115,31 @@
       }
       OB.setHtml(body, positions
         .map((p) => {
-          const legs = p.selections
-            .filter((s) => s.my_back_stake_cents || s.my_lay_stake_cents || s.frozen_cents)
+          const live = p.selections.filter(
+            (s) => s.my_back_stake_cents || s.my_lay_stake_cents || s.frozen_cents
+          );
+          const legs = live
             .map(
               (s) => `<tr>
                 <td>${OB.esc(s.name)}</td>
                 <td class="tn">${s.my_back_stake_cents ? OB.fmt(s.my_back_stake_cents) : '—'}</td>
                 <td class="tn">${s.my_lay_stake_cents ? OB.fmt(s.my_lay_stake_cents) : '—'}</td>
-                <td class="tn">${OB.fmt(s.frozen_cents)}</td>
               </tr>`
             )
             .join('');
+          // ONE escrow figure, for the position, instead of a per-leg column
+          // that repeated the Backed column.
+          //
+          // The table used to end BACKED | LAID | FROZEN, and for any back-only
+          // leg lib/match.js's escrowFor equals the stake — so every such row
+          // printed the same number twice (`$50.51 / — / $50.51`) and the third
+          // column read as "Frozen is a word a bettor will take to mean staked",
+          // when it is the collateral held against the whole position. That is
+          // the number a player actually wants ("how much of my money is tied
+          // up"), and it is a property of the position rather than of a leg, so
+          // it belongs beside the position's own name.
+          const frozen = p.selections.reduce((a, s) => a + (Number(s.frozen_cents) || 0), 0);
+          const frozenNote = frozen ? ` · escrow held <span class="tn">${OB.fmt(frozen)}</span>` : '';
           const matrix = p.pnl_if_win
             .map(
               (w) =>
@@ -145,9 +159,9 @@
               <div><strong>${OB.esc(p.market_name)}</strong> <span class="chip ${OB.esc(p.market_status)}">${OB.esc(
             p.market_status
           )}</span></div>
-              <div class="muted">${OB.esc(p.event_name)}</div>
+              <div class="muted">${OB.esc(p.event_name)}${frozenNote}</div>
             </div>
-            <table><thead><tr><th>Selection</th><th>Backed</th><th>Laid</th><th>Frozen</th></tr></thead><tbody>${legs}</tbody></table>
+            <table><thead><tr><th>Selection</th><th>Backed</th><th>Laid</th></tr></thead><tbody>${legs}</tbody></table>
             <div class="pnlrow">${matrix}</div>
             <div>${cash}</div>
           </div>`;
@@ -273,7 +287,11 @@
       }
       const credits = ['deposit', 'settle', 'refund', 'release'];
       OB.setHtml(tx,
-        '<table><thead><tr><th>Type</th><th>Amount</th><th>Balance</th><th>Frozen</th><th>When</th></tr></thead><tbody>' +
+        // "Balance" in this column is the balance AFTER the row, while the
+        // "Balance" figure at the top of the same screen is the total. Same
+        // word, two meanings, one page — which is how a reader checks one
+        // against the other and concludes the ledger is wrong.
+        '<table><thead><tr><th>Type</th><th>Amount</th><th>Balance after</th><th>Frozen after</th><th>When</th></tr></thead><tbody>' +
         w.transactions
           .map((t) => {
             const isCredit = credits.indexOf(t.type) >= 0 && t.amount_cents >= 0;

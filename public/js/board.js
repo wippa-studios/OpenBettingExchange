@@ -156,8 +156,39 @@
       renderRaces();
       return;
     }
+    // A FAILED LOAD AND AN EMPTY CATALOGUE ARE NOT THE SAME SCREEN.
+    //
+    // loadEvents() used to answer both with `state.events = []`, so a 500 from
+    // /api/events and a venue with genuinely nothing on it rendered the same
+    // card saying "No open events right now". The first thing an operator
+    // concludes on seeing that is "we have gone out of business" — which is the
+    // exact inverse of the truth, and it happened on every transient blip.
+    //
+    // So the failure says it FAILED, names why, offers a retry, and never claims
+    // to know anything about the catalogue. The empty state keeps its own copy
+    // and says how to fill it.
+    if (OB.state.eventsError) {
+      page.innerHTML =
+        `<div class="card"><div class="empty err">The board could not be loaded — ${OB.esc(
+          OB.state.eventsError
+        )}</div>` +
+        `<div class="row center"><button class="btn primary" id="boardRetry">Try again</button></div>` +
+        `<p class="muted fineprint">This is a fault, not an empty market list. If it persists the venue is not trading.</p></div>`;
+      const retry = document.getElementById('boardRetry');
+      if (retry) {
+        retry.onclick = async () => {
+          retry.disabled = true;
+          retry.textContent = 'Retrying…';
+          await OB.loadEvents();
+          OB.renderMarkets();
+        };
+      }
+      return;
+    }
     if (!OB.state.events.length) {
-      page.innerHTML = '<div class="card"><div class="empty">No open events right now</div></div>';
+      page.innerHTML =
+        '<div class="card"><div class="empty">No open events right now</div>' +
+        '<p class="muted fineprint">The catalogue loaded and is genuinely empty — nothing is scheduled to trade.</p></div>';
       return;
     }
     const groups = new Map();
@@ -177,11 +208,30 @@
             <span class="chip ${OB.esc(e.status)}">${OB.esc(e.status)}</span>
           </div>`;
         for (const m of e.markets) {
+          // ONE status, once. The event chip above and the market chip here sat
+          // three lines apart saying `upcoming` and `open` about the same thing
+          // in two different visual languages, and on this catalogue EVERY
+          // market was `open` under an `upcoming` event — twelve pairs of chips
+          // per board, which is how a board ends up with a status nobody can read
+          // at a glance.
+          //
+          // So the event chip is the authority and a market chip is printed only
+          // when the market is NOT open: `suspended` and `settled` are the states
+          // an operator has to notice, and `open` is the absence of news.
+          const marketStatus = m.status && m.status !== 'open'
+            ? `<span class="chip ${OB.esc(m.status)}">${OB.esc(m.status)}</span>`
+            : '';
+          // `$0.00 matched` on every market with no volume is a number that is
+          // always zero, and a row of zeros reads as a broken counter rather than
+          // as a market nobody has backed.
+          const matched = m.total_matched_cents
+            ? `<span class="muted tn">${OB.fmt(m.total_matched_cents)} matched</span>`
+            : '';
           html += `<div class="mkt">
             <div class="mkthead">
               <span>${OB.esc(m.name)}</span>
-              <span class="chip ${OB.esc(m.status)}">${OB.esc(m.status)}</span>
-              <span class="muted tn">${OB.fmt(m.total_matched_cents)} matched</span>
+              ${marketStatus}
+              ${matched}
             </div>
             ${ladderHtml(m, e)}
           </div>`;

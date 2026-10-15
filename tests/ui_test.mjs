@@ -112,6 +112,11 @@ const EXPECTED_PREAUTH_401 = /401 \(Unauthorized\)/;
 // WORKING, exactly as the signed-out 401 above is the whoami probe working.
 let expectLock403 = false;
 const EXPECTED_LOCK_403 = /403 \(Forbidden\)/;
+// Set while #68 injects a 500 on /api/events on purpose. Chromium logs the
+// refused response as a console error, and a test that manufactures the fault
+// it then asserts on must not be failed by its own instrumentation.
+let expectEvents500 = false;
+const EXPECTED_EVENTS_500 = /500 \(Internal Server Error\)/;
 page.on('pageerror', (e) => pageErrors.push(String(e)));
 page.on('console', (msg) => {
   if (msg.type() !== 'error') return;
@@ -119,6 +124,7 @@ page.on('console', (msg) => {
   if (!signedIn && EXPECTED_PREAUTH_401.test(msg.text())) return;
   if (expectAuth401 && EXPECTED_PREAUTH_401.test(msg.text())) return;
   if (expectLock403 && EXPECTED_LOCK_403.test(msg.text())) return;
+  if (expectEvents500 && EXPECTED_EVENTS_500.test(msg.text())) return;
   pageErrors.push(text);
 });
 
@@ -866,6 +872,597 @@ try {
     check('admin body is a stable shared mount', degrade);
   });
 
+// ── #68 §2.4: the operator console's visual language does not exist ───────
+  //
+  // public/admin-risk.js renders ten class names style.css never defines. A
+  // missing class is invisible to every check that asserts an element EXISTS —
+  // the meter, the stat tiles and the tables are all in the DOM — so every
+  // assertion here is about GEOMETRY, VISIBILITY or COLOUR: the things that
+  // change when a rule exists.
+  await scenario('#68 the risk desk renders its meter, its KPI row and a kill switch that looks like one', async () => {
+    await page.click('[data-view="risk"]');
+    // `attached`, not `visible`: a .meter with zero height is not visible, which
+    // IS the defect. Waiting for visible here would turn it into a 10s timeout
+    // instead of the measured failure below.
+    await page.waitForSelector('#adminBody .meter', { state: 'attached', timeout: 10000 });
+
+    const desk = await page.evaluate(() => {
+      const box = (sel) => {
+        const n = document.querySelector(sel);
+        if (!n) return null;
+        const r = n.getBoundingClientRect();
+        const cs = getComputedStyle(n);
+        return { w: Math.round(r.width), h: Math.round(r.height), display: cs.display, background: cs.backgroundColor };
+      };
+      return { meter: box('#adminBody .meter'), fill: box('#adminBody .meterfill'), kill: box('#riskKill'), withdraw: box('#riskWithdraw') };
+    });
+    check(
+      '#68 the market-maker pressure meter has height',
+      !!desk.meter && desk.meter.h > 0 && desk.meter.display !== 'none',
+      `(meter ${desk.meter ? `${desk.meter.w}x${desk.meter.h} display:${desk.meter.display}` : 'absent'})`
+    );
+    check(
+      '#68 the meter fill is painted, not a zero-box',
+      !!desk.fill && desk.fill.h > 0 && desk.fill.background !== 'rgba(0, 0, 0, 0)',
+      `(fill ${desk.fill ? `${desk.fill.w}x${desk.fill.h} ${desk.fill.background}` : 'absent'})`
+    );
+    check(
+      '#68 the fill is the width the markup asked for',
+      !!desk.fill && !!desk.meter && desk.fill.w > 0 && desk.fill.w < desk.meter.w + 1,
+      `(fill ${desk.fill ? desk.fill.w : '?'} within meter ${desk.meter ? desk.meter.w : '?'})`
+    );
+
+    // THE HIGHEST-CONSEQUENCE ITEM IN THE BATCH. The most destructive control
+    // in the product rendered identically to the second-most destructive, so an
+    // operator could not see which one they were about to press.
+    check(
+      '#68 the kill switch does not look like the button beside it',
+      !!desk.kill && !!desk.withdraw && desk.kill.background !== desk.withdraw.background,
+      `(kill ${desk.kill ? desk.kill.background : '?'} vs withdraw ${desk.withdraw ? desk.withdraw.background : '?'})`
+    );
+    check(
+      '#68 the kill switch is drawn in the danger colour',
+      !!desk.kill && desk.kill.background === 'rgb(253, 236, 235)',
+      `(kill bg ${desk.kill ? desk.kill.background : '?'} — --red-bg is rgb(253,236,235))`
+    );
+    check(
+      '#68 the withdraw button is NOT drawn as a second danger control',
+      !!desk.withdraw && desk.withdraw.background === 'rgb(255, 255, 255)',
+      `(withdraw bg ${desk.withdraw ? desk.withdraw.background : '?'})`
+    );
+
+    // The KPI row: six numbers intended as a row, stacked in a column because
+    // .statgrid had no rule.
+    await page.click('[data-view="ledger"]');
+    await page.waitForSelector('#adminBody .statgrid .stat', { timeout: 10000 });
+    const kpi = await page.evaluate(() => {
+      const stats = [...document.querySelectorAll('#adminBody .statgrid .stat')];
+      const boxes = stats.map((n) => n.getBoundingClientRect());
+      const grid = document.querySelector('#adminBody .statgrid');
+      return {
+        n: stats.length,
+        rows: new Set(boxes.map((b) => Math.round(b.y))).size,
+        gridDisplay: grid ? getComputedStyle(grid).display : null,
+        gridWidth: grid ? Math.round(grid.getBoundingClientRect().width) : 0,
+        widest: Math.round(Math.max(...boxes.map((b) => b.width))),
+      };
+    });
+    check('#68 the ledger KPI tiles are laid out by a real grid', kpi.gridDisplay === 'grid', `(display ${kpi.gridDisplay})`);
+    check(
+      '#68 the six ledger figures share a row rather than a column',
+      kpi.n >= 6 && kpi.rows === 1 && kpi.widest < kpi.gridWidth * 0.3,
+      `(${kpi.n} tiles in ${kpi.rows} row(s), widest ${kpi.widest}px of ${kpi.gridWidth}px)`
+    );
+
+    // .small: the sub-labels were rendering at 14px body size because the class
+    // meant nothing. Type SIZE is out of scope for this issue, so this asserts
+    // that the class RESOLVES — a rule exists and it is smaller than body —
+    // rather than that any particular number is correct.
+    const small = await page.evaluate(() => {
+      const n = document.querySelector('#adminBody .small');
+      if (!n) return null;
+      return { px: parseFloat(getComputedStyle(n).fontSize), body: parseFloat(getComputedStyle(document.body).fontSize) };
+    });
+    check(
+      '#68 the small sub-label class actually makes text smaller',
+      !!small && small.px < small.body,
+      `(${small ? `${small.px}px vs body ${small.body}px` : 'no .small on the ledger'})`
+    );
+
+    // Each of the ten names must now have a rule of its own. The geometry
+    // assertions above prove three of them are load-bearing; this proves the
+    // rest exist, which is the only way to catch one being renamed back.
+    await page.click('[data-view="risk"]');
+    await page.waitForSelector('#adminBody table.tbl', { timeout: 10000 });
+    const defined = await page.evaluate((names) => {
+      const found = new Set();
+      for (const sheet of document.styleSheets) {
+        let rules;
+        try {
+          rules = sheet.cssRules;
+        } catch {
+          continue;
+        }
+        for (const r of rules) {
+          if (!r.selectorText) continue;
+          for (const part of r.selectorText.split(',')) {
+            const t = part.trim();
+            if (names.includes(t)) found.add(t);
+          }
+        }
+      }
+      const tbl = document.querySelector('#adminBody table.tbl');
+      const cell = tbl ? tbl.querySelector('td') : null;
+      return {
+        missing: names.filter((n) => !found.has(n)),
+        tblPadding: cell ? getComputedStyle(cell).padding : null,
+      };
+    }, ['.meter', '.meterfill', '.statgrid', '.stat', '.small', '.bad', '.ok', '.gap', '.tbl']);
+    check(
+      '#68 every class the operator console renders now has a rule',
+      defined.missing.length === 0,
+      `(no rule for: ${defined.missing.join(', ') || 'none'})`
+    );
+    check(
+      '#68 the operator tables take their own cell padding',
+      defined.tblPadding === '6px 8px',
+      `(td padding ${defined.tblPadding})`
+    );
+
+    // The dialog's own confirm button has to match what it is about to do, for
+    // the same reason the kill switch's own styling had to: a red "Release" is
+    // an action dressed as a danger, and an operator reads colour faster than
+    // they read the verb.
+    await page.click('[data-view="risk"]');
+    await page.waitForSelector('#riskKill', { timeout: 10000 });
+    const killLabel = ((await page.locator('#riskKill').textContent()) || '').trim();
+    await page.click('#riskKill');
+    await page.waitForSelector('.modal[role="dialog"] #askGo', { timeout: 10000 });
+    const confirmTone = await page.evaluate(() => getComputedStyle(document.querySelector('.modal[role="dialog"] #askGo')).backgroundColor);
+    const confirmLabel = ((await page.locator('.modal[role="dialog"] #askGo').textContent()) || '').trim();
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('.modal[role="dialog"]', { state: 'detached', timeout: 5000 }).catch(() => {});
+    check(
+      '#68 the kill-switch dialog\'s confirm button matches what the button does',
+      // Off (the dangerous direction) => red. On (releasing) => the neutral
+      // primary face, never red.
+      /pull/i.test(killLabel)
+        ? confirmTone === 'rgb(253, 236, 235)' && /pull/i.test(confirmLabel)
+        : confirmTone === 'rgb(10, 10, 11)' && /release/i.test(confirmLabel),
+      `(button said "${killLabel}", confirm "${confirmLabel}" in ${confirmTone})`
+    );
+
+  });
+
+  // ── #68 §2.2: the account panel claims to be a modal and is not ───────────
+  //
+  // `#accountModal` is declared `role="dialog" aria-modal="true"` and is
+  // hidden/shown through the overlay stack like #authModal — but it matched no
+  // rule in style.css, so `openOverlay()` toggled a class nothing styled. The
+  // result was a permanent full-width block at the bottom of <body>, on screen
+  // on every short page (My Bets, Wallet, all ten admin tabs).
+  //
+  // Asserted as VISIBILITY and GEOMETRY, never as presence: the panel is in the
+  // DOM either way, which is exactly why this survived.
+  await scenario('#68 the account panel is a modal, not a permanent block at the bottom of the page', async () => {
+    // Wallet is a short page, so the leaked panel was on screen there.
+    await page.click('#nav button[data-page="wallet"]');
+    await page.waitForSelector('#wBal', { timeout: 10000 });
+    await page.waitForTimeout(400);
+    const closed = await page.evaluate(() => {
+      const n = document.getElementById('accountModal');
+      const r = n.getBoundingClientRect();
+      return {
+        display: getComputedStyle(n).display,
+        visible: r.width > 0 && r.height > 0,
+        position: getComputedStyle(n).position,
+        coversViewport: r.width >= window.innerWidth - 1 && r.height >= window.innerHeight - 1,
+        onScreen: r.top < window.innerHeight && r.bottom > 0,
+      };
+    });
+    check('#68 the account panel is not rendered until it is opened', !closed.visible && closed.display === 'none', `(display ${closed.display}, ${closed.visible ? 'visible' : 'not visible'})`);
+    check(
+      '#68 no account panel is left on screen over a short page',
+      !closed.onScreen,
+      `(it occupies the viewport ${closed.onScreen ? '' : 'nowhere'}; position ${closed.position})`
+    );
+    // The controls inside it occupied real boxes on the page, so a screen
+    // reader walking My Bets or the Wallet reached a password form as ordinary
+    // in-flow content with no dialog announced. An empty box is the observable
+    // form of "not in the page".
+    const leaked = await page.evaluate(() => {
+      const ids = ['pwCurrent', 'pwNew', 'pwGo'];
+      return ids.map((id) => {
+        const n = document.getElementById(id);
+        return n ? Math.round(n.getBoundingClientRect().height) : -1;
+      });
+    });
+    check(
+      '#68 the password form occupies no space on the page',
+      leaked.every((h) => h === 0),
+      `(heights ${leaked.join(', ')}px)`
+    );
+
+    await page.click('#accountBtn');
+    await page.waitForSelector('#accountModal.show', { timeout: 5000 });
+    const open = await page.evaluate(() => {
+      const n = document.getElementById('accountModal');
+      const cs = getComputedStyle(n);
+      const r = n.getBoundingClientRect();
+      const box = document.querySelector('#accountModal .box');
+      return {
+        display: cs.display,
+        position: cs.position,
+        coversViewport: r.width >= window.innerWidth - 1 && r.height >= window.innerHeight - 1,
+        boxWidth: box ? Math.round(box.getBoundingClientRect().width) : 0,
+        boxCentred: box
+          ? Math.abs((box.getBoundingClientRect().left + box.getBoundingClientRect().right) / 2 - window.innerWidth / 2) < 2
+          : false,
+        focused: document.activeElement ? document.activeElement.id : null,
+      };
+    });
+    check('#68 opening the account panel overlays the page', open.display === 'flex' && open.position === 'fixed' && open.coversViewport, `(display ${open.display}, position ${open.position})`);
+    check('#68 the account panel is a centred box, not a full-width bar', open.boxWidth > 100 && open.boxWidth < 600 && open.boxCentred, `(box ${open.boxWidth}px, centred ${open.boxCentred})`);
+    check('#68 opening it moves focus into the dialog', open.focused === 'pwCurrent', `(focus on ${open.focused})`);
+
+    // Escape closes it and returns focus where it came from — the behaviour a
+    // static block can never have, and the one that makes it a modal.
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 3000 });
+    const after = await page.evaluate(() => ({
+      display: getComputedStyle(document.getElementById('accountModal')).display,
+      focused: document.activeElement ? document.activeElement.id : null,
+    }));
+    check('#68 Escape closes the account panel', after.display === 'none', `(display ${after.display})`);
+    check('#68 Escape returns focus to the button that opened it', after.focused === 'accountBtn', `(focus on ${after.focused})`);
+
+    // Leave the desk where the next scenario expects to find it.
+    await page.click('#nav button[data-page="admin"]');
+    await page.waitForSelector('[data-view="markets"]', { timeout: 10000 });
+  });
+
+// ── #68 §3.1: a 500 and an empty venue rendered the same screen ───────────
+  //
+  // shell.js answered a failed /api/events with `state.events = []`, which
+  // board.js rendered as "No open events right now" — the same card a venue
+  // with genuinely nothing on it produces. The operator's first conclusion on
+  // seeing that is "we have gone out of business", which is the inverse of the
+  // truth, and it happened on every transient blip.
+  // ── #68 §5 cheap wins, on the surfaces they touch ─────────────────────────
+  await scenario('#68 the one-liners: slip label, ledger column, drawer, money format', async () => {
+    // `Place —` on a disabled button read as a truncated string.
+    await page.evaluate(async () => {
+      window.location.hash = '#/markets';
+      await window.OB.refreshMarkets();
+    });
+    await page.waitForSelector('.ladder .lcell[data-bet]', { timeout: 20000 });
+    await page.locator('.ladder button.lcell[data-bet]').first().click();
+    await page.waitForSelector('#slip .sliprow [data-stake]', { timeout: 5000 });
+    await page.fill('#slip [data-stake]', '0.40');
+    await page.dispatchEvent('#slip [data-stake]', 'change');
+    await page.waitForTimeout(300);
+    const placeLabel = (await page.locator('#slip button.place').first().textContent()) || '';
+    check(
+      '#68 a disabled Place button says Place, not a truncated "Place —"',
+      placeLabel.trim() === 'Place' && (await page.locator('#slip button.place').first().isDisabled()),
+      `("${placeLabel.trim()}")`
+    );
+    // Clean the slip up so the next section starts empty.
+    await page.locator('#slip [data-rm]').first().click();
+
+    // The wallet ledger's BALANCE column means "balance after" while the figure
+    // at the top of the same screen labelled BALANCE means the total.
+    await page.click('#nav button[data-page="wallet"]');
+    await page.waitForSelector('#wBal', { timeout: 10000 });
+    // The faucet writes a transaction, so the ledger table exists. Without one
+    // there is no table at all and the column name cannot be read.
+    await page.locator('#page [data-dep]').first().click();
+    await page.waitForSelector('#wTx table', { timeout: 15000 });
+    const walletHeads = await page.evaluate(() =>
+      [...document.querySelectorAll('#wTx th')].map((n) => n.textContent.trim())
+    );
+    check(
+      '#68 the ledger column says which balance it is',
+      walletHeads.indexOf('Balance after') >= 0 && walletHeads.indexOf('Balance') < 0,
+      `(${walletHeads.join(' / ')})`
+    );
+
+    // One negative-money format: admin.js rendered $-140.43, core.js -$140.43.
+    check(
+      '#68 the player-facing signed format is the minus-sign one',
+      (await page.evaluate(() => window.OB.signed(-14043))) === '−$140.43',
+      `(signed(-14043) = ${await page.evaluate(() => window.OB.signed(-14043))})`
+    );
+    //
+    // A loss is MADE, not hoped for: `daily_pnl_cents` is the bot's balance
+    // minus its day-start balance, so raising the baseline in the same column
+    // lib/risk.js reads produces a real negative. Without it the check is
+    // vacuous — a venue whose bot happens to be up today renders no negative
+    // and the assertion passes whatever the formatter does. The baseline is
+    // restored immediately afterwards.
+    {
+      const { DatabaseSync } = await import('node:sqlite');
+      const db = new DatabaseSync(path.join(TMP, 'ui.db'));
+      const rows = db.prepare('SELECT bot_id, day_start_balance FROM risk_bots').all();
+      for (const r of rows) {
+        db.prepare('UPDATE risk_bots SET day_start_balance = ? WHERE bot_id = ?').run(
+          r.day_start_balance + 12345,
+          r.bot_id
+        );
+      }
+      db.close();
+      await page.click('#nav button[data-page="admin"]');
+      await page.click('[data-view="risk"]');
+      await page.waitForSelector('#adminBody .meter', { timeout: 10000 });
+      const adminMoney = await page.evaluate(() => {
+        const cells = [...document.querySelectorAll('#adminBody td span')].map((n) => n.textContent.trim());
+        return cells.filter((t) => /^[-−+]?\$/.test(t));
+      });
+      const negatives = adminMoney.filter((t) => /^[-−]/.test(t));
+      check(
+        '#68 the operator console renders a negative amount to check the format of',
+        negatives.length > 0,
+        `(${adminMoney.length} figures: ${adminMoney.slice(0, 5).join(' | ')})`
+      );
+      check(
+        '#68 the operator console uses the same negative-money format as the player screens',
+        negatives.length > 0 && negatives.every((t) => !/^\$-/.test(t)),
+        `(${negatives.join(' | ')})`
+      );
+      const db2 = new DatabaseSync(path.join(TMP, 'ui.db'));
+      for (const r of rows) {
+        db2.prepare('UPDATE risk_bots SET day_start_balance = ? WHERE bot_id = ?').run(r.day_start_balance, r.bot_id);
+      }
+      db2.close();
+    }
+
+    // The drawer: picking a destination left the drawer open over it.
+    await page.setViewportSize({ width: 700, height: 900 });
+    await page.waitForTimeout(200);
+    await page.click('#navToggle');
+    await page.waitForFunction(() => document.body.classList.contains('nav-open'), null, { timeout: 3000 });
+    await page.click('#nav button[data-page="wallet"]');
+    await page.waitForTimeout(500);
+    check(
+      '#68 choosing a destination closes the navigation drawer',
+      !(await page.evaluate(() => document.body.classList.contains('nav-open'))),
+      '(the drawer was still open over the page it navigated to)'
+    );
+    await page.setViewportSize({ width: 1400, height: 900 });
+    await page.click('#nav button[data-page="admin"]');
+    await page.waitForSelector('[data-view="markets"]', { timeout: 10000 });
+    await page.click('[data-view="markets"]');
+    await page.waitForSelector('#adminBody', { timeout: 10000 });
+  });
+
+  // ── 
+  await scenario('#68 the board says which of the two it is: a fault, or an empty catalogue', async () => {
+   // A deliberately broken route is a hazard to everything after it: the board
+   // stays broken, and every later scenario inherits a page with an error card on
+   // it. Undo the injection and restore the board on EVERY path, so a failure in
+   // here is a named failure rather than a cascade.
+   try {
+    // A real 500, injected on the route the app actually calls.
+    expectEvents500 = true;
+    await page.route('**/api/events*', (route) =>
+      route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'catalogue unavailable' }) })
+    );
+    await page.evaluate(() => {
+      location.hash = '#/markets';
+      window.OB.refreshMarkets();
+    });
+    await page.waitForSelector('#boardRetry', { timeout: 15000 });
+    const failed = await page.evaluate(() => {
+      const card = document.querySelector('#page .card');
+      return {
+        text: (card ? card.textContent : '') || '',
+        retry: !!document.getElementById('boardRetry'),
+        coloured: card ? getComputedStyle(card.querySelector('.empty')).color : null,
+      };
+    });
+    check(
+      '#68 a failed board load says it FAILED and names the reason',
+      /could not be loaded/i.test(failed.text) && /catalogue unavailable/i.test(failed.text),
+      `("${failed.text.replace(/\s+/g, ' ').slice(0, 90)}")`
+    );
+    check(
+      '#68 a failed board load is NOT the empty-catalogue message',
+      !/no open events right now/i.test(failed.text),
+      `("${failed.text.replace(/\s+/g, ' ').slice(0, 90)}")`
+    );
+    check('#68 a failed board load offers a retry', failed.retry);
+    check(
+      '#68 a fault is drawn in the alarm colour, not the muted empty state',
+      failed.coloured === 'rgb(194, 38, 31)',
+      `(colour ${failed.coloured} — --red is rgb(194,38,31))`
+    );
+
+    // The retry has to work, or the button is decoration.
+    await page.unroute('**/api/events*');
+    expectEvents500 = false;
+    await page.click('#boardRetry');
+    await page.waitForSelector('.ladder .lcell[data-bet]', { timeout: 15000 });
+    check('#68 retrying after a failure loads the board again', true);
+
+    // Now the genuinely empty case, with the route answering 200 and no
+    // events. It must be a DIFFERENT screen, not a differently-worded one.
+    await page.route('**/api/events*', (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ events: [] }) })
+    );
+    await page.evaluate(() => window.OB.refreshMarkets());
+    await page.waitForSelector('#page .card .empty', { timeout: 15000 });
+    const empty = await page.evaluate(() => {
+      const card = document.querySelector('#page .card');
+      return {
+        text: (card ? card.textContent : '') || '',
+        retry: !!document.getElementById('boardRetry'),
+      };
+    });
+    check(
+      '#68 a genuinely empty catalogue says so, and says the load worked',
+      /no open events right now/i.test(empty.text) && /genuinely empty|loaded/i.test(empty.text),
+      `("${empty.text.replace(/\s+/g, ' ').slice(0, 90)}")`
+    );
+    check('#68 an empty catalogue offers no retry — nothing failed', !empty.retry);
+   } finally {
+    await page.unroute('**/api/events*').catch(() => {});
+    expectEvents500 = false;
+    await page.evaluate(() => window.OB.refreshMarkets()).catch(() => {});
+    await page.waitForSelector('.ladder .lcell[data-bet]', { timeout: 20000 }).catch(() => {});
+   }
+  });
+
+  // ── #68 §3.3 / §3.4 / §5: the player and operator surfaces ────────────────
+  await scenario('#68 positions, the settle dialog and the cheap wins', async () => {
+    // ── §3.3 BACKED and FROZEN printed the same number on every back leg ───
+    //
+    // Driven from a FIXTURE rather than from a bet placed through the slip. A
+    // position needs a matched order, and whether a given price crosses depends
+    // on what the bots are quoting at that moment — so the fixture made this
+    // check fail roughly a third of runs for reasons that had nothing to do with
+    // what it is checking. This is the same renderer on the same endpoint; only
+    // the response is pinned.
+    //
+    // The payload is built to contain exactly the case the finding is about: a
+    // back-only leg, where lib/match.js's escrowFor equals the stake, so the
+    // old FROZEN column printed the BACKED number again on every such row.
+    await page.route('**/api/positions', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          positions: [
+            {
+              market_id: 1,
+              market_name: 'Match Odds',
+              market_status: 'open',
+              event_name: 'Fixture vs Server',
+              cashout: null,
+              selections: [
+                { name: 'Back only', my_back_stake_cents: 5051, my_lay_stake_cents: 0, frozen_cents: 5051 },
+                { name: 'Laid too', my_back_stake_cents: 0, my_lay_stake_cents: 2000, frozen_cents: 4000 },
+              ],
+              pnl_if_win: [
+                { name: 'Back only', pnl_cents: 5000 },
+                { name: 'Laid too', pnl_cents: -4000 },
+              ],
+            },
+          ],
+        }),
+      })
+    );
+    await page.click('#nav button[data-page="bets"]');
+    await page.click('[data-tab="positions"]');
+    await page.waitForSelector('#betsBody .poscard', { timeout: 10000 });
+    const pos = await page.evaluate(() => {
+      const card = document.querySelector('#betsBody .poscard');
+      if (!card) return null;
+      return {
+        heads: [...card.querySelectorAll('th')].map((n) => n.textContent.trim()),
+        rows: [...card.querySelectorAll('tbody tr')].map((r) =>
+          [...r.querySelectorAll('td')].map((n) => n.textContent.trim())
+        ),
+        head: (card.querySelector('.poshead') || {}).textContent.replace(/\s+/g, ' ').trim() || '',
+      };
+    });
+    check(
+      '#68 the positions table drops the column that duplicated Backed',
+      !!pos && pos.heads.indexOf('Frozen') < 0,
+      `(${pos ? pos.heads.join(' / ') : 'no position card'})`
+    );
+    check(
+      '#68 a back-only leg is shown once, not twice',
+      !!pos && pos.rows.some((r) => r[1] === '$50.51') && pos.rows.every((r) => r.length === 3),
+      `(${pos ? JSON.stringify(pos.rows) : ''})`
+    );
+    check(
+      '#68 the escrow a position holds is stated once, on the position',
+      !!pos && /escrow held \$90\.51/i.test(pos.head),
+      `("${pos ? pos.head.slice(0, 90) : ''}")`
+    );
+    await page.unroute('**/api/positions');
+
+    // ── §3.4 the settle dialog named nothing ────────────────────────────────
+    await page.click('#nav button[data-page="admin"]');
+    await page.click('[data-view="markets"]');
+    await page.waitForSelector('#adminBody [data-settle]', { timeout: 10000 });
+    const target = await page.evaluate(() => {
+      const b = document.querySelector('#adminBody [data-settle]');
+      return b ? Number(b.dataset.settle) : null;
+    });
+    if (target === null) {
+      // Every market in the catalogue has already been settled by the #51 and
+      // #52 scenarios that follow. Say so by name rather than skipping: a
+      // silent pass here would be a check that verifies nothing.
+      check('#68 fixture: a market to settle', false, '(every market is settled — the dialog checks could not run)');
+      await page.click('#nav button[data-page="admin"]');
+      await page.waitForSelector('[data-view="markets"]', { timeout: 10000 });
+      return;
+    }
+    await page.locator(`#adminBody [data-settle="${target}"]`).click();
+    await page.waitForSelector('.modal[role="dialog"] #sdGo', { timeout: 10000 });
+    const named = await page.evaluate(() => {
+      const title = document.querySelector('#sdTitle');
+      const facts = document.querySelector('.sd-facts');
+      const rows = [...document.querySelectorAll('.modal[role="dialog"] #sdWinners .optrow')];
+      return {
+        title: (title ? title.textContent : '').trim(),
+        facts: (facts ? facts.textContent : '').replace(/\s+/g, ' ').trim(),
+        ariaLabel: document.querySelector('.modal[role="dialog"]').getAttribute('aria-label') || '',
+        rows: rows.map((r) => r.textContent.replace(/\s+/g, ' ').trim()),
+      };
+    });
+    check(
+      '#68 the settle dialog names the EVENT, not the market type',
+      /settle/i.test(named.title) && !/^settle winner$/i.test(named.title.trim()),
+      `("${named.title}")`
+    );
+    check(
+      '#68 the settle dialog is labelled to assistive tech by event and market',
+      /settle .+ — /i.test(named.ariaLabel),
+      `("${named.ariaLabel}")`
+    );
+    check(
+      '#68 the settle dialog states what the decision moves',
+      /matched/i.test(named.facts) && /runners/i.test(named.facts) && /\$/.test(named.facts),
+      `("${named.facts.slice(0, 80)}")`
+    );
+    check(
+      '#68 every runner in the settle dialog carries a price, not a bare dash',
+      named.rows.length > 0 && named.rows.every((r) => /LTP|best back|no trades/i.test(r)),
+      `(${named.rows.length} rows: ${named.rows.slice(0, 2).join(' | ').slice(0, 90)})`
+    );
+    await page.click('.modal[role="dialog"] #sdCancel');
+    await page.waitForTimeout(300);
+
+    // ── §5: two status chips three lines apart, and a row of $0.00 ─────────
+    const boardCopy = await page.evaluate(async () => {
+      window.location.hash = '#/markets';
+      await window.OB.refreshMarkets();
+      await new Promise((r) => setTimeout(r, 900));
+      const heads = [...document.querySelectorAll('.mkthead .chip')].map((n) => n.textContent.trim());
+      const heads2 = [...document.querySelectorAll('.evmeta .chip')].map((n) => n.textContent.trim());
+      const matched = [...document.querySelectorAll('.mkthead .muted')].map((n) => n.textContent.trim());
+      return { heads, heads2, matched };
+    });
+    check(
+      '#68 a market never repeats "open" under an event chip that already says it is trading',
+      !boardCopy.heads.includes('open'),
+      `(event chips ${JSON.stringify(boardCopy.heads2.slice(0, 3))}, market chips ${JSON.stringify(boardCopy.heads.slice(0, 3))})`
+    );
+    check(
+      '#68 no market advertises $0.00 matched',
+      !boardCopy.matched.some((m) => /\$0\.00\s+matched/.test(m)),
+      `(${boardCopy.matched.length} matched labels: ${boardCopy.matched.slice(0, 3).join(' | ')})`
+    );
+    await page.evaluate(() => {
+      window.location.hash = '#/admin';
+    });
+    await page.waitForSelector('[data-view="markets"]', { timeout: 10000 });
+    await page.click('[data-view="markets"]');
+    await page.waitForSelector('#adminBody', { timeout: 10000 });
+  });
+
   // ── #51: a held market can be released as a DEAD HEAT, chosen by NAME ────
   //
   // Two defects, both on the operator's most consequential screen:
@@ -964,11 +1561,39 @@ try {
     );
     if ((await heldRow.count()) === 0) return;
 
-    // The reason prompt is unchanged and still comes first (lib/results.js
-    // refuses a release with no reason).
+// The reason dialog comes first and the picker second (lib/results.js
+    // refuses a release with no reason). Both are now REAL dialogs on the
+    // shared overlay stack rather than window.prompt, so they are driven
+    // through the DOM. `prompts` is still recorded so that "no native dialog is
+    // raised any more" is an assertion rather than an assumption.
     prompts.length = 0;
-    promptQueue = ['ui test: joint winners confirmed against the results feed'];
     await heldRow.click();
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
+    check(
+      '#51 the release asks for a written reason in a dialog on the app, not a browser prompt',
+      (await page.locator('.modal[role="dialog"] [data-ask="reason"]').count()) === 1 && prompts.length === 0,
+      `(${prompts.length} native prompt(s): ${prompts.join(' | ').slice(0, 90)})`
+    );
+    // A reason under five characters is refused BEFORE anything is sent, with
+    // the error beside the field.
+    await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'no');
+    await page.click('.modal[role="dialog"] #askGo');
+    await page.waitForSelector('.modal[role="dialog"] .askerr:not([hidden])', { timeout: 3000 });
+    check(
+      '#51 a too-short reason is refused with the error beside the field',
+      /least 5 characters/i.test(
+        (await page.locator('.modal[role="dialog"] .askerr:not([hidden])').first().textContent()) || ''
+      ),
+      `("${((await page.locator('.modal[role="dialog"] .askerr:not([hidden])').first().textContent()) || '').trim()}")`
+    );
+    check(
+      '#51 nothing was released while the reason was refused',
+      releasePayload === null,
+      `(payload ${JSON.stringify(releasePayload)})`
+    );
+    await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'ui test: joint winners confirmed against the results feed');
+    await page.click('.modal[role="dialog"] #askGo');
+
     // The picker is CHECKED for, not awaited. An awaited one turns "the control
     // does not exist" into an opaque 10s timeout that aborts the scenario, and
     // every later assertion — including the dead-heat payload, which is the
@@ -1000,7 +1625,6 @@ try {
       );
       return;
     }
-    check('#51 the release still asks for a written reason first', /reason/i.test(prompts[0] || ''), `("${(prompts[0] || '').slice(0, 60)}")`);
 
     // (b) — by NAME. The runner names come from this market's own book.
     const rows = await page.locator('.modal[role="dialog"] #hoWinners .optrow').allTextContents();
@@ -1063,8 +1687,10 @@ try {
     );
 
     // Reopen and commit the tie for real.
-    promptQueue = ['ui test: joint winners confirmed against the results feed'];
     await page.locator(`#adminBody [data-release-settle="${heldMarketId}"]`).click();
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
+    await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'ui test: joint winners confirmed against the results feed');
+    await page.click('.modal[role="dialog"] #askGo');
     await page.locator('.modal[role="dialog"] #hoWinners').waitFor({ state: 'attached', timeout: 10000 });
     await page.locator('.modal[role="dialog"] #hoWinners .hoPick').nth(0).check();
     await page.locator('.modal[role="dialog"] #hoWinners .hoPick').nth(1).check();
@@ -1136,9 +1762,11 @@ try {
     await page.click('[data-view="results"]');
     await page.waitForSelector(`#adminBody [data-release-settle="${soloMarketId}"]`, { timeout: 10000 });
 
-    promptQueue = ['ui test: single winner confirmed against the results feed'];
     releasePayload = null;
     await page.locator(`#adminBody [data-release-settle="${soloMarketId}"]`).click();
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
+    await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'ui test: single winner confirmed against the results feed');
+    await page.click('.modal[role="dialog"] #askGo');
     await page.locator('.modal[role="dialog"] #hoWinners').waitFor({ state: 'attached', timeout: 10000 });
     const soloBox = page.locator('.modal[role="dialog"] #hoWinners .hoPick').first();
     const soloId = Number(await soloBox.getAttribute('value'));
@@ -1182,23 +1810,42 @@ try {
     }
     const mktId = Number(await suspendBtn.getAttribute('data-toggle'));
     const willSuspend = (await suspendBtn.getAttribute('data-status')) === 'suspended';
+    // Re-locate the row BY ID for every click. `.first()` resolves against the
+    // table as it is NOW, and the table re-renders after each action: clicking
+    // a stale row reads a stale `data-status` and suspends a market that was
+    // about to be restored. This was a real flake, not a theoretical one.
+    const toggleRow = (id) => page.locator(`#adminBody [data-toggle="${id}"]`).first();
 
-    // Cancelling the prompt must not suspend anything.
+    // Cancelling the dialog must not suspend anything. The reason control is a
+    // real dialog on the app's overlay stack now, so this is driven through the
+    // DOM; `prompts` is watched throughout to prove no NATIVE dialog is raised
+    // any more, because the old mechanism was window.prompt and "it still
+    // works" would have satisfied the original test.
     prompts.length = 0;
-    promptQueue = [];
     delete adminWrites[`PATCH /api/admin/markets/${mktId}`];
-    await suspendBtn.click();
-    await page.waitForTimeout(600);
+    await toggleRow(mktId).click();
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
     check(
-      '#52 suspending asks for a reason and sends nothing when cancelled',
+      '#52 suspending asks for a reason in an app dialog, and raises no browser prompt',
+      prompts.length === 0,
+      `(${prompts.length} native prompt(s): ${prompts.join(' | ').slice(0, 60)})`
+    );
+    await page.click('.modal[role="dialog"] #askCancel');
+    await page.waitForTimeout(400);
+    check(
+      '#52 suspending sends nothing when the reason dialog is cancelled',
       adminWrites[`PATCH /api/admin/markets/${mktId}`] === undefined,
       `(payload ${JSON.stringify(adminWrites[`PATCH /api/admin/markets/${mktId}`])})`
     );
-    check('#52 the suspend prompt is about the reason', /reason/i.test(prompts[0] || ''), `("${(prompts[0] || '').slice(0, 60)}")`);
+    check(
+      '#52 cancelling leaves no dialog behind',
+      (await page.locator('.modal[role="dialog"]').count()) === 0
+    );
 
-    prompts.length = 0;
-    promptQueue = ['ui test: price feed disagreement, market withdrawn pending review'];
-    await suspendBtn.click();
+    await toggleRow(mktId).click();
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
+    await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'ui test: price feed disagreement, market withdrawn pending review');
+    await page.click('.modal[role="dialog"] #askGo');
     await page.waitForFunction(
       () => /^Market (suspended|open)$/.test((document.querySelector('#toast') || {}).textContent || ''),
       { timeout: 15000 }
@@ -1211,12 +1858,29 @@ try {
     );
 
     // Put it back, so the suite leaves the catalogue as it found it.
-    const restoreBtn = page.locator(`#adminBody [data-toggle="${mktId}"]`).first();
-    await restoreBtn.waitFor({ timeout: 10000 });
-    promptQueue = ['ui test: feed reconciled, market restored'];
-    await restoreBtn.click();
+    //
+    // `data-status` is the status the button WILL SET, not the market's current
+    // one: a suspended market offers a button that sets 'open' and is labelled
+    // "Restore". So "is the market suspended now?" is answered by the LABEL.
+    //
+    // The old assertion here waited for `dataset.status === 'open'`, which is
+    // exactly what the row reads the moment the suspend succeeds — so it was
+    // satisfied before the restore was even attempted, and a restore that sent
+    // nothing at all would have passed it. The post-condition below is the real
+    // one: the row offers Suspend again, which only happens once the market is
+    // open again.
+    const restoreBtn = toggleRow(mktId);
     await page.waitForFunction(
-      (id) => document.querySelector(`#adminBody [data-toggle="${id}"]`)?.dataset.status === 'open',
+      (id) => /restore/i.test((document.querySelector(`#adminBody [data-toggle="${id}"]`) || {}).textContent || ''),
+      mktId,
+      { timeout: 15000 }
+    );
+    await restoreBtn.click();
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
+    await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'ui test: feed reconciled, market restored');
+    await page.click('.modal[role="dialog"] #askGo');
+    await page.waitForFunction(
+      (id) => /suspend/i.test((document.querySelector(`#adminBody [data-toggle="${id}"]`) || {}).textContent || ''),
       mktId,
       { timeout: 15000 }
     );

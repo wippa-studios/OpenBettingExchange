@@ -440,9 +440,24 @@
     const qs = OB.state.sport ? `?sport=${encodeURIComponent(OB.state.sport)}` : '';
     try {
       const events = (await OB.api('GET', '/api/events' + qs)).events;
-      if (seq === OB.state.eventsReqSeq) OB.state.events = events;
-    } catch {
-      if (seq === OB.state.eventsReqSeq) OB.state.events = [];
+      if (seq === OB.state.eventsReqSeq) {
+        OB.state.events = events;
+        // A LOAD THAT WORKED. Cleared here rather than in renderMarkets, so the
+        // flag can never outlive the response it belongs to.
+        OB.state.eventsError = null;
+      }
+    } catch (e) {
+      if (seq === OB.state.eventsReqSeq) {
+        OB.state.events = [];
+        // AND A LOAD THAT DID NOT. These two used to be the same screen: a 500
+        // and a venue with nothing on both rendered "No open events right now",
+        // which is the one thing a trader must never be told when the exchange
+        // is broken. An empty catalogue is a business state and a 500 is a
+        // fault; the board now says which one the user is looking at and offers
+        // a retry, because the first question after a failed load is "try
+        // again", and before that it is "is this us or the market?".
+        OB.state.eventsError = (e && e.message) || 'The board could not be loaded';
+      }
     }
     // Pure loader: rendering is refreshMarkets()'s job.
   }
@@ -458,6 +473,7 @@
   OB.state.navReqSeq = 0;
   OB.state.boardReqSeq = 0;
   OB.state.marketReqSeq = 0;
+  OB.state.eventsError = null;
   async function refreshMarkets() {
     const seq = ++OB.state.refreshSeq;
     if (OB.state.feedMode) {

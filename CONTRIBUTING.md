@@ -35,7 +35,7 @@ Sign in as `demo` / `demo123`, or `admin` / `admin123` for the trading desk.
 npm test            # 765 checks: unit + API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
-npm run test:ui     # 150 checks: real Chromium via Playwright (frontend changes)
+npm run test:ui     # 195 checks: real Chromium via Playwright (frontend changes)
 ```
 
 All three run offline: temporary or in-memory databases, an ephemeral port, and
