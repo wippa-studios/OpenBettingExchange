@@ -55,6 +55,20 @@ const JOBS_INTERVALS = {
   // cadence: tight enough that a 6-second delay is honoured, loose enough
   // that the scan is trivial. 0 disables it.
   delayReleaseMs: Number(process.env.DELAY_RELEASE_INTERVAL_MS || 5000),
+  // The LAPSE sweep (#97) — its OWN knob, deliberately NOT delayReleaseMs.
+  //
+  // It shipped riding the delay-release timer, which meant LAPSE was dead on any
+  // venue that set DELAY_RELEASE_INTERVAL_MS=0 — a documented, supported value,
+  // and the natural setting for an operator who has withdrawn in-play (see
+  // docs/ROADMAP.md §5, which withdrew the feature but kept the mechanism).
+  // That coupling made a money-affecting promise — "this order will not carry
+  // past the off" — quietly depend on an unrelated operational toggle, with no
+  // log line anywhere saying the sweep was not running. It is the dead-control
+  // shape this repository keeps finding, and the reason it is a separate knob
+  // rather than a shared one: the two passes read different predicates and have
+  // different reasons to exist. Five seconds is the same cadence for the same
+  // reason as above. 0 disables it, loudly.
+  lapseMs: Number(process.env.LAPSE_INTERVAL_MS || 5000),
 };
 const PAY = require('./lib/payments');
 const TEN = require('./lib/tenants');
@@ -1811,9 +1825,9 @@ app.get('/api/format/:price', limit('read'), (req, res) => {
 // comparison in this handler for there to be raced. See lib/bookversion.js for
 // the rest.
 app.post('/api/orders', requireAuth, limit('trade'), (req, res) => {
-  const { selection_id, side, price, stake_cents, client_order_id, selection_version, market_version } = req.body || {};
+  const { selection_id, side, price, stake_cents, client_order_id, selection_version, market_version, persistence } = req.body || {};
   const result = M.placeOrder(db, req.user, {
-    selection_id, side, price, stake_cents, client_order_id, selection_version, market_version,
+    selection_id, side, price, stake_cents, client_order_id, selection_version, market_version, persistence,
   });
   // A replay created nothing, so it must not broadcast as though it did —
   // otherwise a retried request makes every other client's board flicker for a
@@ -1840,12 +1854,67 @@ app.get('/api/orders', requireAuth, limit('read'), (req, res) => {
   res.json({ orders: M.openOrdersFor(db, req.user.id) });
 });
 
+// ── Order lifecycle: amend, and cancel in bulk (#97) ────────────────────────
+//
+// Before this, the only way to change a resting order was cancel-then-replace,
+// which loses the queue position (FIFO within a level is `ORDER BY price, id`),
+// churns the ledger through a release and a fresh escrow where one delta would
+// do, and is two round trips whose worst split leaves a trader flat when they
+// meant to be hedged. `PATCH` below does it in one transaction and keeps the
+// order's id, which IS its queue position.
+//
+// Nothing is compared here, for the same reason nothing is compared in
+// `POST /api/orders`: a route that read the book version and decided here would
+// be the check-then-act the transaction exists to prevent. `selection_version`
+// and `market_version` are passed through UNVALIDATED and the engine compares
+// them inside the amend.
+app.patch('/api/orders/:id', requireAuth, limit('trade'), (req, res) => {
+  const { price, stake_cents, persistence, selection_version, market_version } = req.body || {};
+  const result = M.amendOrder(db, req.user, intId(req.params.id), {
+    price, stake_cents, persistence, selection_version, market_version,
+  });
+  // An amend changes the book for EVERYBODY, so this broadcasts unconditionally:
+  // unlike a placement there is no "replay created nothing" case, because an
+  // amend that changed nothing still means the client's own order list is
+  // current. `market_version` rides along for the same reason it does on
+  // placement — a client running the handshake must not need a second request to
+  // learn the version its next order should claim.
+  broadcast('book', { market_id: result.order.market_id });
+  broadcast('orders', {}, req.user.id);
+  broadcast('balance', {}, req.user.id);
+  res.json({ ...result, market_version: BOOKVERSION.marketVersion(db, result.order.market_id) });
+});
+
 app.post('/api/orders/:id/cancel', requireAuth, limit('trade'), (req, res) => {
   const order = M.cancelOrder(db, req.user, intId(req.params.id));
   broadcast('book', { market_id: order.market_id });
   broadcast('orders', {}, req.user.id);
   broadcast('balance', {}, req.user.id);
   res.json({ order });
+});
+
+// Bulk cancel. Registered BEFORE nothing in particular and AFTER the
+// single-order route above on purpose: the paths cannot collide
+// (`/api/orders/:id/cancel` is two segments deeper), and putting it directly
+// beside the route it generalises is what a reader needs to see.
+//
+// 200 for every well-formed request, whatever the per-order outcomes. That is
+// the PARTIAL RESULT the issue asks for, not a shortcut: a batch of forty
+// cancels in which thirty-nine worked is a success that happened, and answering
+// 409 or 500 for it would leave the client unable to tell which thirty-nine —
+// which is the situation a bulk endpoint exists to remove. Only a malformed LIST
+// is a 400, and at that point nothing has been read or written.
+//
+// The per-id authorisation is the single-order rule, unchanged, applied
+// independently to each id: an order that is not yours is reported `not_found`
+// and is NOT cancelled, which is the same answer the single-order route gives so
+// that neither endpoint is an oracle for which ids exist.
+app.post('/api/orders/bulk-cancel', requireAuth, limit('trade'), (req, res) => {
+  const result = M.cancelOrders(db, req.user, (req.body || {}).order_ids);
+  for (const marketId of result.market_ids) broadcast('book', { market_id: marketId });
+  broadcast('orders', {}, req.user.id);
+  broadcast('balance', {}, req.user.id);
+  res.json(result);
 });
 
 app.get('/api/positions', requireAuth, limit('read'), (req, res) => {
@@ -2681,6 +2750,35 @@ if (JOBS_INTERVALS.delayReleaseMs > 0) {
       }
     })
   );
+}
+
+// THE LAPSE SWEEP (#97), on its own timer and its own guard.
+//
+// It used to sit inside the block above, which read well — both are "an OPEN
+// order needs attention right now", both are cheap scans — and was wrong. The
+// block above is gated on DELAY_RELEASE_INTERVAL_MS, so an operator who turned
+// the delay-release pass off also turned LAPSE off without being told, and every
+// order they had marked "do not carry me past the off" simply rested forever.
+// A trader who believes an order is time-limited and is not is worse off than
+// one who never asked: the promise was made and nothing kept it.
+//
+// Separate `if`, separate knob, same cadence — and it warns at boot when
+// disabled, because a silent 0 here is the same class of bug.
+if (JOBS_INTERVALS.lapseMs > 0) {
+  jobTimers.push(
+    JOBS.every(JOBS_INTERVALS.lapseMs, async () => {
+      const lapsed = MATCH.lapseOrders(db);
+      if (lapsed.lapsed > 0) {
+        console.log(`[lapse] cancelled ${lapsed.lapsed} unmatched LAPSE order(s) on the turn in-play, ${lapsed.released_cents} cents released`);
+      }
+    })
+  );
+} else {
+  // Said out loud, because the failure this replaces was silent. An operator who
+  // sets this to 0 has just left every trader with a LAPSE order on the venue
+  // believing their order is time-limited when it is not, and nothing about the
+  // running process would otherwise say so.
+  console.warn('[lapse] LAPSE_INTERVAL_MS=0 — the lapse sweep is OFF. Orders marked LAPSE will rest past the turn in-play.');
 }
 
 // The results poll. This job did not exist even though

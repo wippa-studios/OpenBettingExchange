@@ -32,6 +32,8 @@ each rule so you can check the arithmetic yourself.
 | **Market** | A set of runners on one event, exactly one of which wins. |
 | **LTP** | Last traded price. Only real trades move it — never the bots' quotes or the drift. |
 | **Matched** | Executed. **Unmatched** remainder stays on the book as a limit order. |
+| **Amend** | Change the price and/or size of a resting order in place, keeping its place in the queue. |
+| **Lapse / persist** | An order's **time in force**: whether its unmatched remainder is cancelled when the market turns in-play, or carried into it. |
 
 ## Prices and the tick ladder
 
@@ -296,8 +298,32 @@ frozen in the wallet on top of that column until settlement releases it.
 | Place a back | freeze `stake` | — |
 | Place a lay @ Q | — | freeze `round((Q − 1) × stake)` |
 | A lay fills `f` at match price `P` (own price `Q`) | — | keep `round((P−1)·f)` + `round((Q−1)·remainder)` frozen; release the difference, or top up the rare 1¢ |
+| **Amend the remainder** (new price `Q'`, new stake `S'`) | freeze `remainder'` | freeze `round((Q' − 1) × remainder')` |
 | Cancel the remainder | release `orders.frozen_cents` | release `orders.frozen_cents` |
 | Settle | consume `stake` | consume `round((P−1)·stake)` |
+
+An amend is a **single step on the same two figures** as a fill, not a second
+escrow formula. Both write
+`holdRemainderEscrow(held, target)` in `lib/match.js`, which is the one place
+in the codebase where a remainder-escrow change moves money:
+
+```
+delta = target − frozen_cents
+delta > 0 → escrow(delta)      delta < 0 → release(−delta)
+```
+
+What differs between the two callers is only `target`. A fill's target is *this
+fill's settlement liability plus the new remainder's escrow*. An amend's target
+is *just the new remainder's escrow* — because an amend matched nothing, so it
+owes no new fill liability, and the matched part's collateral is already held
+and must not move. That is why the 1¢ rounding cases survive an amend: the
+same `escrowFor`, the same single `Math.round`, the same rare top-up branch.
+
+Note the sign convention is **target minus held**, so a positive delta is
+"the venue took more". The rare 1¢ top-up of E17/E18 is therefore a positive
+delta on this convention, and a release is the negative one — the inverse of
+the pre-amend fill formula above, which is stated in the older direction. Read
+the code, not the two formulas as a pair.
 
 Why a fill re-derives no formula: placement, matching and settlement each round
 a liability **once** (house rule), and three independently rounded formulas do
@@ -345,6 +371,189 @@ balance cannot cover, and `frozen_cents` can never go negative (guarded in
 E12, E14–E23), `tests/settle.test.js` (S12–S16, S19, and the S20 tick × stake
 property sweep asserting frozen ≥ Σ settlement releases and frozen → 0 after
 settle/void), `tests/store.test.js` (D3, D7 migration).
+
+## Amending, bulk cancel and time in force
+
+### What the lifecycle is
+
+`place → fill → cancel` was the whole lifecycle for a long time, and a
+professional workflow stalls on each gap:
+
+- **Amend.** The only way to change a resting order was cancel-then-replace,
+  which is worse than it sounds. See below.
+- **Bulk cancel.** One order per request. A market maker with forty resting
+  orders made forty round trips to pull them before kick-off.
+- **Time in force.** Every order was `GFD`-ish: it rested until it matched or
+  somebody cancelled it, including across the turn in-play. A trader who wanted
+  to be flat before an event started had to watch a clock and cancel by hand.
+
+### Amending a resting order
+
+`PATCH /api/orders/:id` changes the price, the size, or both, **in one
+transaction**, and it **keeps the order's `id`**.
+
+Keeping the `id` is not an optimisation — **the `id` is the queue position**,
+because FIFO inside a price level is `ORDER BY price, id` (E13, E20). So:
+
+| | queue position at the same price | ledger rows |
+| --- | --- | --- |
+| Cancel-and-replace (the old way) | **lost** — the replacement gets a higher `id` | a release plus a fresh escrow |
+| **Amend** | **kept** — same row, same `id` | one adjustment of exactly the delta |
+
+That is the whole point of the feature, and it is the easiest thing to get
+wrong: an implementation that cancels and re-places behind the amend's back
+keeps every other assertion green while silently demoting the trader. So the
+test asserts the **order of the match rows** — bob rests first, carol second,
+bob resizes, a taker arrives, and bob's order must be filled first. A sibling
+check (A7) runs the same fixture the old way and asserts the *opposite* answer,
+so A6 cannot be satisfied by a test that is not measuring queue position.
+
+The stated limitation, pinned by a test rather than left to a comment: an amend
+to a **new** price keeps the `id`, so the order joins that level **ahead** of
+orders that rested there longer. That is what "keep the id" means here; it is
+not a claim of venue parity, and it is strictly better than the demotion
+cancel-and-replace would cause.
+
+Three refusals, each a decision:
+
+- **A crossing price is refused** (`409 amend_would_cross`). Placing at a
+  crossing price *matches*; an amend does not. Refusing keeps "amend" from
+  becoming a second way to take liquidity at a price the client never wrote.
+  The check counts resting orders **and** still-delayed ones, because a delayed
+  order is released into the book as a *taker* later — ignoring it would let an
+  amend become an unfilled market order the client did not ask for. It is
+  **deliberately over-cautious about your own orders**: the self-match guard
+  means your own back and your own lay can rest against each other, so an amend
+  into a price crossing *your own* order is refused too. The invariant protected
+  is a property of the book **as displayed** — a book that reads as crossed is a
+  support incident whatever the guard would have done with it — rather than of
+  executability. The cost is that repricing is occasionally refused against
+  liquidity you could not have traded against anyway.
+- **A stake at or below what has already matched is refused.** An order cannot
+  be amended into a fully matched one; that state belongs to a counterparty, and
+  amending into it would release collateral securing nothing.
+- **A body with nothing to change is refused** (`400`). A `200` that changed
+  nothing tells a client the venue heard it without saying whether it did
+  anything, which is how a stale client comes to believe it is hedged when it
+  is not. Re-sending the values the order *already has* is accepted and is
+  idempotent — it moves no money and bumps no version.
+
+An amend runs **the same gates a placement does** — the stake bounds, the
+market/selection/event status, the in-play suspension, the off-time backstop,
+the responsible-gambling gates and the abuse limits. A control that exists on the
+placement path and not on the amend path is a control with a hole in it, and the
+hole is the one a client told "amend instead of re-placing" drives straight
+into. The abuse gates apply to the **delta**, not to the whole order: a shrink
+can never push anyone past a cap, and refusing an amend that *reduces* risk
+would punish a trader for de-risking.
+
+An amend is a **book change** and bumps the book version (#92) when the price or
+the size moved. It is deliberately **not** under the "an order that merely
+rests" carve-out that placement lives under: this changes the size another
+client is reading at a level. A persistence-only amend bumps nothing, because
+`bookFor` does not read that column, so no reader of the book can see it change.
+
+It also does **not** disturb the order's in-play bet delay. An order resting
+through a delay must not become instantly matchable because its owner resized
+it.
+
+### Bulk cancel
+
+`POST /api/orders/bulk-cancel` takes `order_ids`, a JSON array of 1…200 positive
+integers. Three rules, and each one is a decision rather than a default:
+
+1. **The whole list is validated before anything is read or written.** A
+   malformed list is a `400` that cancels nothing — not "the good ids". And no
+   element is ever interpolated into SQL: each reaches SQLite as a bound
+   parameter of a single-row `WHERE id = ?`. The precedent is #29, where a `LIKE`
+   built from a request body revoked every session on the venue.
+2. **Every id is authorised independently, and the result is partial.** A batch
+   of forty cancels in which thirty-nine worked is a success that happened;
+   refusing the whole batch for one unusable id is what makes a bulk endpoint
+   worse than a loop. The response is `200` whatever the per-order outcomes.
+3. **Another user's order reports `not_found`** — identical to the answer for an
+   id that does not exist — and is **not** cancelled. The endpoint is not an
+   oracle for which ids are real, which matters on a venue whose order ids are
+   sequential.
+
+Each id is cancelled in its **own** transaction, so a failure on one costs that
+order only and cannot unwind the escrow of orders already cancelled. That is
+also why a cancellation must never grow a private shortcut around
+`cancelOrderTx`: the single funnel that re-reads and refuses a stale row is what
+makes the next point safe.
+
+### Time in force: `LAPSE` and `PERSIST`
+
+`persistence` is a **closed vocabulary**, settable at placement and amendable
+afterwards, with a database `CHECK` so no internal caller can smuggle a value
+past the API either:
+
+- **`PERSIST`** (the default) — the unmatched remainder carries into the
+  in-play market. This is the venue's *entire previous behaviour*: an order that
+  says nothing behaves exactly as it did before the feature existed, which is
+  why the column's own `DEFAULT` is `PERSIST`. A database upgrading into this
+  therefore has every pre-existing row already correct — not as a convenience,
+  but because those orders *were* persist orders, and rewriting them would start
+  cancelling a resting book nobody asked to have cancelled.
+- **`LAPSE`** — cancel the unmatched remainder when the market turns in-play.
+
+**`MARKET_ON_CLOSE` is deliberately not in the set.** It means "into the
+starting-price auction", and this engine has no auction and no
+`starting_price` field at all — so accepting it would be accepting an
+instruction the venue cannot carry out. A closed vocabulary that refuses it
+loudly beats an open column that stores a promise and drops it on the floor.
+
+The sweep runs on its own timer (`LAPSE_INTERVAL_MS`, five seconds, `0`
+disables with a boot warning) and is modelled on the in-play delay-release pass:
+per-order transactions, the scan outside and the decision **inside** the write
+transaction, and a re-read of both the order and the market's in-play flag
+before acting.
+
+**It cannot race an arrival at the same instant**, and the argument is
+structural rather than a timing claim. `transaction()` opens with
+`BEGIN IMMEDIATE`, so whichever pass commits first is the only one whose state
+the other will ever read. If the sweep commits first, a taker's
+`status = 'open'` scan runs on a fresh snapshot and does not see the order. If
+the taker commits first, the sweep re-reads the row inside its own transaction,
+sees `matched_cents` advanced, and either skips a filled order or cancels only
+what is left. So an order is **either matched or cancelled, never both** — and
+the failure this rules out is the worst shape this engine has had for it: a
+`matches` row written against an order whose collateral `cancelOrderTx` had
+already released, which leaves a market permanently unsettleable *and*
+un-voidable while every double-entry invariant stays silent.
+
+That is proven **under concurrency**, not single-threaded: two OS processes
+released from a single barrier, over several rounds, with a control that runs
+first and proves the same arrival really does fill the order when no sweep is
+running. `tests/marketversion.test.js` MV6 makes the same move for the same
+reason, and `lib/limits.js` L13 is the lesson the issue cites.
+
+The invariant is asserted **venue-wide**, over every order rather than the one
+the taker aimed at, because when the two genuinely interleave the order that
+would show a corruption is not necessarily the target. The fixture also rests a
+**block** of orders rather than one, and that is not decoration: with a single
+candidate the sweep took the write lock on every round, because a per-order
+cancellation is a short transaction and a placement is a long one, so half the
+assertions never ran. With a block, the two overlap and the rounds resolve
+several ways — sweep-only, taker-only, and split, where the sweep cancels some
+orders while the taker fills others in the same round. Which branch a given
+round takes is reported rather than asserted, because that is a property of the
+scheduler and asserting it would be a check that cries wolf.
+
+The protection is not "the guard happens to be inside a transaction". It is
+that every cancellation goes through **one funnel** that re-reads the row and
+refuses it. That was verified by mutation rather than assumed: replacing the
+funnel with a private release-and-write on the stale row is caught immediately,
+while merely moving the guard *outside* the transaction survives — because the
+funnel re-reads anyway. Which is why this pass must never grow a shortcut
+around it.
+
+A market that has **not** turned in-play is not a refusal — it is a later pass,
+so the order is simply left alone and the next sweep must still find it.
+
+*Tests:* `tests/amend.test.js` (A1–A17 the amend, B1–B6 bulk cancel, C1–C6
+persistence and the two-process race), `tests/orderlife.test.js` (R1–R9 over
+real HTTP), `tests/store.test.js` (D9, the pre-feature database upgrade).
 
 ## Settlement
 
@@ -1168,6 +1377,11 @@ Listed so nobody mistakes a scope decision for a bug:
   [Pre-off only](#pre-off-only).
 - **Partial-fill queueing, cross-market matching.** A taker takes resting
   liquidity immediately and then rests its remainder.
+- **`MARKET_ON_CLOSE`, and any starting-price auction.** `persistence` is
+  `LAPSE` or `PERSIST` and is a closed vocabulary; the database refuses a third
+  value. `MARKET_ON_CLOSE` would need an auction and a `starting_price` field,
+  neither of which exists. See
+  [Time in force](#time-in-force-lapse-and-persist).
 - **Dead heats in sports with no dead-heat rule.** The engine *can* divide a
   payout among joint winners, but only where the sport's rules permit one. A
   multi-winner signal under a single-winner rule is **held**, not settled as a

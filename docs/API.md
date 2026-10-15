@@ -264,6 +264,7 @@ than only the annotated few:
 | `feed_unavailable` | `503` | the odds-feed reads, when the collector cannot be reached |
 | `feed_stale` | `503` | `GET /api/feed/health` only, when the collector answered and its prices are out of date |
 | `market_version_stale` | — | `POST /api/orders`, when a supplied book version is materially behind |
+| `amend_would_cross` | — | `PATCH /api/orders/:id`, when the new price would price-cross the resting book. `409`, because the request is well formed and would be fine on a different book |
 
 The two feed codes are the reason the derived list cannot be the whole answer.
 Both are `503`, they mean opposite things operationally — go and look at the
@@ -520,9 +521,11 @@ so a retried request does not flicker every other client's board. Connect with
 
 | Route | Request | Success | Errors |
 | --- | --- | --- | --- |
-| `POST /api/orders` | `{ selection_id, side, price, stake_cents, client_order_id?, selection_version?, market_version? }` | `201 { order, fills, book, market_version }`; `200` with `idempotent_replay: true` when `client_order_id` has been seen | see below |
-| `GET /api/orders` | — | `200 { orders }` — unmatched orders only, newest first | `401` |
+| `POST /api/orders` | `{ selection_id, side, price, stake_cents, client_order_id?, persistence?, selection_version?, market_version? }` | `201 { order, fills, book, market_version }`; `200` with `idempotent_replay: true` when `client_order_id` has been seen | see below |
+| `GET /api/orders` | — | `200 { orders }` — unmatched orders only, newest first. Each order carries `persistence` | `401` |
+| `PATCH /api/orders/:id` | `{ price?, stake_cents?, persistence?, selection_version?, market_version? }` — at least one | `200 { order, book, market_version, price_changed, size_changed, escrow_delta_cents }` | `400` non-integer id, nothing to amend, stake below what is already matched; `404` not your order; `409` would price-cross, or the market is closed/suspended |
 | `POST /api/orders/:id/cancel` | — | `200 { order }`; releases the escrow on the unmatched remainder | `400` non-integer id, already cancelled, or fully matched; `404` not your order |
+| `POST /api/orders/bulk-cancel` | `{ order_ids: [id, …] }` — 1…200 integers | `200 { results, cancelled, failed, released_cents, market_ids }` — **one outcome per id, always 200** | `400` the list is not an array, is empty, is over 200, or holds a non-integer; `401` |
 | `GET /api/positions` | — | `200 { positions }` — exposure, if-win P&L and a cash-out quote per market. Every `pnl_if_win` row carries the runner's `status`, so a **void** runner (one withdrawn before the off) is visibly not an outcome the player is still exposed to rather than reading as an ordinary row | `401` |
 | `POST /api/markets/:id/cashout` | — | `200` — the venue **buyout**, see below | `400` non-integer id; `404` unknown market; `403` suspended/self-excluded/RG; `409` off time, held market, or no quotable position |
 
@@ -532,7 +535,9 @@ integer, a `stake_cents` that is not a number or falls outside
 **number** (a quoted `"2.4"` is refused — the boundary is type-strict, not
 coerced), **insufficient available balance for the stake/liability**, a
 `client_order_id` that is not a string / longer than 64 chars / contains
-anything but `[A-Za-z0-9._:-]`, or a `selection_version` / `market_version`
+anything but `[A-Za-z0-9._:-]`, a `persistence` that is not `"LAPSE"` or
+`"PERSIST"` (absent means `PERSIST` — see below), or a `selection_version` /
+`market_version`
 that is not a non-negative integer; `429` for a stake or market-liability cap
 breach; `403` for a session limit, an owed reality check or a self-exclusion;
 `404 Selection not found` — which is also what a **feed** selection id gets,
@@ -551,6 +556,86 @@ than clamps, this one cannot make that branch the primary check.
 `fills` is `[{ price, stake_cents }]` at the **resting** order's price. An order
 placed on an in-play market is accepted and escrowed but carries
 `delayed: true` and an `eligible_at`; it does not match until the delay expires.
+
+### The rest of the order lifecycle: amend, bulk cancel, time in force
+
+Before this, the lifecycle was place → fill → cancel and nothing else. A client
+that wanted to change a resting order had to cancel it and place it again.
+
+**`PATCH /api/orders/:id` — amend a resting order.** It changes the price, the
+size, or both, **in one transaction**, and it **keeps the order's `id`**. The
+`id` is not a convenience — it *is* the queue position, because FIFO inside a
+price level is `ORDER BY price, id`. So resizing an order at an unchanged price
+leaves it exactly where it was in the queue, which is the entire point: a
+cancel-and-replace at the same price silently demotes a trader behind everyone
+who arrived after them. `docs/EXCHANGE_RULES.md` states the full rule.
+
+`escrow_delta_cents` is **signed**: positive means the venue took more
+collateral, negative means it returned some, `0` means the order's wallet
+position is unchanged (which is the correct answer for a lay amended at the same
+price, and for a *back* amended in price at all — a backer's escrow is its
+stake, not a function of price). Only the **unmatched remainder** moves; an
+order's already-matched liability is untouched.
+
+Three refusals worth stating, because each is a decision rather than an
+oversight:
+
+- `400 Nothing to amend` — a body with none of `price`, `stake_cents`,
+  `persistence`. Re-sending the values the order already has is *not* this: it
+  is accepted, is idempotent, moves no money and bumps no version.
+- `400` if the new stake is at or below what has already matched. An order
+  cannot be amended into a fully matched one — that state belongs to a
+  counterparty.
+- `409 amend_would_cross` if the new price would cross the resting book.
+  Placing at a crossing price *matches*; an amend does not, and refusing it
+  rather than silently filling keeps "amend" from being a second way to take
+  liquidity at a price the client did not write. Cancel and place if that is
+  what you meant.
+
+**`POST /api/orders/bulk-cancel` — cancel a list.** `order_ids` is a JSON array
+of 1…200 positive integers. The whole list is validated **before anything is
+read or written**, so a malformed list is a `400` that cancels nothing, and no
+element is ever interpolated into SQL.
+
+Every id is then authorised **independently**, and the answer is a **partial
+result**, not an all-or-nothing refusal: a batch of forty cancels in which
+thirty-nine worked is a success that happened. The response is `200` whatever
+the per-order outcomes.
+
+```json
+{
+  "results": [
+    { "order_id": 41, "status": "cancelled",        "code": "cancelled",         "released_cents": 2000 },
+    { "order_id": 42, "status": "not_found",        "code": "not_found" },
+    { "order_id": 43, "status": "error",            "code": "cancel_failed", "detail": "…" }
+  ],
+  "cancelled": 1,
+  "failed": 2,
+  "released_cents": 2000,
+  "market_ids": [7]
+}
+```
+
+`status` is one of `cancelled`, `not_found`, `already_cancelled`,
+`fully_matched`, or `error`. Every entry carries a `code` with the same value;
+`released_cents` appears on the entries that actually released something. An
+order belonging to **another user** reports `not_found` — identical to the answer
+for an id that does not exist, so the endpoint is not an oracle for which ids are
+real, and it is **not** cancelled.
+
+**`persistence` — time in force.** `"LAPSE"` or `"PERSIST"`, a closed
+vocabulary, settable on placement and amendable afterwards. `"PERSIST"` is the
+default and is this venue's *entire previous behaviour*: an order that says
+nothing rests until it matches or is cancelled, including across the turn
+in-play. `"LAPSE"` cancels the unmatched remainder when the market turns
+in-play; a scheduled sweep does it, modelled on the in-play delay-release pass.
+
+`MARKET_ON_CLOSE` is **not** accepted, and the database `CHECK` refuses it too.
+It means "into the starting-price auction", and this engine has no auction and
+no starting-price field — storing the value would be a promise with nothing
+behind it. `0` disables the sweep via `LAPSE_INTERVAL_MS`; the venue warns at
+boot when it is off, because a silently-dead sweep turns "time in force" into
+a word.
 
 ### The market-version handshake: `selection_version` and `market_version`
 

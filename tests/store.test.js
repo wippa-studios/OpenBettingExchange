@@ -233,6 +233,64 @@ check('D8 a pre-book-version database upgrades and gains both counters at 0', as
   for (const s of ['', '-wal', '-shm']) fs.rmSync(file + s, { force: true });
 });
 
+// D9: a pre-#97 database upgrades and GAINS orders.persistence (#97), defaulted
+// to PERSIST.
+//
+// The same trap as D7 and D8, and for the same reason a FRESH database cannot
+// catch it: SCHEMA and the migrations agree on a fresh install, so the only
+// environment that can see a missing ALTER is one created before the column
+// existed.
+//
+// The DEFAULT is the load-bearing half of this check. A database upgrading into
+// time-in-force has, by definition, a resting book whose orders were all placed
+// before anyone could express a persistence — and every one of them PERSISTED,
+// because that was this venue's only behaviour. Backfilling them to anything
+// else would start cancelling orders nobody asked to be cancelled the moment a
+// market went in-play. So the assertion is not "the column exists": it is "every
+// pre-existing row already reads correctly".
+check('D9 a pre-persistence database upgrades and its resting orders are all PERSIST', async () => {
+  const file = path.join(os.tmpdir(), `ob_mig_persist_${process.pid}.db`);
+  fs.rmSync(file, { force: true });
+  const seed = new DatabaseSync(file);
+  // An orders table in its pre-#97 shape: no persistence column at all.
+  seed.exec(`CREATE TABLE orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, market_id INTEGER NOT NULL,
+    selection_id INTEGER NOT NULL, side TEXT NOT NULL, price REAL NOT NULL,
+    stake_cents INTEGER NOT NULL, matched_cents INTEGER NOT NULL DEFAULT 0,
+    frozen_cents INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open',
+    placed_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT)`);
+  seed.prepare("INSERT INTO orders (user_id, market_id, selection_id, side, price, stake_cents) VALUES (1,1,1,'back',2.0,5000)").run();
+  seed.close();
+
+  const db = openStore(file); // must not throw
+  const col = db.prepare("SELECT name FROM pragma_table_info('orders') WHERE name='persistence'").get();
+  assert.ok(col, 'column added by the migration');
+  assert.strictEqual(
+    db.prepare('SELECT persistence FROM orders WHERE id = 1').get().persistence,
+    'PERSIST',
+    'and the pre-existing order persists, which is exactly what it did before #97'
+  );
+  // The sweep's index exists too, and SCHEMA runs BEFORE the migrations — so an
+  // index over this column placed in SCHEMA would have aborted the boot of this
+  // very database. That is the trap migrateEligibleAt records, hit again.
+  assert.ok(
+    db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_orders_lapse'").get(),
+    'the lapse sweep index is created by the migration, not by SCHEMA'
+  );
+  // The CHECK rides on the ALTER, so an upgraded database refuses a value a
+  // fresh one refuses too.
+  assert.throws(
+    () => db.prepare("UPDATE orders SET persistence = 'MARKET_ON_CLOSE' WHERE id = 1").run(),
+    /CHECK constraint failed/
+  );
+  db.close();
+  // And a second open is a no-op, not a duplicate-ALTER failure.
+  const again = openStore(file);
+  assert.strictEqual(again.prepare('SELECT COUNT(*) c FROM orders').get().c, 1);
+  again.close();
+  for (const s of ['', '-wal', '-shm']) fs.rmSync(file + s, { force: true });
+});
+
 (async () => {
   // Drain the collected checks IN ORDER, awaiting each. A check that rejects
   // is a failure of this suite, not of the next file: exiting here stops
