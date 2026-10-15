@@ -1285,45 +1285,38 @@ function clampFeedLimit(raw, fallback) {
  * printed `[feed] unreachable: undefined`: the one condition the line exists to
  * report, reported as an unreachable feed with no reason attached.
  *
- * So staleness is derived HERE, from the two things health() actually returns —
- * its `ok` verdict, which IS the staleness computation, and the frame age
- * against the threshold the caller was configured with. Every field read below
- * is a field health() returns; `tests/feedboot-line.test.js` pins that by
- * feeding this function the REAL healthPayload rather than a hand-written
- * fixture, so if the payload changes shape this file fails rather than quietly
- * testing a shape that no longer occurs.
+ * ── AND THE TWIN WAS MISSED, WHICH IS WHY THIS IS NOW A RENDERER ──────────
+ * The correction above was applied HERE and nowhere else. `GET /api/feed/health`,
+ * further down this same file, still read `h.error || h.detail` — fields
+ * healthPayload never sets, so it logged `(no detail)` on every stale feed — and
+ * still answered a fixed `503 {ok:false, error:'Odds feed unavailable'}` for a
+ * stale feed and an unreachable one alike. Two readers of one payload, one rule
+ * each, and they disagreed; the fix had a test here and nothing over there, so
+ * nothing failed.
+ *
+ * So the rule now lives ONCE in `lib/feed.js` (`classifyHealth`, next to the
+ * payload it reads) and this function only chooses words. A second copy of the
+ * discriminator is what let the twin drift in the first place, and re-introducing
+ * one would re-open the defect. Every verdict below is read from `c`, which
+ * `tests/feedboot-line.test.js` also drives into the real HTTP route, so the two
+ * sites are pinned against each other rather than merely next to each other.
  */
 function feedBootStatus(h, staleSeconds) {
-  if (!h || typeof h !== 'object') {
-    return { level: 'error', message: 'health check returned no payload' };
-  }
-  // health() returns `{ok:false, error}` ONLY when the probe itself threw;
-  // healthPayload sets `ok` and never sets `error`. So the PRESENCE of `error`
-  // is the discriminator between "could not ask" and "asked, and the answer is
-  // bad" — which is the distinction the old `if (h.ok)` threw away.
-  if (h.error) return { level: 'error', message: `unreachable: ${h.error}` };
+  const c = FEED.classifyHealth(h, staleSeconds);
+  if (c.kind === 'no_payload') return { level: 'error', message: c.reason };
+  if (c.kind === 'unreachable') return { level: 'error', message: c.reason };
   // Feed 1 has no odds columns at all, so there is no frame to age and nothing
   // that can go stale. "newest frame unknown" there is a warning about a number
   // this deployment was never going to publish.
-  if (h.priced === false) {
+  if (c.kind === 'unpriced') {
     return {
       level: 'log',
-      message: `odds feed connected — feed ${h.feed}: ${h.markets || 0} fixtures, no prices on this feed`,
+      message: `odds feed connected — feed ${c.feed}: ${h.markets || 0} fixtures, no prices on this feed`,
     };
   }
-  const age = typeof h.odds_age_seconds === 'number' ? h.odds_age_seconds : null;
-  // Compared exactly as healthPayload compares it, against the SAME configured
-  // threshold — a boot line that used its own copy of the limit could disagree
-  // with /api/feed/health about whether the feed is stale, which is the class of
-  // bug this function exists to end.
-  const stale = h.ok === false || (age !== null && age > staleSeconds);
-  // `ok === false` with no age at all means the collector has never captured an
-  // odds frame. "no odds frame recorded yet" says that; "unknown" claims a
-  // measurement was taken and could not be reported.
-  const frame = age === null ? 'no odds frame recorded yet' : `newest frame ${age}s old`;
   return {
-    level: stale ? 'warn' : 'log',
-    message: `odds feed connected — ${h.markets || 0} markets, ${frame}${stale ? ' (STALE)' : ''}`,
+    level: c.stale ? 'warn' : 'log',
+    message: `odds feed connected — ${h.markets || 0} markets, ${c.frame}${c.stale ? ' (STALE)' : ''}`,
   };
 }
 
@@ -1367,11 +1360,66 @@ app.get('/api/feed/nav', aw(async (req, res) => {
   }
 }));
 
+/**
+ * The ONE 503 body for a feed that cannot be served, shaped from the shared
+ * classifier.
+ *
+ * Both failure paths run through here, which is the point. `health()` catches its
+ * own driver errors and answers `{ok:false, error}`, so the route's `catch` is the
+ * defensive branch — but "the probe threw" and "the probe answered not-ok" are the
+ * same event to a client, and two bodies is how they would drift apart.
+ *
+ * What changed, and what it cost an operator (#85): this used to send one fixed
+ * `{ok:false, error:'Odds feed unavailable'}` for a STALE feed as well, so a
+ * collector that had quietly stopped polling was indistinguishable from a
+ * database that was down — and the log line beside it read `h.error || h.detail`,
+ * fields `healthPayload` never sets, so it printed `(no detail)` on every stale
+ * feed and never once named the condition. `odds_age_seconds` was computed,
+ * published on the healthy path, and thrown away here, on the only path that
+ * needs it.
+ *
+ * So the stale answer now carries the number that separates the two cases and the
+ * window it exceeded, under its own `code`. Nothing internal is added: every extra
+ * field is either a feed-derived number the `200` already publishes or the
+ * configured window that already governs that `200`'s `ok`, and `apiError` still
+ * strips `details` from a 5xx.
+ */
+function feedHealthFailure(res, c) {
+  if (c.kind === 'stale') {
+    return apiError(res, 503, 'Odds feed stale', { code: 'feed_stale' }, {
+      extra: {
+        ok: false,
+        // The diagnostic that was discarded, and the line it was judged against —
+        // "5000" alone does not tell a client whether that is stale.
+        odds_age_seconds: c.age,
+        stale_after_seconds: c.threshold,
+        // Which feed answered, and whether it has odds columns at all: a feed
+        // reporting zero ages on a feed with no prices is a different problem.
+        feed: c.feed,
+        priced: c.priced,
+      },
+    });
+  }
+  // Unreachable, or a probe that never answered. `odds_age_seconds: null` rather
+  // than absent: no age was measured, and a client reading the field should find
+  // the same "nothing measured" answer here as the null a Delay key publishes for
+  // `data_age_seconds`, rather than having to tell absent from zero.
+  return apiError(res, 503, 'Odds feed unavailable', { code: 'feed_unavailable' }, {
+    extra: { ok: false, odds_age_seconds: null },
+  });
+}
+
 // Feed liveness. The client-facing error is genericized at this boundary:
 // a driver failure can embed host/user detail in its message (pg errors do),
 // so the detail goes to the server log and the client gets a status that is
 // uninformative but true. Resilient to whatever health() returns OR throws —
 // including a future detail field with driver messages in it.
+//
+// The verdict itself is NOT taken here: `classifyHealth` in lib/feed.js decides
+// stale-vs-unreachable from the same rule the boot line reads, so the two readers
+// of this payload cannot drift (see `feedBootStatus` for how the last time they
+// did). What a stale feed publishes is a feed-derived age and the configured
+// window, not internals.
 app.get('/api/feed/health', aw(async (req, res) => {
   if (!config.FEED_ENABLED) return apiError(res, 409, 'Feed is disabled');
   let h;
@@ -1379,11 +1427,16 @@ app.get('/api/feed/health', aw(async (req, res) => {
     h = await FEED.health();
   } catch (e) {
     console.error('[feed] health check failed:', e.message);
-    return apiError(res, 503, 'Odds feed unavailable', { code: 'feed_unavailable' }, { extra: { ok: false } });
+    // Classified as "never asked", which is what a throw before an answer means.
+    return feedHealthFailure(res, FEED.classifyHealth(null, config.FEED_STALE_SECONDS));
   }
-  if (h && h.ok) return res.json(h);
-  console.error('[feed] health check reported failure:', (h && (h.error || h.detail)) || '(no detail)');
-  apiError(res, 503, 'Odds feed unavailable', { code: 'feed_unavailable' }, { extra: { ok: false } });
+  const c = FEED.classifyHealth(h, config.FEED_STALE_SECONDS);
+  if (c.ok) return res.json(h);
+  // `c.reason` is the diagnosis, from the same classifier that produced the
+  // verdict — not `(h.error || h.detail)`, which was undefined on every stale
+  // feed and printed `(no detail)` where the operator needed the condition named.
+  console.error('[feed] health check reported failure:', c.reason);
+  return feedHealthFailure(res, c);
 }));
 
 // ── Feed collector: operator surface ──────────────────────────────────────
