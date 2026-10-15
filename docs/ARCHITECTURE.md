@@ -2,7 +2,9 @@
 
 The design a maintainer needs before changing the engine. For the behavioural
 rules — who wins, who pays what, and why each is that way — see
-[`EXCHANGE_RULES.md`](EXCHANGE_RULES.md). For the HTTP surface, see
+[`EXCHANGE_RULES.md`](EXCHANGE_RULES.md). For customer pre-verification, AML/CTF
+monitoring and the data-source register, see
+[`COMPLIANCE.md`](COMPLIANCE.md). For the HTTP surface, see
 [`API.md`](API.md).
 
 ## Contents
@@ -24,7 +26,7 @@ browser   public/    index.html, style.css, classic scripts — no build step
              admin.js, admin-risk.js, ladder.js
    │      fetch() + EventSource          same-origin, httpOnly cookie session
    ▼
-server    server.js  2,560 lines, 87 routes
+server    server.js  4061 lines, 125 routes
              1. baseline security headers
              2. origin guard — BEFORE any body parsing
              3. express.json({ limit: 256kb })
@@ -40,7 +42,7 @@ server    server.js  2,560 lines, 87 routes
 engine    lib/       31 modules + lib/payments/ — see the table below
    │
    ▼
-storage   data/openbettingexchange.db   SQLite (WAL), 29 tables, created on first run
+storage   data/openbettingexchange.db   SQLite (WAL), 37 tables, created on first run
 ```
 
 There is no ORM, no migration framework and no service layer beyond `lib/`. The
@@ -85,13 +87,7 @@ The dependency direction is strictly one way: `match → ledger → tx`, with
 | `lib/ops.js` | health, readiness, metrics, backup, restore | write to balances |
 | `lib/audit.js` | the append-only operator action log | be a source of truth for state |
 | `lib/admin.js` | operator account mutations: status, role, balance | move money without an audit row |
-| `lib/feed.js` | the feed seam: resolve the configured provider and forward to it | decide what a feed price means (see [FEED.md](FEED.md)) |
-| `lib/feed/provider.js` | the price-feed contract, the provider registry, and the `FEED_PROVIDER` lookup | serve anything itself |
-| `lib/feed/shape.js` | **the one shaper**: rows → markets, markets → nav tree, health → payload | talk to a transport, or be forked for one |
-| `lib/feed/postgres.js` | the collector's `v_feed1`/`v_feed2`, as a provider | be the only reader of the feed |
-| `lib/feed/http.js` | a generic JSON-over-HTTP feed provider, mapped from configuration | shape markets of its own |
-| `lib/feed/fieldmap.js` | the field-map grammar and vocabularies, dependency-free so `lib/config.js` can validate them at boot | import `lib/config.js` — that is the cycle it exists to avoid |
-| `lib/feedcat.js` | materialise the feed's catalogue into local rows on an operator's request, and translate between the feed's id space and this venue's | write a **feed price** into `fair_price`/`ltp` — it seeds the venue's own even money and never re-prices an existing selection; delete a row; run unprompted |
+| `lib/feed.js` | read the feed collector's database (`v_feed1`/`v_feed2`) and serve the board | decide what a feed price means (see [FEED.md](FEED.md)) |
 | `lib/feedcreds.js` | per-tenant Betfair credentials: seal, open, status | **return a plaintext credential to an HTTP caller** — no function here does, and a test asserts adding one would be deliberate |
 | `lib/feedrunner.js` | supervise the collector as a child process: spawn, restart, backoff, redact its output | poll Betfair itself (the collector does that) |
 | `lib/seed.js` | first-run fixtures, board roll-forward | run on every boot unconditionally |
@@ -131,7 +127,7 @@ that once made the automated results poll settle nothing while reporting success
 
 ## Why these choices
 
-- **No ORM, no migrations.** The schema is 29 tables of plain SQL with `CHECK`
+- **No ORM, no migrations.** The schema is 37 tables of plain SQL with `CHECK`
   constraints on the money columns. A contributor can read the whole data model
   in one file, and the database itself refuses an invalid cent. `docs:check`
   verifies the table count against the code, so the figure above cannot rot.
@@ -166,6 +162,37 @@ that once made the automated results poll settle nothing while reporting success
   admin desk stay open: matched positions must still settle, and a lock that
   blocks the operator holding the key is a trap rather than a control. See
   [EXCHANGE_RULES.md](EXCHANGE_RULES.md#tenants-and-suspension).
+- **Compliance is enforced in the engine, and the SEAM is the deliverable.**
+  The identity provider follows the `lib/payments/provider.js` boundary exactly:
+  no vendor is built in, `assertProvider` refuses a half-implemented one at boot,
+  and a reference implementation beside it proves the seam works without a
+  network. Which KYC provider an Australian venue may use is not a technical
+  question. Pre-verification is gated in `lib/match.js validateOrder` (before
+  collateral), in `lib/limits.js assertTradeable` (the one function every money
+  path already calls), at deposit **confirmation** and before a withdrawal hold —
+  and a regulated deployment with no provider configured **aborts the launch**.
+  See [COMPLIANCE.md](COMPLIANCE.md).
+- **An AML alert is a finding, not a log line.** `lib/aml/findings.js` reuses the
+  `lib/jobs.js` reconciliation pattern verbatim — keyed by subject, re-surfacing
+  until a human closes it with a written reason, and with no automatic expiry — in
+  its own table because the two have opposite retention answers and opposite
+  audiences (tipping off). `lib/retention.js` holds the declarative list of tables
+  a generic retention job must not touch, and a test greps every module to keep it
+  true.
+- **A rule set that would not fire on real activity is not a control.** Every rule
+  in `lib/aml/rules.js` is expressed in this venue's own ledger and calibrated
+  against this venue's own behaviour, with the reasoning published through
+  `/api/admin/aml/rules`. The clearest case is the published indicator
+  *"continually bets short-odd favourites and then requests an immediate
+  withdrawal"* — which describes an ordinary exchange customer, and which is
+  therefore measured as the *distribution of a customer's wins* instead. See
+  [COMPLIANCE.md](COMPLIANCE.md#22-calibration-is-not-a-detail--it-is-the-control).
+- **Age assurance and identity are two records with two retentions.** The reform
+  bill's explanatory memorandum addresses age assurance separately and provides
+  that personal information collected for it must be destroyed once used. So there
+  is no date of birth on `users`, no document column anywhere, and `age_assurance`
+  is individually erasable — and is the one table `lib/retention.js` explicitly
+  refuses to protect.
 - **SSE plus a 15s poll fallback in the browser.** The stream is a nicety; the
   board must still move if a proxy drops it.
 
@@ -270,7 +297,7 @@ Deliberately narrow, and asserted by tests rather than assumed:
 
 ## Testing strategy
 
-1036 checks across 73 suites, plus a 220-check browser suite and a live smoke script.
+1181 checks across 73 suites, plus a 220-check browser suite and a live smoke script.
 | Layer | Where | What it proves |
 | --- | --- | --- |
 | Pure maths | `tests/odds.test.js`, `tests/tx.test.js` | ladder, conversions, transaction depth |
@@ -301,9 +328,6 @@ worse than no assertion, since it reads as coverage.
 - **A real results provider**: replace the admin settle call with a feed
   consumer. `settleMarket` is already the single, idempotent, audited entry
   point, and `lib/resultsfeed.js` is already a transport behind that boundary.
-  If the venue has materialised the feed's catalogue, the provider's ids are
-  translated at the boundary by `lib/feedcat.js` `admitSignal` before anything
-  reads them — see [FEED.md](FEED.md#id-spaces-the-results-protocol).
 - **A different cash-out model**: `lib/cashout.js` builds a plan and
   `cashoutMarket` executes it in one transaction. The derivation lives in that
   file's header; anything that changes the arithmetic should change it there and

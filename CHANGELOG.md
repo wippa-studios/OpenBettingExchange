@@ -127,6 +127,95 @@ must agree with the highest released heading.
   field all abort the launch. A half-mapped feed would otherwise serve markets
   with no id, no name and no runners — an empty board, which reads as a quiet
   Tuesday rather than as a misconfiguration.
+- **Compliance seams: customer pre-verification, AML/CTF monitoring, and a
+  data-source register.** For an operator going live in Australia. Full rationale
+  in [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md).
+
+  **`lib/identity/` — the identity provider seam.** Modelled on
+  `lib/payments/provider.js`: a contract with a closed decision vocabulary, an
+  `assertProvider` that refuses a half-implemented provider at boot, and a
+  network-free reference implementation beside it. **No vendor is built in, and
+  that is the deliverable** — which KYC provider an Australian venue may use is
+  not a technical question, it is a contract somebody has been through legal
+  review on.
+
+  Australian law has required identity verification **before** an online gambling
+  account is created since **29 September 2024**, and the interim allowance for
+  deferring it was **repealed**. The gate is therefore in the **engine**, not in
+  routes: `lib/match.js` `validateOrder` beside the off-time gate and before any
+  collateral is touched; `lib/limits.js` `assertTradeable`, the one function every
+  money path already calls; `confirmDeposit` before the credit (a check at intent
+  creation consumes nothing and gates nothing); and `openWithdrawal` before the
+  hold — the one place where custody and play pull in opposite directions, since
+  refusing a self-excluded player's own money out is right and paying an
+  **unverified** account is not. Each refusal carries a distinct
+  `details.code`.
+
+  **Age assurance is a separate record from identity, and separately erasable.**
+  The reform bill's explanatory memorandum addresses it separately, provides that
+  personal information collected for it must be **destroyed once used**, and
+  provides that no Australian is to be forced to use government identification
+  for it. So there is **no date of birth on `users`, no document column and no
+  image anywhere in the schema** — `age_assurance` holds an attestation and an
+  opaque vendor handle, and applying a verification decision erases it **in the
+  same transaction**. A tombstone is left so the erasure is provable. The record is
+  built to be complete if a privacy-preserving digital-identity network returns
+  nothing at all, which is the likely shape of the provision.
+
+  **`lib/aml/` — monitoring against AUSTRAC's published online-betting
+  indicators**, as a declarative, operator-inspectable rule table (the
+  `lib/voidrules.js` pattern). The rule source is the published indicator, and
+  every rule carries its calibration reasoning through `/api/admin/aml/rules`.
+  **Calibration is treated as the control, not a detail**: the published
+  indicator *"continually bets short-odd favourites and then requests an
+  immediate withdrawal"* describes an ordinary exchange customer, and is
+  therefore measured as the *distribution of a customer's wins*; "obscure market"
+  is this venue's own liquidity rather than an absolute stake; and "large bet" is
+  the **escrow**, not the stake, because a lay at 10.0 freezes nine times the
+  stake. Tests assert the naive reading does **not** fire.
+
+  Alerts are **persistent findings** that re-surface until a human closes them
+  with a written reason — the `lib/jobs.js` reconciliation pattern, in its own
+  table because the two have opposite retention answers and opposite audiences.
+  **Tipping off is a criminal offence**, so the customer's own surface carries no
+  screening outcome at all, staff need a row in an `aml_entitlements` table that
+  **ships empty**, and no AML gauge is published to `/metrics`.
+
+  The **AUD 5,000** threshold (from 31 March 2026) is configuration, and crossing
+  it creates a **durable obligation**, not a log line — on two bases, so
+  structuring is caught. Threshold transaction reports and suspicious matter
+  reports are **generated** with their definitions and a machine-readable export.
+  **Nothing is submitted to any regulator.**
+
+  **`lib/funding.js` — the deposit intake gate.** A third-party-funded deposit is
+  **refused**, not flagged, and the check runs before the credit because NPP/Osko
+  transfers are irrevocable with no chargeback. The **Osko trap** is handled
+  explicitly: an operator's receiving PayID is normally registered to a
+  *contracted processor*, not to the venue, so a naive name match would refuse
+  every legitimate Australian deposit. `owner_kind` answers "whose instrument is
+  it", and `unknown` is **refused** — an instrument whose owner nobody can state
+  *is* the third-party case. Payment methods carry the **terms** under which the
+  venue may use them (approved-seller status and the countries it covers), and
+  `credit_linked` expresses that credit is a *relationship*, not a name — so
+  "accepts Apple Pay" and "accepts a credit-linked instrument" are different
+  answers. Funding jurisdiction is screened separately from the session-side gate
+  already in `lib/tenants.js`.
+
+  **`lib/datasources.js` — the register.** Racing NSW's rules require an approval
+  regardless of where the operator is domiciled or licensed, so the venue needs to
+  know per source: owner, approval, permitted uses (**display / store / settle**)
+  and expiry. It extends `result_events` with `data_source_id` without changing the
+  existing coarse `source` vocabulary, and makes an unattributed settlement
+  **visible** rather than inventing a licence attribution for it.
+
+  **`lib/retention.js` — which tables a retention job must not delete**, with a
+  reason per table, and `age_assurance` explicitly *exempt from protection*
+  because it is the one record that must be destroyed.
+
+  Every new key is in `.env.example` with the default `lib/config.js` uses, and
+  the server says **loudly at boot** which of these are not enforced on your
+  deployment. A deployment that declares itself regulated with no identity provider
+  configured **aborts the launch**.
 
 - **Order lifecycle beyond place/fill/cancel** (#97). `PATCH /api/orders/:id`
   amends the price, the size, or both of a resting order **in one transaction**,
