@@ -138,7 +138,9 @@ that once made the automated results poll settle nothing while reporting success
 - **Credentials scoped by construction, not by convention.** Feed credentials
   are sealed with AES-256-GCM and bound to tenant and field as additional
   authenticated data, so a row moved in the database fails to decrypt rather than
-  becoming another tenant's credential.
+  becoming another tenant's credential. `open` has no absent answer at all, so an
+  edited row — moved, column-swapped, truncated, or emptied — is always a loud
+  integrity failure and never reads as an unconfigured field.
 - **SSE plus a 15s poll fallback in the browser.** The stream is a nicety; the
   board must still move if a proxy drops it.
 

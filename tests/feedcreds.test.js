@@ -487,6 +487,136 @@ check('K18 a credential row MOVED to another tenant will not decrypt', async () 
   db.close();
 });
 
+// K19: #62, THE INTEROPERABILITY MATRIX.
+//
+// K18 proves the CIPHER is bound to its tenant and field. It does not prove the
+// STORE is, because K18 only ever moves a WHOLE row, and the issue's own
+// evidence is narrower and uglier than that:
+//
+//   "the binding is not even per-field: after swapping a single column, T1's
+//    password decrypts alongside T2's username, so fields mix freely across
+//    tenants"
+//
+// and it adds truncation, which K18 does not test at all. So every shape an
+// operator with a sqlite prompt can produce — a restore, a migration bug, a
+// backup loaded into the wrong database — is asserted here, against the real
+// store, through the real read path the collector is handed.
+//
+// A test that only proves a VALID envelope still decrypts proves nothing, which
+// is why the control matters: both tenants are read back successfully FIRST, so
+// every refusal below is a specific refusal and not the store refusing
+// everything.
+check('K19 a swapped, re-pointed or truncated row fails to decrypt — every shape', async () => {
+  const { db, tenant, admin } = (await venue());
+  const otherId = Number(
+    db.prepare("INSERT INTO tenants (slug, name) VALUES ('k19-other', 'K19 Other')").run().lastInsertRowid
+  );
+  const otherAdmin = (await auth.registerUser(db, { username: 'k19other', password: 'pw-other-1234', balance_cents: 0 }));
+  db.prepare("UPDATE users SET role='admin', tenant_id = ? WHERE id = ?").run(otherId, otherAdmin.id);
+
+  const ONE = { appKey: 'AAAACREDnotreal1', username: 'tenant-one-bf', password: 'pw-tenant-one' };
+  const TWO = { appKey: 'BBBBcrednotreal2', username: 'tenant-two-bf', password: 'pw-tenant-two' };
+  const seed = () => {
+    FC.setCredentials(db, { actor: admin, tenantId: tenant.id, ...ONE });
+    FC.setCredentials(db, { actor: otherAdmin, tenantId: otherId, ...TWO });
+  };
+  seed();
+
+  // THE CONTROL. Both tenants read back their own credential, so every refusal
+  // below is a refusal of a SPECIFIC tamper and not of the store in general.
+  const ctlOne = FC.collectorEnv(db, tenant.id);
+  const ctlTwo = FC.collectorEnv(db, otherId);
+  assert.strictEqual(ctlOne.BETFAIR_USERNAME, ONE.username, 'tenant one reads its own credential');
+  assert.strictEqual(ctlOne.BETFAIR_PASSWORD, ONE.password);
+  assert.strictEqual(ctlTwo.BETFAIR_USERNAME, TWO.username, 'tenant two reads its own credential');
+  assert.strictEqual(ctlTwo.BETFAIR_PASSWORD, TWO.password);
+
+  const read = (id) => {
+    try { return { ok: true, value: FC.collectorEnv(db, id) }; } catch (e) { return { ok: false, err: e }; }
+  };
+  // Both of the OTHER tenant's secrets, so a leak assertion covers the field
+  // that was actually moved as well as the ones that merely travelled with it.
+  const secrets = [TWO.username, TWO.password, TWO.appKey];
+
+  // Every case, collected rather than asserted as it runs. This file exits on
+  // the FIRST failed check, so a per-case assert would report whichever shape
+  // happened to come first and hide the other four — the masking trap this repo
+  // has already been bitten by.
+  const leaks = [];
+  const cases = [
+    ['a whole row re-pointed at another tenant', tenant.id, () => {
+      db.prepare('DELETE FROM feed_credentials WHERE tenant_id = ?').run(otherId);
+      db.prepare(
+        `INSERT INTO feed_credentials (tenant_id, app_key, username, password, login_mode)
+         SELECT ?, app_key, username, password, login_mode FROM feed_credentials WHERE tenant_id = ?`
+      ).run(otherId, tenant.id);
+    }, otherId],
+    ['a single COLUMN swapped between two tenants (username)', tenant.id, () => {
+      db.prepare(
+        `UPDATE feed_credentials SET username = (SELECT username FROM feed_credentials WHERE tenant_id = ?)
+          WHERE tenant_id = ?`
+      ).run(otherId, tenant.id);
+    }, tenant.id],
+    ["one tenant's username envelope dropped into another tenant's PASSWORD column", tenant.id, () => {
+      db.prepare(
+        `UPDATE feed_credentials SET password = (SELECT username FROM feed_credentials WHERE tenant_id = ?)
+          WHERE tenant_id = ?`
+      ).run(otherId, tenant.id);
+    }, tenant.id],
+    ['the ciphertext truncated by four characters', tenant.id, () => {
+      db.prepare(
+        'UPDATE feed_credentials SET app_key = substr(app_key, 1, length(app_key) - 4) WHERE tenant_id = ?'
+      ).run(tenant.id);
+    }, tenant.id],
+    ['the envelope truncated to NOTHING (column emptied)', tenant.id, () => {
+      db.prepare('UPDATE feed_credentials SET password = ? WHERE tenant_id = ?').run('', tenant.id);
+    }, tenant.id],
+    ['the envelope truncated to three segments (ciphertext segment dropped)', tenant.id, () => {
+      const env = db.prepare('SELECT app_key FROM feed_credentials WHERE tenant_id=?').get(tenant.id).app_key;
+      db.prepare('UPDATE feed_credentials SET app_key=? WHERE tenant_id=?').run(env.split(':').slice(0, 3).join(':'), tenant.id);
+    }, tenant.id],
+  ];
+
+  for (const [what, victimId, tamper, readFrom] of cases) {
+    seed(); // every case starts from a clean, valid pair of rows
+    tamper();
+    const r = read(readFrom);
+    if (r.ok) {
+      leaks.push(`${what}: DECRYPTED CLEANLY as ${JSON.stringify(r.value && r.value.BETFAIR_USERNAME)}`);
+    } else {
+      // Loud, and loud for the RIGHT reason: a 500 integrity failure, never a
+      // 404, never a null, and never the 503 "storage is not configured" — a
+      // refusal that points the operator at their server config rather than at
+      // a row that has been edited is how a tampered row reads as healthy.
+      if (r.err.status !== 500) leaks.push(`${what}: refused but with ${r.err.status}, not a 500 integrity failure`);
+      if (!/could not be decrypted|unrecognised format/.test(r.err.message)) {
+        leaks.push(`${what}: refused as "${r.err.message}" — that does not report an integrity failure`);
+      }
+    }
+    let leaked = null;
+    try { leaked = JSON.stringify(FC.collectorEnv(db, readFrom)); } catch { leaked = ''; }
+    for (const s of secrets) {
+      if (leaked.includes(s)) leaks.push(`${what}: LEAKED the other tenant's ${s}`);
+    }
+    // And the untouched tenant is untouched: a refusal on one row must not be
+    // achieved by breaking the read path for everyone.
+    const survivor = read(victimId === readFrom ? otherId : victimId);
+    if (!survivor.ok) leaks.push(`${what}: the OTHER tenant could no longer read its own credential (${survivor.err.message})`);
+    else if (survivor.value.BETFAIR_USERNAME !== (victimId === readFrom ? TWO.username : ONE.username)) {
+      leaks.push(`${what}: the untouched tenant read the WRONG username`);
+    }
+  }
+
+  assert.deepStrictEqual(leaks, [], 'database-level tampering must be a loud integrity failure, every shape:\n  ' + leaks.join('\n  '));
+
+  // …and the store still works afterwards. The refusals must cost the operator
+  // their working credential, not just the tampered copy.
+  seed();
+  const healed = FC.collectorEnv(db, tenant.id);
+  assert.strictEqual(healed.BETFAIR_PASSWORD, ONE.password, 'a genuine credential is unaffected');
+  db.close();
+});
+
 (async () => {
   for (const [name, fn] of checks) {
     try {
@@ -500,7 +630,7 @@ check('K18 a credential row MOVED to another tenant will not decrypt', async () 
     console.log('  ok', name);
   }
   console.log(`\nfeedcreds.test.js: ${passed} checks passed`);
-  if (passed < 18) { console.error('expected 18 checks'); process.exit(1); }
+  if (passed < 20) { console.error('expected 20 checks'); process.exit(1); }
   if (failures.length) {
     console.error(`failed: ${failures.join(', ')}`);
     process.exitCode = 1;

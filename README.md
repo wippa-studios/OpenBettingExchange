@@ -390,7 +390,10 @@ Credentials are **scoped to the caller's own tenant**, enforced inside
 that tenant (`403` otherwise, `404` for one that does not exist), and there is no
 venue-wide feed inventory. Each sealed field is additionally bound to its tenant
 and field name as GCM associated data, so a row moved at the database level fails
-to decrypt rather than becoming another venue's credential.
+to decrypt rather than becoming another venue's credential — and so does a single
+column swapped between two rows, an envelope moved into another field, or one
+truncated or emptied in storage. An integrity failure is never reported as an
+absent credential.
 
 `SIGTERM` and `SIGINT` drain the venue: job timers stopped, collector stopped
 (SIGTERM, then SIGKILL after a grace period), listener closed, exit 0 — so a
