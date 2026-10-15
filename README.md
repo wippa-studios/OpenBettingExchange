@@ -110,6 +110,9 @@ in place.
    fair-price helper (decimal, American, fractional, implied), monitor matched
    volume and overround, suspend a market, and settle it with a winning runner or
    void it. Settlement pays every matched pot, net of commission, immediately.
+   A market can also be declared `payout_shape: 'place'` at creation, and a
+   single runner can be removed before the off — which is what a withdrawn horse
+   is.
 
 ## Feature status
 
@@ -119,6 +122,7 @@ in place.
 | Matching engine: best-for-taker sweeps, resting-price execution, partial fills, FIFO, self-match guard | Available |
 | Escrow wallet: available vs frozen, full transaction ledger, faucet | Available |
 | Settlement: pot distribution, void refunds, commission on net winnings, auto-cancel, double-settle protection | Available |
+| Withdrawn runners: a declared non-runner voids that **selection** (orders cancelled, escrow released, backers refunded) while the rest of the market settles | Available (`lib/settle.js` `voidSelection`, [`EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#withdrawn-runners-non-runners)) |
 | Dead-heat / joint-favourite settlement | Available |
 | Cash-out: venue buyout priced from fair probabilities, any number of runners, all-or-nothing | Available |
 | Cash-out venue-risk caps: unpaid exposure and daily outlay | Available (`lib/cashoutrisk.js`; operator-configured) |
@@ -235,6 +239,9 @@ full specification, with worked examples, is in
 | A user never matches their own order | No self-lay; own liquidity is not executable | `match` (E6) |
 | Pot per match is `s + (Q−1)·s`; the winner is credited the pot | Settlement is zero-sum apart from commission | `settle` (S1–S3) |
 | Void refunds each side its **own** contribution | Nobody wins or loses on a void | `settle` (S4, S10) |
+| A **declared non-runner** voids that selection alone: its resting orders are cancelled, its matched legs refunded at the match price, and the market settles on the runners that ran | Settling a withdrawn runner charged a bettor a full stake on a horse that never started — and conservation stayed green, because the money went somewhere real | `nonrunner` (N1, N4), `voidrules` (V1) |
+| A withdrawal notice before the off removes the runner while the market keeps trading; a sport with no withdrawal rule **holds** it instead | A racing concept applied to a football fixture would be an invented rule, and ignoring it would leave a player exposed | `nonrunner` (N4, N6), `voidrules` (V5) |
+| A refund that cannot be audited **does not happen** | An unauditable transfer of a player's stake is the thing the audit trail exists to prevent | `nonrunner` (N3) |
 | Commission applies to **net winnings per user per market**, only if positive | Mirrors the real-world model; never a fee on a loser | `settle` (S7) |
 | A settled market is frozen and cannot settle twice | No double payment | `settle` (S6), `api` |
 | Cash-out is a **venue buyout** priced at `Σ pᵢ·Payoutᵢ` less a margin, not a market hedge | Hedging N runners against a fair book destroys value; derivation in `lib/cashout.js` | `cashout2` (C1–C5) |
@@ -280,6 +287,7 @@ scripts. The complete reference, including every parameter, is in
 | `GET /api/admin/competitions?sport_id=` | Competitions for a sport (admin) |
 | `PATCH /api/admin/markets/:id` | Suspend or restore a market (admin) |
 | `POST /api/admin/markets/:id/settle` | Settle with a winner or `void: true` (admin) |
+| `POST /api/admin/markets/:id/selections/:selectionId/void` | Remove one runner before the off: `{ reason }`, ≥5 chars (admin) |
 | `GET /api/admin/stats` | Matched volume, open orders, overround (admin) |
 
 ## Configuration
@@ -418,7 +426,7 @@ weight.
 ```bash
 
 
-npm test            # 817 checks: unit and API integration, fully offline
+npm test            # 843 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 212 checks: real Chromium via Playwright (board and admin desk)

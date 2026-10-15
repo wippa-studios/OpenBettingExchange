@@ -46,7 +46,7 @@ delay, per-user abuse limits, responsible-gambling controls, and an operator des
 
 | | |
 |---|---|
-| Tests | **817 checks / 64 suites**, plus a **212-check** Playwright browser suite |
+| Tests | **843 checks / 66 suites**, plus a **212-check** Playwright browser suite |
 | CI | 8 jobs: node 22 + 24, browser, guards, load smoke, dependency audit, and two secret scans |
 | Supply chain | every action pinned to a full commit SHA, dependabot configured |
 | Docs | `check-docs.mjs` **fails the build** when documentation contradicts the code |
@@ -145,7 +145,7 @@ Measured, not remembered:
 So the changelog documents **two releases that never happened**, on the repo's
 first two days, with no tags and no version bump behind them. `[0.2.0]` describes
 "a real-browser Playwright suite (24 checks)" — that was day 2 of a 166-commit
-repo. It is 212 browser checks and 64 suites now.
+repo. It is 212 browser checks and 66 suites now.
 
 For an open-source project this is worse than an absent changelog, because it
 answers "is this maintained?" wrongly. A reader concludes there is a release
@@ -292,9 +292,15 @@ The launch backlog built from this review is tracked in #138, with the decisions
 between this venue and Betfair considerably. Read it alongside the tracker, not
 instead of it. Three consequences worth acting on:
 
-- **`#88` claims a reproducible money-path defect on `main`.** If that holds it
-  outranks everything in §2 — it loses a bettor's stake rather than omitting a
-  feature. Verify before believing; check it first.
+- **`#88` claimed a reproducible money-path defect on `main`. VERIFIED, and it
+  outranked everything in §2** — it lost a bettor's stake rather than omitting a
+  feature, so it was fixed before anything else on this list. Measured on the old
+  code, a completed race with one declared non-runner settled as a clean finish:
+  the backer's stake was gone (`balance_cents` 100000 → 90000), the withdrawn
+  selection was still `open`, and `assertConserved` returned **0** throughout.
+  The rule table is now consulted per sport, `non_runners` is an independent
+  signal rather than a sub-case of `abandoned`, and a selection-level void
+  exists. What the issue got **wrong** is in §5.6.
 - **`#90` is not in the feed plan's estimate.** The plan's stages do not mention the client-facing SSE stream, so its 13–17 day figure excludes it. An earlier version of this file said the plan had costed streaming as already built. That was wrong, and I made the claim without re-reading the plan.
 - **`#95` does not touch §2.6.** The colour-separation decision concerns the colour pair on the ladder, not the market model. An earlier version of this file said a second market shape would invalidate it. That claim was unsupported.
 
@@ -318,3 +324,20 @@ are the ones that a future contributor is most likely to repeat.
    worktree before trusting a suite.
 5. **Assuming the repo's state instead of checking it.** Twice, both times the
    brief was wrong rather than the code being broken.
+6. **Testing a KEY when the defect was a COMBINATION.** `#88` is the fourth time
+   this pass found a green assertion that structurally could not see the defect,
+   and the first time the *assertion itself was the right shape and aimed at the
+   wrong thing*. Every declared rule key was reachable — `non_runner` included,
+   through the abandoned branch — and the key-reachability check passed while a
+   completed race with a withdrawn runner settled that runner as a loser and
+   charged a bettor their whole stake. Reach tests the key; the money was in the
+   combination of `status` and `non_runners`. `tests/voidrules.test.js` now
+   asserts the combination, and every case in it asserts the control beside it
+   (the same signal without the withdrawal), so a table that voided or settled
+   everything cannot pass either.
+
+   The issue also claimed `tests/voidrules.test.js` existed and that
+   `rules-consistency.test.js` held the reachability check. Neither was true: the
+   void-rule cases lived in `results.test.js`, and the reachability check is
+   `settlement-findings.test.js` (S-F5) — a claim traced from a comment in
+   `lib/voidrules.js` that had been wrong for longer than the issue.

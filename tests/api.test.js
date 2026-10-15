@@ -421,6 +421,94 @@ const check = async (name, fn) => {
       assert.strictEqual(forbidden.status, 403);
     });
 
+    // #88, at the route: removing ONE runner before the off. There was no route
+    // for this at all — a withdrawn horse could only be settled as a loser, or
+    // left quoted as a live outcome. Driven over HTTP because the parts that
+    // matter here are the route's own: the guards, the mandatory reason, and the
+    // report of what was released and refunded. The engine's arithmetic is
+    // tests/nonrunner.test.js's job.
+    await check('pre-off removal route: removes a runner, refunds, keeps the market open', async () => {
+      const admin = cookieOf(await j('POST', '/api/auth/login', { body: { username: 'admin', password: 'admin123' } }));
+      const sport = (await j('GET', '/api/sports')).json.sports.find((s) => s.slug === 'horse_racing');
+      assert.ok(sport, 'horse racing is seeded');
+      const ev = await j('POST', '/api/admin/events', {
+        body: { sport_id: sport.id, name: 'withdrawal-route event', starts_at: '2031-01-01T00:00:00Z' },
+        cookie: admin,
+      });
+      assert.strictEqual(ev.status, 201, `event created (${JSON.stringify(ev.json)})`);
+      const mkt = await j('POST', '/api/admin/markets', {
+        body: { event_id: ev.json.event.id, name: 'Winner' },
+        cookie: admin,
+      });
+      assert.strictEqual(mkt.status, 201);
+      assert.strictEqual(mkt.json.market.payout_shape, 'win', 'a market with no declared payout shape is a win market');
+      const mid = mkt.json.market.id;
+      const a = await j('POST', '/api/admin/selections', { body: { market_id: mid, name: 'Red' }, cookie: admin });
+      const b = await j('POST', '/api/admin/selections', { body: { market_id: mid, name: 'Blue' }, cookie: admin });
+      assert.strictEqual(a.status, 201);
+      const red = a.json.selection.id;
+      // Alice backs Red and it rests: no counterparty, so this is a pure escrow
+      // release, which is what makes the pre-state assertions meaningful.
+      const bet = await j('POST', '/api/orders', { body: { selection_id: red, side: 'back', price: 2.5, stake_cents: 10000 }, cookie: alice });
+      assert.strictEqual(bet.status, 201, `order placed (${JSON.stringify(bet.json)})`);
+      const beforeMe = (await j('GET', '/api/me', { cookie: alice })).json.user;
+      assert.strictEqual(beforeMe.frozen_cents, 10000, 'the stake is committed before the removal');
+      const beforeBook = (await j('GET', `/api/markets/${mid}/book`)).json;
+      assert.strictEqual(beforeBook.book.find((s) => s.selection_id === red).status, 'open',
+        'the runner is a live outcome before the removal');
+
+      // GUARDS, all before the action that would move money.
+      assert.strictEqual((await j('POST', `/api/admin/markets/${mid}/selections/${red}/void`, { body: { reason: 'x' }, cookie: admin })).status, 400,
+        'a reason shorter than 5 characters is refused');
+      assert.strictEqual((await j('POST', `/api/admin/markets/${mid}/selections/${red}/void`, { body: {}, cookie: admin })).status, 400,
+        'no reason at all is refused');
+      assert.strictEqual((await j('POST', `/api/admin/markets/${mid}/selections/abc/void`, { body: { reason: 'steward withdrew Red' }, cookie: admin })).status, 400,
+        'a non-integer selection id is refused');
+      assert.strictEqual((await j('POST', `/api/admin/markets/${mid}/selections/${red}/void`, { body: { reason: 'steward withdrew Red' } })).status, 401,
+        'anonymous');
+      assert.strictEqual((await j('POST', `/api/admin/markets/${mid}/selections/${red}/void`, { body: { reason: 'steward withdrew Red' }, cookie: alice })).status, 403,
+        'non-admin');
+      // And none of the above moved a cent.
+      assert.strictEqual((await j('GET', '/api/me', { cookie: alice })).json.user.frozen_cents, 10000, 'still committed');
+
+      const done = await j('POST', `/api/admin/markets/${mid}/selections/${red}/void`, {
+        body: { reason: 'Steward withdrew Red before the off' },
+        cookie: admin,
+      });
+      assert.strictEqual(done.status, 200, `removed (${JSON.stringify(done.json)})`);
+      assert.deepStrictEqual(done.json.voided_selections, [red], 'and the response names the runner');
+      assert.strictEqual(done.json.released_cents, 10000, 'reporting the escrow it released');
+      assert.strictEqual(done.json.refunded_cents, 0, 'and nothing to refund: the order never matched');
+
+      // THE EFFECT. The stake is back, the runner is out of the book, and the
+      // market is still trading — which is the difference between removing one
+      // runner and voiding the market.
+      const afterMe = (await j('GET', '/api/me', { cookie: alice })).json.user;
+      assert.strictEqual(afterMe.frozen_cents, 0, "alice's stake is released");
+      assert.strictEqual(afterMe.balance_cents, beforeMe.balance_cents, 'and her balance is untouched');
+      const afterBook = (await j('GET', `/api/markets/${mid}/book`)).json;
+      assert.strictEqual(afterBook.book.find((s) => s.selection_id === red).status, 'void', "the runner is not 'open'");
+      assert.strictEqual(afterBook.book.find((s) => s.selection_id === b.json.selection.id).status, 'open', 'the other runner is untouched');
+      const stillOpen = await j('POST', '/api/orders', { body: { selection_id: b.json.selection.id, side: 'back', price: 2.5, stake_cents: 10000 }, cookie: alice });
+      assert.strictEqual(stillOpen.status, 201, 'and the market still takes orders');
+      const refused = await j('POST', '/api/orders', { body: { selection_id: red, side: 'back', price: 2.5, stake_cents: 10000 }, cookie: alice });
+      assert.strictEqual(refused.status, 409, 'while the removed runner takes none');
+      // Cancelled, so this check leaves no live exposure behind: a later check in
+      // this suite asserts a GLOBAL frozen balance for alice, and an order left
+      // resting here would make it fail for a reason that has nothing to do with
+      // what it is testing.
+      const cancelled = await j('POST', `/api/orders/${stillOpen.json.order.id}/cancel`, { cookie: alice });
+      assert.strictEqual(cancelled.status, 200, 'and the new order cancels normally');
+      assert.strictEqual((await j('GET', '/api/me', { cookie: alice })).json.user.frozen_cents, 0, 'leaving no escrow behind');
+
+      // AUDITED, by the primitive, inside the refund's own transaction.
+      const log = await j('GET', '/api/admin/audit?limit=100', { cookie: admin });
+      const row = log.json.entries.find((r) => r.action === 'selection.voided' && r.target === `market:${mid}`);
+      assert.ok(row, `a selection.voided audit row exists (${JSON.stringify(log.json.entries.slice(0, 3))})`);
+      assert.strictEqual(row.after.selections[0].status, 'void');
+      assert.strictEqual(row.after.released_cents, 10000);
+    });
+
     // #30. The settle audit row recorded the LITERAL 'open' as the "before"
     // state, whatever the market actually was. Settling an open market makes
     // the lie invisible, so this check settles a SUSPENDED one: settleTx refuses

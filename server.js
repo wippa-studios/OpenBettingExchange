@@ -2648,12 +2648,24 @@ app.post('/api/admin/events', requireAdmin, limit('admin'), (req, res, next) => 
 });
 
 app.post('/api/admin/markets', requireAdmin, limit('admin'), (req, res, next) => {
-  const { event_id, name } = req.body || {};
+  const { event_id, name, payout_shape } = req.body || {};
   if (!Number.isInteger(Number(event_id)) || !String(name || '').trim()) {
     return apiError(res, 400, 'event_id and name required');
   }
+  // payout_shape is DECLARED, not inferred (#88). The engine has one payout
+  // shape — one winning selection takes the pot — and the only thing this column
+  // does is let an operator say "this is NOT that". A market declared 'place'
+  // is one the engine cannot settle correctly once a runner is withdrawn, so it
+  // refuses it out loud (held, with the reason recorded) instead of computing a
+  // plausible wrong number. Omitting it means 'win', which is every market this
+  // venue has ever created.
+  if (payout_shape !== undefined && payout_shape !== null && payout_shape !== '' && !['win', 'place'].includes(payout_shape)) {
+    return apiError(res, 400, "payout_shape must be 'win' or 'place'");
+  }
   try {
-    db.prepare('INSERT INTO markets (event_id, name) VALUES (?, ?)').run(Number(event_id), String(name).trim());
+    db.prepare('INSERT INTO markets (event_id, name, payout_shape) VALUES (?, ?, ?)').run(
+      Number(event_id), String(name).trim(), payout_shape || 'win'
+    );
   } catch (e) {
     if (!isSqliteConstraint(e)) return next(e);
     return apiError(res, 400, 'Invalid event_id');
@@ -2756,6 +2768,39 @@ app.post('/api/admin/markets/:id/settle', requireAdmin, limit('admin'), (req, re
     broadcast('balance', {}, u.user_id);
     broadcast('orders', {}, u.user_id);
   }
+  res.json(result);
+});
+
+// ── PRE-OFF SELECTION REMOVAL (#88) ─────────────────────────────────────────
+// There was no way to remove a single runner before this. A withdrawn horse had
+// to be settled as a loser (charging its backers) or be left on the board as a
+// live outcome; the only void in the venue was a whole-market one. The results
+// feed can now declare a withdrawal (lib/results.js applyWithdrawal), and this
+// is the same operation for a human: a venue whose feed cannot tell it, or an
+// operator who has seen the withdrawal on the racecard, removes the runner here.
+//
+// EXPLICIT AND REASONED, like every other money-moving operator action: the
+// reason is mandatory, the audit row is written by the primitive inside the
+// refund's own transaction (lib/settle.js voidSelection, with mustRecord), and
+// the response reports exactly what was released and refunded so the operator
+// can see the money rather than infer it.
+//
+// It refuses a settled market (409), a held market (409), a selection that is not
+// in this market (400) and a second removal of the same runner (a no-op) — all of
+// them in the engine, so this route cannot be the only thing enforcing them.
+app.post('/api/admin/markets/:id/selections/:selectionId/void', requireAdmin, limit('admin'), (req, res) => {
+  const mid = intId(req.params.id);
+  const selId = intId(req.params.selectionId);
+  // The PATH names the runner, and nothing in the body can override it. A body
+  // field that could pick which runner to remove would make the audited URL and
+  // the refunded selection disagree, which is precisely the ambiguity the audit
+  // row exists to remove.
+  const result = SET.voidSelection(db, mid, [selId], {
+    actor: req.user,
+    reason: (req.body || {}).reason,
+  });
+  broadcast('book', { market_id: mid });
+  broadcast('settlement', { market_id: mid });
   res.json(result);
 });
 

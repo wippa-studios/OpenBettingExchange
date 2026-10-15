@@ -65,13 +65,13 @@ The dependency direction is strictly one way: `match → ledger → tx`, with
 | `lib/ledger.js` | the **only** writer of balances/escrow and `transactions` rows | decide who wins |
 | `lib/accounts.js` | double-entry postings; conservation and segregation checks | be written to outside `ledger` |
 | `lib/match.js` | order validation, book sweeps, fills, `bookFor`, positions, overround | settle anything |
-| `lib/settle.js` | market settlement: pot distribution (single winner or a dead heat's joint set), commission, void, auto-cancel | place orders |
+| `lib/settle.js` | market settlement: pot distribution (single winner or a dead heat's joint set), commission, market **and selection** voids, auto-cancel | place orders |
 | `lib/cashout.js` | quote and execute a **venue buyout** at `Σ pᵢ·Payoutᵢ` less a margin | touch the raw pot maths, or hedge |
 | `lib/cashoutrisk.js` | venue cash-out exposure caps: outstanding and daily outlay | decide what a position is worth |
 | `lib/limits.js` | abuse controls: stake, market liability, daily settled, self-exclusion | decide who wins |
 | `lib/rg.js` | responsible gambling: session limit, reality check, rolling deposit limit | be enforced anywhere but the one gate in `limits.js` |
 | `lib/risk.js` | market-maker risk: liability and loss caps, quote skew, kill switch | place orders directly |
-| `lib/results.js` / `lib/voidrules.js` | per-sport void rules, outcome application, settlement holds, provenance | invent an outcome |
+| `lib/results.js` / `lib/voidrules.js` | per-sport void rules, outcome application, withdrawn-runner handling, settlement holds, provenance | invent an outcome |
 | `lib/resultsfeed.js` | the results transport: fetch, normalise, report health | decide or settle anything |
 | `lib/inplay.js` | suspension and the in-play bet delay gates | unfreeze a market on its own authority |
 | `lib/offtime.js` | the pre-off cut-off | be bypassed by a route |
@@ -106,11 +106,15 @@ A single back order that matches, from click to settlement:
    - a lay that matches better than its own price releases the excess escrow, or
      tops up the rare 1¢ when per-fill roundings sum above the placement rounding.
 4. **Broadcast** sends `book` to everyone and `orders`/`balance` to that user.
-5. **Settlement** (`settle.settleMarket`) validates the admin's intent strictly,
+5. **Settlement** (`settle.settleMarket`) validates the caller's intent strictly,
    freezes the market, auto-cancels unmatched orders (releasing escrow), then
    walks every match: the winner's side is credited the pot, void refunds each
    side its own contribution, commission is charged on net winnings per user, and
-   the event completes when all of its markets are settled.
+   the event completes when all of its markets are settled. A runner declared a
+   **non-runner** takes a different path — `settle.voidSelection` cancels its
+   resting orders, refunds its matched legs and marks the selection `void` while
+   the market settles on the runners that ran. It is a separate primitive because
+   the two operations move different money and end in different states.
 6. The wallet is only ever mutated through `ledger.js`, and every mutation
    writes a `transactions` row carrying `balance_after` and `frozen_after`.
 
@@ -219,7 +223,7 @@ Deliberately narrow, and asserted by tests rather than assumed:
 
 ## Testing strategy
 
-817 checks across 64 suites, plus a 212-check browser suite and a live smoke script.
+843 checks across 66 suites, plus a 212-check browser suite and a live smoke script.
 
 | Layer | Where | What it proves |
 | --- | --- | --- |
