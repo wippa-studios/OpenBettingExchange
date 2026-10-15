@@ -162,10 +162,21 @@ app.use((req, res, next) => {
 // The SSE stream is exempt in effect, not in code: `/api/stream` sets its own
 // `Cache-Control: no-cache` through `res.writeHead`, and a header passed to
 // writeHead takes precedence over one set with setHeader.
-app.use('/api', (req, res, next) => {
-  res.setHeader('Cache-Control', 'no-store');
-  next();
-});
+  app.use('/api', (req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    // The version a client built against, on EVERY /api response. An external
+    // strategy has no other way to discover what it is talking to: the URL does
+    // not change, so without this there is no signal at all that the contract
+    // has moved.
+    //
+    // A RESPONSE header rather than a request header, deliberately. Requiring
+    // clients to send it would break every existing call the day it landed, and
+    // a version you can only opt out of is not a stability promise. Additive, and
+    // on every response including errors, so a client learns the version from a
+    // failure too — which is when it matters most.
+    res.setHeader('X-API-Version', config.API_VERSION);
+    next();
+  });
 
 // ── Origin guard FIRST, before any body parsing ───────────────────────────────
 //
@@ -936,12 +947,52 @@ const volumeSweeper = setInterval(() => {
 if (volumeSweeper.unref) volumeSweeper.unref();
 
 /** Rate-limit middleware factory: 429 with Retry-After once the budget is spent. */
+/**
+ * The current budget for a route's bucket: limit, remaining, seconds to reset.
+ *
+ * Returns null for a bucket that is disabled or absent, which is the caller's
+ * signal to emit NO headers at all rather than a misleading `X-RateLimit-Limit: 0`.
+ * A disabled limit is not a limit of zero — announcing it as one would tell a
+ * pacing client to back off against a ceiling that does not exist.
+ *
+ * `remaining` excludes the request being served right now, so a client reading the
+ * header after its own successful call sees what is genuinely left.
+ */
+function volumeBudget(req, bucket) {
+  const cfg = VOLUME_BUCKETS[bucket];
+  if (!cfg || cfg.limit <= 0) return null;
+  const key = volumeKey(req, bucket);
+  const now = Date.now();
+  const hits = (volumeHits.get(key) || []).filter((t) => now - t < cfg.windowMs);
+  const oldest = hits.length ? hits[0] : now;
+  return {
+    limit: cfg.limit,
+    remaining: Math.max(0, cfg.limit - hits.length),
+    resetSeconds: Math.max(0, Math.ceil((cfg.windowMs - (now - oldest)) / 1000)),
+  };
+}
+
 function limit(bucket) {
   const middleware = (req, res, next) => {
     const retryAfter = volumeExceeded(req, bucket);
+    // Budget headers on EVERY response through a limited route, not only on the
+    // 429. A client that discovers the limit only by hitting it has no way to
+    // back off before it does, and one that has to guess will eventually get it
+    // wrong. Exposing `remaining` is what lets a strategy pace itself instead of
+    // discovering the ceiling.
+    const budget = volumeBudget(req, bucket);
+    if (budget) {
+      res.setHeader('X-RateLimit-Limit', String(budget.limit));
+      res.setHeader('X-RateLimit-Remaining', String(Math.max(0, budget.remaining)));
+      res.setHeader('X-RateLimit-Reset', String(budget.resetSeconds));
+    }
     if (retryAfter > 0) {
       res.setHeader('Retry-After', String(retryAfter));
-      return res.status(429).json({ error: 'Too many requests', retry_after_seconds: retryAfter });
+      return res.status(429).json({
+        error: 'Too many requests',
+        code: 'rate_limited',
+        retry_after_seconds: retryAfter,
+      });
     }
     next();
   };
@@ -2806,6 +2857,29 @@ app.use(express.static(path.join(__dirname, 'public')));
 // handler to catch its own rejection). It is here because the first one that
 // does not should log the error it actually threw, not ERR_HTTP_HEADERS_SENT.
 // eslint-disable-next-line no-unused-vars
+/**
+ * Default machine-readable code per HTTP status.
+ *
+ * Only statuses this venue actually returns, and only where the meaning is
+ * unambiguous. 4xx codes name the CALLER's situation; the 5xx entries are
+ * deliberately coarse because a 5xx message is generic anyway and inventing a
+ * precise code for "something broke" would tell a client more than the venue
+ * knows. `rate_limited` is set explicitly by the volume limiter rather than
+ * derived, because a 429 on a full venue and a 429 on a rate-limited caller are
+ * different events wearing the same status — conflating them is the mistake the
+ * API reference already warns about.
+ */
+const ERROR_CODES = {
+  400: 'bad_request',
+  401: 'unauthenticated',
+  403: 'forbidden',
+  404: 'not_found',
+  409: 'conflict',
+  413: 'payload_too_large',
+  422: 'unprocessable',
+  500: 'internal_error',
+};
+
 function errorHandler(err, req, res, next) {
   if (res.headersSent) return next(err);
   const raw = Number(err.status) || 500;
@@ -2813,6 +2887,21 @@ function errorHandler(err, req, res, next) {
   const status = raw >= 500 && !expose ? 500 : raw;
   if (status >= 500 && !expose) console.error('[api]', err);
   const body = { error: status >= 500 && !expose ? 'Internal error' : err.message || 'Request failed' };
+  // A MACHINE-READABLE CODE ON EVERY RESPONSE THAT HAS ONE.
+  //
+  // `error` is prose and is allowed to change wording without notice. A program
+  // cannot branch on it. So every response carries a stable `code`:
+  //
+  //   1. an explicit one the route set (details.code, already used by the tenant
+  //      and cash-out paths), promoted to the top level where a client can read
+  //      it without knowing where else to look;
+  //   2. otherwise one derived from the status, so a client can ALWAYS branch on
+  //      something — even on the hundreds of routes nobody has annotated.
+  //
+  // The derived fallback is the part that matters. A guarantee that depends on
+  // every future contributor remembering to add a code is not a guarantee; this
+  // one holds on the first request, and improves as routes annotate themselves.
+  body.code = (err.details && err.details.code) || ERROR_CODES[status] || 'unexpected_status';
   // Structured context (which limit was breached, what it is) is a 4xx-only
   // affordance. It is deliberately absent from a 5xx even if present on the
   // error, so an internal failure cannot leak detail through it.
