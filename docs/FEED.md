@@ -154,11 +154,48 @@ result was collected, stored, and then made invisible to every consumer.
 Measured on a real collector run: six rows in `market_result`, zero visible in
 `v_feed2`.
 
-A **non-runner never voids a market.** `REMOVED` is an input to settlement, not an
-outcome: a football fixture with one late withdrawal must not be reported as a
-cancellation. In `lib/voidrules.js` a non-runner list only changes the outcome
-when the signal is `abandoned` — a `completed` signal that happens to name a
-withdrawn runner settles normally — and `VOIDED` is the only status that voids.
+A **non-runner does not void a MARKET — it voids a SELECTION.** `REMOVED` is an
+input to settlement, not an outcome: a football fixture with one late withdrawal
+must not be reported as a cancellation, and a race with one runner pulled still
+has a winner who must be paid. What `REMOVED` does is remove that runner's
+selection from the book — cancelling its resting orders, releasing their escrow
+and refunding its matched legs at the match price — while every other runner
+settles normally.
+
+That is a change, and the previous behaviour of this file described the defect
+`#88` reproduced. It said:
+
+> In `lib/voidrules.js` a non-runner list only changes the outcome when the
+> signal is `abandoned` — a `completed` signal that happens to name a withdrawn
+> runner settles normally.
+
+Which was true, and was the bug: `non_runner: VOID` was reachable only from the
+abandoned branch, which `abandoned_other` already covered, so the only
+combination the rule exists for — a race that COMPLETES with a runner withdrawn,
+the ordinary case — never consulted it. The withdrawn runner settled as an
+ordinary loser, its backers were charged full stake, its selection stayed
+`open` on the ladder, and the books balanced the whole time.
+
+The rule table now has `non_runner: settle_with_voids` for the racing sports, and
+`lib/voidrules.js` consults `non_runners` independently of `status` because the
+two facts are orthogonal: "this runner did not start" and "this event did not
+run". `abandoned` / `walkover` / `postponed` are decided by `status` alone.
+
+Two consequences for a feed integration:
+
+- **A withdrawal can arrive before the off.** A signal of
+  `{ non_runners: [ids] }` with **no `status`** is a withdrawal notice, not an
+  outcome: the selection is removed and refunded and the market stays open and
+  tradable. `lib/results.js` (`applyWithdrawal`) handles it. The venue's
+  scheduled poller still only asks about markets that are already OFF
+  (`pendingMarkets`), so pre-off withdrawals need a delivery route — a webhook or
+  an operator call — rather than the timer. That gap is transport, not rules, and
+  it is the honest reason `applyOutcome` handles a signal the poller never sends.
+- **A sport that declares no `non_runner` rule is untouched.** `non_runners` is
+  only a signal for a sport whose rules define it. A stray list on a football
+  fixture changes nothing (there is no such outcome in football), and a
+  withdrawal NOTICE alone holds such a market for a human rather than inventing a
+  racing rule for it.
 
 ### Feed 1 is supported, and it loads
 

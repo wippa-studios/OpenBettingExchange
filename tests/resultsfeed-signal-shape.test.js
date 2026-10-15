@@ -271,6 +271,58 @@ check('S9 a configured feed that has never once answered is not "ok"', () => {
   assert.strictEqual(RF.health({ staleAfterMs: 60000 }).status, 'not_configured');
 });
 
+
+// A WITHDRAWN RUNNER OVER THE WIRE (#88). The transport was never the defect —
+// `normaliseSignal` has always carried `non_runners` — but the consumer settled
+// a completed race that named one as a clean finish, so the signal arrived and
+// was ignored. This drives it the whole way a provider's response would.
+check('S10 a withdrawn runner over the feed is voided, refunded, and the race still settles', async () => {
+  RF.resetState();
+  const f = await market('horse_racing');
+  const alice = f.db.prepare('SELECT balance_cents b, frozen_cents fr FROM users WHERE username=?').get(`alice${venue}`);
+  assert.strictEqual(alice.fr, 1000, 'the backer has the withdrawn runner at risk before anything happens');
+  const fetcher = RF.createFetcher({
+    url: 'https://results.example/v1/outcomes',
+    // Beta won; Alpha was declared a non-runner before the off.
+    fetchImpl: replying({ outcomes: [{ market_id: f.marketId, status: 'completed', winners: [f.beta], non_runners: [f.alpha] }] }),
+  });
+  const run = await RF.pollNow(f.db, { fetcher });
+  assert.strictEqual(run.applied, 1);
+  assert.strictEqual(run.results[0].outcome, 'settled', 'the race settles on the runner that ran');
+  assert.strictEqual(run.results[0].rule, 'non_runner', 'under the withdrawal rule');
+  assert.deepStrictEqual(run.results[0].voided_selections, [f.alpha]);
+  const after = f.db.prepare('SELECT balance_cents b, frozen_cents fr FROM users WHERE username=?').get(`alice${venue}`);
+  assert.strictEqual(after.b, 100000, 'the withdrawn runner cost the backer nothing');
+  assert.strictEqual(after.fr, 0, 'and released their escrow');
+  const alpha = f.db.prepare('SELECT status FROM selections WHERE id=?').get(f.alpha);
+  assert.strictEqual(alpha.status, 'void', 'the runner is off the board');
+  // Provenance carries WHICH runner, not just that something happened.
+  const src = f.db.prepare('SELECT payload FROM result_events WHERE market_id=?').get(f.marketId);
+  assert.strictEqual(JSON.parse(src.payload).non_runners[0], f.alpha);
+  assert.deepStrictEqual(sourceRows(f), [{ decision: 'settle', rule: 'non_runner' }]);
+  assert.strictEqual(acc.assertConserved(f.db), 0, 'and it was a refund, not a transfer');
+});
+
+// The CONTROL for S10, and the reason a transport-level test belongs here: the
+// same sport, the same feed, the same shape — without the withdrawal list this is
+// an ordinary finish and the backer LOSES. If S10 could pass while everything
+// settled, this would not notice.
+check('S11 without the withdrawal the same feed loses the backer their stake', async () => {
+  RF.resetState();
+  const f = await market('horse_racing');
+  const fetcher = RF.createFetcher({
+    url: 'https://results.example/v1/outcomes',
+    fetchImpl: replying({ outcomes: [{ market_id: f.marketId, status: 'completed', winners: [f.beta] }] }),
+  });
+  const run = await RF.pollNow(f.db, { fetcher });
+  assert.strictEqual(run.results[0].outcome, 'settled');
+  assert.deepStrictEqual(run.results[0].voided_selections, [], 'nothing is voided');
+  const alice = f.db.prepare('SELECT balance_cents b, frozen_cents fr FROM users WHERE username=?').get(`alice${venue}`);
+  assert.strictEqual(alice.b, 99000, 'Alpha lost and her 1000 stake went with it — the pre-#88 outcome');
+  assert.strictEqual(f.db.prepare('SELECT status FROM selections WHERE id=?').get(f.alpha).status, 'open');
+  assert.strictEqual(acc.assertConserved(f.db), 0, 'which balanced just as neatly');
+});
+
 (async () => {
   for (const [name, fn] of checks) {
     try {
@@ -283,5 +335,5 @@ check('S9 a configured feed that has never once answered is not "ok"', () => {
     console.log(`  ok   ${name}`);
   }
   console.log(`\nresultsfeed-signal-shape.test.js: ${passed} checks passed`);
-  if (passed < 9) { console.error("expected 9 checks"); process.exit(1); }
+  if (passed < 11) { console.error("expected 11 checks"); process.exit(1); }
 })();

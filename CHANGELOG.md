@@ -61,6 +61,30 @@ All notable changes to this project are documented here. The format follows
   `POST /api/orders` builds its argument field by field, so a `rule_id` in a
   request body never reaches the engine.
 
+- **A selection-level void** (`settle.voidSelection`), distinct from the
+  market-level one, for a runner withdrawn from a market that is still on. It
+  cancels resting orders on that selection and releases their escrow, refunds
+  its matched legs at the match price, and marks the selection `void` — without
+  touching any other runner. Until this existed the only void in the venue was
+  scoped `WHERE market_id = ?`, so there was no way to remove one runner at all.
+  An operator reaches it at
+  `POST /api/admin/markets/:id/selections/:selectionId/void` (reason required,
+  audited by the primitive inside the refund's own transaction, and a refund
+  that cannot be audited does not happen).
+
+- **A withdrawn runner can be expressed as a signal, before or after the off**
+  (`results.applyOutcome`). `{ non_runners: [ids] }` with no `status` is a
+  withdrawal notice: the runner is removed and refunded and the market stays open
+  and tradable. A `completed` outcome carrying `non_runners` settles the market
+  on its winner and voids the withdrawn selections on the way — a fourth decision,
+  `settle_with_voids`, in `lib/voidrules.js`.
+
+- **`markets.payout_shape`**, declared at creation as `win` (the default) or
+  `place`. It exists so an operator can say "this market is not the one shape
+  this engine settles". A `place` market whose outcome depends on a withdrawal is
+  **held** with the reason recorded, rather than settled with arithmetic that
+  would be wrong for every place bettor in it.
+
 - **The house no longer fills an automated order** (#67), in both directions.
   The sweep refuses a crossing where exactly one side is the house *and* exactly
   one side is automated; a rule taking the desk's resting quote is the same
@@ -197,6 +221,52 @@ so the README's own picture contradicted its own text.
   the mandatory password change that locks it out of trading.
 
 ### Fixed
+
+- **A declared non-runner was settled as a loser** (#88, `priority:P0`,
+  `area:money`). A race that completed with one runner withdrawn — the ordinary
+  case, since a horse is pulled and the rest of the field runs — settled as a
+  clean finish: the withdrawn runner's backers were charged their **full stake**
+  as though their horse had run and lost, and the selection stayed `open`, still
+  quoted in the ladder and priced into the positions P&L matrix. The books
+  balanced throughout. Conservation could not see it, because the money went
+  somewhere real — just to the wrong person — which is the same blind spot as the
+  `greyhounds`/`greyhound` slug mismatch.
+
+  Two causes, one root. `ruleKey` consulted `non_runners` only under
+  `status === 'abandoned'`, so the `non_runner` rule was reachable only for a
+  race that was abandoned *and* had a withdrawal list — a case `abandoned_other`
+  already refunded — and unreachable for the one it exists to handle. And the
+  rules table is now consulted **per sport**: a signal is only evidence for a
+  sport whose rules define it, so a stray `non_runners` on a football fixture
+  changes nothing while a racing one voids that selection.
+
+  `non_runners` is now an independent fact rather than a sub-case of `abandoned`,
+  because "a horse was withdrawn" and "the race was abandoned" are orthogonal: an
+  abandoned race is refunded in full either way, and a completed one settles on
+  its winner either way. Malformed ids are dropped rather than coerced
+  (`Number(true) === 1` would void a real runner on a horse that raced), and a
+  withdrawn selection's matched legs are excluded from settlement and from
+  cash-out, because their escrow has already gone back to the players.
+
+- **A withdrawal that also names the winner as withdrawn, one that names a
+  selection from another market, one for a sport with no withdrawal rule, and one
+  on a `place` market are all HELD** rather than resolved. Each costs money in one
+  direction or the other — paying a runner that never started, or not paying the
+  runners that did.
+
+  And the ordering: a withdrawal followed by a **market** void refunds each leg
+  exactly once. `markSettled` stamps `status = 'void'` onto every selection when a
+  market is voided, so the aggregation can no longer tell which runner a
+  withdrawal had already refunded — reading it that way either double-refunded
+  (refused as "releasing more than frozen", rolling back the whole payout) or
+  refunded nothing and stranded every backer's escrow, and both reported the
+  market `settled`. The set of already-refunded ids is now read *before* the
+  outcome is stamped.
+
+- **A market void refunds nothing.** `markSettled` sets every selection to `void`
+  *before* the legs are aggregated, so the new "skip voided selections" filter hid
+  every match from a market void. The filter is now conditional on the market not
+  being voided, and `tests/settle.test.js` (S4, S10) covers it.
 
 The feed read path was still written against the retired `betfair-market-snapshots`
 schema (`markets`, `snapshots`, `market_runners`). Rewritten against the

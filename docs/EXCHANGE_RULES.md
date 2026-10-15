@@ -12,6 +12,7 @@ each rule so you can check the arithmetic yourself.
 - [Settlement](#settlement)
 - [Commission](#commission)
 - [Voiding](#voiding)
+- [Withdrawn runners (non-runners)](#withdrawn-runners-non-runners)
 - [Cash-out](#cash-out)
 - [Tenants and suspension](#tenants-and-suspension)
 - [Markets, events and lifecycle](#markets-events-and-lifecycle)
@@ -347,9 +348,19 @@ settle/void), `tests/store.test.js` (D3, D7 migration).
 
 ## Settlement
 
-A market is settled exactly once, by an admin, with either a **winning runner**
-or `void: true`. The input is validated strictly — `void: "false"` is not a
-boolean, `true` is not a selection id, and both at once is contradictory.
+A market is settled exactly once, with either a **winning runner**, a **dead heat**
+(a set of joint winners) or `void: true`. The input is validated strictly —
+`void: "false"` is not a boolean, `true` is not a selection id, and both at once is
+contradictory.
+
+A settlement is terminal and irreversible, so **a held market cannot be settled**
+except through the reasoned release path (`POST /api/admin/results/held/:id/release`),
+which requires a written reason. The poller and the release both honour the hold;
+the plain admin settle route used to bypass it, so the check moved INTO the
+settlement primitive where no new caller can forget it.
+
+`payout_shape` is how the operator declares that a market is NOT the one shape
+this engine settles — see [Place markets](#place-markets-and-what-the-venue-refuses).
 
 For a match of stake `s` at price `Q`, the pot is `s + (Q−1)·s = s·Q`:
 
@@ -420,18 +431,100 @@ net (rather than per match) is deliberate: for 5050 + 5050 of winnings the fee i
 
 ## Voiding
 
-`void: true` means the event did not produce a result (cancelled, postponed,
-abandoned). Every matched stake returns to the person who committed it — a
-backer gets their stake, a layer gets their liability — and nobody pays
-commission. Voiding is visible in the wallet as a `refund` transaction and in
-history as a settlement with zero P&L.
+**Market-level.** `void: true` means the event did not produce a result
+(cancelled, postponed, abandoned). Every matched stake returns to the person who
+committed it — a backer gets their stake, a layer gets their liability — and
+nobody pays commission. Voiding is visible in the wallet as a `refund` transaction
+and in history as a settlement with zero P&L. Every selection in the market
+becomes `void`, because the whole book is refunded.
+
+**Selection-level.** One runner withdrawn from a race that is still on is *not* a
+market void, and treating it as one would refund everybody — including the backers
+of the runners that finished. See [Withdrawn runners](#withdrawn-runners-non-runners).
 
 A void refunds the liability **at the match price**, which is what the escrow
 actually froze. A layer who offered 10000 @ 2.10 and matched at 2.00 is
 refunded 10000, not 11000, because the extra 1000 was already released when
-the better fill happened.
+the better fill happened. That rule is written once, in `liabilityOf()`, and used
+by every path that moves a lay's collateral — a market void, a selection void,
+settlement and cash-out — because four copies of the same formula is how a refund
+and a settlement start disagreeing by a cent on a half-cent price.
 
 *Tests:* `tests/settle.test.js` (S4, S10).
+
+### Withdrawn runners (non-runners)
+
+A **market** void and a **selection** void are different operations with
+different money, and only the first existed until `#88`.
+
+A runner declared a **non-runner** before the off is removed from the book:
+
+| | What happens | Who is paid |
+| --- | --- | --- |
+| Resting orders on that runner | cancelled, remainder escrow released | nobody — the stake was never at risk |
+| Matched legs on that runner | refunded at the **match price** (the backer's stake, the layer's liability) | both sides, each its own contribution |
+| The market | **stays open** — every other runner keeps trading | the winner, in full, at settlement |
+| The selection | `status = 'void'` | — |
+
+That is a **refund**, not a transfer and not a payout: the pot does not move, it
+comes back. No commission is charged, and no `settlements` row is written,
+because nothing was settled on a runner that never started — the player's wallet
+shows a `refund` transaction, which is where their own history lives.
+
+Three things follow from the selection becoming `void`, and they are the reason
+it is a durable state rather than a flag on an order:
+
+- new orders on it are refused (`409`, the ladder no longer quotes it as live),
+  and the house bot stops quoting it;
+- settlement **skips** its matched legs, because their escrow is gone — settling
+  them would debit a stake already returned;
+- cash-out **refuses** it. A position that has been refunded is not a position,
+  and buying it out would pay the player a second time.
+
+The rules table owns whether `non_runners` means anything at all, per sport
+(`lib/voidrules.js`): the racing slugs declare `non_runner: settle_with_voids`,
+and a sport that does not declare it is **unaffected** — a stray withdrawal list
+on a football fixture changes nothing, because a withdrawn player is not an
+outcome in football. The signal is consulted independently of `status`, because
+"a runner was withdrawn" and "the race was abandoned" are orthogonal facts: an
+abandoned race is refunded in full either way, and a completed one settles on
+its winner either way.
+
+**Before the off, as a signal.** A feed signal of `{ non_runners: [ids] }` with
+no `status` is a withdrawal notice rather than an outcome, and `applyOutcome`
+removes the runner and leaves the market open. An operator can do the same by
+hand — `POST /api/admin/markets/:id/selections/:selectionId/void` with a written
+reason, audited by the primitive itself inside the refund's own transaction.
+
+**What is refused, and why.** Each of these holds the market for a human rather
+than resolving it:
+
+| Signal | Answer |
+| --- | --- |
+| the same selection named as both winner and non-runner | held — paying the withdrawn runner invents a result; voiding the winner refuses to pay the runners that ran |
+| a non-runner id that is not in this market | held — the id is the instruction to move money |
+| a withdrawal notice in a sport with no `non_runner` rule | held — applying a racing rule to a football fixture would invent one |
+| a withdrawal on a market declared `payout_shape: 'place'` | held — see below |
+
+### Place markets, and what the venue refuses
+
+A **place** payout depends on a finishing *position*, and its distribution
+**changes** when a runner is withdrawn: the field shrinks, so the place terms
+change and every place bettor's payout must be recomputed. That is not a
+selection void, and this engine cannot compute it — it has one payout shape (one
+winning selection takes the pot) and computes that one.
+
+Rather than compute a plausible wrong number, a market can be **declared** a
+place market at creation (`POST /api/admin/markets` with
+`payout_shape: 'place'`), and then any outcome the engine cannot price correctly
+**holds**, with the reason on the market and on the provenance row. `payout_shape`
+is a closed vocabulary (`win`, `place`) whose only job is to let an operator say
+"this is not the shape the engine settles"; the default is `win`, which is every
+market this venue has ever created. Modelling the shapes properly is `#95`.
+
+*Tests:* `tests/voidrules.test.js` (V1–V11, the rule table and the signal
+**combinations**), `tests/nonrunner.test.js` (N1–N11, the money path end to end),
+`tests/api.test.js` (the pre-off removal route).
 
 ## Cash-out
 
@@ -720,7 +813,7 @@ sport ──< competition ──< event ──< market ──< runner
                                       │
                         open ──suspended──open
                           │
-                      settled   (terminal: winner | void | held)
+                      settled   (terminal: winner | dead heat | void | held)
 ```
 
 - **open** — orders accepted, ladders quoted.
@@ -733,6 +826,10 @@ sport ──< competition ──< event ──< market ──< runner
   settlement until a human releases it with a written reason. A disputed or
   unrecognised outcome parks here rather than being settled or voided, because
   settling picks a side and voiding may give away money the venue owes.
+- A **runner** is `open`, `suspended` or `void`. A runner becomes `void` from a
+  market void, or on its own when it is withdrawn — see
+  [Withdrawn runners](#withdrawn-runners-non-runners). A `void` runner takes no
+  orders, is not quoted, is skipped at settlement and cannot be cashed out.
 - An event is **completed** when all of its markets are settled. That flag is a
   *settlement* fact and is deliberately NOT what makes a market eligible for
   automatic settlement: it can only be true once every market on the event has
@@ -769,6 +866,15 @@ One definition serves both sides. `lib/results.js` `pendingMarkets` is the singl
 query, used by the consumer (`pollOnce`) and by the transport, which POSTs
 precisely that set — a transport asking about a different set would look healthy
 while outcomes never arrived.
+
+**A withdrawal before the off is not in that set, deliberately.** The poll asks
+about markets that are off, because that is when a *result* exists. A withdrawal
+is the opposite — it exists *before* the off, and asking about every open market
+on every cycle would mean posting the whole board to the provider and treating
+the absence of an answer as meaningful. So a pre-off withdrawal is delivered by
+something else: a webhook, or an operator on
+`POST /api/admin/markets/:id/selections/:selectionId/void`. Both reach
+`applyOutcome`, which handles a signal carrying `non_runners` and no `status`.
 
 **The transport is a signal, not an authority.** A response the venue cannot
 read raises rather than being read as "no outcomes", and a payload containing
@@ -939,6 +1045,15 @@ Listed so nobody mistakes a scope decision for a bug:
   payout among joint winners, but only where the sport's rules permit one. A
   multi-winner signal under a single-winner rule is **held**, not settled as a
   joint favourite.
+- **Place markets and any other payout shape.** The engine settles one shape: a
+  single winning selection takes the pot. A market declared
+  `payout_shape: 'place'` is **held** rather than settled with the wrong
+  arithmetic — see [Place markets](#place-markets-and-what-the-venue-refuses).
+  Modelling the shapes properly is `#95`.
+- **A pre-off withdrawal over the scheduled poller.** The poller asks only about
+  markets whose event is already OFF, so a withdrawal arriving before the off
+  needs a webhook or an operator call. The engine handles the signal either way;
+  what does not exist is a timer that fetches it.
 - **Real money.** No PSP is integrated — the payments machinery ships but
   terminates in a reference provider that moves no money. No KYC/AML, no age
   verification, no licensing path, and the seeded bot's fair prices are a
