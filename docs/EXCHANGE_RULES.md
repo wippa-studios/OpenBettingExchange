@@ -806,6 +806,80 @@ already-signed-in player, T23 reads and the admin desk survive, T24 resting
 orders and escrow, T25 scoped to its own tenant, T26 restoring opens the gate
 again), `tests/api.test.js` (the whole surface over HTTP).
 
+## Currency
+
+**A venue trades in exactly one currency.** It is `VENUE_CURRENCY` in `.env`
+(default `AUD`), validated at boot to a three-letter uppercase ISO 4217 code.
+
+It is carried on the tenant (`tenants.currency`), and read from there — by
+`lib/accounts.js` when it resolves a ledger account, by `lib/payments/` when it
+credits a deposit, by `/api/branding` for the browser's formatter, and by
+`lib/reports.js`. The schema default for the three currency columns is that same
+configured value, so an insert that forgets one gets the venue's own money
+rather than a stale constant.
+
+`PUT /api/admin/tenants/:id` accepts `currency`, and it is audited like every
+other administrative fact. It can only be set to the venue's currency.
+
+### What used to be here
+
+`accounts.currency` and `payment_intents.currency` both existed and were written
+with the literal `'USD'` at eight sites — two in `lib/accounts.js`, four in
+`lib/payments/` (two of them a `currency = 'USD'` **default parameter** that the
+module's own caller ignored by passing a literal in its place), and two column
+defaults in `lib/store.js`. **Nothing read either column.** A currency nobody
+reads cannot record what a bucket is denominated in; it recorded that someone
+once typed `'USD'`, and the browser showed a `$` no matter where the venue
+traded.
+
+### Where it is enforced
+
+| | |
+| --- | --- |
+| **`accountId()`** | Reads the row back and refuses one whose currency is not the one asked for |
+| **`post()`** | Refuses a set of postings spanning two currencies, so two denominations can never be added together |
+| **`confirmDeposit()`** | Refuses to credit a payment intent recorded in a currency that is not the payer's tenant's |
+| **`configure()`** | Refuses a tenant currency other than the venue's |
+| **`moneySymbol()`** | Renders the published code's symbol; an unknown code renders as itself, and a missing one renders as no symbol at all |
+
+The silent no-op is the part worth naming. `accounts` has a UNIQUE index on
+`(kind, IFNULL(user_id, 0))` that does **not** span currency, so one player has
+one `player_funds` bucket and the venue has one `house_float`. An
+`INSERT OR IGNORE` of a second currency hit that index, the insert was ignored,
+the caller carried on, and the account it then resolved was the one that
+*already existed* — in the wrong currency, with no error anywhere. A control
+that reports success while doing nothing. `ensureAccountRow()` now reads the row
+back and compares its currency, so that path throws.
+
+### What per-player multi-currency would require (deferred, not built)
+
+This is option B of `#104`, and it is **not** implemented. It is not a display
+setting, and it is not a matter of storing a second string:
+
+1. **`accounts.tenant_id`.** There is no tenant column on `accounts`, and the
+   four venue kinds are *global singletons* — one `house_float` for everyone.
+   Two venues cannot hold two house accounts without it.
+2. **The unique index must span currency** (`(kind, tenant_id, user_id,
+   currency)`). Without that, step 1 buys nothing: the index still allows one
+   bucket per player, so the second currency is refused by the database and
+   ignored by the insert — the silent no-op above, unchanged.
+3. **A rate SOURCE and a conversion POINT.** There is no FX rate anywhere in
+   this codebase, and adding one means deciding where conversion happens
+   relative to commission and settlement. The obvious point — settlement — is
+   the worst available one, because commission and the pot are integer cents
+   and a converted amount has to be rounded *somewhere*. Rounding inside
+   settlement is a money bug of exactly the class the invariant table above
+   exists to prevent.
+4. **A written rounding policy** before any of it: rate source, conversion
+   timing against commission and settlement, the rounding point, and proof the
+   rounding is house-favourable. Commission rounding already needed that
+   treatment; an FX amount is a larger one.
+
+Until that policy exists, `post()` throws rather than guessing. That is what
+makes the one-currency mode safe to ship.
+
+*Tests:* `tests/currency.test.js`.
+
 ## Markets, events and lifecycle
 
 ```
@@ -1068,6 +1142,13 @@ Listed so nobody mistakes a scope decision for a bug:
   `house_float → player_funds` rather than debiting the bot's balance — see
   [Who funds a buyout](#who-funds-a-buyout) for why that leaves no balance a
   quote could be tested against.
+- **Multi-currency, and FX.** A venue trades in **one** currency, set by
+  `VENUE_CURRENCY` and carried on the tenant. Per-player multi-currency is
+  option B of `#104` and is not built: it needs `accounts.tenant_id`, a unique
+  index that spans currency, a rate source, and a written rounding policy
+  decided **before** the code — because the natural place to convert is
+  settlement, which is the worst place in this codebase to introduce a
+  rounding decision. See [Currency](#currency).
 - **Horizontal scale.** SQLite is single-writer and synchronous — which is *why*
   the sweep is atomic, and a genuine strength — but it is one process on one
   machine. `npm run load` measures that single node (~500 orders/sec placed);
