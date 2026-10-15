@@ -48,11 +48,34 @@ const failedNames = [];
 
 console.log(`→ ${suites.length} unit/API suites, each in its own process (a failure never masks the rest)`);
 
+// Per-suite wall-clock ceiling.
+//
+// WHY THIS EXISTS, because it was found the expensive way. `spawnSync` has no
+// timeout by default, so a suite that HANGS stops the entire run: no summary
+// line, no exit code, no failure recorded — the remaining ~48 suites simply
+// never run, and the only symptom is silence. That is the worst possible
+// failure mode for a gate, because it is indistinguishable from a slow run.
+//
+// The trigger was a single over-specified assertion in express5.test.js: a
+// `listen()`ed server was closed *after* the assertions rather than in a
+// `finally`, so the failed assertion leaked the socket and the suite hung. The
+// fix belongs in the tests, and it does — but it must ALSO belong here, because
+// the next such bug should cost a failed line, not a dead run.
+//
+// Generous enough to be uninteresting: the slowest suite here is api.test.js at
+// well under two minutes, so 5 minutes is a hang and not a slow suite. It is
+// reported as TIMEOUT and distinct from an assertion failure on purpose — "it
+// hung" and "it asserted wrong" are different diagnoses, and collapsing them
+// sends the reader to the wrong file.
+const SUITE_TIMEOUT_MS = 300_000;
+
 for (const suite of suites) {
   const run = spawnSync(process.execPath, [path.join('tests', suite)], {
     cwd: ROOT,
     encoding: 'utf8',
     env: { ...process.env, ...SUITE_ENV[suite] },
+    timeout: SUITE_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
   });
   // The suite's own per-check lines stay visible, unfiltered.
   if (run.stdout) process.stdout.write(run.stdout);
@@ -72,7 +95,12 @@ for (const suite of suites) {
   } else {
     failures++;
     failedNames.push(suite);
-    const why = run.status === null ? `signal ${run.signal}` : `exit ${run.status}`;
+    const timedOut = !!(run.error && run.error.code === 'ETIMEDOUT');
+    const why = timedOut
+      ? `TIMEOUT after ${Math.round(SUITE_TIMEOUT_MS / 1000)}s (it hung, which is not the same as it failed)`
+      : run.status === null
+        ? `signal ${run.signal}`
+        : `exit ${run.status}`;
     console.log(`  FAIL ${suite} — ${count} checks ok, then ${why}`);
   }
 }
