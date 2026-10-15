@@ -32,7 +32,7 @@ Sign in as `demo` / `demo123`, or `admin` / `admin123` for the trading desk.
 ```bash
 
 
-npm test            # 868 checks: unit + API integration, fully offline
+npm test            # 884 checks: unit + API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 215 checks: real Chromium via Playwright (frontend changes)

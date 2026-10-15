@@ -393,6 +393,48 @@ so the README's own picture contradicted its own text.
 
 ### Fixed
 
+- **`accounts.currency` was a decorative column** (#104). It was written with
+  the literal `'USD'` and read by **nothing**, so it recorded nothing about what
+  a bucket was denominated in and nothing validated it. The issue named eight
+  sites; there were eight — two in `lib/accounts.js`, four in `lib/payments/`
+  (two of them a `currency = 'USD'` **default parameter** that the module's own
+  caller ignored by passing a literal in its place), and two column defaults in
+  `lib/store.js`.
+
+  **A venue now trades in exactly one currency**, set by `VENUE_CURRENCY`
+  (`AUD`) and carried on the tenant. It is read — never written-and-forgotten —
+  at five choke points: `accountId()` asserts the currency of the account it
+  resolves, `post()` refuses a set of postings spanning two currencies,
+  `confirmDeposit()` refuses to credit an intent in a currency that is not the
+  payer's tenant's, `configure()` refuses a tenant off the venue's currency, and
+  the browser's one formatter renders the code `/api/branding` publishes.
+
+  **The silent no-op is now loud.** `accounts`' unique index is on
+  `(kind, IFNULL(user_id, 0))` and does not span currency, so one player has one
+  `player_funds` bucket and the venue one `house_float`. An `INSERT OR IGNORE`
+  of a second currency hit that index, was ignored, and the caller carried on
+  holding the account that already existed — in the wrong currency, with no
+  error. A control that reports success while doing nothing. `ensureAccountRow()`
+  now reads the row back and compares its currency.
+
+  Also: the browser's `fmt`/`signed` had a hard-coded `'$'`, so a white-label
+  venue painted every amount with a dollar sign — as did four hard-coded
+  `$10/$50/$100/$1,000` faucet chips in the wallet. `createDepositIntent` and
+  `createWithdrawal` kept their `currency` parameter and lost its `'USD'`
+  default, because the signature has to be right for the real PSP integration
+  that module exists to make room for; with no default, omitting it is a
+  `TypeError` rather than a silent booking in dollars.
+
+  Per-player **multi-currency (option B) is deliberately not implemented**. It
+  needs `accounts.tenant_id`, a unique index that spans currency, a rate source,
+  and a written rounding policy — because the natural conversion point is
+  settlement, which is the worst place in this codebase to introduce a rounding
+  decision. See [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#currency).
+
+  *This is not a behaviour change for the default deployment's arithmetic:
+  `postings` still sum, and the existing suites were untouched. What changes is
+  that a currency nobody chose can no longer be recorded silently.*
+
 - **A declared non-runner was settled as a loser** (#88, `priority:P0`,
   `area:money`). A race that completed with one runner withdrawn — the ordinary
   case, since a horse is pulled and the rest of the field runs — settled as a
