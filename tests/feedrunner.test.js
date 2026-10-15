@@ -139,6 +139,35 @@ await check('R3 redact removes every known secret and leaves ordinary text intac
   assert.strictEqual(FRUN.redact('abc', ['a']), 'abc');
 });
 
+// The floor this replaces skipped every secret under four characters, and
+// USERNAME_RE accepts three. So a three-character username reached the log ring
+// verbatim. These checks are the reason that cannot come back.
+await check('R3a a SHORT secret is redacted where it stands alone', () => {
+  // `BETFAIR_USERNAME` may legitimately be three characters.
+  assert.strictEqual(FRUN.redact('login as abc ok', ['abc']), 'login as [redacted] ok',
+    'a 3-character username was not redacted at all — it reached health().recent_log');
+  assert.strictEqual(FRUN.redact('{"username":"xyz"}', ['xyz']), '{"username":"[redacted]"}',
+    'a short username in collector output survived');
+});
+
+await check('R3b a short secret does not garble a longer word containing it', () => {
+  // The reason the old floor existed, and the reason it was not needed.
+  assert.strictEqual(FRUN.redact('table scan', ['ab']), 'table scan',
+    '"table" was mangled into "t[redacted]le" — the exact garbling the floor was added to prevent');
+  assert.strictEqual(FRUN.redact('market_id=1 st-1 table', ['ab']), 'market_id=1 st-1 table');
+  // …but a real standalone occurrence is still caught, including next to a
+  // hyphen or underscore, which USERNAME_RE permits inside a username.
+  assert.strictEqual(FRUN.redact('user=ab, next', ['ab']), 'user=[redacted], next');
+  assert.strictEqual(FRUN.redact('path /ab/ end', ['ab']), 'path /[redacted]/ end');
+});
+
+await check('R3c a secret containing regex metacharacters is a LITERAL', () => {
+  // A password of `a.b` must not behave like the pattern "a, any char, b".
+  assert.strictEqual(FRUN.redact('secret=a.b here', ['a.b']), 'secret=[redacted] here');
+  assert.strictEqual(FRUN.redact('secret=axb here', ['a.b']), 'secret=axb here',
+    'the pattern matched something it should not have — the value was treated as a regex');
+});
+
 // ── backoff ──────────────────────────────────────────────────────────────────
 
 await check('R4 backoff grows and is capped, so a bad credential cannot hammer Betfair', async () => {
