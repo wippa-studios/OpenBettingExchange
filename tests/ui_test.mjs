@@ -2242,6 +2242,256 @@ try {
     await reload();
   });
 
+// ── #66: dark mode ────────────────────────────────────────────────────────
+  //
+  // Three claims, in increasing order of how easily they could be faked:
+  //
+  //   1. THE LIGHT PALETTE DID NOT MOVE. Read out of the `:root` rule itself,
+  //      value by value, against the hexes the file ships. A theme delivered
+  //      "by media query" can still quietly have edited a light value, and
+  //      nothing else in the suite would notice.
+  //   2. THE DARK VALUES ACTUALLY APPLY, from the COMPUTED styles of the real
+  //      ladder cells — not from the token block, which proves only that a
+  //      block of text exists.
+  //   3. THE BACK/LAY PAIR IS READABLE ON THE DARK GROUND. The price contrast
+  //      is computed here, in the browser, from what the cells actually paint,
+  //      and asserted against 4.5:1. That is the whole reason this is not a
+  //      block copy: a straight inversion puts dark blue on a near-black
+  //      ground, and this check fails.
+  const _lum = (rgb) => {
+    const m = /rgba?\(([^)]+)\)/.exec(rgb);
+    if (!m) return null;
+    const p = m[1].split(/[,/]/).map(Number);
+    const lin = (c) => {
+      const s = c / 255;
+      return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * lin(p[0]) + 0.7152 * lin(p[1]) + 0.0722 * lin(p[2]);
+  };
+  const ratioOf = (a, b) => {
+    const [x, y] = [_lum(a) + 0.05, _lum(b) + 0.05].sort((p, q) => q - p);
+    return Math.round((x / y) * 100) / 100;
+  };
+  // Measured from the COMPUTED styles of the real elements, so it is the colour
+  // on screen rather than the colour someone intended.
+  const cellContrast = (sel) =>
+    page.evaluate((s) => {
+      const n = document.querySelector(s);
+      if (!n) return null;
+      const cs = getComputedStyle(n);
+      const parse = (v) => {
+        const m = /rgba?\(([^)]+)\)/.exec(v);
+        if (!m) return null;
+        const p = m[1].split(/[,/]/).map(Number);
+        return [p[0], p[1], p[2]];
+      };
+      const lin = (c) => {
+        const s = c / 255;
+        return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+      };
+      const L = ([r, g, b]) => 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+      const fg = parse(cs.color);
+      const bg = parse(cs.backgroundColor);
+      if (!fg || !bg) return null;
+      const a = L(fg) + 0.05;
+      const c = L(bg) + 0.05;
+      return Math.round((Math.max(a, c) / Math.min(a, c)) * 100) / 100;
+    }, sel);
+
+  // Every colour role the house palette ships, byte for byte.
+  const HOUSE = {
+    '--bg': '#ffffff', '--bg2': '#f7f7f8', '--card': '#ffffff', '--card2': '#f5f5f6',
+    '--line': '#e6e6e8', '--line2': '#d3d3d7', '--text': '#0a0a0b', '--muted': '#6b6b73',
+    '--accent': '#b9b9c0', '--accent-bg': '#f0f0f2',
+    '--blue': '#1b5fd9', '--blue-bg': '#e8f0fe', '--blue-line': '#c3dafb',
+    '--pink': '#d6147a', '--pink-bg': '#fdecf4', '--pink-line': '#f8c8de',
+    '--red': '#c2261f', '--red-bg': '#fdeceb', '--green': '#0f7a3d', '--green-bg': '#e6f5ec',
+  };
+
+  const declaredRootTokens = () =>
+    page.evaluate(() => {
+      const out = {};
+      for (const sheet of document.styleSheets) {
+        let rules;
+        try {
+          rules = sheet.cssRules;
+        } catch {
+          continue;
+        }
+        for (const r of rules) {
+          // The BASE :root only — the dark block is `:root[data-theme='dark']`,
+          // a different selectorText, so it cannot be picked up here.
+          if (r.selectorText !== ':root') continue;
+          for (const name of r.style) {
+            if (name.startsWith('--')) out[name] = r.style.getPropertyValue(name).trim();
+          }
+        }
+      }
+      return out;
+    });
+
+  const activeTheme = () => page.getAttribute('html', 'data-theme');
+  const pageBg = () => page.evaluate(() => getComputedStyle(document.documentElement).backgroundColor);
+  const freshLoad = async () => {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#balance:not([hidden])', { timeout: 15000 });
+  };
+  const clearTheme = () =>
+    page.evaluate(() => {
+      try {
+        localStorage.removeItem('obx.theme');
+      } catch {}
+    });
+
+  // A live, full-strength cell: `.depth` and `.carried` set opacity, and an
+  // empty cell has no price at all. Colour and background are read from the
+  // SAME element so the ratio is the one the eye receives.
+  const LIVE_BACK = '.lcell.back:not(.depth):not(.carried):not(.empty)';
+  const LIVE_LAY = '.lcell.lay:not(.depth):not(.carried):not(.empty)';
+  const onBoard = async () => {
+    await page.evaluate(() => {
+      location.hash = '#/markets';
+    });
+    await page.waitForSelector(`${LIVE_BACK}`, { timeout: 15000 });
+  };
+
+  await scenario('#66 dark mode: the light palette is untouched and the dark one is readable', async () => {
+   try {
+    await onBoard();
+    // ── 1. the light values, value by value ──────────────────────────────
+    const rootTokens = await declaredRootTokens();
+    const moved = Object.entries(HOUSE)
+      .filter(([k, v]) => (rootTokens[k] || '').toLowerCase() !== v)
+      .map(([k, v]) => `${k} is ${rootTokens[k]} not ${v}`);
+    check(
+      '#66 every light palette value is byte-identical',
+      moved.length === 0,
+      `(${moved.join(', ') || 'all 20 unchanged'})`
+    );
+
+    // ── the default follows the OS, and light is what light users get ─────
+    await page.emulateMedia({ colorScheme: 'light' });
+    await clearTheme();
+    await freshLoad();
+    check('#66 with no stored choice a light OS gets the light theme', (await activeTheme()) === 'light', `(data-theme=${await activeTheme()})`);
+    check('#66 the resolved light background is still #ffffff', (await pageBg()) === 'rgb(255, 255, 255)', `(${await pageBg()})`);
+    await onBoard();
+    const lBack = await cellContrast(LIVE_BACK);
+    const lLay = await cellContrast(LIVE_LAY);
+    check(
+      '#66 the light ladder prices are the numbers that shipped',
+      Math.abs(lBack - 4.97) < 0.02 && Math.abs(lLay - 4.36) < 0.02,
+      `(back ${lBack}:1, lay ${lLay}:1 — the lay price was already below the 4.5 AA floor before this issue)`
+    );
+
+    // ── 2. the dark values apply, from the computed styles ────────────────
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await clearTheme();
+    await freshLoad();
+    check(
+      '#66 a dark OS resolves to the dark theme with no stored choice',
+      (await activeTheme()) === 'dark',
+      `(data-theme=${await activeTheme()})`
+    );
+    check('#66 the dark ground is applied, not merely declared', (await pageBg()) === 'rgb(11, 11, 13)', `(${await pageBg()})`);
+
+    // ── 3. the pair, measured where it is painted ─────────────────────────
+    await onBoard();
+    const dBack = await cellContrast(LIVE_BACK);
+    const dLay = await cellContrast(LIVE_LAY);
+    check('#66 the dark back price clears AA on its own cell', dBack !== null && dBack >= 4.5, `(${dBack}:1)`);
+    check('#66 the dark lay price clears AA on its own cell', dLay !== null && dLay >= 4.5, `(${dLay}:1)`);
+    check(
+      '#66 both dark prices beat the light values they replace',
+      dBack > lBack && dLay > lLay,
+      `(dark ${dBack}/${dLay} vs light ${lBack}/${lLay})`
+    );
+
+    // The invariant style.css:39 states: the two sides are never allowed to be
+    // near enough. In light mode the two CELL FILLS are 1.01:1 apart — identical
+    // in luminance, separated by hue alone — so the dark pair is required to do
+    // better on lightness, not merely to differ.
+    const sides = await page.evaluate(() => {
+      const g = (s) => getComputedStyle(document.querySelector(s));
+      const b = document.querySelector('.lcell.back:not(.depth):not(.carried):not(.empty)');
+      const l = document.querySelector('.lcell.lay:not(.depth):not(.carried):not(.empty)');
+      return { backBg: g('.lcell.back').backgroundColor, layBg: g('.lcell.lay').backgroundColor, backFg: getComputedStyle(b).color, layFg: getComputedStyle(l).color };
+    });
+    const fillSep = ratioOf(sides.backBg, sides.layBg);
+    check(
+      '#66 the two sides differ in colour and in luminance',
+      sides.backBg !== sides.layBg && sides.backFg !== sides.layFg && fillSep >= 1.25,
+      `(fills ${fillSep}:1, ${sides.backBg} vs ${sides.layBg})`
+    );
+    const darkMeta = await themeColor();
+    check('#66 theme-color follows the dark ground', darkMeta === 'rgb(11, 11, 13)', `(${darkMeta})`);
+
+    // ── 4. the manual override persists, and beats the OS ────────────────
+    // Driven the way a user does it: open Account, click the visible chip. A
+    // hidden <input> cannot be clicked directly (the click and the label's own
+    // activation toggle it twice), so a test that pokes the input would prove
+    // the wiring works and not that the control is usable.
+    await page.click('#accountBtn');
+    await page.waitForSelector('#accountModal.show', { timeout: 5000 });
+    check(
+      '#66 the appearance control is offered where the other settings are',
+      await page.isVisible('#themePicker .themepick-row'),
+      '(the account panel carries no theme control)'
+    );
+    await page.click('#themePicker .themepick-opt:has(input[value="light"])');
+    await page.waitForFunction(() => document.documentElement.getAttribute('data-theme') === 'light', null, { timeout: 3000 });
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 3000 });
+    check(
+      '#66 an explicit Light choice overrides a dark OS',
+      (await activeTheme()) === 'light',
+      `(data-theme=${await activeTheme()})`
+    );
+    await freshLoad();
+    check(
+      '#66 the choice survives a reload, against a dark OS',
+      (await activeTheme()) === 'light',
+      `(data-theme=${await activeTheme()})`
+    );
+    check(
+      '#66 the control shows which ANSWER is stored, not which theme resulted',
+      await page.isChecked('#themePicker input[value="light"]'),
+      '(the Light chip is ticked while the OS still says dark)'
+    );
+
+    // And back to Auto, which a two-state toggle cannot offer.
+    await page.click('#accountBtn');
+    await page.waitForSelector('#accountModal.show', { timeout: 5000 });
+    await page.click('#themePicker .themepick-opt:has(input[value="auto"])');
+    await page.waitForFunction(() => document.documentElement.getAttribute('data-theme') === 'dark', null, { timeout: 3000 });
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 3000 });
+    check(
+      '#66 Auto hands the decision back to the OS',
+      (await activeTheme()) === 'dark',
+      `(data-theme=${await activeTheme()})`
+    );
+
+    // ── 5. no flash: the decision is made before the stylesheet parses ────
+    const order = await page.evaluate(() =>
+      [...document.querySelectorAll('head script[src], head link[rel="stylesheet"]')].map((n) => n.getAttribute('src') || n.getAttribute('href'))
+    );
+    const at = (s) => order.indexOf(s);
+    check(
+      '#66 the theme script is loaded before the stylesheet, so there is no flash',
+      at('/js/theme.js') >= 0 && at('/js/theme.js') < at('/style.css'),
+      `(${order.join(' -> ')})`
+    );
+
+   } finally {
+    // Leave the suite where it found it whatever happened above: no stored
+    // choice, a light OS. Every later scenario reads the house palette, and a
+    // run that aborted mid-theme would hand them a dark venue.
+    await clearTheme();
+    await page.emulateMedia({ colorScheme: 'light' });
+    await freshLoad();
+   }
+  });
   await scenario('#52 the desk can set the brand it serves', async () => {
     await page.click('#nav button[data-page="admin"]');
     await page.waitForSelector('[data-view="tenants"]', { timeout: 10000 });
