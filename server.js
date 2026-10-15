@@ -2203,6 +2203,12 @@ app.put('/api/admin/tenants/:id', requireAdmin, limit('admin'), (req, res) => {
       ...(b.name === undefined ? {} : { name: b.name }),
       ...(b.status === undefined ? {} : { status: b.status }),
       ...(b.commission_bps === undefined ? {} : { commission_bps: Number(b.commission_bps) }),
+      // #104: the tenant's currency is an audited administrative fact like the
+      // rest of this body. Without it here, TEN.configure()'s currency
+      // parameter would be unreachable from the API and a tenant could only be
+      // re-denominated by hand-editing the database — which is exactly the
+      // corruption its own guard exists to catch.
+      ...(b.currency === undefined ? {} : { currency: b.currency }),
       ...(b.brand === undefined ? {} : { brand: b.brand }),
       ...(b.jurisdictions === undefined ? {} : { jurisdictions: b.jurisdictions }),
     })

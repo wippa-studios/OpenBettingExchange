@@ -39,6 +39,12 @@
     events: [],
     slip: [],             // [{selection_id, selection_name, market_id, market_name, event_name, side, price, stake_cents}]
     betsTab: 'open',
+    // The currency this tenant trades in (#104). Published by /api/branding and
+    // set by applyBranding() in shell.js — the ONLY thing that may write it, so
+    // there is one answer to "what currency is this page in" rather than a
+    // default here and a value over there. Null until branding arrives, which
+    // moneySymbol() renders as a bare amount rather than a guessed symbol.
+    currency: null,
     sse: null,
     pollTimer: null,
     flashTimer: null,
@@ -118,7 +124,46 @@
   }
   const isCurrent = (mount, seq) => state.reqSeq[mount] === seq;
 
-  const fmt = (cents) => '$' + ((Number(cents) || 0) / 100).toFixed(2);
+  // The symbol to put in front of an amount, DISPLAY ONLY.
+  //
+  // This is a rendering table, not a second source of truth about money: the
+  // ledger is denominated in whatever /api/branding published and nothing here
+  // can change that. It exists because the alternative — the hard-coded '$'
+  // this replaces — told a player on an Australian venue that every amount was
+  // in dollars.
+  //
+  // The map is deliberately SHORT and DELIBERATELY INCOMPLETE.
+  //
+  //   - '$' is shared by dozens of currencies, so the ambiguous ones carry a
+  //     disambiguating prefix (A$, C$, NZ$). Rendering USD as '$' and AUD as
+  //     'A$' is the point: '$50.51' on an Australian venue is the bug.
+  //   - A code with no entry here falls back to the CODE ITSELF ('BRL 50.51'),
+  //     which is unambiguous and needs no registry maintenance.
+  //   - A currency the server never sent renders as NO symbol at all, a bare
+  //     '50.51'. That is the one fallback worth arguing for: a missing symbol
+  //     is visibly missing, whereas a WRONG one is not. Branding is awaited at
+  //     boot before anything renders, so this is the failure path, not the
+  //     normal one.
+  //   - Zero-decimal currencies (JPY, KRW) are absent on purpose. Every amount
+  //     in this codebase is integer cents divided by 100 — the ledger stores
+  //     cents and the invariant table is stated in them — so a currency with no
+  //     minor unit cannot be represented honestly here, and showing '¥' next to
+  //     a value scaled by 100 would be a wrong number rather than a rough one.
+  const MONEY_SYMBOLS = { AUD: 'A$', CAD: 'C$', EUR: '€', GBP: '£', NZD: 'NZ$', USD: '$' };
+
+  function moneySymbol(code) {
+    if (typeof code !== 'string') return '';
+    if (MONEY_SYMBOLS[code]) return MONEY_SYMBOLS[code];
+    // Not normalised to upper case: the server validates the shape and a
+    // lowercase value reaching here is a finding, and rendering it back as it
+    // arrived is how an operator sees it.
+    return /^[A-Z]{3}$/.test(code) ? code + ' ' : '';
+  }
+
+  // Every amount on every screen goes through these two. They took a hard-coded
+  // '$' before #104, so a white-label venue rendered its own money with
+  // another currency's symbol.
+  const fmt = (cents) => moneySymbol(state.currency) + ((Number(cents) || 0) / 100).toFixed(2);
   const signed = (cents) => (cents >= 0 ? '+' : '−') + fmt(Math.abs(cents));
   const price2 = (p) => (p == null ? '—' : Number(p).toFixed(2));
 
@@ -466,5 +511,5 @@
   // Derived from the file's own definitions rather than hand-listed, because
   // a hand-written list is how a name goes missing and surfaces as an
   // undefined reference buried in a view three files away.
-  Object.assign(OB, { $, FOCUSABLE, Ladder, TREE_LEVELS, api, askDialog, askReason, attr, beginLoad, closeOverlay, el, esc, fmt, isCurrent, logout, num, openOverlay, overlayStack, price2, qa, refreshMe, renderHeader, setHtml, signed, state, toast, trapTab });
+  Object.assign(OB, { $, FOCUSABLE, Ladder, TREE_LEVELS, api, askDialog, askReason, attr, beginLoad, closeOverlay, el, esc, fmt, isCurrent, logout, moneySymbol, num, openOverlay, overlayStack, price2, qa, refreshMe, renderHeader, setHtml, signed, state, toast, trapTab });
 })();
