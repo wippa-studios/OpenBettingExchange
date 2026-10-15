@@ -241,9 +241,11 @@ check('L7b every rendered bar width is a finite percentage', async () => {
     { size_cents: 500, matched_cents: 500 },
   ]) {
     const bar = client.matchedCellParts(lv, String).bar;
-    assert.ok(/^<span class="mbar"/.test(bar), `a traded level draws a bar (${JSON.stringify(lv)})`);
-    const w = bar.match(/width:(\d+)%/);
-    assert.ok(w, `the bar carries a width percentage (got ${bar})`);
+    // SVG, not a styled span: the strict `style-src 'self'` CSP blocks inline
+    // style attributes, so the width is geometry. See L8 and public/ladder.js.
+    assert.ok(/^<svg class="mbar"/.test(bar), `a traded level draws a bar (${JSON.stringify(lv)})`);
+    const w = bar.match(/width="(\d+)"/);
+    assert.ok(w, `the bar carries a width (got ${bar})`);
     const pct = Number(w[1]);
     assert.ok(Number.isInteger(pct) && pct >= 1 && pct <= 100, `width in 1..100 (got ${pct})`);
   }
