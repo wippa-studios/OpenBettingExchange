@@ -205,10 +205,22 @@
         // rounds to 0% would say the opposite of what is true — and 0% is the
         // rendering this whole rule exists to avoid. A $1 matched against
         // $1,000,000 available is a hundredth of a percent and still happened.
-        : `<span class="mbar" aria-hidden="true"><span class="mfill" style="width:${Math.min(
+        // THE WIDTH IS AN SVG ATTRIBUTE, NOT AN INLINE STYLE. This bar shipped
+        // with `style="width:N%"` and rendered NOTHING in a browser: the venue
+        // serves `style-src 'self'` with no `'unsafe-inline'`, so every inline
+        // style attribute is blocked. The server-side tests all passed, the
+        // matched column carried the right numbers, and the feature was simply
+        // invisible — the "it works because the arithmetic is right" failure.
+        //
+        // `tests/ui_test.mjs` caught it, with its check for uncaught page errors.
+        // The fix is NOT to weaken the CSP; it is to stop using a mechanism the
+        // CSP forbids. An SVG `width` attribute is geometry, not CSS, so
+        // `style-src` does not govern it.
+        : `<svg class="mbar" viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true"`
+          + `><rect class="mfill" x="0" y="0" height="8" width="${Math.min(
             100,
             Math.max(1, Math.round(share * 100))
-          )}%"></span></span>`,
+          )}"></rect></svg>`,
       // Appended to the cell's accessible label, which leads with the unmatched
       // size because that is what pressing the button acts on.
       labelSuffix: f.matched_cents ? `, ${money(f.matched_cents)} matched` : '',
