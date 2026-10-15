@@ -270,7 +270,7 @@ Deliberately narrow, and asserted by tests rather than assumed:
 
 ## Testing strategy
 
-1028 checks across 73 suites, plus a 220-check browser suite and a live smoke script.
+1036 checks across 73 suites, plus a 220-check browser suite and a live smoke script.
 | Layer | Where | What it proves |
 | --- | --- | --- |
 | Pure maths | `tests/odds.test.js`, `tests/tx.test.js` | ladder, conversions, transaction depth |

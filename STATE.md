@@ -58,7 +58,7 @@ unfalsifiable.)*
 | | |
 |---|---|
 
-| Tests | **1028 checks / 73 suites**, plus a **220-check** Playwright browser suite, also runnable in a seeded random order (**#134**). **Dated snapshot, 2026-10-16** — the preamble above says so, but a reader who lands on this cell does not see the preamble, so it says so here too. These two figures are machine-asserted against `npm test` by `check-docs.mjs`, so they cannot quietly rot; see §1a. |
+| Tests | **1036 checks / 73 suites**, plus a **220-check** Playwright browser suite, also runnable in a seeded random order (**#134**). **Dated snapshot, 2026-10-16** — the preamble above says so, but a reader who lands on this cell does not see the preamble, so it says so here too. These two figures are machine-asserted against `npm test` by `check-docs.mjs`, so they cannot quietly rot; see §1a. |
 | CI | **7 jobs, 8 runs** — the `test` matrix runs on node 22 and 24, so there is one more run than job. *(This cell said "8 jobs" for months. It contradicted its own list — which enumerates seven — and `ci.yml` has seven. The 8 is real, but it is runs.)* |
 | Supply chain | every action pinned to a full commit SHA, dependabot configured |
 | Docs | `check-docs.mjs` **fails the build** when documentation contradicts the code |
