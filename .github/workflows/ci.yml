@@ -241,9 +241,18 @@ jobs:
         # exits 1, prints all three disagreements, and emits an `::error::`
         # annotation for each one, so nothing is hidden behind the green.
         #
-        # Flip it to blocking by deleting the `continue-on-error` line below. That
-        # is the right move the moment #84's decision lands, whichever way it goes.
-        continue-on-error: true
+        # This was advisory only while #84's decision was unmade, and the reason
+        # is worth keeping: a BLOCKING gate on an unmade decision fails every pull
+        # request until it is made, which is the same failure as no gate at all
+        # with more noise. #84 is now decided — `[0.1.0]` and `[0.2.0]` are folded
+        # into `[Unreleased]`, because nothing was ever tagged and the `[0.2.0]`
+        # contents were a snapshot of day 2 rather than of a shipped state.
+        #
+        # So the gate is BLOCKING now, and stays that way: this asserts a fact
+        # about absent objects (a tag, a version bump) that no doc-vs-code check
+        # can reach, which is the same blind spot class as #82's conflict markers
+        # and #84's fabricated releases. The next person to add a dated heading
+        # without cutting a tag fails here rather than shipping the claim.
         run: node scripts/check-release-facts.mjs
 
   # A capacity smoke, not a benchmark: it asserts the system survives concurrent
