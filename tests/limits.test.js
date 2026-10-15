@@ -139,6 +139,66 @@ check('L6 daily cap stops matching but the order still rests', async () => {
   assert.strictEqual(L.marketLiability(db, alice.id, MKT), 5000);
 });
 
+// ── #14: the RESTING side ───────────────────────────────────────────────────
+//
+// L6 above proves the cap stops a capped user TAKING. It says nothing about the
+// other half, and the other half was not enforced: a capped user's order sat in
+// the book and the next arrival matched it. The cap was defeated by resting
+// instead of taking, which is the same player using the same permission.
+//
+// The delay-release pass already consulted matchingAllowed, so two of the three
+// sweeps honoured the cap and the busiest one did not — which is exactly why
+// L6 could stay green for as long as it did.
+check('L6b a capped user at their cap is not matched as a RESTING order either', async () => {
+  const { db, alice, bob, marketId: MKT, selId: SEL } = (await fixture());
+
+  // Alice is AT her cap. Her order goes in first, so she is the resting side the
+  // taker reaches.
+  db.prepare("INSERT INTO settlements (market_id,user_id,credit_cents,commission_cents,pnl_cents) VALUES (?,?,0,0,?)")
+    .run(MKT, alice.id, 5000);
+  L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global', max_daily_settled_cents: 5000 });
+  assert.strictEqual(L.matchingAllowed(db, alice.id, MKT), false, 'fixture must start at the cap');
+
+  const aliceOrder = M.placeOrder(db, alice, { selection_id: SEL, side: 'back', price: 2.0, stake_cents: 2000 }).order;
+
+  // Bob arrives with money and no cap, and sweeps.
+  const r = M.placeOrder(db, bob, { selection_id: SEL, side: 'lay', price: 2.0, stake_cents: 5000 });
+
+  assert.strictEqual(r.fills.length, 0, 'a capped user was matched through the resting side');
+  assert.strictEqual(
+    db.prepare('SELECT matched_cents m, status s FROM orders WHERE id = ?').get(aliceOrder.id).m, 0,
+    "the capped user's resting order took a fill"
+  );
+  assert.strictEqual(
+    db.prepare('SELECT status s FROM orders WHERE id = ?').get(aliceOrder.id).s, 'open',
+    'the capped user\'s order was cancelled rather than left resting — a daily cap expires on its own'
+  );
+  // Bob's stake rests rather than erroring: someone else being capped is not
+  // Bob's error, and refusing his placement would be the cap punishing a
+  // stranger, which is what #13 was.
+  assert.strictEqual(r.order.status, 'open');
+  assert.strictEqual(r.order.matched_cents, 0);
+  assert.strictEqual(db.prepare('SELECT COUNT(*) c FROM matches').get().c, 0, 'a match row was written anyway');
+});
+
+check('L6c the cap lifts, and the order that was held back then matches', async () => {
+  const { db, alice, bob, marketId: MKT, selId: SEL } = (await fixture());
+  db.prepare("INSERT INTO settlements (market_id,user_id,credit_cents,commission_cents,pnl_cents) VALUES (?,?,0,0,?)")
+    .run(MKT, alice.id, 5000);
+  L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global', max_daily_settled_cents: 5000 });
+  const aliceOrder = M.placeOrder(db, alice, { selection_id: SEL, side: 'back', price: 2.0, stake_cents: 2000 }).order;
+  M.placeOrder(db, bob, { selection_id: SEL, side: 'lay', price: 2.0, stake_cents: 5000 });
+  assert.strictEqual(db.prepare('SELECT matched_cents m FROM orders WHERE id = ?').get(aliceOrder.id).m, 0);
+
+  // Raise the cap. The order was left RESTING precisely so this is possible.
+  L.setLimits(db, { actor: alice, userId: alice.id, scope: 'global', max_daily_settled_cents: 9000 });
+  const r = M.placeOrder(db, bob, { selection_id: SEL, side: 'lay', price: 2.0, stake_cents: 5000 });
+
+  assert.strictEqual(db.prepare('SELECT matched_cents m FROM orders WHERE id = ?').get(aliceOrder.id).m, 2000,
+    'the order was destroyed instead of held back — the cap is transient and must not cancel');
+  assert.strictEqual(r.fills.length, 1, 'the later taker took no fill');
+});
+
 // ── #18: NET has to mean net of the FEE as well as the losses ──────────────
 //
 // L7 above claims to prove "net, not gross", but every settlement it inserts
