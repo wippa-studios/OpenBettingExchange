@@ -241,10 +241,10 @@
       </div>
       <div class="row mt">
         <span class="muted">Faucet:</span>
-        <button class="btn sm" data-dep="1000">$10</button>
-        <button class="btn sm" data-dep="5000">$50</button>
-        <button class="btn sm" data-dep="10000">$100</button>
-        <button class="btn sm" data-dep="100000">$1,000</button>
+        <button class="btn sm" data-dep="1000">${OB.fmt(1000)}</button>
+        <button class="btn sm" data-dep="5000">${OB.fmt(5000)}</button>
+        <button class="btn sm" data-dep="10000">${OB.fmt(10000)}</button>
+        <button class="btn sm" data-dep="100000">${OB.fmt(100000)}</button>
       </div>
       <h3>Transactions</h3>
       <div id="wTx"><div class="empty">Loading…</div></div>
