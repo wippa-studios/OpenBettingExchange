@@ -500,7 +500,7 @@ conversation.
 
 Reassessed after Phases 1–4, the follow-on work, and the first outside
 review of the money path. The suite is now **817 checks across 64 suites**,
-plus a live smoke script and a 212-check browser suite, all green.
+plus a live smoke script and a 215-check browser suite, all green.
 
 ### Recently completed
 

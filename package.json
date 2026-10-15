@@ -9,6 +9,7 @@
     "test": "node tests/run_all.js",
     "test:smoke": "./tests/smoke.sh",
     "test:ui": "node tests/ui_test.mjs",
+    "test:ui:shuffle": "node tests/ui_test.mjs --shuffle",
     "shots": "node scripts/shoot.mjs",
     "docs:check": "node scripts/check-docs.mjs",
     "check:secrets": "node scripts/check-no-secrets.mjs",

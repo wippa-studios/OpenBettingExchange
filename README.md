@@ -421,7 +421,8 @@ weight.
 npm test            # 817 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
-npm run test:ui     # 212 checks: real Chromium via Playwright (board and admin desk)
+npm run test:ui     # 215 checks: real Chromium via Playwright (board and admin desk)
+npm run test:ui:shuffle   # the same 215 checks in a seeded random order (#134)
 npm run docs:check  # fail if the documentation contradicts the code
 ```
 
@@ -430,6 +431,14 @@ Tests use in-memory or temporary databases, an ephemeral port and a disabled
 drift loop, so `npm test` needs no credentials and no network. The browser suite
 asserts the ladder's *geometry* as well as its presence; a mis-stacked price
 column looks fine in a screenshot but fails an x/y assertion.
+
+`npm run test:ui:shuffle` runs the same browser checks in a **seeded random
+order** and prints the seed. It exists because the suite used to be one long
+script: scenarios settled markets that later scenarios were written to find still
+open, so the gate's result depended on *when* it ran — #134 measured three
+clean-`main` runs as pass / fail / pass. Every scenario now builds its own
+fixture and tears it down, and the shuffle is what keeps that honest. Replay a
+failing order exactly with `npm run test:ui -- --shuffle=<seed>`.
 
 **Before trusting a test, confirm it can fail.** Deliberately invert the
 behaviour it covers and check it goes red. This repository has repeatedly shipped

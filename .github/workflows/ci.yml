@@ -82,6 +82,16 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Browser suite
         run: npm run test:ui
+      # The same checks again, in a seeded random order. #134: the suite used to
+      # be one long script whose scenarios settled markets that later scenarios
+      # were written to find still open, so the gate passed or failed on WHEN it
+      # ran — three clean-`main` runs gave pass / fail / pass. Every scenario now
+      # builds its own fixture and tears it down; this job is what holds that
+      # claim to account. A single fixed-order run cannot catch a regression that
+      # re-introduces the dependency, because the dependency is invisible in the
+      # order the suite happens to be written in.
+      - name: Browser suite, shuffled order
+        run: npm run test:ui:shuffle
 
   # Guardrails that do not need a full test run. Cheap, and they catch the
   # class of change that quietly breaks the project's central promise.

@@ -35,11 +35,20 @@ Sign in as `demo` / `demo123`, or `admin` / `admin123` for the trading desk.
 npm test            # 817 checks: unit + API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
-npm run test:ui     # 212 checks: real Chromium via Playwright (frontend changes)
+npm run test:ui     # 215 checks: real Chromium via Playwright (frontend changes)
+npm run test:ui:shuffle   # the same 215 checks in a seeded random order
 ```
 
-All three run offline: temporary or in-memory databases, an ephemeral port, and
+All of them run offline: temporary or in-memory databases, an ephemeral port, and
 the drift loop disabled. Nothing needs credentials or a network.
+
+`npm run test:ui:shuffle` runs the browser checks in a seeded random order and
+prints the seed. Every scenario builds its own fixture and cleans up after
+itself, so the result must not depend on what ran before it — the shuffle is how
+that is checked rather than asserted. A browser scenario that needs a market to
+settle creates one through the operator's own create route and deletes it when it
+finishes; it must never settle "whatever is still open". Replay a failing run
+with `npm run test:ui -- --shuffle=<seed>`.
 
 ## House conventions
 
