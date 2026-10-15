@@ -58,7 +58,7 @@ unfalsifiable.)*
 | | |
 |---|---|
 
-| Tests | **868 checks / 67 suites**, plus a **212-check** Playwright browser suite. **Dated snapshot, 2026-10-16** — the preamble above says so, but a reader who lands on this cell does not see the preamble, so it says so here too. These two figures are machine-asserted against `npm test` by `check-docs.mjs`, so they cannot quietly rot; see §1a. |
+| Tests | **868 checks / 67 suites**, plus a **215-check** Playwright browser suite, also runnable in a seeded random order (**#134**). **Dated snapshot, 2026-10-16** — the preamble above says so, but a reader who lands on this cell does not see the preamble, so it says so here too. These two figures are machine-asserted against `npm test` by `check-docs.mjs`, so they cannot quietly rot; see §1a. |
 | CI | **7 jobs, 8 runs** — the `test` matrix runs on node 22 and 24, so there is one more run than job. *(This cell said "8 jobs" for months. It contradicted its own list — which enumerates seven — and `ci.yml` has seven. The 8 is real, but it is runs.)* |
 | Supply chain | every action pinned to a full commit SHA, dependabot configured |
 | Docs | `check-docs.mjs` **fails the build** when documentation contradicts the code |
@@ -221,7 +221,6 @@ first two days, with no tags and no version bump behind them. `[0.2.0]` describe
 
 "a real-browser Playwright suite (24 checks)" — that was true on day 2, when the
 repository had **8 commits**. It is 212 browser checks and 67 suites now.
-
 For an open-source project this is worse than an absent changelog, because it
 answers "is this maintained?" wrongly. A reader concludes there is a release
 history; there is none. `[0.2.0]` also contains **two separate `### Fixed`
@@ -271,15 +270,49 @@ desk-filled.
 The agent found it by checking. It was the second time this pass that an
 instruction I wrote about the repo's state turned out to be wrong.
 
-### 2.4 Known defect: the browser suite is order-dependent
+### 2.4 Known defect: the browser suite is order-dependent — FIXED at `fix/browserorder`
 
-**Characterised, not fixed.** Three clean-`main` runs gave pass / fail / pass.
-Cause: scenarios in `ui_test.mjs` settle markets, and a later scenario needs a
-leftover. A gate that passes or fails on execution order is not a gate.
+Three clean-`main` runs gave pass / fail / pass. Cause: scenarios in
+`ui_test.mjs` settled markets, and a later scenario was written to find a market
+still open — it read whatever `[data-settle]` control the desk happened to show,
+which after #51 and #52 had run was a market those two had already settled. A
+gate that passes or fails on execution order is not a gate.
 
-A related assertion was also found to be vacuous — it waited for a row state
-that was already true *before* the action under test, so a no-op would have
-passed. Fixed in the frontend branch.
+Fixed. `tests/ui_test.mjs` is now a list of registered scenarios rather than one
+long script, and every scenario:
+
+- **builds its own fixture** — a market it creates through `POST
+  /api/admin/markets` (the desk lists markets newest-first, so its own is the row
+  its controls live on) — and **deletes it in a `finally`**;
+- **owns its account**: four throwaway accounts instead of one shared
+  `uitester`, because the password-change scenario changed the password the
+  registration scenario asserted, and the audit row the desk scenario read was a
+  property of the run order;
+- **states its preconditions** — `signIn()`, `atMarkets()`, `atAdmin(view)` —
+  instead of inheriting whichever page and session the previous one left;
+- **restores what it changed** — tenant brand, viewport, bot day-start balance,
+  mocked routes and open overlays all go back in a `finally`.
+
+One teardown is deliberately partial, and the reason is the money path: the
+fixture deletes catalogue rows but leaves `orders`, `settlements`, `transactions`
+and `entries` alone. The ledger is append-only by design, and `orders.frozen_cents`
+is escrow a live order still holds — deleting either without the reversing legs
+desynchronises `users.balance_cents` from the accounts, which the suite's own
+`ledger shows no cache divergence` check (and `/api/admin/readiness` behind it)
+is right to fail on.
+
+**Run-order shuffling is a supported mode, not a comment.** `npm run
+test:ui:shuffle` runs the same 215 checks in a seeded random order and prints the
+seed; `--shuffle=<n>` replays one exactly. Without a shuffle, "each scenario
+builds its own fixture" is a claim; with one it is falsifiable, and a shuffle you
+cannot replay is a flake you cannot diagnose.
+
+A related assertion was also found to be vacuous — it waited for a row state that
+was already true *before* the action under test, so a no-op would have passed.
+**That one was already fixed on `main`** by `82528f5` (the #68 batch), which
+replaced the `dataset.status === 'open'` wait with the post-condition "the row
+offers Suspend again". Verified present in this worktree; the comment recording
+the old shape is at `tests/ui_test.mjs`.
 
 ### 2.5 Blocked on a person, not on engineering
 

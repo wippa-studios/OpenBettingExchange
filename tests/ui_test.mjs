@@ -1,16 +1,47 @@
 // ui_test.mjs — REAL-BROWSER verification of the exchange UI.
 // Run: npm run test:ui
+// Run in a shuffled order: npm run test:ui -- --shuffle      (prints the seed)
+//                           npm run test:ui -- --shuffle=1234 (replay a seed)
 //
 // Boots the server on a temp DB (bots on, drift off), drives the page in
 // Chromium, and fails on ANY uncaught page error — the class of bug that
 // `node --check` cannot see (wrong element id, runtime TypeError, a render
 // path that never fires).
+//
+// #134 — WHY THIS FILE IS A LIST OF SCENARIOS AND NOT A SCRIPT.
+//
+// It used to be one long script, and a script has an order whether it admits it
+// or not. The scenarios below settle markets, and a later one was written to
+// find a market still open: it read whatever `[data-settle]` control the desk
+// happened to show, which after #51 and #52 had run was a market those two had
+// already settled. So the gate's result depended on WHEN it ran — #134 measured
+// three clean-`main` runs as pass / fail / pass, which is the definition of a
+// gate that cannot be trusted.
+//
+// The dependency is invisible in file order, which is why it survived: reading
+// the scenarios top to bottom, the ones that settle come last, so a reader
+// checks that each has a fixture and never asks where the fixture came from.
+// `--shuffle` is what makes it visible again.
+//
+// Two rules replace the accident of order:
+//
+//   1. Every scenario builds what it needs and tears it down again. Nothing
+//      reads a page state, a market or an account a predecessor left behind.
+//      `withMarket()` is the fixture: a market this scenario created through
+//      the operator's own create route, deleted when the scenario ends.
+//   2. `--shuffle` runs the scenarios in a seeded random order and PRINTS THE
+//      SEED. Rule 1 is a claim; the shuffle is what makes it falsifiable, and a
+//      shuffle you cannot replay is a flake you cannot diagnose.
 import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+
+// The window size every geometry assertion in this file is written against.
+// Declared before the browser exists, because the browser is created with it.
+const VIEWPORT = { width: 1400, height: 900 };
 
 // ── port discovery (S11) ────────────────────────────────────────────────────
 // lib/config.js enforces PORT ∈ [1, 65535], so the server itself cannot bind
@@ -43,17 +74,54 @@ const check = (name, ok, extra = '') => {
   }
 };
 
-// An async SCENARIO: its body runs (the old code passed async fns to check(),
-// which only coerced them truthy — the admin section never executed and its
-// checks passed vacuously). Inner assertions still call check() themselves;
-// a thrown error fails the scenario instead of aborting the whole run.
-const scenario = async (name, fn) => {
-  try {
-    await fn();
-  } catch (e) {
-    console.log('  FAIL', name, '—', (e && e.message) || e);
-    process.exitCode = 1;
+// ── the scenario registry ───────────────────────────────────────────────────
+//
+// Registering and running are separate steps on purpose: the registration pass
+// below walks the file top to bottom and only RECORDS what each scenario is,
+// then the runner at the end executes them — in file order by default, or in a
+// shuffled order when asked. That separation is what makes --shuffle possible at
+// all; a suite that runs its scenarios as it parses them cannot reorder them.
+const scenarios = [];
+const scenario = (name, fn) => {
+  scenarios.push({ name, fn });
+};
+
+// ── seeded shuffle ──────────────────────────────────────────────────────────
+//
+// mulberry32 rather than Math.random(): a shuffle that cannot be replayed is a
+// flake that cannot be diagnosed, and the acceptance bar for #134 is "passes
+// three times in a row", which is only a meaningful claim if a failing run can
+// be re-run in exactly the order that produced it. The seed is printed at the
+// top of the run for that reason.
+const mulberry32 = (seed) => () => {
+  let s = (seed + 0x6d2b79f5) | 0;
+  let t = Math.imul(s ^ (s >>> 15), 1 | s);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+
+const argv = process.argv.slice(2);
+const shuffleFlag = argv.find((a) => a === '--shuffle' || a.startsWith('--shuffle='));
+const SHUFFLE =
+  !!shuffleFlag ||
+  /^(1|true|yes|on)$/i.test(String(process.env.UI_TEST_SHUFFLE || '').trim());
+// `--shuffle=<n>` wins over the env var, and a bare `--shuffle` draws a fresh
+// seed. Anything unparseable as an integer is treated as "draw one" rather than
+// silently shuffling by seed 0 — a typo must not quietly become a fixed order.
+const seedArg =
+  (shuffleFlag && shuffleFlag.includes('=') ? shuffleFlag.split('=')[1] : '') ||
+  String(process.env.UI_TEST_SEED || process.env.UI_TEST_SHUFFLE_SEED || '');
+const SHUFFLE_SEED = /^\d+$/.test(seedArg) ? Number(seedArg) : 1 + Math.floor(Math.random() * 2147483646);
+
+const plannedOrder = () => {
+  if (!SHUFFLE) return scenarios;
+  const rnd = mulberry32(SHUFFLE_SEED);
+  const out = [...scenarios];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
   }
+  return out;
 };
 
 const server = spawn(process.execPath, ['--no-warnings', 'server.js'], {
@@ -64,6 +132,14 @@ const server = spawn(process.execPath, ['--no-warnings', 'server.js'], {
   // demo-password account unable to reach anything except the panel that
   // changes it — correct behaviour, and it would otherwise block every flow
   // here on the first login.
+  //
+  // The rate-limit budgets are raised for the same reason and with the same
+  // caveat: now that each scenario signs in and out for itself (#134), one run
+  // spends a few dozen `auth` requests from a single address, and the 60/min
+  // production default would start refusing logins for reasons that have
+  // nothing to do with what is under test. Nothing in THIS file asserts on a
+  // 429 — tests/ratelimit-coverage.test.js owns that, with its own budgets — so
+  // raising them here removes a flake without removing a check.
   env: {
     ...process.env,
     DB_PATH: path.join(TMP, 'ui.db'),
@@ -71,6 +147,11 @@ const server = spawn(process.execPath, ['--no-warnings', 'server.js'], {
     DRIFT_ENABLED: 'false',
     ADMIN_PASSWORD: 'ui-admin-password',
     DEMO_PASSWORD: 'ui-demo-password',
+    RATE_LIMIT_AUTH: '600',
+    RATE_LIMIT_ADMIN: '2000',
+    RATE_LIMIT_READ: '4000',
+    RATE_LIMIT_TRADE: '2000',
+    RATE_LIMIT_CASHOUT: '400',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -94,7 +175,18 @@ for (let i = 0; i < 60; i++) {
 }
 
 const browser = await chromium.launch();
-const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+const page = await browser.newPage({ viewport: VIEWPORT });
+
+// The venue is loaded ONCE, here, before any scenario runs.
+//
+// It used to be loaded inside whichever scenario happened to be written first,
+// which is only the same thing while the file order is the run order. Under a
+// shuffle the first scenario to execute could be one that never navigates, and
+// every relative URL in the page ("/api/…") then resolves against about:blank
+// — which is not a failure of the scenario that ran, it is a failure of every
+// scenario after it. The board scenario below still does its own goto, because
+// "the shell renders from a cold load" is one of the things it asserts.
+await page.goto(BASE, { waitUntil: 'domcontentloaded' });
 
 // Any uncaught exception in the page is a failure, whatever else passes.
 // The app probes /api/me on load to detect an existing session; while signed
@@ -128,9 +220,295 @@ page.on('console', (msg) => {
   pageErrors.push(text);
 });
 
+
+// ── precondition helpers (#134) ─────────────────────────────────────────────
+//
+// Every scenario below starts by saying what it needs: this account, this page,
+// this admin tab, this market. Before #134 they did not — each one opened
+// wherever the previous one happened to leave the browser, which is precisely
+// what made the suite order-dependent. The helpers are small on purpose; the
+// value is that "which view is on screen" stops being inherited state.
+const waitForAuthLabel = (want) =>
+  page.waitForFunction((w) => document.getElementById('authBtn').textContent.trim() === w, want, { timeout: 20000 });
+
+const signOut = async () => {
+  if (((await page.locator('#authBtn').textContent()) || '').trim() !== 'Sign out') return;
+  signedIn = false; // before the click, so the logout's own /api/me 401 is expected
+  await page.click('#authBtn');
+  await waitForAuthLabel('Sign in');
+};
+
+const signIn = async (user, pass) => {
+  await signOut();
+  await page.click('#authBtn');
+  await page.waitForSelector('#authModal.show', { timeout: 10000 });
+  await page.fill('#authUser', user);
+  await page.fill('#authPass', pass);
+  await page.click('#authGo');
+  await page.waitForSelector('#balance:not([hidden])', { timeout: 20000 });
+  signedIn = true;
+};
+
+// Register a throwaway account and leave the browser signed in as it. Written
+// through the real /api/auth/register route rather than a direct database row,
+// so the account is one the product itself would have created — a hand-inserted
+// user would not have the account row the audit trail and the limits screen
+// both read.
+const registerAccount = (username, email) =>
+  page.evaluate(
+    async ([u, e]) => {
+      const r = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: u, email: e, password: 'secret1' }),
+      });
+      if (!r.ok) throw new Error(`register ${u} answered ${r.status}: ${(await r.text()).slice(0, 120)}`);
+    },
+    [username, email]
+  ).then(async () => {
+    await signIn(username, 'secret1');
+  });
+
+// `OB.goTo` is the app's own navigation helper, which re-renders when the hash
+// is already the one asked for — clicking a nav button that is already active
+// fires no hashchange and would leave the scenario where it found the page.
+//
+// Every wait here names what it was waiting for AND what the page actually
+// showed when it gave up. "Timeout 25000ms exceeded" against a selector is a
+// symptom; on an order-dependent suite the symptom is rarely the point, and the
+// reader has to be able to see which state the scenario inherited.
+const waitOrExplain = async (selector, what, timeout = 25000) => {
+  try {
+    await page.waitForSelector(selector, { timeout });
+  } catch (e) {
+    const seen = await page
+      .evaluate(() => ({
+        page: window.OB && window.OB.state ? window.OB.state.page : null,
+        user: window.OB && window.OB.state && window.OB.state.user ? window.OB.state.user.username : null,
+        sport: window.OB && window.OB.state ? window.OB.state.sport : null,
+        overlays: [...document.querySelectorAll('.show')].map((n) => n.id || n.className),
+        text: ((document.querySelector('#page') || {}).textContent || '').replace(/\s+/g, ' ').trim().slice(0, 140),
+      }))
+      .catch(() => null);
+    throw new Error(`${what}: ${selector} never appeared — ${JSON.stringify(seen)}`);
+  }
+};
+
+const atMarkets = async () => {
+  // The refresh is part of the precondition, not an optimisation. `renderPage()`
+  // renders the board from `OB.state.events` and does NOT re-fetch, and the 15s
+  // poll is switched off whenever the SSE stream is live — which it is for every
+  // signed-in scenario here. So once any load of /api/events has failed, every
+  // later `goTo('markets')` re-renders the SAME fault card, and a scenario that
+  // navigates to the board as its first act inherits a failure it did not cause.
+  // (Reported to the frontend owners: in the product the only recovery from a
+  // failed board load is the Retry button, because the poll never retries one.)
+  await page.evaluate(async () => {
+    window.OB.goTo('markets');
+    await window.OB.refreshMarkets();
+  });
+  await waitOrExplain('#page .ladder .lcell[data-bet]', 'the ladder never rendered');
+};
+const atBets = async () => {
+  await page.evaluate(() => window.OB.goTo('bets'));
+  await waitOrExplain('#page #betsBody', 'My Bets never rendered');
+};
+const atWallet = async () => {
+  await page.evaluate(() => window.OB.goTo('wallet'));
+  await waitOrExplain('#page #wBal', 'the Wallet never rendered');
+};
+const ADMIN_READY =
+  '#adminBody .adm-tbl tbody tr, #adminBody .statgrid, #adminBody table, #adminBody .empty, #adminBody .meter, #adminBody .card';
+const atAdmin = async (view) => {
+  await page.evaluate(() => window.OB.goTo('admin'));
+  await waitOrExplain('[data-view="markets"]', 'the operator desk never opened');
+  if (!view) return;
+  await page.click(`[data-view="${view}"]`);
+  await waitOrExplain(ADMIN_READY, `the ${view} view never rendered`);
+};
+const onBoardCell = () => waitOrExplain('#page .ladder button.lcell[data-bet]', 'a price cell never appeared');
+
+// ── fixture markets (#134) ──────────────────────────────────────────────────
+//
+// A scenario that holds, suspends or settles a market now creates its OWN
+// through the operator's own create route, and deletes it when it finishes.
+// The alternative — settling whatever open market the desk happened to be
+// showing — is what made the suite order-dependent: after #51 and #52 had run,
+// there was nothing left for the next scenario to settle.
+//
+// Created rather than borrowed for a second reason too. The desk lists markets
+// newest-first, so a market this scenario made is the row its controls live on
+// — the scenario never has to search for "an open one" and cannot pick up
+// another scenario's in-flight state by accident.
+const FIXTURE_EVENT = 'UI Test Fixture Event';
+
+const createFixtureMarket = (label, runners = 3) =>
+  page.evaluate(
+    async ([eventName, marketName, n]) => {
+      const post = async (url, body) => {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) throw new Error(`${url} answered ${r.status}: ${(await r.text()).slice(0, 120)}`);
+        return r.json();
+      };
+      const sports = await (await fetch('/api/sports')).json();
+      const list = sports.sports || [];
+      if (!list.length) throw new Error('the catalogue has no sport to hang a fixture event on');
+      // Far future: an event whose start has passed is a different market to
+      // the board, and a fixture must not depend on the clock.
+      const { event } = await post('/api/admin/events', {
+        sport_id: list[0].id,
+        name: eventName,
+        starts_at: '2030-01-01 00:00:00',
+      });
+      const { market } = await post('/api/admin/markets', { event_id: event.id, name: marketName });
+      const selectionIds = [];
+      for (let i = 0; i < n; i++) {
+        const { selection } = await post('/api/admin/selections', {
+          market_id: market.id,
+          name: `${marketName} Runner ${i + 1}`,
+          fair_price: 2 + i * 0.5,
+        });
+        selectionIds.push(selection.id);
+      }
+      return { marketId: market.id, eventId: event.id, selectionIds };
+    },
+    [FIXTURE_EVENT, `UI Test ${label}`, runners]
+  );
+
+let sqlite = null;
+// The server writes to this database continuously (the bots requote every few
+// seconds), and node:sqlite fails immediately on contention by default. Without
+// a busy timeout, writing the same row the suite writes before a check can lose
+// that race and throw "database is locked" — a failure in the FIXTURE code that
+// reads like a failure in the product.
+const openDb = async () => {
+  if (!sqlite) ({ DatabaseSync: sqlite } = await import('node:sqlite'));
+  const db = new sqlite(path.join(TMP, 'ui.db'));
+  db.exec('PRAGMA busy_timeout = 10000');
+  return db;
+};
+
+const dropFixtureMarket = async (fx) => {
+  if (!fx) return;
+  const db = await openDb();
+  // Foreign keys are off for THIS connection only, so a table the fixture never
+  // touched cannot turn a teardown into an error halfway through and leave a
+  // half-deleted fixture behind.
+  db.exec('PRAGMA foreign_keys = OFF');
+  const byMarket = (sql) => db.exec(sql.replace('{m}', String(fx.marketId)));
+  // WHAT IS DELETED, and what deliberately is not.
+  //
+  // Catalogue rows only: the event, the market, its selections and the things
+  // that merely POINT at them. That is enough to put the board and the desk
+  // back exactly as they were for whichever scenario runs next.
+  //
+  // `orders`, `matches`, `settlements`, `transactions` and `entries` stay. The
+  // ledger is append-only by design — "corrections are reversing postings, which
+  // is why there is no updated_at" — and `orders.frozen_cents` is escrow a live
+  // order is still holding. Deleting an order or a posting without the reversing
+  // legs the product would write desynchronises users.balance_cents from the
+  // accounts, and this suite's OWN `ledger shows no cache divergence` check
+  // (and /api/admin/readiness behind it) is right to fail when that happens. A
+  // test fixture must not rewrite the money history to tidy up after itself;
+  // the database is a temp directory that is deleted when the run ends.
+  byMarket('DELETE FROM cashout_quotes WHERE market_id = {m}');
+  byMarket('DELETE FROM result_events WHERE market_id = {m}');
+  byMarket('DELETE FROM price_history WHERE selection_id IN (SELECT id FROM selections WHERE market_id = {m})');
+  byMarket('DELETE FROM user_rules WHERE selection_id IN (SELECT id FROM selections WHERE market_id = {m})');
+  byMarket('DELETE FROM selections WHERE market_id = {m}');
+  byMarket('DELETE FROM markets WHERE id = {m}');
+  db.exec(`DELETE FROM events WHERE id = ${Number(fx.eventId)}`);
+  db.close();
+  // The deleted market may still be painted on whatever board the browser is
+  // showing, and a stale card's price cells are clickable buttons pointing at a
+  // market that no longer exists. Repaint before the next scenario reads the
+  // page rather than trusting the 15s poll to get there first.
+  await page.evaluate(() => (window.OB ? window.OB.refreshAll() : null)).catch(() => {});
+};
+
+// withMarket: the fixture, with the teardown attached to the scenario. A
+// scenario that builds a market and forgets to drop it is the exact defect
+// #134 is about, one level down, so the pairing is not left to the caller.
+const withMarket = async (label, body, runners = 3) => {
+  const fx = await createFixtureMarket(label, runners);
+  try {
+    return await body(fx);
+  } finally {
+    await dropFixtureMarket(fx);
+  }
+};
+
+// ── between-scenario reset ──────────────────────────────────────────────────
+//
+// A safety net, not the mechanism: each scenario undoes its own changes (see
+// the try/finally blocks below), and this catches the ones that die before
+// their cleanup runs. Without it a scenario that aborts mid-way leaves a mocked
+// route, a 700px viewport or a one-sport board filter installed, and every
+// scenario after it fails for a reason that has nothing to do with itself —
+// which is how a real defect gets reported as a mystery.
+const resetBetweenScenarios = async () => {
+  await page.setViewportSize(VIEWPORT).catch(() => {});
+  await page.unroute('**/api/positions').catch(() => {});
+  await page.unroute('**/api/events*').catch(() => {});
+  await page.emulateMedia({ colorScheme: 'light' }).catch(() => {});
+  // An overlay left open is the loudest way one scenario can break the next
+  // twenty: #accountModal covers the viewport, so every later click lands on it
+  // and reports "Timeout 30000ms exceeded" against a button that was never the
+  // problem. Escape closes the TOP overlay, so it may need pressing more than
+  // once — the same rule the app's own overlay stack uses. The selector names
+  // the overlays, not `.show`: the toast carries that class too and pressing
+  // Escape at a toast is three wasted round trips per scenario.
+  const openOverlays = '#authModal.show, #accountModal.show, .modal[role="dialog"]';
+  for (let i = 0; i < 3; i++) {
+    if (!(await page.locator(openOverlays).count())) break;
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(150);
+  }
+  await page
+    .evaluate(() => {
+      try {
+        localStorage.removeItem('obx.theme');
+      } catch {}
+      if (!window.OB || !window.OB.state) return;
+      // `betsTab` is app state that outlives navigation: a scenario that clicks
+      // Positions leaves every later scenario looking at Positions, even
+      // though "Open orders" is what the app ships as the default. Scenarios
+      // that need a specific tab select it themselves; this only keeps the
+      // next scenario from inheriting one it never asked for.
+      window.OB.state.betsTab = 'open';
+      if (window.OB.state.sport !== null) {
+        window.OB.state.sport = null;
+        return window.OB.refreshAll();
+      }
+    })
+    .catch(() => {});
+};
+
+if (SHUFFLE) {
+  console.log(
+    `ui_test.mjs: run order SHUFFLED — seed ${SHUFFLE_SEED}. ` +
+      `Replay this exact order with: npm run test:ui -- --shuffle=${SHUFFLE_SEED}`
+  );
+}
+
 try {
   // ── board renders with bot liquidity ──────────────────────────────────
+  //
+  // The FIRST scenario has to do what the browser did on the very first load,
+  // because a shuffled run may not be the first one any more: navigate to the
+  // venue from scratch rather than inheriting whatever the previous scenario
+  // painted. Every later scenario calls atMarkets() instead.
+  scenario('the board renders with bot liquidity', async () => {
   await page.goto(BASE, { waitUntil: 'domcontentloaded' });
+  // The one scenario that asserts what a SIGNED-OUT visitor sees has to put
+  // itself in that state: in a shuffled run the session cookie may be an
+  // operator's by the time this gets here (#134).
+  await signOut();
+  await atMarkets();
   await page.waitForSelector('.ladder .lcell[data-bet]', { timeout: 15000 });
   const cells = await page.locator('.ladder .lcell[data-bet]').count();
   check('ladder renders price cells', cells >= 6, `(${cells} cells)`);
@@ -252,8 +630,12 @@ try {
   await page.waitForTimeout(600);
 
   check('signed-out user sees the sign-in button', (await page.locator('#authBtn').textContent()) === 'Sign in');
+  });
 
   // ── seeded search: results appear, a click navigates (CRITICAL 3) ─────
+  scenario('the global search finds a seeded runner, and the pick navigates', async () => {
+  await signOut();
+  await atMarkets();
   await page.fill('#globalSearch', 'Arsenal');
   await page.waitForSelector('#searchResults .srow', { timeout: 5000 });
   const srows = await page.locator('#searchResults .srow').count();
@@ -264,8 +646,16 @@ try {
   await page.waitForSelector('.ladder', { timeout: 5000 });
   check('search click re-renders the board without errors', true);
   check('search input is cleared after the pick', (await page.locator('#globalSearch').inputValue()) === '');
+  });
 
   // ── clicking a price without a session opens the auth modal ──────────
+  //
+  // One scenario, because the three checks are one story: the modal opens, the
+  // topmost-overlay Escape closes it, and the keyboard alone can reach the same
+  // cell. Split them and the second has to invent its own starting state.
+  scenario('a price cell signed out opens sign-in, and Escape closes it', async () => {
+  await signOut();
+  await atMarkets();
   await page.locator('.ladder button.lcell[data-bet]').first().click();
   await page.waitForSelector('#authModal.show', { timeout: 5000 });
   check('clicking a price unauthenticated opens sign-in', true);
@@ -286,20 +676,29 @@ try {
   await page.keyboard.press('Enter');
   await page.waitForSelector('#authModal.show', { timeout: 5000 });
   check('a focused ladder cell responds to Enter (keyboard bet path)', true);
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(
+    () => !document.getElementById('authModal').classList.contains('show'),
+    null,
+    { timeout: 3000 }
+  );
+  });
 
   // ── sign in as the seeded demo user ──────────────────────────────────
-  await page.fill('#authUser', 'demo');
-  await page.fill('#authPass', 'ui-demo-password');
-  await page.click('#authGo');
+  scenario('signing in as the seeded demo user replaces the button with sign out', async () => {
+  await signIn('demo', 'ui-demo-password');
   // Wait for the real success signal (balance chip), then assert the modal closed.
   await page.waitForSelector('#balance:not([hidden])', { timeout: 10000 });
   check('auth modal closes after sign-in', (await page.locator('#authModal').getAttribute('class')) !== 'show');
   const balance = (await page.locator('#balance').textContent()) || '';
-  signedIn = true;
   check('balance chip shows after sign-in', /\$\d/.test(balance), `(${balance.trim()})`);
   check('sign-in button becomes sign out', (await page.locator('#authBtn').textContent()) === 'Sign out');
+  });
 
   // ── place a bet through the slip ─────────────────────────────────────
+  scenario('a bet placed through the slip reaches the book', async () => {
+  await signIn('demo', 'ui-demo-password');
+  await atMarkets();
   const target = page.locator('.ladder .lcell[data-bet]').first();
   const clickedPrice = (await target.getAttribute('data-price')) || '';
   const clickedSide = (await target.getAttribute('data-side')) || '';
@@ -347,33 +746,40 @@ try {
   check('placing a bet reports matched or resting', /Matched|Resting/.test(toast), `("${toast.trim()}")`);
   await page.waitForFunction(() => document.getElementById('slip').hidden, null, { timeout: 5000 });
   check('slip clears after placing', true);
+  });
 
   // ── my bets shows the order or a position ────────────────────────────
-  await page.click('#nav button[data-page="bets"]');
-  await page.waitForSelector('#betsBody', { timeout: 5000 });
+  scenario('My Bets renders both tabs for a signed-in customer', async () => {
+  await signIn('demo', 'ui-demo-password');
+  await atBets();
   await page.click('[data-tab="positions"]');
-  await page.waitForSelector('#betsBody .poscard, #betsBody .empty', { timeout: 5000 });
+  await page.waitForSelector('#betsBody .poscard, #betsBody .empty', { timeout: 10000 });
   const posHtml = (await page.locator('#betsBody').innerHTML()) || '';
   check('positions tab renders without error', posHtml.length > 0);
   await page.click('[data-tab="open"]');
-  await page.waitForSelector('#betsBody table, #betsBody .empty', { timeout: 5000 });
+  await page.waitForSelector('#betsBody table, #betsBody .empty', { timeout: 10000 });
   const openHtml = (await page.locator('#betsBody').innerHTML()) || '';
   check('open orders tab renders without error', openHtml.length > 0);
+  });
 
   // ── wallet shows the ledger ──────────────────────────────────────────
-  await page.click('#nav button[data-page="wallet"]');
-  await page.waitForSelector('#wBal', { timeout: 5000 });
+  scenario('the wallet renders a balance and its ledger', async () => {
+  await signIn('demo', 'ui-demo-password');
+  await atWallet();
   const bal = (await page.locator('#wBal').textContent()) || '';
   check('wallet renders a balance', /\$\d/.test(bal), `(${bal})`);
   await page.waitForFunction(() => document.querySelector('#wTx table, #wTx .empty'), null, { timeout: 10000 });
   check('wallet renders transactions or an empty state', true);
+  });
 
   // ── admin desk is hidden for a normal user ───────────────────────────
+  scenario('the admin tab is hidden for a customer', async () => {
+  await signIn('demo', 'ui-demo-password');
+  await atMarkets();
   check('admin tab hidden for a customer', await page.locator('#navAdmin').isHidden());
-  await page.click('#nav button[data-page="markets"]');
-  await page.waitForSelector('.ladder button.lcell[data-bet]', { timeout: 5000 });
   await page.screenshot({ path: SHOT, fullPage: false });
   console.log('  info screenshot:', SHOT);
+  });
 
   // ── #50: cash-out must not change which view is on screen ──────────────
   //
@@ -468,35 +874,103 @@ try {
       return window.__obViews;
     });
 
-  // The fixture is shared by the two checks below and is built ONCE: it is the
-  // expensive part (real matched bets), and each check is its own scenario so
-  // that neither can hide behind the other's failure. With the bug present the
-  // first scenario leaves the Open orders tab on screen, and a single combined
-  // scenario would then abort on a missing button — reporting (b) and never
-  // running (a) at all.
-  let cashoutFixture = [];
-  await scenario('#50 cash-out: the multi-position fallback moves the operator', async () => {
-    // ── fixture: TWO cash-out-eligible positions ──────────────────────────
+  // THE FIXTURE, and the #134 change to it. These two scenarios used to share
+  // one: the first built the eligible positions and stashed them in
+  // `cashoutFixture`, and the second read the stash. That is the same defect
+  // class as the settled markets, one level up — the second scenario could only
+  // run after the first, so the order of the suite decided whether it had a
+  // fixture at all. Each now builds what IT needs.
+  //
+  // ensureEligible tops the account up to `n` cash-out-eligible positions and
+  // tops the WALLET up too, because these scenarios are the only thing in the
+  // suite that spends real stake and three of them each start from whatever the
+  // others left. Reading "how many are there" from the server rather than
+  // tracking them locally is what lets it be idempotent.
+  const ensureEligible = async (n) => {
+    let eligible = await cashoutEligible();
     const mktIds = await page.evaluate(() => [
       ...new Set([...document.querySelectorAll('.lcell[data-bet]')].map((c) => c.dataset.mkt)),
     ]);
-    let eligible = await cashoutEligible();
     for (const id of mktIds.slice(0, 8)) {
-      if (eligible.length >= 2) break;
+      if (eligible.length >= n) break;
+      const funds = await page.evaluate(() =>
+        fetch('/api/me').then((r) => r.json()).then((m) => Number(m.balance_cents || 0))
+      );
+      if (funds < 10000) {
+        // The same play-money faucet the Wallet's $10 button calls. Without it
+        // the third scenario to run in a shuffled order can be left with an
+        // empty wallet and fail for a reason that is not what it is testing.
+        await page.evaluate(() =>
+          fetch('/api/wallet/deposit', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ amount_cents: 100000 }),
+          })
+        );
+      }
       await placeBack(id, 50);
       eligible = await cashoutEligible();
     }
-    cashoutFixture = eligible;
+    return { eligible, quoted: mktIds.length };
+  };
+
+  // Leave EXACTLY one eligible position: top up until there are two or more,
+  // then cash out all but the last. Both the "single outcome" and the
+  // "cash out from another page" scenarios need exactly one, and asserting
+  // "exactly one" on an account a previous scenario topped up would be the
+  // order-dependence again.
+  const leaveExactlyOneEligible = async () => {
+    // Top the account up FIRST: placing a bet needs the board on screen, and
+    // reducing the list needs My Bets. Doing it the other way round silently
+    // placed nothing — `placeBack` finds no ladder cells off the board, returns
+    // false, and the scenario carried on to assert "exactly one" over nothing.
+    await atMarkets();
+    const top = await ensureEligible(2);
+    let eligible = top.eligible;
+    await atBets();
+    await page.click('#page [data-tab="positions"]');
+    await page.waitForSelector('#page #betsBody .poscard, #page #betsBody .empty', { timeout: 15000 });
+    // The rendered cards are re-read on every pass, because the list the server
+    // reports and the list on screen are two loads of the same thing and the
+    // top-up above wrote a third. Cash out of the DOM, not out of `eligible`.
+    for (let guard = 0; guard < 8; guard++) {
+      eligible = await cashoutEligible();
+      if (eligible.length <= 1) break;
+      const id = eligible[0];
+      const btn = page.locator(`#betsBody [data-cashout="${id}"]`);
+      if ((await btn.count()) === 0) break;
+      await btn.click();
+      await page.waitForFunction(
+        (m) => !document.querySelector(`#betsBody [data-cashout="${m}"]`),
+        id,
+        { timeout: 15000 }
+      );
+    }
+    eligible = await cashoutEligible();
+    return { eligible, quoted: top.quoted };
+  };
+
+  scenario('#50 cash-out: the multi-position fallback moves the operator', async () => {
+    await signIn('demo', 'ui-demo-password');
+    await atMarkets();
+    // ── fixture: TWO cash-out-eligible positions ──────────────────────────
+    const { eligible, quoted } = await ensureEligible(2);
     check(
       '#50 fixture: two cash-out-eligible positions exist',
       eligible.length >= 2,
-      `(${eligible.length} of ${mktIds.length} markets quoted)`
+      `(${eligible.length} of ${quoted} markets quoted)`
     );
     if (eligible.length < 2) return;
 
     // From the page the fallback TARGETS: My Bets, Open orders tab showing.
-    await page.click('#nav button[data-page="bets"]');
-    await page.waitForSelector('#page [data-tab="open"].primary', { timeout: 10000 });
+    //
+    // The tab is SELECTED rather than assumed. `OB.state.betsTab` is app state
+    // that survives navigation, so "open orders is the default" only holds until
+    // some earlier scenario clicks Positions — which is one inherited page state
+    // away from being the default being wrong (#134).
+    await atBets();
+    await page.click('#page [data-tab="open"]');
+    await page.waitForSelector('#page [data-tab="open"].primary', { timeout: 20000 });
     const beforeMulti = await viewOnScreen();
     check(
       '#50 fixture: Open orders is the tab under test',
@@ -525,37 +999,20 @@ try {
     );
   });
 
-  await scenario('#50 cash-out: the single-outcome branch stays on its own page', async () => {
-    if (cashoutFixture.length < 2) {
-      check('#50 fixture for the single-outcome branch', false, '(no eligible positions)');
-      return;
-    }
-    // Open the Positions tab explicitly rather than relying on the check
-    // above having switched it, so this scenario's starting point is the same
-    // whether or not the fallback above works.
-    await page.click('#nav button[data-page="bets"]');
-    await page.waitForSelector('#page #betsBody', { timeout: 10000 });
-    await page.click('#page [data-tab="positions"]');
-    await page.waitForSelector('#page #betsBody .poscard', { timeout: 10000 });
-
+  scenario('#50 cash-out: the single-outcome branch stays on its own page', async () => {
+    await signIn('demo', 'ui-demo-password');
+    // Open the Positions tab explicitly rather than relying on any earlier
+    // scenario having switched it, so this scenario's starting point is the
+    // same whatever ran before it.
+    //
     // ── (a) leave exactly one eligible position, cashing the rest out from
     // the Positions tab. Those per-position controls do not route, so the
     // board the next step needs is untouched by the reduction.
-    let eligible = await cashoutEligible();
-    for (const id of eligible.slice(0, -1)) {
-      await page.locator(`#betsBody [data-cashout="${id}"]`).click();
-      await page.waitForFunction(
-        (m) => !document.querySelector(`#betsBody [data-cashout="${m}"]`),
-        id,
-        { timeout: 10000 }
-      );
-    }
-    eligible = await cashoutEligible();
-    check('#50 fixture: exactly one cash-out-eligible position remains', eligible.length === 1, `(${eligible.length})`);
+    const { eligible } = await leaveExactlyOneEligible();
+    check('#50 fixture: exactly one cash-out-eligible position remains', eligible.length === 1, `(${eligible.length}: markets ${JSON.stringify(eligible)})`);
     if (eligible.length !== 1) return;
 
-    await page.click('#nav button[data-page="markets"]');
-    await page.waitForSelector('#page .ladder', { timeout: 10000 });
+    await atMarkets();
     const beforeSingle = await viewOnScreen();
     check(
       '#50 fixture: the Exchange ladder is the view under test',
@@ -590,22 +1047,16 @@ try {
   // calls loadWallet(), which bails on a missing #wTx — so a cash-out from the
   // Wallet strands the My Bets card over the wallet indefinitely. Same defect,
   // no 200ms repair, and therefore assertable by a single read.
-  await scenario('#50 cash-out from another page leaves that page on screen', async () => {
-    // Top the fixture back up to exactly one eligible position: the check
-    // above cashed the last one out.
-    const mktIds = await page.evaluate(() => [
-      ...new Set([...document.querySelectorAll('.lcell[data-bet]')].map((c) => c.dataset.mkt)),
-    ]);
-    for (const id of mktIds.slice(0, 8)) {
-      if ((await cashoutEligible()).length >= 1) break;
-      await placeBack(id, 50);
-    }
-    const eligible = await cashoutEligible();
-    check('#50 fixture: exactly one cash-out-eligible position remains', eligible.length === 1, `(${eligible.length})`);
+  scenario('#50 cash-out from another page leaves that page on screen', async () => {
+    // The same "exactly one" fixture as the scenario above, built again rather
+    // than inherited: that scenario cashed the last one out, and a shuffled run
+    // may not have run it at all.
+    await signIn('demo', 'ui-demo-password');
+    const { eligible } = await leaveExactlyOneEligible();
+    check('#50 fixture: exactly one cash-out-eligible position remains', eligible.length === 1, `(${eligible.length}: markets ${JSON.stringify(eligible)})`);
     if (eligible.length !== 1) return;
 
-    await page.click('#nav button[data-page="wallet"]');
-    await page.waitForSelector('#page #wBal', { timeout: 10000 });
+    await atWallet();
     await page.waitForSelector('#page #wTx table, #page #wTx .empty', { timeout: 10000 });
     const before = await viewOnScreen();
     check(
@@ -631,17 +1082,10 @@ try {
   });
 
   // ── admin desk: overround column + the server-backed fair-price helper ──
-  await scenario('admin desk renders the overround column', async () => {
-    await page.click('#authBtn'); // sign out of the customer session
-    await page.waitForFunction(() => document.getElementById('authBtn').textContent === 'Sign in', null, { timeout: 10000 });
-    await page.click('#authBtn');
-    await page.waitForSelector('#authModal.show', { timeout: 5000 });
-    await page.fill('#authUser', 'admin');
-    await page.fill('#authPass', 'ui-admin-password');
-    await page.click('#authGo');
-    await page.waitForSelector('#navAdmin:not([hidden])', { timeout: 10000 });
-    await page.click('#nav button[data-page="admin"]');
-    await page.waitForSelector('#adminBody table', { timeout: 10000 });
+  scenario('admin desk renders the overround column', async () => {
+    await signIn('admin', 'ui-admin-password');
+    await atAdmin('markets');
+    await page.waitForSelector('#adminBody table', { timeout: 15000 });
     const heads = await page.locator('#adminBody th').allTextContents();
     check('overround column present', heads.some((h) => /overround/i.test(h)), `(${heads.join(',')})`);
     const orCells = await page.locator('#adminBody td:nth-child(6)').count();
@@ -654,22 +1098,33 @@ try {
   // Escape must close it (the global handler used to only know #authModal),
   // and the pick-a-winner hint must render — whenText(settled_at) was always
   // truthy, so it never did.
-  await scenario('settle dialog: aria role, W6 hint, Escape via the overlay stack', async () => {
-    const settleBtn = page.locator('#adminBody [data-settle]').first();
-    if ((await settleBtn.count()) === 0) return; // every market settled already — nothing to check
-    await settleBtn.click();
-    await page.waitForSelector('.modal[role="dialog"]', { timeout: 5000 });
-    check('settle dialog opens with role=dialog', true);
-    const hint = ((await page.locator('.modal[role="dialog"] .hint').textContent()) || '').trim();
-    check('unsettled market shows the pick-a-winner hint', /Pick the winning runner/.test(hint), `("${hint.slice(0, 40)}…")`);
-    await page.keyboard.press('Escape');
-    await page.waitForFunction(() => !document.querySelector('.modal[role="dialog"]'), null, { timeout: 5000 });
-    check('Escape closes the settle dialog (topmost overlay)', true);
+  //
+  // Own fixture (#134). This used to open the settle dialog on whatever open
+  // market the desk happened to show and returned silently — "every market
+  // settled already — nothing to check" — when there was none. A silent return
+  // is a check that verifies nothing, and the state it was silently skipping on
+  // was created by the scenarios below. It now opens a market it created, so the
+  // dialog is always there to be asserted on.
+  scenario('settle dialog: aria role, W6 hint, Escape via the overlay stack', async () => {
+    await signIn('admin', 'ui-admin-password');
+    await withMarket('settle dialog aria', async (fx) => {
+      await atAdmin('markets');
+      await page.waitForSelector(`#adminBody [data-settle="${fx.marketId}"]`, { timeout: 15000 });
+      await page.locator(`#adminBody [data-settle="${fx.marketId}"]`).click();
+      await page.waitForSelector('.modal[role="dialog"]', { timeout: 10000 });
+      check('settle dialog opens with role=dialog', true);
+      const hint = ((await page.locator('.modal[role="dialog"] .hint').textContent()) || '').trim();
+      check('unsettled market shows the pick-a-winner hint', /Pick the winning runner/.test(hint), `("${hint.slice(0, 40)}…")`);
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => !document.querySelector('.modal[role="dialog"]'), null, { timeout: 10000 });
+      check('Escape closes the settle dialog (topmost overlay)', true);
+    });
   });
 
-  await scenario('fair-price helper returns server-side conversions', async () => {
-    await page.click('[data-view="create"]');
-    await page.waitForSelector('[data-fair]', { timeout: 10000 });
+  scenario('fair-price helper returns server-side conversions', async () => {
+    await signIn('admin', 'ui-admin-password');
+    await atAdmin('create');
+    await page.waitForSelector('[data-fair]', { timeout: 15000 });
     await page.fill('[data-fair]', '2.5');
     await page.dispatchEvent('[data-fair]', 'change');
     // the conversions come from lib/odds.js via /api/format — the desk must not
@@ -687,11 +1142,17 @@ try {
   // new admin tabs. The mutations themselves are covered by admin.test.js and
   // the live curl e2e; this scenario proves the UI surfaces actually render
   // and that the identifier flow works in a real browser.
-  await scenario('register accepts an email; login accepts that email', async () => {
-    await page.click('#authBtn'); // sign out of admin
-    await page.waitForFunction(() => document.getElementById('authBtn').textContent === 'Sign in', null, { timeout: 10000 });
+  //
+  // EVERY scenario below registers its OWN account (#134). They used to share
+  // one — `uitester`, created by whichever of them ran first — so the password
+  // the account-panel scenario changed it to, and the audit row the admin
+  // scenario looked for, were both properties of the run ORDER. Four accounts
+  // instead of one is the price of "this scenario needs an account with a
+  // password change in its audit trail" being a statement about itself.
+  scenario('register accepts an email; login accepts that email', async () => {
+    await signOut();
     await page.click('#authBtn');
-    await page.waitForSelector('#authModal.show', { timeout: 5000 });
+    await page.waitForSelector('#authModal.show', { timeout: 10000 });
     await page.click('#authSwitch'); // → register mode
     await page.waitForFunction(() => document.getElementById('authEmailWrap').style.display !== 'none', null, { timeout: 5000 });
     check('register mode reveals the email field', true);
@@ -700,9 +1161,9 @@ try {
     await page.fill('#authPass', 'secret1');
     await page.click('#authGo');
     await page.waitForSelector('#balance:not([hidden])', { timeout: 10000 });
+    signedIn = true;
     check('registration completes and signs in', true);
-    await page.click('#authBtn'); // sign out
-    await page.waitForFunction(() => document.getElementById('authBtn').textContent === 'Sign in', null, { timeout: 10000 });
+    await signOut();
     await page.click('#authBtn');
     await page.waitForSelector('#authModal.show', { timeout: 5000 });
     // Login mode: the email field is hidden, and the single identifier field
@@ -713,13 +1174,19 @@ try {
     await page.fill('#authPass', 'secret1');
     await page.click('#authGo');
     await page.waitForSelector('#balance:not([hidden])', { timeout: 10000 });
+    signedIn = true;
     const who = (await page.locator('#who').textContent()) || '';
     check('sign-in by email lands in the right account', who.includes('uitester'), `(${who.trim()})`);
   });
 
-  await scenario('account panel: sessions, and a password change that survives', async () => {
+  // Its own account, not `uitester`: this scenario CHANGES the password, and
+  // the scenario that registers uitester asserts the account is reachable with
+  // `secret1`. Sharing one account made those two assertions a coin toss on
+  // which ran first.
+  scenario('account panel: sessions, and a password change that survives', async () => {
+    await registerAccount('paneltester', 'paneltester@example.com');
     await page.click('#accountBtn');
-    await page.waitForSelector('#accountModal.show', { timeout: 5000 });
+    await page.waitForSelector('#accountModal.show', { timeout: 10000 });
     check('account panel opens as a dialog', (await page.locator('#accountModal').getAttribute('role')) === 'dialog');
     await page.waitForFunction(
       () => /this device/.test(document.getElementById('sessionList').textContent || ''),
@@ -737,13 +1204,12 @@ try {
     );
     check('password change reports the result', true);
     await page.keyboard.press('Escape');
-    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 5000 });
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 10000 });
     // The caller's own session must still work — sign out and back in with the NEW password.
-    await page.click('#authBtn');
-    await page.waitForFunction(() => document.getElementById('authBtn').textContent === 'Sign in', null, { timeout: 10000 });
+    await signOut();
     await page.click('#authBtn');
     await page.waitForSelector('#authModal.show', { timeout: 5000 });
-    await page.fill('#authUser', 'uitester@example.com');
+    await page.fill('#authUser', 'paneltester@example.com');
     await page.fill('#authPass', 'secret1'); // the OLD one
     expectAuth401 = true; // a wrong-password login is an expected 401
     await page.click('#authGo');
@@ -757,27 +1223,35 @@ try {
     await page.fill('#authPass', 'secret2'); // the NEW one
     await page.click('#authGo');
     await page.waitForSelector('#balance:not([hidden])', { timeout: 10000 });
+    signedIn = true;
     check('the new password works', true);
   });
 
-  await scenario('admin desk: users and audit tabs', async () => {
-    await page.click('#authBtn'); // sign out of uitester
-    await page.waitForFunction(() => document.getElementById('authBtn').textContent === 'Sign in', null, { timeout: 10000 });
-    await page.click('#authBtn');
-    await page.waitForSelector('#authModal.show', { timeout: 5000 });
-    await page.fill('#authUser', 'admin');
-    await page.fill('#authPass', 'ui-admin-password');
-    await page.click('#authGo');
-    await page.waitForSelector('#navAdmin:not([hidden])', { timeout: 10000 });
-    await page.click('#nav button[data-page="admin"]');
-    await page.waitForSelector('[data-view="users"]', { timeout: 10000 });
-    await page.click('[data-view="users"]');
-    await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
+  scenario('admin desk: users and audit tabs', async () => {
+    // Its own account, changed a password, so the audit row this scenario reads
+    // is one it created rather than one it inherited (#134).
+    await registerAccount('audittester', 'audittester@example.com');
+    await page.click('#accountBtn');
+    await page.waitForSelector('#accountModal.show', { timeout: 10000 });
+    await page.fill('#pwCurrent', 'secret1');
+    await page.fill('#pwNew', 'secret2');
+    await page.click('#pwGo');
+    await page.waitForFunction(
+      () => /Password changed/.test(document.getElementById('pwNote').textContent || ''),
+      null,
+      { timeout: 10000 }
+    );
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 10000 });
+
+    await signIn('admin', 'ui-admin-password');
+    await atAdmin('users');
+    await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 15000 });
     const userRows = await page.locator('#adminBody .adm-tbl tbody tr').count();
     check('users tab lists accounts', userRows >= 2, `(${userRows} rows)`);
     const acts = await page.locator('#adminBody [data-act]').count();
     check('each account row carries actions', acts >= userRows * 3, `(${acts} controls)`);
-    await page.fill('#userSearch', 'uitester');
+    await page.fill('#userSearch', 'audittester');
     await page.click('#userSearchGo');
     await page.waitForFunction(
       () => document.querySelectorAll('#adminBody .adm-tbl tbody tr').length === 1,
@@ -790,8 +1264,8 @@ try {
     // id that depends on seed ordering.
     const uid = ((await page.locator('#adminBody .adm-tbl tbody tr td').first().textContent()) || '').trim();
 
-    await page.click('[data-view="audit"]');
-    await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
+    await atAdmin('audit');
+    await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 15000 });
     const auditText = (await page.locator('#adminBody .adm-tbl tbody').textContent()) || '';
     check('audit tab records the password change with an actor and reason', /user\.password_changed/.test(auditText), `(${auditText.slice(0, 60)}…)`);
     await page.fill('#auditTarget', `user:${uid}`);
@@ -879,12 +1353,13 @@ try {
   // the meter, the stat tiles and the tables are all in the DOM — so every
   // assertion here is about GEOMETRY, VISIBILITY or COLOUR: the things that
   // change when a rule exists.
-  await scenario('#68 the risk desk renders its meter, its KPI row and a kill switch that looks like one', async () => {
-    await page.click('[data-view="risk"]');
+  scenario('#68 the risk desk renders its meter, its KPI row and a kill switch that looks like one', async () => {
+    await signIn('admin', 'ui-admin-password');
+    await atAdmin('risk');
     // `attached`, not `visible`: a .meter with zero height is not visible, which
     // IS the defect. Waiting for visible here would turn it into a 10s timeout
     // instead of the measured failure below.
-    await page.waitForSelector('#adminBody .meter', { state: 'attached', timeout: 10000 });
+    await page.waitForSelector('#adminBody .meter', { state: 'attached', timeout: 15000 });
 
     const desk = await page.evaluate(() => {
       const box = (sel) => {
@@ -1044,10 +1519,10 @@ try {
   //
   // Asserted as VISIBILITY and GEOMETRY, never as presence: the panel is in the
   // DOM either way, which is exactly why this survived.
-  await scenario('#68 the account panel is a modal, not a permanent block at the bottom of the page', async () => {
+  scenario('#68 the account panel is a modal, not a permanent block at the bottom of the page', async () => {
     // Wallet is a short page, so the leaked panel was on screen there.
-    await page.click('#nav button[data-page="wallet"]');
-    await page.waitForSelector('#wBal', { timeout: 10000 });
+    await signIn('demo', 'ui-demo-password');
+    await atWallet();
     await page.waitForTimeout(400);
     const closed = await page.evaluate(() => {
       const n = document.getElementById('accountModal');
@@ -1115,27 +1590,20 @@ try {
     }));
     check('#68 Escape closes the account panel', after.display === 'none', `(display ${after.display})`);
     check('#68 Escape returns focus to the button that opened it', after.focused === 'accountBtn', `(focus on ${after.focused})`);
-
-    // Leave the desk where the next scenario expects to find it.
-    await page.click('#nav button[data-page="admin"]');
-    await page.waitForSelector('[data-view="markets"]', { timeout: 10000 });
   });
 
-// ── #68 §3.1: a 500 and an empty venue rendered the same screen ───────────
+// ── #68 §5 cheap wins, on the surfaces they touch ─────────────────────────
   //
-  // shell.js answered a failed /api/events with `state.events = []`, which
-  // board.js rendered as "No open events right now" — the same card a venue
-  // with genuinely nothing on it produces. The operator's first conclusion on
-  // seeing that is "we have gone out of business", which is the inverse of the
-  // truth, and it happened on every transient blip.
-  // ── #68 §5 cheap wins, on the surfaces they touch ─────────────────────────
-  await scenario('#68 the one-liners: slip label, ledger column, drawer, money format', async () => {
+  // The viewport and the bot baseline are both changed here and both are put
+  // back in a finally: a scenario that leaves a 700px-wide browser or a
+  // shifted day-start balance behind makes every scenario after it fail for a
+  // reason that is not its own (#134).
+  scenario('#68 the one-liners: slip label, ledger column, drawer, money format', async () => {
     // `Place —` on a disabled button read as a truncated string.
-    await page.evaluate(async () => {
-      window.location.hash = '#/markets';
-      await window.OB.refreshMarkets();
-    });
-    await page.waitForSelector('.ladder .lcell[data-bet]', { timeout: 20000 });
+    await signIn('admin', 'ui-admin-password');
+    try {
+    await atMarkets();
+    await onBoardCell();
     await page.locator('.ladder button.lcell[data-bet]').first().click();
     await page.waitForSelector('#slip .sliprow [data-stake]', { timeout: 5000 });
     await page.fill('#slip [data-stake]', '0.40');
@@ -1147,13 +1615,12 @@ try {
       placeLabel.trim() === 'Place' && (await page.locator('#slip button.place').first().isDisabled()),
       `("${placeLabel.trim()}")`
     );
-    // Clean the slip up so the next section starts empty.
+    // Clean the slip up so nothing is left half-filled on the page.
     await page.locator('#slip [data-rm]').first().click();
 
     // The wallet ledger's BALANCE column means "balance after" while the figure
     // at the top of the same screen labelled BALANCE means the total.
-    await page.click('#nav button[data-page="wallet"]');
-    await page.waitForSelector('#wBal', { timeout: 10000 });
+    await atWallet();
     // The faucet writes a transaction, so the ledger table exists. Without one
     // there is no table at all and the column name cannot be read.
     await page.locator('#page [data-dep]').first().click();
@@ -1181,8 +1648,7 @@ try {
     // and the assertion passes whatever the formatter does. The baseline is
     // restored immediately afterwards.
     {
-      const { DatabaseSync } = await import('node:sqlite');
-      const db = new DatabaseSync(path.join(TMP, 'ui.db'));
+      const db = await openDb();
       const rows = db.prepare('SELECT bot_id, day_start_balance FROM risk_bots').all();
       for (const r of rows) {
         db.prepare('UPDATE risk_bots SET day_start_balance = ? WHERE bot_id = ?').run(
@@ -1191,29 +1657,35 @@ try {
         );
       }
       db.close();
-      await page.click('#nav button[data-page="admin"]');
-      await page.click('[data-view="risk"]');
-      await page.waitForSelector('#adminBody .meter', { timeout: 10000 });
-      const adminMoney = await page.evaluate(() => {
-        const cells = [...document.querySelectorAll('#adminBody td span')].map((n) => n.textContent.trim());
-        return cells.filter((t) => /^[-−+]?\$/.test(t));
-      });
-      const negatives = adminMoney.filter((t) => /^[-−]/.test(t));
-      check(
-        '#68 the operator console renders a negative amount to check the format of',
-        negatives.length > 0,
-        `(${adminMoney.length} figures: ${adminMoney.slice(0, 5).join(' | ')})`
-      );
-      check(
-        '#68 the operator console uses the same negative-money format as the player screens',
-        negatives.length > 0 && negatives.every((t) => !/^\$-/.test(t)),
-        `(${negatives.join(' | ')})`
-      );
-      const db2 = new DatabaseSync(path.join(TMP, 'ui.db'));
-      for (const r of rows) {
-        db2.prepare('UPDATE risk_bots SET day_start_balance = ? WHERE bot_id = ?').run(r.day_start_balance, r.bot_id);
+      // The restore is a finally, not a line after the checks. A baseline left
+      // shifted makes every LATER run of the risk desk report a loss that is
+      // not there, and in a shuffled order "later" is whichever scenario the
+      // seed happened to pick.
+      try {
+        await atAdmin('risk');
+        await page.waitForSelector('#adminBody .meter', { timeout: 15000 });
+        const adminMoney = await page.evaluate(() => {
+          const cells = [...document.querySelectorAll('#adminBody td span')].map((n) => n.textContent.trim());
+          return cells.filter((t) => /^[-−+]?\$/.test(t));
+        });
+        const negatives = adminMoney.filter((t) => /^[-−]/.test(t));
+        check(
+          '#68 the operator console renders a negative amount to check the format of',
+          negatives.length > 0,
+          `(${adminMoney.length} figures: ${adminMoney.slice(0, 5).join(' | ')})`
+        );
+        check(
+          '#68 the operator console uses the same negative-money format as the player screens',
+          negatives.length > 0 && negatives.every((t) => !/^\$-/.test(t)),
+          `(${negatives.join(' | ')})`
+        );
+      } finally {
+        const db2 = await openDb();
+        for (const r of rows) {
+          db2.prepare('UPDATE risk_bots SET day_start_balance = ? WHERE bot_id = ?').run(r.day_start_balance, r.bot_id);
+        }
+        db2.close();
       }
-      db2.close();
     }
 
     // The drawer: picking a destination left the drawer open over it.
@@ -1228,19 +1700,26 @@ try {
       !(await page.evaluate(() => document.body.classList.contains('nav-open'))),
       '(the drawer was still open over the page it navigated to)'
     );
-    await page.setViewportSize({ width: 1400, height: 900 });
-    await page.click('#nav button[data-page="admin"]');
-    await page.waitForSelector('[data-view="markets"]', { timeout: 10000 });
-    await page.click('[data-view="markets"]');
-    await page.waitForSelector('#adminBody', { timeout: 10000 });
+    } finally {
+      // Back to the shape the rest of the suite measures geometry against.
+      await page.setViewportSize(VIEWPORT);
+    }
   });
 
-  // ── 
-  await scenario('#68 the board says which of the two it is: a fault, or an empty catalogue', async () => {
+  // ── #68 §3.1: a 500 and an empty venue rendered the same screen ───────────
+  //
+  // shell.js answered a failed /api/events with `state.events = []`, which
+  // board.js rendered as "No open events right now" — the same card a venue
+  // with genuinely nothing on it produces. The operator's first conclusion on
+  // seeing that is "we have gone out of business", which is the inverse of the
+  // truth, and it happened on every transient blip.
+  scenario('#68 the board says which of the two it is: a fault, or an empty catalogue', async () => {
    // A deliberately broken route is a hazard to everything after it: the board
    // stays broken, and every later scenario inherits a page with an error card on
    // it. Undo the injection and restore the board on EVERY path, so a failure in
    // here is a named failure rather than a cascade.
+   await signIn('demo', 'ui-demo-password');
+   await atMarkets();
    try {
     // A real 500, injected on the route the app actually calls.
     expectEvents500 = true;
@@ -1249,7 +1728,7 @@ try {
     );
     await page.evaluate(() => {
       location.hash = '#/markets';
-      window.OB.refreshMarkets();
+      return window.OB.refreshMarkets();
     });
     await page.waitForSelector('#boardRetry', { timeout: 15000 });
     const failed = await page.evaluate(() => {
@@ -1313,7 +1792,7 @@ try {
   });
 
   // ── #68 §3.3 / §3.4 / §5: the player and operator surfaces ────────────────
-  await scenario('#68 positions, the settle dialog and the cheap wins', async () => {
+  scenario('#68 positions, the settle dialog and the cheap wins', async () => {
     // ── §3.3 BACKED and FROZEN printed the same number on every back leg ───
     //
     // Driven from a FIXTURE rather than from a bet placed through the slip. A
@@ -1326,6 +1805,12 @@ try {
     // The payload is built to contain exactly the case the finding is about: a
     // back-only leg, where lib/match.js's escrowFor equals the stake, so the
     // old FROZEN column printed the BACKED number again on every such row.
+    //
+    // The mock is un-installed in a finally. It used to be un-installed on the
+    // line after the last check, which a thrown wait would skip — and a mocked
+    // /api/positions left installed hands every later scenario a position list
+    // this test made up (#134).
+    await signIn('demo', 'ui-demo-password');
     await page.route('**/api/positions', (route) =>
       route.fulfill({
         status: 200,
@@ -1351,9 +1836,10 @@ try {
         }),
       })
     );
-    await page.click('#nav button[data-page="bets"]');
+    try {
+    await atBets();
     await page.click('[data-tab="positions"]');
-    await page.waitForSelector('#betsBody .poscard', { timeout: 10000 });
+    await page.waitForSelector('#betsBody .poscard', { timeout: 15000 });
     const pos = await page.evaluate(() => {
       const card = document.querySelector('#betsBody .poscard');
       if (!card) return null;
@@ -1380,27 +1866,25 @@ try {
       !!pos && /escrow held \$90\.51/i.test(pos.head),
       `("${pos ? pos.head.slice(0, 90) : ''}")`
     );
-    await page.unroute('**/api/positions');
+    } finally {
+      await page.unroute('**/api/positions').catch(() => {});
+    }
 
     // ── §3.4 the settle dialog named nothing ────────────────────────────────
-    await page.click('#nav button[data-page="admin"]');
-    await page.click('[data-view="markets"]');
-    await page.waitForSelector('#adminBody [data-settle]', { timeout: 10000 });
-    const target = await page.evaluate(() => {
-      const b = document.querySelector('#adminBody [data-settle]');
-      return b ? Number(b.dataset.settle) : null;
-    });
-    if (target === null) {
-      // Every market in the catalogue has already been settled by the #51 and
-      // #52 scenarios that follow. Say so by name rather than skipping: a
-      // silent pass here would be a check that verifies nothing.
-      check('#68 fixture: a market to settle', false, '(every market is settled — the dialog checks could not run)');
-      await page.click('#nav button[data-page="admin"]');
-      await page.waitForSelector('[data-view="markets"]', { timeout: 10000 });
-      return;
-    }
-    await page.locator(`#adminBody [data-settle="${target}"]`).click();
-    await page.waitForSelector('.modal[role="dialog"] #sdGo', { timeout: 10000 });
+    //
+    // On a market this scenario created (#134). It used to open the dialog on
+    // whichever market the desk listed first and, when the catalogue had been
+    // settled out from under it by an earlier scenario, report
+    // "fixture: a market to settle — every market is settled". That named
+    // failure was honest, and it was also the suite telling the truth about
+    // itself: this check only had a fixture if the scenarios before it had
+    // left one.
+    await signIn('admin', 'ui-admin-password');
+    await withMarket('settle dialog naming', async (fx) => {
+    await atAdmin('markets');
+    await page.waitForSelector(`#adminBody [data-settle="${fx.marketId}"]`, { timeout: 15000 });
+    await page.locator(`#adminBody [data-settle="${fx.marketId}"]`).click();
+    await page.waitForSelector('.modal[role="dialog"] #sdGo', { timeout: 15000 });
     const named = await page.evaluate(() => {
       const title = document.querySelector('#sdTitle');
       const facts = document.querySelector('.sd-facts');
@@ -1434,10 +1918,12 @@ try {
     );
     await page.click('.modal[role="dialog"] #sdCancel');
     await page.waitForTimeout(300);
+    });
 
     // ── §5: two status chips three lines apart, and a row of $0.00 ─────────
+    await signIn('demo', 'ui-demo-password');
     const boardCopy = await page.evaluate(async () => {
-      window.location.hash = '#/markets';
+      window.OB.goTo('markets');
       await window.OB.refreshMarkets();
       await new Promise((r) => setTimeout(r, 900));
       const heads = [...document.querySelectorAll('.mkthead .chip')].map((n) => n.textContent.trim());
@@ -1455,12 +1941,6 @@ try {
       !boardCopy.matched.some((m) => /\$0\.00\s+matched/.test(m)),
       `(${boardCopy.matched.length} matched labels: ${boardCopy.matched.slice(0, 3).join(' | ')})`
     );
-    await page.evaluate(() => {
-      window.location.hash = '#/admin';
-    });
-    await page.waitForSelector('[data-view="markets"]', { timeout: 10000 });
-    await page.click('[data-view="markets"]');
-    await page.waitForSelector('#adminBody', { timeout: 10000 });
   });
 
   // ── #51: a held market can be released as a DEAD HEAT, chosen by NAME ────
@@ -1520,26 +2000,19 @@ try {
     }
   });
 
-  await scenario('#51 held release: joint winners are expressible from the desk', async () => {
-    // The desk is left on the Ops view by the previous scenario, so open
-    // Markets first: the id is read from a row that carries a Settle control,
-    // which by definition has not been settled yet. Discovered, not hard-coded.
-    await page.click('[data-view="markets"]');
-    await page.waitForSelector('#adminBody [data-settle]', { timeout: 10000 });
-    const heldMarketId = await page.evaluate(() => {
-      const b = document.querySelector('#adminBody [data-settle]');
-      return b ? Number(b.dataset.settle) : null;
-    });
-    if (heldMarketId === null) {
-      check('#51 fixture: an open market to hold', false, '(no markets on the desk)');
-      return;
-    }
+  scenario('#51 held release: joint winners are expressible from the desk', async () => {
+    await signIn('admin', 'ui-admin-password');
+    // TWO markets of its own, created up front (#134). This used to take the
+    // first two open markets the desk listed and SETTLE both of them — which is
+    // how the suite used to leave later scenarios with no market to settle, and
+    // how its own result came to depend on what had run before it.
+    await withMarket('held release dead heat', async (tieFx) => {
+    const heldMarketId = tieFx.marketId;
     // A held market is needed, and the seeded catalogue has none. Set the same
     // columns the results poll writes, so this is the real hold rather than a
     // mocked flag — the route under test reads them.
     {
-      const { DatabaseSync } = await import('node:sqlite');
-      const db = new DatabaseSync(path.join(TMP, 'ui.db'));
+      const db = await openDb();
       db.prepare(
         'UPDATE markets SET settlement_hold = 1, hold_reason = ? WHERE id = ? AND status = ?'
       ).run('result feed: dead heat disputed', heldMarketId, 'open');
@@ -1551,15 +2024,14 @@ try {
       }
     }
 
-    await page.click('[data-view="results"]');
-    await page.waitForSelector('#adminBody [data-release-settle]', { timeout: 10000 });
+    await atAdmin('results');
+    await page.waitForSelector(`#adminBody [data-release-settle="${heldMarketId}"]`, { timeout: 15000 });
     const heldRow = page.locator(`#adminBody [data-release-settle="${heldMarketId}"]`);
     check(
       '#51 fixture: the held market is listed on the desk',
       (await heldRow.count()) === 1,
       `(market ${heldMarketId})`
     );
-    if ((await heldRow.count()) === 0) return;
 
 // The reason dialog comes first and the picker second (lib/results.js
     // refuses a release with no reason). Both are now REAL dialogs on the
@@ -1735,36 +2207,31 @@ try {
       { timeout: 10000 }
     );
     check('#51 the released market leaves the held queue', true);
+    });   // the dead-heat market is deleted here; the single-winner path gets its own
 
     // ── ONE tick is a plain win, not a one-element dead heat ────────────────
     // lib/results.js refuses a dead_heat list shorter than two distinct ids, so
     // a picker that sent `dead_heat: [x]` for a single winner would 400 on the
-    // commonest release of all. Held from the same columns as above.
-    await page.click('[data-view="markets"]');
-    await page.waitForSelector('#adminBody [data-settle]', { timeout: 10000 });
-    const soloMarketId = await page.evaluate(() => {
-      const b = document.querySelector('#adminBody [data-settle]');
-      return b ? Number(b.dataset.settle) : null;
-    });
-    if (soloMarketId === null) {
-      check('#51 fixture: a second market for the single-winner path', false, '(none left open)');
-      return;
-    }
+    // commonest release of all. Held from the same columns as above — on a
+    // SECOND market of this scenario's own (#134), not on "whatever is still
+    // open", which is how this half of the scenario used to depend on the half
+    // above it.
+    await withMarket('held release single winner', async (soloFx) => {
+    const soloMarketId = soloFx.marketId;
     {
-      const { DatabaseSync } = await import('node:sqlite');
-      const db = new DatabaseSync(path.join(TMP, 'ui.db'));
+      const db = await openDb();
       db.prepare('UPDATE markets SET settlement_hold = 1, hold_reason = ? WHERE id = ?').run(
         'result feed: unrecognised result',
         soloMarketId
       );
       db.close();
     }
-    await page.click('[data-view="results"]');
-    await page.waitForSelector(`#adminBody [data-release-settle="${soloMarketId}"]`, { timeout: 10000 });
+    await atAdmin('results');
+    await page.waitForSelector(`#adminBody [data-release-settle="${soloMarketId}"]`, { timeout: 15000 });
 
     releasePayload = null;
     await page.locator(`#adminBody [data-release-settle="${soloMarketId}"]`).click();
-    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 10000 });
+    await page.waitForSelector('.modal[role="dialog"] [data-ask="reason"]', { timeout: 15000 });
     await page.fill('.modal[role="dialog"] [data-ask="reason"]', 'ui test: single winner confirmed against the results feed');
     await page.click('.modal[role="dialog"] #askGo');
     await page.locator('.modal[role="dialog"] #hoWinners').waitFor({ state: 'attached', timeout: 10000 });
@@ -1783,6 +2250,7 @@ try {
         (releasePayload.dead_heat === undefined || releasePayload.dead_heat === null),
       `(payload ${JSON.stringify(releasePayload)}, expected winner ${soloId})`
     );
+    });
   });
 
   // ── #52 (2/3): settlement and suspend carry a written reason ─────────────
@@ -1798,18 +2266,35 @@ try {
   // Asserted on the wire and then in the audit trail, because the claim is
   // about the RECORD: a reason typed into a dialog and dropped on the floor
   // satisfies every DOM assertion there is.
-  await scenario('#52 settlement and suspend record a written reason', async () => {
-    await page.click('[data-view="markets"]');
-    await page.waitForSelector('#adminBody [data-settle], #adminBody [data-toggle]', { timeout: 10000 });
+  scenario('#52 settlement and suspend record a written reason', async () => {
+    await signIn('admin', 'ui-admin-password');
+    // TWO fixture markets, one per action (#134). The suspend/restore pair and
+    // the settlement used to be whatever two rows the desk listed first, and the
+    // settlement SETTLED one of them — the same leftover-state dependency #134 is
+    // about, one scenario removed.
+    let mktId = null;
+    let settleId = null;
+
+    await withMarket('suspend and restore', async (susFx) => {
+    mktId = susFx.marketId;
+    await atAdmin('markets');
+    await page.waitForSelector(`#adminBody [data-toggle="${mktId}"]`, { timeout: 15000 });
 
     // ── suspend / restore ──────────────────────────────────────────────────
-    const suspendBtn = page.locator('#adminBody [data-toggle]').first();
-    if ((await suspendBtn.count()) === 0) {
-      check('#52 fixture: a market to suspend', false, '(every market already settled)');
-      return;
-    }
-    const mktId = Number(await suspendBtn.getAttribute('data-toggle'));
+    const suspendBtn = page.locator(`#adminBody [data-toggle="${mktId}"]`).first();
+    // `data-status` is the status the button WILL SET. On a market this scenario
+    // created it is therefore "suspended", and the label reads Suspend. Stated
+    // as a check rather than assumed: the whole suspend/restore pair below only
+    // means anything if the market really was open before the first click, and
+    // "it was open because nobody had touched it" is not a thing a test gets to
+    // take on faith.
     const willSuspend = (await suspendBtn.getAttribute('data-status')) === 'suspended';
+    check(
+      '#52 fixture: the market under test starts open, not suspended',
+      willSuspend && /suspend/i.test((await suspendBtn.textContent()) || ''),
+      `(button offers ${await suspendBtn.getAttribute('data-status')})`
+    );
+    if (!willSuspend) return;
     // Re-locate the row BY ID for every click. `.first()` resolves against the
     // table as it is NOW, and the table re-renders after each action: clicking
     // a stale row reads a stale `data-status` and suspends a market that was
@@ -1890,14 +2375,14 @@ try {
       !!restore && restore.status === 'open' && typeof restore.reason === 'string' && restore.reason.length >= 5,
       `(payload ${JSON.stringify(restore)})`
     );
+    });
 
     // ── settle ────────────────────────────────────────────────────────────
-    const settleBtn = page.locator('#adminBody [data-settle]').first();
-    if ((await settleBtn.count()) === 0) {
-      check('#52 fixture: a market to settle', false, '(none left open)');
-      return;
-    }
-    const settleId = Number(await settleBtn.getAttribute('data-settle'));
+    await withMarket('settle with a written reason', async (setFx) => {
+    settleId = setFx.marketId;
+    await atAdmin('markets');
+    await page.waitForSelector(`#adminBody [data-settle="${settleId}"]`, { timeout: 15000 });
+    const settleBtn = page.locator(`#adminBody [data-settle="${settleId}"]`);
     await settleBtn.click();
     await page.waitForSelector('.modal[role="dialog"] #sdGo', { timeout: 10000 });
     check(
@@ -1933,12 +2418,13 @@ try {
       !!settle && typeof settle.reason === 'string' && settle.reason.length >= 5 && settle.winner_selection_id != null,
       `(payload ${JSON.stringify(settle)})`
     );
+    });   // the settled market is deleted here; its audit rows are not
 
     // And it is in the RECORD, which is the whole claim. Two filters: the
     // settlement and the suspend/restore pair are different market ids.
     const auditFor = async (target) => {
-      await page.click('[data-view="audit"]');
-      await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
+      await atAdmin('audit');
+      await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 15000 });
       await page.fill('#auditTarget', target);
       await page.click('#auditGo');
       await page.waitForFunction(
@@ -1985,23 +2471,33 @@ try {
   // the UI — while reading a CSS variable that was never set returns the house
   // palette, which is true whether or not the branding works. So the only
   // honest assertion is a distinctive colour on :root after a fresh load.
-  const houseAccent = await page.evaluate(() => {
-    for (const sheet of document.styleSheets) {
-      let rules;
-      try {
-        rules = sheet.cssRules;
-      } catch {
-        continue;
-      }
-      for (const r of rules) {
-        if (r.selectorText === ':root') {
-          const m = /--accent:\s*([^;]+)/.exec(r.style.cssText);
-          if (m) return m[1].trim();
+  //
+  // Read LAZILY, on first use, rather than once at registration time (#134): it
+  // is a fact about the page, and after the refactor the page the suite opens on
+  // is no longer guaranteed to be the page each scenario starts from.
+  let houseAccentCache;
+  const houseAccent = async () => {
+    if (houseAccentCache === undefined) {
+      houseAccentCache = await page.evaluate(() => {
+        for (const sheet of document.styleSheets) {
+          let rules;
+          try {
+            rules = sheet.cssRules;
+          } catch {
+            continue;
+          }
+          for (const r of rules) {
+            if (r.selectorText === ':root') {
+              const m = /--accent:\s*([^;]+)/.exec(r.style.cssText);
+              if (m) return m[1].trim();
+            }
+          }
         }
-      }
+        return null;
+      });
     }
-    return null;
-  });
+    return houseAccentCache;
+  };
 
   const branding = () =>
     page.evaluate(async () => {
@@ -2037,7 +2533,13 @@ try {
 
   const brand = { name: 'UI Test Exchange', logo: '/assets/logo.png', terms_url: '/terms/ui-test', palette: { accent: '#ff6600', pink: '#00aa88' } };
 
-  await scenario('#52 the browser consumes /api/branding after a reload', async () => {
+  scenario('#52 the browser consumes /api/branding after a reload', async () => {
+    // The brand is cleared FIRST and restored in a finally (#134). "What ships
+    // when no brand is set" is only a fact about the venue if no brand is set,
+    // and in a shuffled run one of the two other branding scenarios may have
+    // written one. Without this the check below would be asserting a property
+    // of the run order.
+    await signIn('admin', 'ui-admin-password');
     const before = await branding();
     check(
       '#52 /api/branding serves the caller\'s tenant',
@@ -2046,13 +2548,16 @@ try {
     );
     if (!before || !before.tenant) return;
     const tid = before.tenant.id;
-
+    const house = await houseAccent();
+    await writeBrand(tid, { name: '', logo: '', favicon: '', terms_url: null, palette: {} });
+    await reload();
+    try {
     // Before anything: the house palette, whatever the response says.
     const virgin = await rootVars();
     check(
       '#52 fixture: the house palette is what ships when no brand is set',
-      virgin.accent.toLowerCase() === (houseAccent || '').toLowerCase(),
-      `(accent=${virgin.accent}, house is ${houseAccent})`
+      virgin.accent.toLowerCase() === (house || '').toLowerCase(),
+      `(accent=${virgin.accent}, house is ${house})`
     );
 
     await writeBrand(tid, brand);
@@ -2061,7 +2566,7 @@ try {
     check(
       '#52 the tenant palette reaches :root as a CSS custom property',
       after.accent.toLowerCase() === '#ff6600' && after.pink.toLowerCase() === '#00aa88',
-      `(accent=${after.accent}, pink=${after.pink}, house is ${houseAccent})`
+      `(accent=${after.accent}, pink=${after.pink}, house is ${house})`
     );
     check(
       '#52 the brand name reaches the page title',
@@ -2085,8 +2590,8 @@ try {
     check(
       '#52 a palette value that is not a colour is ignored, not applied',
       poisoned.accent.toLowerCase() !== 'not-a-colour' &&
-        poisoned.accent.toLowerCase() === (houseAccent || '').toLowerCase(),
-      `(accent=${poisoned.accent}, house is ${houseAccent})`
+        poisoned.accent.toLowerCase() === (house || '').toLowerCase(),
+      `(accent=${poisoned.accent}, house is ${house})`
     );
     check(
       '#52 a valid palette key alongside an invalid one still applies',
@@ -2101,11 +2606,9 @@ try {
 
     // ── the terms URL needs a surface; the Account panel is the one there is ─
     // COUNT first, then read: a missing element makes textContent() wait out
-    // the full 30s default, and the scenario must close the modal on BOTH
-    // paths — an overlay left open here breaks every scenario after this one
-    // and buries the real failure under four unrelated ones.
+    // the full 30s default.
     await page.click('#accountBtn');
-    await page.waitForSelector('#accountModal.show', { timeout: 5000 });
+    await page.waitForSelector('#accountModal.show', { timeout: 10000 });
     const hasTermsSlot = (await page.locator('#pwTerms').count()) === 1;
     const termsText = hasTermsSlot ? ((await page.locator('#pwTerms').textContent()) || '').trim() : '';
     check(
@@ -2114,17 +2617,21 @@ try {
       hasTermsSlot ? `("${termsText.slice(0, 60)}")` : '(the account panel has no terms slot at all)'
     );
     await page.keyboard.press('Escape');
-    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 5000 });
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 10000 });
 
-    // Back to the house palette, so the next scenario reads a clean venue.
-    await writeBrand(tid, { name: '', logo: '', terms_url: null, palette: {} });
+    // Back to the house palette, so the run ends on a clean venue whatever ran
+    // last.
+    await writeBrand(tid, { name: '', logo: '', favicon: '', terms_url: null, palette: {} });
     await reload();
     const reset = await rootVars();
     check(
       '#52 clearing the brand puts the house colours back',
-      reset.accent.toLowerCase() === (houseAccent || '').toLowerCase(),
-      `(accent=${reset.accent}, house is ${houseAccent})`
+      reset.accent.toLowerCase() === (house || '').toLowerCase(),
+      `(accent=${reset.accent}, house is ${house})`
     );
+    } finally {
+      await writeBrand(tid, { name: '', logo: '', favicon: '', terms_url: null, palette: {} }).catch(() => {});
+    }
   });
 
   // ── #65: the favicon is the last unbranded asset in the shell ─────────────
@@ -2160,13 +2667,20 @@ try {
   const resolvedBg = () =>
     page.evaluate(() => getComputedStyle(document.documentElement).backgroundColor);
 
-  await scenario('#65 the favicon follows the tenant, and only when it can load', async () => {
+  scenario('#65 the favicon follows the tenant, and only when it can load', async () => {
+    await signIn('admin', 'ui-admin-password');
     const before = await branding();
     if (!before || !before.tenant) {
       check('#65 fixture: a tenant to brand', false, '(no tenant served)');
       return;
     }
     const tid = before.tenant.id;
+    // Start from a brand-free tenant, and put it back that way whatever
+    // happens: the checks below compare against what the SHELL ships, and in a
+    // shuffled run another branding scenario may have left a favicon behind.
+    await writeBrand(tid, { name: '', logo: '', favicon: '', terms_url: null, palette: {} });
+    await reload();
+    try {
     const house = await iconHrefs();
 
     check(
@@ -2240,6 +2754,9 @@ try {
 
     await writeBrand(tid, { name: '', logo: '', favicon: '/assets/favicon.png', terms_url: null, palette: {} });
     await reload();
+    } finally {
+      await writeBrand(tid, { name: '', logo: '', favicon: '', terms_url: null, palette: {} }).catch(() => {});
+    }
   });
 
 // ── #66: dark mode ────────────────────────────────────────────────────────
@@ -2355,7 +2872,8 @@ try {
     await page.waitForSelector(`${LIVE_BACK}`, { timeout: 15000 });
   };
 
-  await scenario('#66 dark mode: the light palette is untouched and the dark one is readable', async () => {
+  scenario('#66 dark mode: the light palette is untouched and the dark one is readable', async () => {
+   await signIn('admin', 'ui-admin-password');
    try {
     await onBoard();
     // ── 1. the light values, value by value ──────────────────────────────
@@ -2492,14 +3010,13 @@ try {
     await freshLoad();
    }
   });
-  await scenario('#52 the desk can set the brand it serves', async () => {
-    await page.click('#nav button[data-page="admin"]');
-    await page.waitForSelector('[data-view="tenants"]', { timeout: 10000 });
-    await page.click('[data-view="tenants"]');
+  scenario('#52 the desk can set the brand it serves', async () => {
+    await signIn('admin', 'ui-admin-password');
+    await atAdmin('tenants');
     await page.waitForFunction(
       () => /tenants/i.test((document.querySelector('#adminBody h4') || {}).textContent || ''),
       null,
-      { timeout: 10000 }
+      { timeout: 15000 }
     );
     const tid = await page.evaluate(() => {
       const b = document.querySelector('#adminBody [data-tenant]');
@@ -2560,35 +3077,40 @@ try {
     // A palette value that is not a colour must never reach the venue: the
     // apply side ignores it, but a blank page for every player is worse than a
     // rejected form.
-    await page.fill(`#tp_${tid}_accent`, 'chartreuse');
-    delete adminWrites[`PUT /api/admin/tenants/${tid}`];
-    await page.click('#tSave');
-    await page.waitForTimeout(800);
-    check(
-      '#52 the desk refuses a palette value that is not a hex colour',
-      adminWrites[`PUT /api/admin/tenants/${tid}`] === undefined,
-      `(payload ${JSON.stringify(adminWrites[`PUT /api/admin/tenants/${tid}`])})`
-    );
-
-    // Restore, through the desk.
-    await page.fill('#tBrandName', '');
-    await page.fill('#tBrandTerms', '');
-    await page.fill('#tBrandLogo', '');
-    for (const k of ['accent', 'bg', 'text', 'blue', 'pink']) {
-      await page.fill(`#tp_${tid}_${k}`, '');
+    try {
+      await page.fill(`#tp_${tid}_accent`, 'chartreuse');
+      delete adminWrites[`PUT /api/admin/tenants/${tid}`];
+      await page.click('#tSave');
+      await page.waitForTimeout(1500);
+      check(
+        '#52 the desk refuses a palette value that is not a hex colour',
+        adminWrites[`PUT /api/admin/tenants/${tid}`] === undefined,
+        `(payload ${JSON.stringify(adminWrites[`PUT /api/admin/tenants/${tid}`])})`
+      );
+    } finally {
+      // Restore, through the desk, in a finally: the two branding scenarios
+      // above both start by asserting the house palette is what ships, and
+      // would fail against a brand this scenario abandoned mid-way (#134).
+      await page.fill('#tBrandName', '');
+      await page.fill('#tBrandTerms', '');
+      await page.fill('#tBrandLogo', '');
+      for (const k of ['accent', 'bg', 'text', 'blue', 'pink']) {
+        await page.fill(`#tp_${tid}_${k}`, '');
+      }
+      await page.click('#tSave');
+      await page.waitForFunction(
+        () => /Tenant updated/.test((document.querySelector('#toast') || {}).textContent || ''),
+        null,
+        { timeout: 15000 }
+      );
     }
-    await page.click('#tSave');
-    await page.waitForFunction(
-      () => /Tenant updated/.test((document.querySelector('#toast') || {}).textContent || ''),
-      null,
-      { timeout: 15000 }
-    );
     await reload();
+    const house = await houseAccent();
     const restored = await rootVars();
     check(
       '#52 clearing the palette from the desk puts the house colours back',
-      restored.accent.toLowerCase() === (houseAccent || '').toLowerCase(),
-      `(accent=${restored.accent}, house is ${houseAccent})`
+      restored.accent.toLowerCase() === (house || '').toLowerCase(),
+      `(accent=${restored.accent}, house is ${house})`
     );
   });
 
@@ -2606,26 +3128,25 @@ try {
   // call, so omitting a key CLEARS that cap. Measured against a running server
   // before this control existed. So the checks read the caps back off the
   // server after changing one of them.
-  await scenario('#52 per-user limits: reachable, and changing one axis keeps the others', async () => {
-    // Arrive at the desk explicitly: whatever scenario ran last may have left
-    // the browser on the board, and the tab strip only exists on #/admin.
-    if (!(await page.locator('[data-view="users"]').count())) {
-      await page.click('#nav button[data-page="admin"]');
-      await page.waitForSelector('[data-view="users"]', { timeout: 10000 });
-    }
-    await page.click('[data-view="users"]');
-    await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 10000 });
-    // uitester, not demo: the first-run-lock scenario below signs demo in and
-    // needs it tradeable enough to be refused by exactly one thing.
-    await page.fill('#userSearch', 'uitester');
+  scenario('#52 per-user limits: reachable, and changing one axis keeps the others', async () => {
+    // Its OWN account (#134). This used to edit `uitester`, which only existed
+    // because the registration scenario had run, and the caps it set survived
+    // into every later run of the scenario in the same process. A fresh
+    // account makes "raising one cap does not clear the others" a statement
+    // about a known starting state: no caps at all.
+    await registerAccount('limitstester', 'limitstester@example.com');
+    await signIn('admin', 'ui-admin-password');
+    await atAdmin('users');
+    await page.waitForSelector('#adminBody .adm-tbl tbody tr', { timeout: 15000 });
+    await page.fill('#userSearch', 'limitstester');
     await page.click('#userSearchGo');
     await page.waitForFunction(
       () => {
         const rows = [...document.querySelectorAll('#adminBody .adm-tbl tbody tr')];
-        return rows.length === 1 && (rows[0].textContent || '').includes('uitester');
+        return rows.length === 1 && (rows[0].textContent || '').includes('limitstester');
       },
       null,
-      { timeout: 10000 }
+      { timeout: 15000 }
     );
     const row = page.locator('#adminBody .adm-tbl tbody tr').first();
     const uid = Number(((await row.locator('td').first().textContent()) || '').trim());
@@ -2643,12 +3164,25 @@ try {
       }, uid);
     const globalRow = async () => (await limitsOf()).find((r) => r.scope === 'global') || null;
 
+    // The starting point, stated. Without it "raising one cap does not clear
+    // the others" would also pass against an account that had no other caps to
+    // clear — which is a check that cannot fail.
+    const capsBefore = await globalRow();
+    check(
+      '#52 fixture: the fresh account has no caps to clear yet',
+      capsBefore === null ||
+        (capsBefore.max_open_stake_cents == null &&
+          capsBefore.max_market_liability_cents == null &&
+          capsBefore.max_daily_settled_cents == null),
+      `(row ${JSON.stringify(capsBefore)})`
+    );
+
     // ── open the limits control ────────────────────────────────────────────
     await row.locator('[data-act="limits"]').click();
-    await page.waitForSelector('.modal[role="dialog"] #lmSave', { timeout: 10000 });
+    await page.waitForSelector('.modal[role="dialog"] #lmSave', { timeout: 15000 });
     check(
       '#52 the limits control opens on the account under edit',
-      /uitester/.test((await page.locator('.modal[role="dialog"] h3').textContent()) || ''),
+      /limitstester/.test((await page.locator('.modal[role="dialog"] h3').textContent()) || ''),
       `("${((await page.locator('.modal[role="dialog"] h3').textContent()) || '').trim()}")`
     );
     check(
@@ -2793,19 +3327,15 @@ try {
   // ── First-run lock ──────────────────────────────────────────────────────
   // A locked account must be told what to do immediately, not left to
   // discover the lock by getting a 403 on their first bet.
-  // #authBtn is Sign out while signed in and Sign in once out, so the first
-  // click signs out and the second opens the modal.
-  await page.click('#authBtn');
-  await page.waitForTimeout(500);
-  await page.click('#authBtn');
-  await page.waitForSelector('#authModal.show', { timeout: 10000 });
-  await page.fill('#authUser', 'demo');
-  await page.fill('#authPass', 'ui-demo-password');
-  await page.click('#authGo');
-  // Configured password => not locked => no forced setup panel.
-  await page.waitForTimeout(600);
-  const setupShown = await page.locator('#accountModal.show').count();
-  check('a configured password does not trigger the setup lock', setupShown === 0, `(${setupShown} modal(s))`);
+  scenario('a configured password does not trigger the setup lock', async () => {
+    // Its own sign-in: the scenario below needs demo UNLOCKED, and a shuffled
+    // run may put that scenario first (#134).
+    await signIn('demo', 'ui-demo-password');
+    // Configured password => not locked => no forced setup panel.
+    await page.waitForTimeout(1500);
+    const setupShown = await page.locator('#accountModal.show').count();
+    check('a configured password does not trigger the setup lock', setupShown === 0, `(${setupShown} modal(s))`);
+  });
 
   // ── #44: the LOCKED sign-in actually forces setup ───────────────────────
   //
@@ -2815,32 +3345,38 @@ try {
   // and the panel stayed closed either way. So the bug shipped with a green
   // test beside it.
   //
-  // This drives the POSITIVE: the server is made to flag demo as locked (the
-  // same column server.js's boot sweep writes), then demo signs in and the UI
-  // must open the panel and say what is wrong.
-  await scenario('a locked account is routed to the password panel on sign-in', async () => {
+  // This drives the POSITIVE: the server is made to flag an account as locked
+  // (the same column server.js's boot sweep writes), then that account signs in
+  // and the UI must open the panel and say what is wrong.
+  //
+  // Its OWN account, not `demo` (#134). The original unlocked demo by changing
+  // its password and left it changed, so in any order where this scenario ran
+  // early, every later scenario that signed in as demo failed to authenticate.
+  // A throwaway account makes the password change part of the scenario's own
+  // private story.
+  scenario('a locked account is routed to the password panel on sign-in', async () => {
+    const LOCKED = 'locktester';
+    await registerAccount(LOCKED, `${LOCKED}@example.com`);
     // Sign OUT before flipping the flag. Flipping it under a live session
     // leaves that session polling endpoints it is no longer allowed to reach,
     // and the resulting 403 is this test manufacturing its own console error.
-    await page.click('#authBtn');
-    await page.waitForFunction(() => document.getElementById('authBtn').textContent === 'Sign in', null, { timeout: 10000 });
+    await signOut();
 
-    // The server is made to flag demo as locked — the same column server.js's
-    // boot sweep writes — so this is the real lock, not a mocked flag.
-    const { DatabaseSync } = await import('node:sqlite');
-    const db = new DatabaseSync(path.join(TMP, 'ui.db'));
-    db.prepare('UPDATE users SET must_change_password = 1 WHERE username = ?').run('demo');
+    // The server is made to flag the account as locked — the same column
+    // server.js's boot sweep writes — so this is the real lock, not a mocked flag.
+    const db = await openDb();
+    db.prepare('UPDATE users SET must_change_password = 1 WHERE username = ?').run(LOCKED);
     db.close();
 
     await page.click('#authBtn');
-    await page.waitForSelector('#authModal.show', { timeout: 5000 });
-    await page.fill('#authUser', 'demo');
-    await page.fill('#authPass', 'ui-demo-password');
+    await page.waitForSelector('#authModal.show', { timeout: 10000 });
+    await page.fill('#authUser', LOCKED);
+    await page.fill('#authPass', 'secret1');
     expectLock403 = true;
     await page.click('#authGo');
 
     // The panel must open on its own. Nothing here clicks anything to get it.
-    await page.waitForSelector('#accountModal.show', { timeout: 10000 });
+    await page.waitForSelector('#accountModal.show', { timeout: 15000 });
     check('a locked sign-in opens the account panel by itself', true);
 
     const toastText = (await page.locator('#toast').textContent()) || '';
@@ -2860,8 +3396,8 @@ try {
     check('the locked account can still see its own sessions', true);
 
     // Clear the lock through the panel, so the run ends the way it started.
-    await page.fill('#pwCurrent', 'ui-demo-password');
-    await page.fill('#pwNew', 'ui-demo-password-2');
+    await page.fill('#pwCurrent', 'secret1');
+    await page.fill('#pwNew', 'secret2');
     await page.click('#pwGo');
     await page.waitForFunction(
       () => /Password changed/.test(document.getElementById('pwNote').textContent || ''),
@@ -2870,7 +3406,43 @@ try {
     );
     check('the panel actually unlocks the account', true);
     expectLock403 = false;
+    // Close the panel. It covers the viewport, and a scenario that ends with it
+    // open makes every click after it time out against the overlay — which reads
+    // as twenty broken scenarios rather than one forgotten Escape (#134).
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.getElementById('accountModal').classList.contains('show'), null, { timeout: 10000 });
+    check('the panel closes once the account is unlocked', true);
+
+    // The board UNDERNEATH was rendered while this account was locked, so it is
+    // showing the 403 fault card ("The board could not be loaded — Change your
+    // password…"), and that card is what the next scenario would inherit. Sign
+    // out and back in as a normal account so this scenario hands over a page a
+    // normal session can actually use — a scenario that has to repair what it
+    // broke is one that is not self-sufficient (#134).
+    await signOut();
+    await signIn('demo', 'ui-demo-password');
+    await atMarkets();
   });
+
+  // ── run the registered scenarios ────────────────────────────────────────
+  //
+  // A scenario that throws is a NAMED failure, not the end of the run: the old
+  // `&&`-style habit of stopping at the first failure hides every later check
+  // behind it, and on an order-dependent suite "which later check also broke"
+  // is most of the diagnosis.
+  const plan = plannedOrder();
+  if (SHUFFLE) {
+    console.log(`  order: ${plan.map((s, i) => `${i + 1}. ${s.name}`).join('\n         ')}`);
+  }
+  for (const s of plan) {
+    try {
+      await s.fn();
+    } catch (e) {
+      console.log('  FAIL', s.name, '—', (e && e.message) || e);
+      process.exitCode = 1;
+    }
+    await resetBetweenScenarios();
+  }
 
   check('no uncaught page errors during the whole run', pageErrors.length === 0, pageErrors.join(' | '));
 } catch (e) {
