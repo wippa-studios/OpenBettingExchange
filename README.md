@@ -208,7 +208,7 @@ layered on `match`.
 | `lib/feed`, `lib/feedcreds`, `lib/feedrunner` | Odds feed reader, encrypted credentials, collector supervisor |
 | `lib/bots`, `lib/drift` | Market-maker ladders and fair-price drift |
 | `lib/userrules` | Player-authored betting rules, evaluated on the price stream |
-| `lib/store`, `lib/seed` | Schema (37 tables) and fixtures |
+| `lib/store`, `lib/seed` | Schema (38 tables) and fixtures |
 
 The frontend (`public/js/`) is split into seven modules (`core`, `shell`, `nav`,
 `board`, `slip`, `views`, `boot`) under the `window.OB` namespace.
@@ -446,7 +446,7 @@ weight.
 ```bash
 
 
-npm test            # 1181 checks: unit and API integration, fully offline
+npm test            # 1269 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 220 checks: real Chromium via Playwright (board and admin desk)

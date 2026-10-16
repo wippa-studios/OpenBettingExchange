@@ -42,7 +42,7 @@ server    server.js  4061 lines, 125 routes
 engine    lib/       31 modules + lib/payments/ — see the table below
    │
    ▼
-storage   data/openbettingexchange.db   SQLite (WAL), 37 tables, created on first run
+storage   data/openbettingexchange.db   SQLite (WAL), 38 tables, created on first run
 ```
 
 There is no ORM, no migration framework and no service layer beyond `lib/`. The
@@ -127,7 +127,7 @@ that once made the automated results poll settle nothing while reporting success
 
 ## Why these choices
 
-- **No ORM, no migrations.** The schema is 37 tables of plain SQL with `CHECK`
+- **No ORM, no migrations.** The schema is 38 tables of plain SQL with `CHECK`
   constraints on the money columns. A contributor can read the whole data model
   in one file, and the database itself refuses an invalid cent. `docs:check`
   verifies the table count against the code, so the figure above cannot rot.
@@ -297,7 +297,7 @@ Deliberately narrow, and asserted by tests rather than assumed:
 
 ## Testing strategy
 
-1181 checks across 73 suites, plus a 220-check browser suite and a live smoke script.
+1269 checks across 75 suites, plus a 220-check browser suite and a live smoke script.
 | Layer | Where | What it proves |
 | --- | --- | --- |
 | Pure maths | `tests/odds.test.js`, `tests/tx.test.js` | ladder, conversions, transaction depth |
