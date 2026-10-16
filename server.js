@@ -41,6 +41,18 @@ const RISK = require('./lib/risk');
 // 15 minutes: it is cheap, and a control nobody runs is not a control.
 const JOBS_INTERVALS = {
   reconcileMs: Number(process.env.RECONCILE_INTERVAL_MS || 900000),
+  // AML MONITORING, ON A TIMER, for the same reason reconciliation is.
+  //
+  // A rule set that only fires when an operator presses a button is a rule set
+  // that does not fire, and the difference is invisible from inside the code:
+  // every assertion passes and no alert is ever raised. That is the dead-control
+  // shape this repository keeps finding, and the reason lib/jobs.js carries an
+  // `amlPass` rather than leaving the scan as a route.
+  //
+  // 0 disables it. The pass itself refuses to run while AML_MONITORING_ENABLED is
+  // false and SAYS SO in its return value, so a misconfigured deployment reports
+  // "off" rather than quietly reporting nothing found.
+  amlMs: Number(process.env.AML_SCAN_INTERVAL_MS || 3600000),
   resultsPollMs: Number(process.env.RESULTS_POLL_INTERVAL_MS || 60000),
   // Backups on a timer, not on request: an operator who forgets to press the
   // button has no backup, and the button is the first thing skipped under
@@ -91,6 +103,21 @@ const BOOKVERSION = require('./lib/bookversion');
 // column comes from here, and the mover view is built from the SAME query the
 // column uses rather than a second one that could disagree with it.
 const MARKETDATA = require('./lib/marketdata');
+// ── Compliance (Australian AML/CTF, data-source register) ────────────────────
+// The identity provider is a SEAM, not a vendor: lib/identity/provider.js is the
+// contract and lib/identity/reference.js is a deterministic reference
+// implementation beside it, on exactly the terms lib/payments/provider.js sets out.
+// No vendor adapter ships here and none is chosen by this repository — which
+// provider an Australian venue may use is not a technical question.
+const IDENTITY = require('./lib/identity');
+const AMLRULES = require('./lib/aml/rules');
+const AMLENGINE = require('./lib/aml/engine');
+const AMLFIND = require('./lib/aml/findings');
+const AMLTHRESH = require('./lib/aml/thresholds');
+const AMLREPORTS = require('./lib/aml/reports');
+const FUNDING = require('./lib/funding');
+const DATASOURCES = require('./lib/datasources');
+const RETENTION = require('./lib/retention');
 
 // Keep the local dashboard alive on stray async failures; log for diagnosis.
 // DELIBERATE demo choice (documented in .github/SECURITY.md): this app is
@@ -1089,7 +1116,32 @@ app.post('/api/auth/register', limit('auth'), async (req, res, next) => {
   const key = 'register:' + (req.socket.remoteAddress || 'unknown');
   if (rlLocked(db, key)) return rlTooManyAttempts(res, key);
   try {
-    const user = await A.registerUser(db, { username, password, email });
+    // WHERE THE ACCOUNT CAME FROM, recorded at creation and never after.
+    //
+    // The address is the SOCKET's, never a header the client could set. lib/config.js
+    // gates the country header behind TRUST_PROXY_JURISDICTION for exactly this
+    // reason — "a client-declared country is not a jurisdiction, and trusting one
+    // would make the control defeatable by editing a header while still being
+    // recorded as enforced" — and an IP is the same class of claim about the same
+    // thing. The forwarded address is only consulted when the operator has
+    // asserted their edge OVERWRITES it, which is the same assertion.
+    //
+    // `device` is a coarse client hint, and it is treated as a SIGNAL rather than
+    // an identity: the link-analysis rule requires BOTH a shared origin and two
+    // distinct usernames before it fires, and it never blocks. See
+    // lib/aml/engine.js sharedOriginGroups.
+    const registrationIp = config.TRUST_PROXY_JURISDICTION
+      ? String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() ||
+        req.socket.remoteAddress ||
+        null
+      : req.socket.remoteAddress || null;
+    const registrationDevice =
+      typeof req.headers['x-client-device'] === 'string'
+        ? String(req.headers['x-client-device']).slice(0, 128)
+        : null;
+    const user = await A.registerUser(db, {
+      username, password, email, registration_ip: registrationIp, registration_device: registrationDevice,
+    });
     rlRecordSuccess(db, key);
     // Jurisdiction gate at session mint, not at bet placement. The country is
     // read ONLY from a proxy-overwritten header, and only when the operator has
@@ -2375,12 +2427,21 @@ app.put('/api/admin/risk/bots/:id', requireAdmin, limit('admin'), (req, res, nex
 // seams. An intent credits nothing until confirmed — that is the whole
 // contract, and it is why these are two calls rather than one.
 app.post('/api/wallet/deposit-intent', requireAuth, limit('wallet'), (req, res, next) => {
-  const amount = Number((req.body || {}).amount_cents);
+  const body = req.body || {};
+  const amount = Number(body.amount_cents);
   // Same reasoning as the faucet above: the intent is a way to move real money
   // in, so self-exclusion has to stop it here too, not only stop trading.
   LIMITS.assertTradeable(db, req.user);
   RG.assertDeposit(db, req.user.id, amount);
-  PAY.openDeposit(db, req.user.id, amount)
+  // THE CHOSEN METHOD, recorded here and enforced at confirmation. It is taken at
+  // intent creation rather than at confirmation because that is the only point at
+  // which the choice is the customer's rather than something they could change
+  // after the money arrived — and the TERMS under which the venue may use a
+  // provider (approved-seller status, countries covered, credit-linked or not) are
+  // what lib/funding.js enforces against it.
+  PAY.openDeposit(db, req.user.id, amount, {
+    paymentMethodSlug: typeof body.payment_method === 'string' ? body.payment_method.slice(0, 64) : null,
+  })
     .then((r) => res.json(r))
     .catch(next);
 });
@@ -2462,6 +2523,18 @@ app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
       provider: body.provider,
       externalId: body.external_id,
       amountCents: Number(body.amount_cents),
+      // WHAT THE RAIL REPORTS ABOUT THE FUNDING, recorded onto the intent before
+      // the gate reads it. This is the only fact the third-party-funding control
+      // has — the difference between "this instrument is registered to the account
+      // holder" and "this instrument is registered to somebody else" IS this field
+      // against the account's verified name. A PSP that does not report a payer
+      // name or a funding country produces a deposit that is REFUSED rather than
+      // cleared, and the refusal code says which fact was missing, so the operator
+      // knows what to configure with their PSP rather than guessing.
+      funding: {
+        payerName: typeof body.payer_name === 'string' ? body.payer_name : undefined,
+        fundingCountry: typeof body.funding_country === 'string' ? body.funding_country : undefined,
+      },
     });
     res.json(r);
   } catch (e) {
@@ -2470,10 +2543,60 @@ app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
     // and lib/payments now answers it 200 {already_confirmed: true} rather than
     // 404 — so this branch is for genuinely unknown ids, which is a real fault.
     // Either way: answer it, do not crash the process.
-    if (e && e.status) return res.status(e.status).json({ error: e.message, details: e.details || null });
+    if (e && e.status) {
+      recordFundingRefusal(e, body.external_id);
+      return res.status(e.status).json({ error: e.message, details: e.details || null });
+    }
     throw e;
   }
 });
+
+/**
+ * Record a deposit REFUSED by the funding gate, OUTSIDE the transaction that
+ * rolled it back.
+ *
+ * This is the half lib/funding.js deliberately does not do for itself: an audit
+ * row written inside `confirmDeposit`'s transaction would be rolled back with the
+ * refusal that wrote it, so the record of the attempt has to be written by the
+ * caller once the transaction has unwound. The reason is the same shape
+ * lib/limits.js's header gives for persisted order refusals.
+ *
+ * ONLY THE FUNDING CODES ARE RECORDED. An identity refusal is recorded by
+ * lib/identity's own audit rows, and recording a general 4xx here would fill the
+ * log with every validation error on the webhook.
+ *
+ * AND NO MONEY MOVED, which is exactly why the row matters: an accepted deposit
+ * on an irrevocable rail cannot be reversed, so "was this attempted, and how
+ * often?" has to be answerable from the log rather than from a balance that never
+ * moved.
+ */
+const FUNDING_REFUSAL_CODES = new Set([
+  'payment_method_unknown',
+  'payment_method_disabled',
+  'payment_method_terms_unrecorded',
+  'credit_linked_method_prohibited',
+  'funding_country_not_permitted',
+  'restricted_funding_jurisdiction',
+  'restricted_payout_jurisdiction',
+  'beneficiary_country_invalid',
+  'funding_instrument_unregistered',
+  'funding_instrument_disabled',
+  'funding_instrument_third_party',
+  'funding_instrument_owner_unknown',
+]);
+function recordFundingRefusal(e, externalId) {
+  const code = e && e.details && e.details.code;
+  if (!code || !FUNDING_REFUSAL_CODES.has(code)) return null;
+  const row = externalId
+    ? db.prepare('SELECT user_id FROM payment_intents WHERE external_id = ?').get(String(externalId))
+    : null;
+  return FUNDING.recordRefusal(db, {
+    actor: null,
+    userId: row ? row.user_id : null,
+    code,
+    detail: e.message,
+  });
+}
 
 // ── Withdrawal lifecycle (admin) ────────────────────────────────────────────
 // The outside audit's F5: a withdrawal could be opened and debited, and
@@ -2513,7 +2636,19 @@ app.post('/api/wallet/withdraw', requireAuth, limit('wallet'), (req, res) => {
   // line refuses anything that is not a positive integer. The coercion here was
   // defeating an existing validator, so the fix is to pass the value through
   // untouched and let that validator do its job, not to add a second one.
-  res.json(PAY.openWithdrawal(db, req.user.id, amount_cents, reason));
+  // THE BENEFICIARY COUNTRY, when the customer states it. Optional and not
+  // prompted for: many providers report it only when they make the payout, and
+  // forcing a country at intake would make venues invent one — a fabricated
+  // country compared against a restricted list is worse than an absent one. What
+  // IS refused is a country the operator has told the venue is restricted, and
+  // the retrospective indicator rule in lib/aml/rules.js catches the rest.
+  res.json(
+    PAY.openWithdrawal(db, req.user.id, amount_cents, reason, {
+      beneficiary_country: typeof (req.body || {}).beneficiary_country === 'string'
+        ? (req.body || {}).beneficiary_country
+        : null,
+    })
+  );
 });
 
 app.get('/api/admin/reconciliation', requireAdmin, limit('admin'), (req, res, next) => {
@@ -2728,7 +2863,14 @@ app.get('/api/admin/results/held', requireAdmin, limit('admin'), (req, res) => {
 app.post('/api/admin/results/held/:id/release', requireAdmin, limit('admin'), (req, res) => {
   const { decision, winner_selection_id, dead_heat, reason } = req.body || {};
   res.json(
+    // `data_source_id` is WHICH LICENSED SOURCE the person releasing the hold was
+    // working from — a parameter of the RELEASE rather than of the hold, because
+    // a manual release is exactly the case where "under whose approval was this
+    // settled?" is the question asked months later. Optional and validated: an
+    // expired or out-of-scope approval refuses the release rather than producing a
+    // settlement nobody can defend.
     RESULTS.releaseHold(db, {
+      dataSourceId: req.query.data_source_id ? intId(req.query.data_source_id) : null,
       actor: req.user,
       marketId: intId(req.params.id),
       decision,
@@ -2764,6 +2906,463 @@ app.get('/api/admin/reconciliation/findings', requireAdmin, limit('admin'), (req
 
 app.post('/api/admin/reconciliation/findings/:id/resolve', requireAdmin, limit('admin'), (req, res) => {
   res.json(JOBS.resolveFinding(db, { actor: req.user, id: intId(req.params.id), reason: (req.body || {}).reason }));
+});
+
+// ── Compliance: customer pre-verification ──────────────────────────────────
+// The PLAYER-facing identity surface, and it is deliberately the narrowest one
+// in the codebase.
+//
+// It answers exactly three questions: what state is my account in, is a
+// verification in progress, and what should I do next. It contains NO screening
+// outcome, NO constituent checks, NO operator-written reason, and NO
+// financial-crime alert — ever. Tipping off is a criminal offence in Australia
+// and the exposure runs to staff who are not entitled to know as well as to the
+// customer, so what a customer is told is bounded here rather than by care at
+// each call site. See lib/aml/findings.js for the three surfaces and the
+// reasoning.
+app.get('/api/identity/me', requireAuth, limit('read'), (req, res) => {
+  res.json(IDENTITY.statusOf(db, req.user.id));
+});
+
+// Starts a verification and returns the vendor session plus whatever client-side
+// token the vendor needs. The client token is OPTIONAL in the contract and may be
+// null: a pure-redirect vendor has none, so nothing here may require one.
+app.post('/api/identity/start', requireAuth, limit('auth'), (req, res, next) => {
+  const b = req.body || {};
+  IDENTITY.startVerification(db, {
+    userId: req.user.id,
+    actor: req.user,
+    // Opaque subject handle. The venue must be able to ask a screening question
+    // without holding the identity that answers it, so the default is a handle
+    // derived from the account and nothing else.
+    reference: typeof b.reference === 'string' ? b.reference.slice(0, 200) : `user:${req.user.id}`,
+    // Optional, and a NAME and NOT a date of birth or a document number. It is
+    // the provider's assertion about the person, recorded so a disputed refusal
+    // can be explained — and so lib/funding.js can compare the name a payment
+    // rail reports against the name the account was verified under, which is the
+    // only way third-party funding is detectable at all.
+    subjectName: typeof b.subject_name === 'string' ? b.subject_name.slice(0, 200) : null,
+  })
+    .then((r) => res.json(r))
+    .catch(next);
+});
+
+// Read the outcome: the decision plus the individual checks that produced it.
+app.get('/api/identity/verification/:id', requireAuth, limit('read'), (req, res, next) => {
+  IDENTITY.readOutcome(db, { verificationId: intId(req.params.id), actor: req.user })
+    .then((r) => res.json(r))
+    .catch(next);
+});
+
+// ── THE SCREENING ENDPOINT, AND WHAT IT DOES NOT RETURN ────────────────────
+//
+// It runs the two screening obligations — the national self-exclusion register
+// and sanctions / PEP — and returns `{ screened: true }`. Nothing else.
+//
+// NOT `hit: true`. A screening endpoint that told the customer they had been
+// matched would be handing them the fact that they are on a national register or
+// a sanctions list, and one that returned `hit: false` would be telling them they
+// had been screened when they had not. Both outcomes go to the financial-crime
+// record instead, through an entitlement-gated surface an analyst reads and they
+// do not.
+app.post('/api/identity/screen', requireAuth, limit('auth'), (req, res, next) => {
+  const b = req.body || {};
+  IDENTITY.screen(db, {
+    userId: req.user.id,
+    actor: req.user,
+    reference: typeof b.reference === 'string' ? b.reference.slice(0, 200) : `user:${req.user.id}`,
+    jurisdiction: typeof b.jurisdiction === 'string' ? b.jurisdiction.slice(0, 2).toUpperCase() : null,
+  })
+    .then((r) => res.json(r))
+    .catch(next);
+});
+
+// The provider's decision CALLBACK. Unauthenticated by session — it authenticates
+// the CALLER with an HMAC over the raw body, and 404s when the secret is unset,
+// exactly as the payments webhook does. Without that check this would be an open
+// endpoint that decides whether a customer may trade.
+// `limit('wallet')`, on the same terms as the payments webhook below: the
+// callback is authenticated by an HMAC rather than by a session, and an
+// unauthenticated caller can still make it do an HMAC comparison per request, so
+// the route carries a volume bucket. tests/ratelimit-coverage.test.js enforces
+// that every route either has one or states why not, and this one has one.
+app.post('/api/identity/callback', limit('wallet'), async (req, res, next) => {
+  if (!config.IDENTITY_CALLBACK_SECRET) return apiError(res, 404, 'Not found');
+  const signature = req.get('x-identity-signature') || '';
+  const raw = req.rawBody ? req.rawBody.toString('utf-8') : JSON.stringify(req.body || {});
+  const ts = req.get('x-identity-timestamp') || '';
+  const expected = crypto
+    .createHmac('sha256', config.IDENTITY_CALLBACK_SECRET)
+    .update(`${ts}.${raw}`)
+    .digest('hex');
+  const a = Buffer.from(expected);
+  const b = Buffer.from(signature);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return apiError(res, 401, 'Bad signature');
+  }
+  IDENTITY.readCallback(db, { rawBody: raw, headers: req.headers, signature, actor: null })
+    .then((r) => res.json(r))
+    .catch(next);
+});
+
+// Tear a vendor session down. A prospective customer who abandons the flow must
+// not leave a live session at the vendor, and the venue needs to be able to end
+// one it can no longer complete.
+app.delete('/api/identity/session/:id', requireAuth, limit('auth'), (req, res, next) => {
+  const row = db.prepare('SELECT user_id FROM identity_verifications WHERE id = ?').get(intId(req.params.id));
+  if (!row) return apiError(res, 404, 'Verification not found');
+  // Own-session only. This is a player route, and a player must not be able to
+  // release another account's vendor session by guessing an id.
+  if (row.user_id !== req.user.id) return apiError(res, 404, 'Verification not found');
+  IDENTITY.releaseSession(db, { verificationId: intId(req.params.id), actor: req.user })
+    .then((r) => res.json(r))
+    .catch(next);
+});
+
+// ── Compliance: the admin desk ─────────────────────────────────────────────
+// Every route below is requireAdmin. The AML surfaces additionally require the
+// ENTITLEMENT check inside lib/aml/findings, because 'admin' is the venue's
+// general operator role and is held by whoever runs the trading desk, the support
+// desk and the content desk. Whether any particular person may read a
+// suspicious-matter file is the operator's compliance officer's decision, and
+// guessing at it in code would be exactly the kind of legal judgement this
+// codebase refuses to make.
+
+// The rule set, with each rule's published indicator, its shipped calibration and
+// the reasoning. This is the "an operator must be able to see what rules exist and
+// why" surface, and it is readable without a JSON viewer: ?format=csv.
+app.get('/api/admin/aml/rules', requireAdmin, limit('admin'), (req, res) => {
+  const tenantsLib = require('./lib/tenants');
+  const tenantId = req.query.tenant_id ? intId(req.query.tenant_id) : tenantsLib.defaultTenant(db).id;
+  const effective = (rule) => AMLENGINE.effectiveTuning(db, rule, tenantId);
+  const rep = { tenant_id: tenantId, rules: AMLRULES.describe(effective), threshold: AMLTHRESH.policy() };
+  if (req_format_is_json(req)) return res.json(rep);
+  res.setHeader('content-type', 'text/csv; charset=utf-8');
+  res.setHeader('content-disposition', 'attachment; filename="aml_rules.csv"');
+  res.send(AMLREPORTS.rulesCsv(rep));
+});
+
+// The operator's calibration of a rule. An audited, reasoned change to a
+// financial-crime control — the decision point this codebase leaves to the
+// compliance officer, made explicit and attributable rather than buried in a
+// constant.
+app.put('/api/admin/aml/rules/:id', requireAdmin, limit('admin'), (req, res) => {
+  const b = req.body || {};
+  const tenantsLib = require('./lib/tenants');
+  const tenantId = b.tenant_id ? intId(b.tenant_id) : tenantsLib.defaultTenant(db).id;
+  res.json(AMLENGINE.setTuning(db, {
+    actor: req.user,
+    ruleId: req.params.id,
+    tenantId,
+    value_cents: b.value_cents ?? null,
+    value_count: b.value_count ?? null,
+    window_days: b.window_days ?? null,
+    reason: b.reason,
+  }));
+});
+
+// Open financial-crime alerts. Requires the ENTITLEMENT, and says so with a
+// distinct machine-readable code when it is absent, because an operator who has
+// not been granted it needs to know that is why rather than concluding the desk
+// is empty.
+app.get('/api/admin/aml/alerts', requireAdmin, limit('admin'), (req, res) => {
+  res.json({ alerts: AMLFIND.openAlerts(db, { actor: req.user, limit: req.query.limit }) });
+});
+
+app.post('/api/admin/aml/alerts/:id/resolve', requireAdmin, limit('admin'), (req, res) => {
+  res.json(AMLFIND.resolveAlert(db, {
+    actor: req.user,
+    id: intId(req.params.id),
+    reason: (req.body || {}).reason,
+  }));
+});
+
+// Grant or revoke the entitlement to read financial-crime material. The
+// mechanism that makes tipping off PREVENTABLE rather than merely forbidden, and
+// it ships with the table empty so the first deployment has to make the decision
+// deliberately.
+app.post('/api/admin/aml/entitlements', requireAdmin, limit('admin'), (req, res) => {
+  const b = req.body || {};
+  res.json(AMLFIND.setEntitlement(db, {
+    actor: req.user,
+    userId: intId(b.user_id),
+    entitled: b.entitled !== false,
+    reason: b.reason,
+  }));
+});
+
+// Open threshold obligations. The duty to report, as a list.
+app.get('/api/admin/aml/thresholds', requireAdmin, limit('admin'), (req, res) => {
+  if (!AMLFIND.entitled(db, req.user)) return apiError(res, 403, 'Not entitled to financial-crime material', { code: 'aml_not_entitled' });
+  res.json({ policy: AMLTHRESH.policy(), obligations: AMLTHRESH.openObligations(db) });
+});
+
+// Discharge an obligation. A human, with a written reason, and the reason is what
+// an examiner reads months later.
+app.post('/api/admin/aml/thresholds/:id/discharge', requireAdmin, limit('admin'), (req, res) => {
+  if (!AMLFIND.entitled(db, req.user)) return apiError(res, 403, 'Not entitled to financial-crime material', { code: 'aml_not_entitled' });
+  const b = req.body || {};
+  res.json(AMLTHRESH.discharge(db, {
+    actor: req.user,
+    id: intId(req.params.id),
+    reportReference: b.report_reference ?? null,
+    reason: b.reason,
+  }));
+});
+
+// Report GENERATION. Not submission — nothing here talks to a regulator, and both
+// payloads say so in their `submission` block so an operator reading the file
+// cannot mistake a generated report for a filed one.
+app.get('/api/admin/aml/reports/threshold-transactions', requireAdmin, limit('admin'), (req, res) => {
+  const rep = AMLREPORTS.thresholdTransactions(db, { actor: req.user, from: req.query.from, to: req.query.to });
+  if (req_format_is_json(req)) return res.json(rep);
+  res.setHeader('content-type', 'text/csv; charset=utf-8');
+  res.setHeader('content-disposition', 'attachment; filename="threshold_transactions.csv"');
+  res.send(AMLREPORTS.thresholdTransactionsCsv(rep));
+});
+
+app.get('/api/admin/aml/reports/suspicious-matter', requireAdmin, limit('admin'), (req, res) => {
+  const rep = AMLREPORTS.suspiciousMatter(db, { actor: req.user });
+  if (req_format_is_json(req)) return res.json(rep);
+  res.setHeader('content-type', 'text/csv; charset=utf-8');
+  res.setHeader('content-disposition', 'attachment; filename="suspicious_matter.csv"');
+  res.send(AMLREPORTS.suspiciousMatterCsv(rep));
+});
+
+// Run a monitoring pass now. The same function the scheduled job runs; exposed
+// because an operator who has just registered a processor pool or calibrated a
+// rule needs to see the effect rather than wait for a timer.
+app.post('/api/admin/aml/scan', requireAdmin, limit('admin'), (req, res) => {
+  const b = req.body || {};
+  res.json(AMLENGINE.scan(db, { actor: req.user, userIds: Array.isArray(b.user_ids) ? b.user_ids.map(intId) : null, limit: b.limit }));
+});
+
+// ── Compliance: identity admin desk ────────────────────────────────────────
+//
+// The ADMIN view of verification state. It is separate from /api/identity/me and
+// deliberately wider: the operator needs the provider, the decision and the
+// constituent checks to answer a customer who disputes a refusal — which is the
+// question the per-customer checks list exists to answer.
+//
+// The checked name is NOT on this response. It is stored, and lib/payments reads
+// it only to compare against a payer name; surfacing it on an admin route that
+// half the venue's operators can reach would widen the exposure of the one piece
+// of identity data this schema holds for a single-purpose comparison.
+app.get('/api/admin/identity/verifications', requireAdmin, limit('admin'), (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT iv.id, iv.user_id, iv.provider, iv.external_id, iv.status, iv.decision,
+              iv.checks, iv.detail, iv.started_at, iv.decided_at, u.username
+         FROM identity_verifications iv JOIN users u ON u.id = iv.user_id
+        ORDER BY iv.id DESC LIMIT ?`
+    )
+    .all(Math.min(Math.max(Number(req.query.limit) || 200, 1), 1000));
+  res.json({
+    enforced: IDENTITY.required(),
+    statuses: IDENTITY.IDENTITY_STATUSES,
+    // The counts an operator opens this screen for: how many accounts are
+    // unverified, and how many are sitting with a human.
+    counts: Object.fromEntries(
+      IDENTITY.IDENTITY_STATUSES.map((s) => [
+        s,
+        db.prepare('SELECT COUNT(*) c FROM users WHERE is_bot = 0 AND role = ? AND identity_status = ?').get('user', s).c,
+      ])
+    ),
+    verifications: rows.map((r) => ({ ...r, checks: r.checks ? JSON.parse(r.checks) : [] })),
+  });
+});
+
+// The operator's remediation path for an account that predates the pre-verification
+// obligation. A decision with a name, a reason and an audit row — never a flag
+// that says "exempt", which is why there is no exempt value in the vocabulary.
+app.post('/api/admin/identity/decision', requireAdmin, limit('admin'), (req, res) => {
+  const b = req.body || {};
+  res.json(IDENTITY.setDecision(db, {
+    actor: req.user,
+    userId: intId(b.user_id),
+    decision: b.decision,
+    reason: b.reason,
+  }));
+});
+
+// The age-assurance register, INCLUDING which records have been erased.
+//
+// Age assurance is personal information that must be destroyed once used, so an
+// operator needs to be able to see both halves: the live attestations and the
+// tombstones proving the erasures happened. An operator who can only see the
+// first half cannot answer "was it destroyed?", and one who can only see the
+// second cannot audit the control.
+app.get('/api/admin/identity/age-assurance', requireAdmin, limit('admin'), (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT a.user_id, a.provider, a.method, a.assurance, a.outcome, a.verified_at,
+              a.expires_at, a.erased_at, u.username
+         FROM age_assurance a JOIN users u ON u.id = a.user_id
+        ORDER BY a.user_id`
+    )
+    .all();
+  res.json({
+    // The reason this is not simply "a date of birth on the user", said in the
+    // payload as well as in the source, because an operator reading this screen
+    // is exactly the person who will ask where the date of birth went.
+    note:
+      'Age assurance is stored as an ATTESTATION and an opaque vendor handle — not a date of ' +
+      'birth, a document type, a document number or an image. The reform bill\'s explanatory ' +
+      'memorandum provides that personal information collected for age assurance must be destroyed ' +
+      'once used, and that no Australian is to be forced to use government identification for it, ' +
+      'so the record is built to be complete if the vendor returns nothing at all.',
+    live: rows.filter((r) => !r.erased_at),
+    erased: rows.filter((r) => r.erased_at),
+  });
+});
+
+// Individual, reasoned, audited erasure. The action the provision is about, made
+// callable rather than a consequence of something else.
+app.post('/api/admin/identity/age-assurance/:id/erase', requireAdmin, limit('admin'), (req, res) => {
+  res.json(IDENTITY.eraseAgeAssurance(db, {
+    userId: intId(req.params.id),
+    actor: req.user,
+    reason: (req.body || {}).reason,
+  }));
+});
+
+// ── Compliance: the data-source register ──────────────────────────────────
+//
+// Racing NSW's rules require an approval from Racing NSW to use NSW race-field
+// information REGARDLESS OF WHERE THE OPERATOR IS DOMICILED OR LICENSED, with fees
+// payable. The register is how the venue knows, per source, who owns it, what
+// approval is held, what it may be used for (display / store / settle) and when it
+// expires — and it ships EMPTY, because this repository does not know what the
+// operator has licensed and a guessed licence reference is worse than none.
+app.get('/api/admin/data-sources', requireAdmin, limit('admin'), (req, res) => {
+  if (req_format_is_json(req)) return res.json(DATASOURCES.overview(db));
+  res.setHeader('content-type', 'text/csv; charset=utf-8');
+  res.setHeader('content-disposition', 'attachment; filename="data_sources.csv"');
+  res.send(AMLREPORTS.dataSourceRegisterCsv(db));
+});
+
+app.put('/api/admin/data-sources/:id', requireAdmin, limit('admin'), (req, res) => {
+  const b = req.body || {};
+  res.json(DATASOURCES.configure(db, {
+    actor: req.user,
+    id: intId(req.params.id),
+    slug: b.slug,
+    name: b.name,
+    owner: b.owner,
+    authority: b.authority ?? null,
+    licence_ref: b.licence_ref ?? null,
+    fee_terms: b.fee_terms ?? null,
+    permits: b.permits ?? [],
+    starts_at: b.starts_at ?? null,
+    expires_at: b.expires_at ?? null,
+    enabled: b.enabled !== false,
+    notes: b.notes ?? null,
+  }));
+});
+
+// Register a new source. PUT covers amendment; this covers a licence the venue
+// does not have a row for yet — which is the state an operator is in the moment
+// they sign, and the moment the register is most useful.
+app.post('/api/admin/data-sources', requireAdmin, limit('admin'), (req, res) => {
+  const b = req.body || {};
+  res.json(DATASOURCES.configure(db, {
+    actor: req.user,
+    slug: b.slug,
+    name: b.name,
+    owner: b.owner,
+    authority: b.authority ?? null,
+    licence_ref: b.licence_ref ?? null,
+    fee_terms: b.fee_terms ?? null,
+    permits: b.permits ?? [],
+    starts_at: b.starts_at ?? null,
+    expires_at: b.expires_at ?? null,
+    enabled: b.enabled !== false,
+    notes: b.notes ?? null,
+  }));
+});
+
+// THE PRE-FLIGHT CHECK: "may I rely on this source for this use?"
+//
+// This is the enforcement the brief asks for — an expired or out-of-scope licence
+// must be VISIBLE BEFORE an operator relies on it, not discovered afterwards. It
+// returns the answer rather than throwing, because the caller is a human about to
+// make a decision and the useful artefact is the reason, not an exception.
+app.get('/api/admin/data-sources/:id/check', requireAdmin, limit('admin'), (req, res) => {
+  const use = String(req.query.use || DATASOURCES.DISPLAY);
+  const result = DATASOURCES.checkUsable(db, intId(req.params.id), use);
+  return res.status(result.ok ? 200 : 409).json({ use, ...result });
+});
+
+// ── Compliance: the deposit funding register ──────────────────────────────
+//
+// Payment methods carry the TERMS under which the venue may use them, which is
+// the difference between "PayPal" and "PayPal, approved seller, Australian
+// customers only". Only the second is a fact anything can be enforced against.
+app.get('/api/admin/payment-methods', requireAdmin, limit('admin'), (req, res) => {
+  res.json({ methods: FUNDING.listMethods(db) });
+});
+
+app.put('/api/admin/payment-methods/:slug', requireAdmin, limit('admin'), (req, res) => {
+  const b = req.body || {};
+  const tenantsLib = require('./lib/tenants');
+  res.json(FUNDING.setMethod(db, {
+    actor: req.user,
+    tenantId: tenantsLib.defaultTenant(db).id,
+    slug: req.params.slug,
+    label: b.label,
+    kind: b.kind,
+    credit_linked: !!b.credit_linked,
+    seller_status: b.seller_status ?? null,
+    permitted_countries: b.permitted_countries ?? null,
+    enabled: b.enabled !== false,
+    note: b.note ?? null,
+  }));
+});
+
+// The registered-instrument register. Ships empty, and an UNREGISTERED instrument
+// is REFUSED rather than allowed — because an instrument whose owner nobody can
+// state IS the third-party-funding case, and on the NPP/Osko rail there is no
+// chargeback to claw a wrongly-accepted deposit back through.
+app.get('/api/admin/funding-instruments', requireAdmin, limit('admin'), (req, res) => {
+  res.json({
+    owner_kinds: FUNDING.OWNER_KINDS,
+    // The Osko trap, in the payload, for the operator configuring their first
+    // row and asking why there is a `processor` option.
+    note:
+      "An operator's receiving PayID on the NPP/Osko rail is normally registered to a contracted " +
+      'processor rather than to the venue, so owner_kind=processor is how a legitimate pool is ' +
+      "declared. owner_kind=unknown REFUSES: an instrument whose owner nobody can state is the " +
+      'third-party case by definition.',
+    instruments: FUNDING.listInstruments(db),
+  });
+});
+
+app.post('/api/admin/funding-instruments', requireAdmin, limit('admin'), (req, res) => {
+  const b = req.body || {};
+  const tenantsLib = require('./lib/tenants');
+  res.json(FUNDING.registerInstrument(db, {
+    actor: req.user,
+    tenantId: tenantsLib.defaultTenant(db).id,
+    label: b.label,
+    instrument_kind: b.instrument_kind,
+    registered_owner: b.registered_owner,
+    owner_kind: b.owner_kind,
+    processor_ref: b.processor_ref ?? null,
+    jurisdiction: b.jurisdiction ?? null,
+    enabled: b.enabled !== false,
+    notes: b.notes ?? null,
+  }));
+});
+
+// ── Compliance: retention ─────────────────────────────────────────────────
+//
+// Which tables are financial-crime records and must not be deleted by a generic
+// retention job. An operator writing a housekeeping job against this database
+// needs to see the list BEFORE they write it, and this repository's own pruner
+// (lib/marketdata.js, 30 days on the trade tape) is named beside it so the two
+// answers cannot be confused.
+app.get('/api/admin/retention', requireAdmin, limit('admin'), (req, res) => {
+  res.json(RETENTION.policy());
 });
 
 // ── In-play desk ──────────────────────────────────────────────────────────
@@ -2939,6 +3538,29 @@ if (JOBS_INTERVALS.reconcileMs > 0) {
     JOBS.every(JOBS_INTERVALS.reconcileMs, async () => {
       const r = await JOBS.reconcileOnce(db);
       if (!r.ok) console.warn(`[reconcile] ${r.findings.length} finding(s); ${r.open.length} open`);
+    })
+  );
+}
+
+// THE AML PASS. Every hour by default, which is the longest lookback any rule
+// tolerates comfortably on a synchronous connection (lib/aml/rules.js caps every
+// window at MAX_WINDOW_DAYS for exactly this reason).
+if (JOBS_INTERVALS.amlMs > 0 && config.AML_MONITORING_ENABLED) {
+  jobTimers.push(
+    JOBS.every(JOBS_INTERVALS.amlMs, async () => {
+      const r = JOBS.amlPass(db);
+      if (r.failed_rules && r.failed_rules.length) {
+        // A RULE THAT THREW IS REPORTED, NOT SWALLOWED. A rule that has stopped
+        // watching is the failure nobody sees from inside the code, so it gets a
+        // line of its own rather than being folded into a count.
+        for (const f of r.failed_rules) {
+          console.warn(`[aml] rule ${f.rule_id} failed for user ${f.user_id}: ${f.error}`);
+        }
+      }
+      if (r.raised) console.log(`[aml] ${r.raised} alert(s) from ${r.scanned} account(s)`);
+      // The threshold sweep is the half that catches what the DEPOSIT PATH never
+      // reached, so its count is announced even when no rule fired.
+      if (r.obligations) console.log(`[aml] ${r.obligations} threshold obligation(s) outstanding`);
     })
   );
 }
@@ -3564,6 +4186,98 @@ async function main() {
       '[rg] venue offers unbounded play. Set RG_SESSION_MINUTES,\n' +
       '[rg] RG_REALITY_CHECK_MINUTES and RG_DEPOSIT_DAILY_CENTS before it can\n' +
       '[rg] serve anyone. Self-exclusion (always on) is not a substitute.'
+    );
+  }
+
+  // ── Compliance, at boot, in the same spirit as every warning above ───────
+  //
+  // A control that is fully instrumented and enforced nowhere is the most
+  // dangerous shape a bug can take, because every signal an operator would check
+  // to confirm it took effect says it did. lib/tenants.js says that about a
+  // suspended tenant, and it is exactly the argument for saying ALL of this out
+  // loud rather than letting a default stand as an answer.
+  //
+  // The identity provider is SELECTED here, at boot, rather than lazily at the
+  // first customer — and a regulated deployment with no provider ABORTS rather
+  // than falling back to the reference implementation. That is lib/config.js's
+  // exit(1) doing the refusing, so this call cannot throw in practice; it is here
+  // so the selection happens at boot and the boot log can say what was chosen.
+  try {
+    IDENTITY.select(config.IDENTITY_PROVIDER || undefined, { identityRequired: config.IDENTITY_REQUIRED });
+  } catch (e) {
+    console.error(`[identity] provider selection failed: ${e.message}`);
+    process.exit(1);
+  }
+  if (config.IDENTITY_REQUIRED) {
+    console.log(`[identity] pre-verification ENFORCED — provider "${config.IDENTITY_PROVIDER}"`);
+    if (!config.IDENTITY_CALLBACK_SECRET) {
+      // Same shape and same reason as PAYMENTS_WEBHOOK_SECRET below: the callback
+      // is the only automated path that writes a decision, and an unauthenticated
+      // one is not a callback.
+      console.warn('[identity] IDENTITY_CALLBACK_SECRET unset — /api/identity/callback returns 404.');
+    }
+  } else {
+    console.warn(
+      '[identity] CUSTOMER PRE-VERIFICATION IS NOT ENFORCED.\n' +
+      '[identity] Australian law has required identity verification BEFORE an online gambling\n' +
+      '[identity] account is created since 29 September 2024, and the interim allowance for\n' +
+      '[identity] deferring it was repealed. On this deployment nothing stops an account from\n' +
+      '[identity] being created, funded, traded with and paid out without ever being verified.\n' +
+      '[identity] Set IDENTITY_REQUIRED=true and IDENTITY_PROVIDER to change that.'
+    );
+  }
+  if (!config.REGULATED_DEPLOYMENT) {
+    console.warn(
+      '[compliance] REGULATED_DEPLOYMENT is not set.\n' +
+      '[compliance] The funding gate and the AML threshold obligation are therefore INERT: this\n' +
+      '[compliance] deployment has no payment instruments to inspect, so refusing an unregistered\n' +
+      '[compliance] one would refuse every deposit. An Australian venue holding a licence must set\n' +
+      '[compliance] it, and must set AML_MONITORING_ENABLED, or the monitoring is not running at all.'
+    );
+  } else {
+    console.log('[compliance] regulated deployment — the funding gate and threshold obligation are live');
+    const registered = db.prepare('SELECT COUNT(*) c FROM funding_instruments WHERE enabled = 1').get().c;
+    if (!registered) {
+      // The register ships EMPTY and every deposit from an unregistered instrument
+      // is refused. An operator who reaches production without registering their
+      // processor pool will find every Osko deposit refused, and the reason has
+      // to be at boot rather than at the first customer.
+      console.warn(
+        `[compliance] NO FUNDING INSTRUMENTS REGISTERED (${registered}).\n` +
+        '[compliance] Every deposit will be refused at intake. Register the venue receiving\n' +
+        '[compliance] accounts and its contracted PROCESSOR POOLS first: on the NPP/Osko rail the\n' +
+        '[compliance] receiving PayID is registered to a processor, not to the venue, so a pool\n' +
+        '[compliance] declared with owner_kind=processor is how a legitimate deposit is cleared.'
+      );
+    }
+    if (!config.AML_MONITORING_ENABLED) {
+      console.warn(
+        '[compliance] REGULATED_DEPLOYMENT=true but AML_MONITORING_ENABLED=false.\n' +
+        '[compliance] The threshold obligation is live, but NO RULE IS RUNNING, so nothing raises a\n' +
+        '[compliance] suspicious-activity alert. Those are different controls and this says so rather\n' +
+        '[compliance] than leaving the operator to assume monitoring came with the threshold.'
+      );
+    }
+    if (!config.AML_RESTRICTED_JURISDICTIONS.length) {
+      console.warn(
+        '[compliance] NO restricted-jurisdiction list is configured.\n' +
+        '[compliance] AML_RESTRICTED_JURISDICTIONS is blank, so the funding-side jurisdiction screen\n' +
+        '[compliance] will find nothing. No list ships with this repository on purpose: a stale\n' +
+        '[compliance] regulatory list is a control that is confidently wrong.'
+      );
+    }
+  }
+  // The entitlement table ships EMPTY, which means nobody may read financial-crime
+  // material. Said here because the surfaces 403 with a code and an operator who
+  // has just gone live deserves to know that is deliberate rather than broken.
+  const entitledCount = db.prepare('SELECT COUNT(*) c FROM aml_entitlements').get().c;
+  if (!entitledCount) {
+    console.warn(
+      '[compliance] NO OPERATOR IS ENTITLED TO FINANCIAL-CRIME MATERIAL.\n' +
+      '[compliance] The alert, obligation and report surfaces return 403 until somebody is granted\n' +
+      '[compliance] the entitlement through POST /api/admin/aml/entitlements. Shipping the table empty\n' +
+      '[compliance] is deliberate: tipping off is a criminal offence and "not configured" must never\n' +
+      '[compliance] quietly mean "everyone may read it".'
     );
   }
 

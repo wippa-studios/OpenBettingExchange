@@ -1,7 +1,7 @@
 # API reference
 
-Base URL `http://127.0.0.1:7777`, loopback only. `server.js` registers **87
-routes** — 84 under `/api` and the three operational endpoints below — and this
+Base URL `http://127.0.0.1:7777`, loopback only. `server.js` registers **125
+routes** — 122 under `/api` and the three operational endpoints below — and this
 file documents all of them. Each route's status codes, field names and error
 shapes were read from the handler that serves it; where a handler is thin, the
 table points at the module that does the work rather than guessing at it.
@@ -1167,6 +1167,156 @@ legs are excluded, because a cash-out is not a trade.
 
 ---
 
+## Customer pre-verification
+
+**Full rationale: [`COMPLIANCE.md`](COMPLIANCE.md).** Summary: Australian law has
+required identity verification **before** an online gambling account is created
+since **29 September 2024**, and the interim allowance for deferring it was
+**repealed**. The gate lives in the **engine**, not in routes — `lib/match.js`
+`validateOrder` (before any collateral is touched), `lib/limits.js`
+`assertTradeable` (the one function every money path already calls),
+`confirmDeposit` before the credit, and `openWithdrawal` before the hold.
+
+Refusals carry a distinct `details.code`: `identity_unverified`,
+`identity_pending`, `identity_failed`, `identity_review`. The server says loudly
+at boot while `IDENTITY_REQUIRED` is false.
+
+### Player surfaces
+
+| Route | Success | Errors |
+| --- | --- | --- |
+| `GET /api/identity/me` | `200 { identity_status, identity_status_at, verification_in_progress, verification_id, message, next, enforced }` | `401`; `429` volume |
+| `POST /api/identity/start` | `201 { verification_id, external_id, status, client_token, identity_status }`. `client_token` is **optional** in the provider contract and may be `null` — a pure-redirect vendor has none | `401`; `429` volume |
+| `GET /api/identity/verification/:id` | `200 { verification_id, decision, identity_status, checks, account_updated, age_assurance_erased }` — `checks` are the **constituent checks** that produced the decision, stored with the vendor's own name alongside the venue's | `404`; `401` own verification only |
+| `POST /api/identity/screen` | `200 { screened: true, checks: 2 }` — **and nothing else** | `401`; `429` volume |
+| `DELETE /api/identity/session/:id` | `200 { verification_id, released }` | `404` (including for someone else's session — own-session only); `401` |
+
+`POST /api/identity/screen` runs the two screening obligations (the national
+self-exclusion register, and sanctions / PEP) and deliberately returns **no
+outcome**. Tipping off is a criminal offence in Australia: an endpoint that
+returned `hit: true` would hand the customer the fact that they are on a national
+register, and one that returned `hit: false` would tell them they had been screened
+when they had not. Both outcomes go to the financial-crime record instead. The
+same reasoning bounds `GET /api/identity/me`: it carries the account's own status
+and what to do next, and **no** screening outcome, constituent check, operator
+reason, alert or verified name.
+
+### The provider callback
+
+`POST /api/payments/webhook` additionally records **what the rail reported about
+the funding** — `payer_name` and `funding_country` — onto the intent before the
+funding gate reads it. Those are the only facts the third-party-funding control
+has, and a PSP that reports neither produces a deposit that is **refused** with a
+code naming which fact was missing. A later confirmation **cannot restate** them.
+
+`POST /api/identity/callback` — **404s when `IDENTITY_CALLBACK_SECRET` is unset**,
+and is authenticated by an HMAC over `<timestamp>.<rawBody>` (headers
+`x-identity-timestamp`, `x-identity-signature`) rather than by a session, exactly as
+`POST /api/payments/webhook` is. It is the only automated path that writes a
+decision.
+
+### Admin surfaces
+
+| Route | Auth | Success | Errors |
+| --- | --- | --- | --- |
+| `GET /api/admin/identity/verifications` | admin | `200 { enforced, statuses, counts, verifications }` — `counts` is per status over non-bot, non-admin accounts, which is what an operator opens this screen for. The checked **subject name is not on this response** | `401`/`403`; `429` |
+| `POST /api/admin/identity/decision` | admin | `200 { user_id, identity_status }`. `decision` is one of `verified`, `failed`, `review` — **there is no `exempt`**, and `unverified` is refused, so this is not a "mark as trusted" button. `reason` is **required** | `400` bad decision or missing reason; `404`; `401`/`403` |
+| `GET /api/admin/identity/age-assurance` | admin | `200 { note, live, erased }` — **both** halves, because an operator who can only see the live attestations cannot answer "was it destroyed?", and one who can only see the tombstones cannot audit the control | `401`/`403` |
+| `POST /api/admin/identity/age-assurance/:id/erase` | admin | `200 { erased, user_id, at }`. Idempotent: a second call reports `already_erased` rather than erroring | `401`/`403` |
+
+**There is no date of birth, no document type, no document number and no image in
+this schema.** Age assurance is stored as an **attestation** and an opaque vendor
+handle, in a record separate from the identity record and **individually erasable**,
+because the reform bill's explanatory memorandum provides that personal information
+collected for age assurance must be destroyed once used and that no Australian is to
+be forced to use government identification for it. Erasure nulls the identifying
+columns and stamps `erased_at` (a tombstone, so the erasure is provable), and
+applying a verification decision erases the artefact **in the same transaction**.
+
+---
+
+## AML / CTF monitoring
+
+**Full rationale, the calibration argument and "what would this have caught":
+[`COMPLIANCE.md`](COMPLIANCE.md).** An alert is a **signal for an analyst, never a
+block**, and nothing in the monitoring path suspends, closes or limits an account.
+
+Every alert surface additionally requires a row in `aml_entitlements`.
+`'admin'` is the venue's *general* operator role; whether a particular person may
+read a suspicious-matter file is the operator's compliance officer's call, so the
+table **ships empty** and the surfaces refuse with `code: "aml_not_entitled"`.
+
+| Route | Auth | Success | Errors |
+| --- | --- | --- | --- |
+| `GET /api/admin/aml/rules` | admin | `200 { tenant_id, rules, threshold }`, or **CSV** with `?format=csv`. Each rule carries its `published_indicator`, its `indicator`, `shipped_tuning`, `effective_tuning`, `overridden`, its **`tunable` block** (which of `value_cents` / `value_count` / `window_days` reaches which parameter, and `null` where a rule has no money parameter at all) and — the point of the surface — its **`calibration` prose**: the ordinary exchange behaviour it was measured *not* to trip on. `evaluate` is deliberately not in the payload | `401`/`403` |
+| `PUT /api/admin/aml/rules/:id` | admin | `200` with the stored override. `reason` is **required**; `window_days` may not exceed 365 because node:sqlite is synchronous | `400` unknown rule, missing reason, an over-long window, or a `value_cents` / `value_count` sent to a rule that has no such parameter — **refused at write time**, so an operator who sets a dollar threshold on a rule with no money parameter sees the error while they are still looking at the screen that set it, rather than discovering at scan time that they tightened nothing; `401`/`403` |
+| `GET /api/admin/aml/alerts` | admin **and entitled** | `200 { alerts }` — open alerts only, re-listed on every read, each with its `evidence` | `403 { code: "aml_not_entitled" }`; `401` |
+| `POST /api/admin/aml/alerts/:id/resolve` | admin | `200 { id, resolved }`. `reason` is **required** — the written reason is what an examiner reads months later. Idempotent | `400` missing reason; `404`; `401`/`403` |
+| `POST /api/admin/aml/entitlements` | admin | `200 { user_id, entitled }`. `reason` **required**, audited. Grant **and revoke** | `400` missing reason; `404`; `401`/`403` |
+| `GET /api/admin/aml/thresholds` | admin **and entitled** | `200 { policy, obligations }` — the threshold as the venue runs it, and every **open** obligation, oldest ungenerated first | `403 { code: "aml_not_entitled" }`; `401` |
+| `POST /api/admin/aml/thresholds/:id/discharge` | admin **and entitled** | `200 { id, discharged }`. `reason` **required**; `report_reference` records the report **generation**, not a filing receipt | `400` missing reason; `404`; `403`; `401` |
+| `POST /api/admin/aml/scan` | admin | `200 { scanned, raised, failed_rules, results }` — runs the same pass the **scheduled** job runs (`lib/jobs.js` `amlPass`, hourly by default). Bounded by `limit`; `user_ids` is accepted for a chosen cohort | `401`/`403`; `429` |
+| `GET /api/admin/aml/reports/threshold-transactions` | admin **and entitled** | **CSV** by default, `?format=json` for the payload. Carries `submission: { submitted: false }` | `400` malformed period; `403`; `401` |
+| `GET /api/admin/aml/reports/suspicious-matter` | admin **and entitled** | **CSV** by default. Every row carries `basis: "rule-fired"` and resolves its `rule_id` to the `indicator` and `published_indicator`. Carries `submission: { submitted: false }` | `403`; `401` |
+
+The threshold is `AML_THRESHOLD_CENTS` (default **500000** — AUD 5,000, the figure
+from 31 March 2026). Crossing it creates a **durable obligation** that re-surfaces
+until a human discharges it, on two bases: `single` (one transaction at or over the
+threshold) and `related` (several that each sat under it and crossed it together —
+structuring is the point).
+
+**Neither report submits anything to any regulator.** A submission is a legal act in
+the operator's name, under their licence, through a channel they have a relationship
+with. Both payloads say so in their own `submission` block.
+
+### Deposit funding
+
+| Route | Auth | Success | Errors |
+| --- | --- | --- | --- |
+| `GET /api/admin/payment-methods` | admin | `200 { methods }` | `401`/`403` |
+| `PUT /api/admin/payment-methods/:slug` | admin | `200` with the stored method | `400 { code: "payment_method_terms_required" }` — a `wallet` or `paypal` **cannot be enabled without recording `seller_status`**, because "PayPal" and "PayPal, approved seller, AU customers only" are different facts and only the second can be enforced; also `400` for a bad `kind`, `seller_status` or `permitted_countries`; `401`/`403` |
+| `GET /api/admin/funding-instruments` | admin | `200 { owner_kinds, note, instruments }` | `401`/`403` |
+| `POST /api/admin/funding-instruments` | admin | `200` with the registered instrument | `400` for a bad `instrument_kind` or `owner_kind`; `401`/`403` |
+
+**The Osko trap, in one line:** on the NPP/Osko rail an operator's receiving PayID
+is normally registered to a **contracted processor**, not to the venue — so a
+name-match rule would refuse every legitimate Australian deposit.
+`owner_kind: 'venue'` and `'processor'` are **cleared**; `'player'` requires the
+name to match; `'unknown'` is **refused**, because an instrument whose owner nobody
+can state *is* the third-party case by definition. The register ships empty and an
+unregistered instrument is refused — and the boot log says so, with what to
+register first.
+
+`NPP/Osko transfers are irrevocable with no chargeback`, so this is a refusal at
+**intake**, before the credit, not a flag discovered afterwards.
+
+### Retention
+
+`GET /api/admin/retention` — admin. `200` with the tables a generic retention job
+**must not** delete (`protected`), the one table it must not keep
+(`exempt`: `age_assurance`, which has to be **destroyed**), and the single pruner
+that exists in this codebase with its window. `lib/retention.js` is the
+declarative list; `tests/aml.test.js` greps every module in `lib/` and fails if a
+`DELETE FROM` ever appears against a protected table.
+
+### Data-source register
+
+| Route | Auth | Success | Errors |
+| --- | --- | --- | --- |
+| `GET /api/admin/data-sources` | admin | `200 { uses, expiry_warning_days, sources, counts, empty, unsettled_without_source, note }`, or **CSV** | `401`/`403` |
+| `POST /api/admin/data-sources` | admin | `200` with the registered source | `400` for a missing `slug`/`name`/`owner`, a `permits` value outside `display`/`store`/`settle`, or a malformed date; `401`/`403` |
+| `PUT /api/admin/data-sources/:id` | admin | `200` with the amended source | same `400`s; `401`/`403` |
+| `GET /api/admin/data-sources/:id/check?use=settle` | admin | `200 { ok: true, source_id, slug, name, owner, authority, licence_ref, use, state, expires_at }`, or **`409`** with `{ ok: false, code, message }` | `409` with a distinct `code` per cause: `unknown_source`, `source_disabled`, `licence_expired`, `not_yet_active`, `use_not_permitted`; `400` for a bad `use` |
+
+Racing NSW's rules require an approval to use NSW race-field information
+**regardless of where the operator is domiciled or licensed**, with fees payable.
+`result_events.source` (`poll`/`webhook`/`manual`/`import`) records **how** an
+outcome arrived and is unchanged; `result_events.data_source_id` records **under
+whose approval**, and an outcome with neither is **counted** on the register rather
+than being refused — forcing one would mean inventing a licence attribution.
+
+---
+
 ## Ops
 
 | Route | Auth | Success | Errors |
@@ -1196,5 +1346,6 @@ trading venue out of rotation over it would manufacture an outage.
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — module layout and the rationale behind it
 - [`EXCHANGE_RULES.md`](EXCHANGE_RULES.md) — the financial invariants, in full
+- [`COMPLIANCE.md`](COMPLIANCE.md) — customer pre-verification, AML/CTF monitoring and the data-source register, and why each decision point is where it is
 - [`FEED.md`](FEED.md) — the odds-feed collector, credentials and supervision
 - [`ROADMAP.md`](ROADMAP.md) — what is deliberately not built, and why
