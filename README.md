@@ -176,7 +176,7 @@ in place.
 | Matching engine: best-for-taker sweeps, resting-price execution, partial fills, FIFO, self-match guard | Available |
 | Escrow wallet: available vs frozen, full transaction ledger, faucet | Available |
 | Settlement: pot distribution, void refunds, commission on net winnings, auto-cancel, double-settle protection | Available |
-| Withdrawn runners: a declared non-runner voids that **selection** (orders cancelled, escrow released, backers refunded) while the rest of the market settles | Available (`lib/settle.js` `voidSelection`, [`EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#withdrawn-runners-non-runners)) |
+| Withdrawn runners: a declared non-runner voids that **selection** (orders cancelled, escrow released, backers refunded) while the rest of the market settles, and a **declared** deduction is then taken off the winnings of the runners that survived — the venue computes no scale, because the stewards declare one | Available (`lib/settle.js` `voidSelection`, [`EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#the-declared-deduction-on-the-runners-that-survived)) |
 | Dead-heat / joint-favourite settlement | Available |
 | Cash-out: venue buyout priced from fair probabilities, any number of runners, all-or-nothing | Available |
 | Cash-out venue-risk caps: unpaid exposure and daily outlay | Available (`lib/cashoutrisk.js`; operator-configured) |
