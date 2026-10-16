@@ -11,8 +11,7 @@ fills the orders, a double-entry ledger accounts for every cent, and settlement
 pays the pot. The operator's revenue is a commission on net winnings, not a
 bookmaker's margin.
 
-**Stack:** Node 22 · Express 5 · `node:sqlite` · zero-build frontend · **two**
-runtime dependencies (`express`, `pg`) · MIT
+**Stack:** Node 22 · Express · SQLite · zero-build frontend
 
 ![The OpenBettingExchange board: sport rail, competition-grouped event cards and a ladder per market](docs/shots/board.png)
 
@@ -25,56 +24,9 @@ runtime dependencies (`express`, `pg`) · MIT
 > no money. See [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md) for the full
 > boundary.
 >
-> Operating a real-money exchange also requires a licence, and the obligations
-> that come with it. Software cannot supply the licence. What software *can*
-> supply is the mechanism and the enforcement — and this repository ships both for
-> most of them, while shipping none of the vendor adapters. See
-> [Compliance](#compliance).
-
-> [!NOTE]
-> **Evaluating this for a licensed Australian venue?** The useful summary is
-> where the code stops, not what it does — so here it is, in the first screen.
->
-> **Ships:** the matching engine, escrow, a double-entry ledger with fund
-> segregation and conservation as queries rather than promises, settlement
-> (withdrawn runners, dead heats, per-sport void rules, dispute holds), cash-out
-> with venue-risk caps, responsible gambling and abuse controls, an operator
-> desk, reporting, a results feed, a data-feed seam with two adapters, and the
-> compliance **mechanisms** — identity pre-verification, AML/CTF monitoring, a
-> deposit funding gate, a licensed data-source register — each with its
-> enforcement wired in and its decision point named rather than guessed.
->
-> **Does not ship:** a payment provider, a KYC provider, or a regulatory list.
-> Those are seams with reference implementations, and the boundary is
-> deliberate: which PSP and which screening vendor a licensed venue may use is
-> not a question this repository should answer. See
-> [`lib/payments/provider.js`](lib/payments/provider.js) and
-> [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md) §7.
->
-> **Three facts worth having before you read another line.**
->
-> - **It is pre-off only, and that agrees with Australian law.** Online in-run
->   betting is not permitted except by voice telephone or in licensed physical
->   venues, so the absence of in-play is not a gap you need to close — it is a
->   product decision that matches the jurisdiction. `lib/offtime.js` closes order
->   placement *and* cash-out at the event's off time, in the engine rather than
->   the routes, and treats an unparseable off time as CLOSED. Whether that
->   satisfies your licence conditions is your counsel's call.
-> - **Race-field approvals follow the data, not the operator.** Racing NSW's
->   rules require an approval to use NSW race-field information *regardless of
->   where the operator is domiciled or licensed*, which is why
->   `lib/datasources.js` is a register — owner, approval, permitted uses, expiry
->   — and not a key. "Are we licensed enough to use this" does not reduce to a
->   tenant row. It ships empty, because a guessed licence reference is worse than
->   none.
-> - **The currency is read, not assumed.** `VENUE_CURRENCY` defaults to `AUD`,
->   and accounts, reports and the frontend formatter all follow it rather than
->   hard-coding a `$`. The venue trades in exactly one currency — see
->   [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#currency).
->
-> One caveat governs all of it: this codebase treats **a green test suite
-> implying more than is true** as a defect class in its own right. Where a
-> control is a convention rather than a gate, the documentation says so.
+> Operating a real-money exchange also requires licensing and regulatory
+> compliance (18+ verification, responsible gambling, AML/KYC, fund segregation).
+> Software cannot supply these. See [`docs/ROADMAP.md`](docs/ROADMAP.md), section 5.
 
 ## Contents
 
@@ -86,10 +38,9 @@ runtime dependencies (`express`, `pg`) · MIT
 - [Financial invariants](#financial-invariants)
 - [API](#api)
 - [Configuration](#configuration)
-- [Odds feed and the venue's own book](#odds-feed-and-the-venues-own-book)
+- [Odds feed (display only)](#odds-feed-display-only)
 - [Development](#development)
 - [Known limitations](#known-limitations)
-- [Compliance](#compliance)
 - [Roadmap](#roadmap)
 - [Security](#security)
 - [Contributing](#contributing)
@@ -114,13 +65,9 @@ design follows from that distinction.
   from the live book, instead of hiding a spread.
 
 Prices come from the built-in demo market-maker bots or, optionally, from a live
-odds feed ([`docs/FEED.md`](docs/FEED.md)) — either the
-[OpenBettingExchangeDataFeed](https://github.com/wippa-studios/OpenBettingExchangeDataFeed)
-collector's Postgres views, or **your own JSON-over-HTTP feed API**, which
-`FEED_PROVIDER=http` points at with no code change. An operator can materialise a
-feed's catalogue into this venue's own book and quote it at its own prices; a
-feed market that has not been materialised is still a reference row somewhere
-else. See [Odds feed and the venue's own book](#odds-feed-and-the-venues-own-book).
+Betfair feed ([`docs/FEED.md`](docs/FEED.md)) collected by
+[OpenBettingExchangeDataFeed](https://github.com/wippa-studios/OpenBettingExchangeDataFeed).
+Feed markets are display-only; see [Odds feed](#odds-feed-display-only).
 
 The frontend is plain HTML, CSS and classic JavaScript with no build step and no
 CDN. Fonts (self-hosted Inter), logo and favicon are all served from `public/`.
@@ -176,7 +123,7 @@ in place.
 | Matching engine: best-for-taker sweeps, resting-price execution, partial fills, FIFO, self-match guard | Available |
 | Escrow wallet: available vs frozen, full transaction ledger, faucet | Available |
 | Settlement: pot distribution, void refunds, commission on net winnings, auto-cancel, double-settle protection | Available |
-| Withdrawn runners: a declared non-runner voids that **selection** (orders cancelled, escrow released, backers refunded) while the rest of the market settles, and a **declared** deduction is then taken off the winnings of the runners that survived — the venue computes no scale, because the stewards declare one | Available (`lib/settle.js` `voidSelection`, [`EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#the-declared-deduction-on-the-runners-that-survived)) |
+| Withdrawn runners: a declared non-runner voids that **selection** (orders cancelled, escrow released, backers refunded) while the rest of the market settles | Available (`lib/settle.js` `voidSelection`, [`EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#withdrawn-runners-non-runners)) |
 | Dead-heat / joint-favourite settlement | Available |
 | Cash-out: venue buyout priced from fair probabilities, any number of runners, all-or-nothing | Available |
 | Cash-out venue-risk caps: unpaid exposure and daily outlay | Available (`lib/cashoutrisk.js`; operator-configured) |
@@ -184,23 +131,13 @@ in place.
 | Liquidity bots and fair-price drift | Available (disable with `BOT_ENABLED=false`) |
 | Admin trading desk: catalogue, suspend/restore, settle, stats, overround | Available |
 | Live updates | Available (SSE with a 15-second poll fallback) |
-| Results feed: transport, per-sport void rules, held disputes, provenance, manual release | Available (transport requires `RESULTS_FEED_URL`) |
+| Results feed: transport (polled **and** pushed), per-sport void rules, held disputes, provenance, manual release | Available. The push transport needs `RESULTS_WEBHOOK_SECRET`; the poll needs `RESULTS_FEED_URL` |
 | Reporting: financial summary with self-check, player statements, volume, commission, operational | Available (`/api/admin/reports/*`, CSV or `?format=json`) |
 | Session limit, reality check, deposit limit | Available, operator-configured (`0` = off; boot warns) |
 | Tenant suspension: cancels resting orders, refuses betting, cash-out, deposits and login | Available (`PUT /api/admin/tenants/:id`; reads and the admin desk stay up — see [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#tenants-and-suspension)) |
 | Responsible gambling: session, reality check, deposit cap, self-exclusion | Available (`lib/rg.js`) |
 | Abuse controls: stake, market liability and daily settlement caps | Available (`lib/limits.js`) |
-| Odds feed: a provider contract and registry, with two adapters — the collector's Postgres views, and a generic JSON-over-HTTP provider an operator points at **their own licensed feed API with no code change** (`FEED_PROVIDER=http`) | Available (`lib/feed/provider.js`, `lib/feed/postgres.js`, `lib/feed/http.js`; the HTTP provider is config-driven — base URL, resource paths, bearer token or static header, timeout, size scale and field maps that rename a vendor's JSON onto the canonical shape) |
-| Provider conformance suite, run against both shipped adapters and a deliberately broken one as a negative control | Available (`tests/feedprovider-conformance.test.js`). **It is a review gate, not a runtime one**: `assertProvider` checks the six method names and that the name is declared, and never runs the battery — a boot must not be a test run. See [`docs/FEED.md`](docs/FEED.md#the-http-providers-keys) |
-| Catalogue materialisation: `POST /api/admin/feed/sync` writes local `sports`/`events`/`markets`/`selections` with a stable `feed_map` in both directions, on an explicit, audited, rate-limited action | Available (`lib/feedcat.js`) |
-| Venue-owned pricing on materialised markets | Available, and it is the point. **No feed price is ever written into `fair_price` or `ltp`** — a new selection is seeded even money (`FEED_BOOK_SEED_PRICE`) and a re-sync may rename a runner but never re-price one. A copied price is not a bad price, it is a good price a sharp client takes from you |
-| A feed market that has **not** been materialised | Display only, and enforced by the engine: no local row, so naming its selection id is `404` before any collateral is taken. Pinned by `tests/feed-display-only.test.js` |
-| Results id translation across the two id spaces | Available (`lib/feedcat.js` `admitSignal`). An id in neither space, or one that reads as two different runners, is **held by name** rather than guessed at |
-| Fund segregation and conservation as a machine-asserted property | Available (`ACCT.segregation`, `ACCT.assertConserved`, published as `obx_ledger_drift_cents` in `/metrics`) |
-| Customer pre-verification: provider contract, reference provider, and four enforcement points that refuse **before** collateral | Mechanism ships; **no vendor adapter** (`lib/identity/`, [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md)) |
-| AML/CTF monitoring: declarative rule set with its calibration reasoning, a rule engine, the AUD 5,000 threshold as a durable obligation, cross-account link analysis, and report generation | Available (`lib/aml/`). **Nothing is submitted to any regulator, and no alert blocks an account** |
-| Third-party funding refusal at deposit intake: registered instruments, payment-method terms, funding-jurisdiction refusals | Available (`lib/funding.js`). The register **ships empty**; on an unregulated install the gate is inert |
-| Licensed data-source register: owner, approval, permitted uses, expiry, with a pre-flight check | Available (`lib/datasources.js`). It ships empty and it refuses nothing until you register something: an outcome naming **no** source is recorded exactly as it always was, because inventing a licence attribution is the fabrication the register exists to prevent |
+| Odds feed ([OpenBettingExchangeDataFeed](https://github.com/wippa-studios/OpenBettingExchangeDataFeed)) | Display only; feed markets are not tradeable |
 | In-play betting | Intentionally withdrawn; see [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#pre-off-only) |
 | Accumulators, each-way | Not implemented |
 | Real-money execution | Not implemented (no PSP integrated) |
@@ -209,7 +146,7 @@ in place.
 
 | | |
 |---|---|
-| **Board in feed mode.** Real fixtures and ladders from the feed. This is the reference book: a market shown here has no local row and is untradeable until an operator materialises it. | **Bet slip.** Clicking a price opens the slip on that side; stake and price step along the ladder. |
+| **Board in feed mode.** Real fixtures and ladders from a live Betfair collector. Prices are a delayed reference book and display-only by engine rule. | **Bet slip.** Clicking a price opens the slip on that side; stake and price step along the ladder. |
 | [![Board in feed mode](docs/shots/feed-board.png)](docs/shots/feed-board.png) | [![Bet slip](docs/shots/betslip.png)](docs/shots/betslip.png) |
 | **Positions.** Per-runner backed and laid stakes, escrow held, and if-this-wins P&L. | **Wallet.** Available versus frozen, with a full ledger of deposits, escrow, releases, payouts and commission. |
 | [![Positions](docs/shots/positions.png)](docs/shots/positions.png) | [![Wallet](docs/shots/wallet.png)](docs/shots/wallet.png) |
@@ -269,18 +206,12 @@ layered on `match`.
 | `lib/audit` | Append-only operator action log |
 | `lib/auth` | scrypt password hashing, opaque session tokens |
 | `lib/feed`, `lib/feedcreds`, `lib/feedrunner` | Odds feed reader, encrypted credentials, collector supervisor |
-| `lib/feed/provider`, `lib/feed/postgres`, `lib/feed/http`, `lib/feed/shape`, `lib/feed/fieldmap` | The provider contract and registry, the two shipped adapters, and the single shaper both of them build on |
-| `lib/feedcat` | Catalogue materialisation and the two-way identity map; the only place a feed id becomes a local id |
 | `lib/bots`, `lib/drift` | Market-maker ladders and fair-price drift |
-| `lib/userrules` | Player-authored betting rules, evaluated on the price stream |
+| `lib/userrules` | Player-authored betting rules, evaluated on the venue's own price — the price walk and a real crossing, neither behind a config gate |
 | `lib/store`, `lib/seed` | Schema (38 tables) and fixtures |
 
 The frontend (`public/js/`) is split into seven modules (`core`, `shell`, `nav`,
-`board`, `slip`, `views`, `boot`) under the `window.OB` namespace. The eighth file,
-`theme.js`, is deliberately outside it: it is a blocking script in `<head>` that
-picks the palette before first paint, because a theme applied after the
-stylesheet has painted is a white flash on every page load, and the venue's CSP
-is `script-src 'self'` with no `unsafe-inline` for an inline snippet to hide in.
+`board`, `slip`, `views`, `boot`) under the `window.OB` namespace.
 
 There is no ORM and no migration tool. The data model is a single readable SQL
 file. Runtime dependencies are Express 5 and `pg` (the feed's Postgres client);
@@ -317,9 +248,6 @@ full specification, with worked examples, is in
 | A **declared non-runner** voids that selection alone: its resting orders are cancelled, its matched legs refunded at the match price, and the market settles on the runners that ran | Settling a withdrawn runner charged a bettor a full stake on a horse that never started — and conservation stayed green, because the money went somewhere real | `nonrunner` (N1, N4), `voidrules` (V1) |
 | A withdrawal notice before the off removes the runner while the market keeps trading; a sport with no withdrawal rule **holds** it instead | A racing concept applied to a football fixture would be an invented rule, and ignoring it would leave a player exposed | `nonrunner` (N4, N6), `voidrules` (V5) |
 | A refund that cannot be audited **does not happen** | An unauditable transfer of a player's stake is the thing the audit trail exists to prevent | `nonrunner` (N3) |
-| A **declared deduction** is taken off the winner's *winnings* on the runners that survived a scratching — and the **venue computes none**. The scale is published per jurisdiction and declared by the stewards, so the feed may carry one and the venue applies what it says | Refunding the scratch is *half* the Australian racing rule. The venue that stops there overpays the survivors' backers on every race with a late scratching — and conservation stays green, because the money goes somewhere real | `deductions` (D1, D2, D8) |
-| A deduction is **refused and named** when it is malformed, negative, over 100%, ambiguous about its unit, or attached to a runner nobody withdrew | A bad figure that silently becomes "no deduction" is a full payout nobody authorised | `deductions` (D4, D9, D11) |
-| A withdrawal with **no** declared deduction still settles, and the absence is **counted** | Refusing would strand a finished race; an unmeasured gap is worse than a tolerated one only if nobody is counting it | `deductions` (D3) |
 | Commission applies to **net winnings per user per market**, only if positive | Mirrors the real-world model; never a fee on a loser | `settle` (S7) |
 | A settled market is frozen and cannot settle twice | No double payment | `settle` (S6), `api` |
 | Cash-out is a **venue buyout** priced at `Σ pᵢ·Payoutᵢ` less a margin, not a market hedge | Hedging N runners against a fair book destroys value; derivation in `lib/cashout.js` | `cashout2` (C1–C5) |
@@ -360,7 +288,6 @@ scripts. The complete reference, including every parameter, is in
 | `GET /api/selections/:id/price-history` | A runner's traded price over a window, bucketed (the trade tape's one reader) |
 | `GET /api/movers` | Board ranked by what traded in the window — the same query as the ladder's matched column |
 | `GET /api/feed/board`, `/api/feed/health` | Board from the odds feed (when `FEED_ENABLED=true`) |
-| `POST /api/admin/feed/sync?limit=&offset=` | Materialise the feed's catalogue into this venue's own book (admin, audited). Answered with what it wrote, what it **refused and why**, and where a capped run resumes |
 | `POST /api/orders`, `GET /api/orders`, `PATCH /api/orders/:id`, `POST /api/orders/:id/cancel`, `POST /api/orders/bulk-cancel` | Place, list, **amend in place** (keeps your queue position), cancel one or a list |
 | `GET /api/positions` | Exposure, if-win P&L, cash-out quote |
 | `POST /api/markets/:id/cashout` | Close a position |
@@ -373,6 +300,7 @@ scripts. The complete reference, including every parameter, is in
 | `PATCH /api/admin/markets/:id` | Suspend or restore a market (admin) |
 | `POST /api/admin/markets/:id/settle` | Settle with a winner or `void: true` (admin) |
 | `POST /api/admin/markets/:id/selections/:selectionId/void` | Remove one runner before the off: `{ reason }`, ≥5 chars (admin) |
+| `POST /api/results/webhook` | **Push** outcomes from a licensed feed: signed + timestamped, ids translated, idempotent. Needs `RESULTS_WEBHOOK_SECRET`, and is the only route a pre-off withdrawal arrives on |
 | `GET /api/admin/stats` | Matched volume, open orders, overround (admin) |
 | `POST /api/admin/maintenance/price-history` | Apply the documented trade-tape retention policy, one bounded pass (admin) |
 | `GET /api/identity/me`, `POST /api/identity/start`, `POST /api/identity/screen` | Customer pre-verification. **The screening endpoint returns no outcome** — tipping off is a criminal offence |
@@ -399,7 +327,6 @@ failing later.
 | --- | --- | --- |
 | `PORT` / `HOST` | `7777` / `127.0.0.1` | Listener. `HOST` is loopback-only by design |
 | `DB_PATH` | `data/openbettingexchange.db` | SQLite file (`:memory:` for tests) |
-| `VENUE_CURRENCY` | `AUD` | The one currency this venue trades in, validated at boot to an ISO-4217 code. Read by the ledger, payments, reports **and** `/api/branding`, which is what the frontend's formatter renders — there is no hard-coded `$` left |
 | `COMMISSION_RATE` | `0.025` | Fee on net winnings |
 | `FAUCET_MAX_CENTS` | `100000` | Faucet cap per deposit |
 | `MIN_STAKE_CENTS` / `MAX_STAKE_CENTS` | `100` / `100000` | Order size bounds |
@@ -415,7 +342,7 @@ failing later.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `BOT_ENABLED` / `DRIFT_ENABLED` | `true` | Demo liquidity and price drift. The bots keep running with the feed on — the reference board has no local row for them to quote, and the venue's own book is quoted from its own prices. **Drift** is the venue's own price moving, and is still suppressed while the feed is on |
+| `BOT_ENABLED` / `DRIFT_ENABLED` | `true` | Demo liquidity and price drift (ignored when the feed is on) |
 | `DRIFT_INTERVAL_MS` | `5000` | Drift cadence |
 | `RISK_MAX_LIABILITY_CENTS` | `5000000` | Maximum debt the market-maker bot may carry |
 | `RISK_MAX_DAILY_LOSS_CENTS` | `1000000` | Bot realised daily loss cap |
@@ -429,16 +356,11 @@ failing later.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `FEED_ENABLED` | `false` | Read fixtures and prices from the feed |
-| `FEED_PROVIDER` | `postgres` | Which implementation of the provider contract serves the board: `postgres` (the collector's views) or `http` (**your own JSON-over-HTTP feed API**). Anything else aborts startup |
-| `FEED_DATABASE_URL` | none | Collector's Postgres URL; required when the feed is on and the provider is `postgres` |
+| `FEED_ENABLED` | `false` | Read fixtures and prices from the feed. Display only |
+| `FEED_DATABASE_URL` | none | Collector's Postgres URL; required when the feed is on |
 | `FEED_NUMBER` | `2` | Feed to read: `1` fixtures only, `2` fixtures, prices and results |
 | `FEED_STALE_SECONDS` | `300` | Frame age beyond which the board reports stale |
 | `FEED_MARKET_LIMIT` | `60` | Markets returned to the board |
-| `FEED_BOOK_SYNC_LIMIT` | `200` | Markets one `POST /api/admin/feed/sync` may materialise. Bounded on purpose: the catalogue is far larger than a page and each market costs a round trip |
-| `FEED_BOOK_SYNC_CONCURRENCY` | `4` | Simultaneous `market()` calls during a sync — pressure on somebody else's licensed API, so it is capped |
-| `FEED_BOOK_SEED_PRICE` | `2` | What a **newly** materialised selection is seeded with. Even money is a neutral starting position, not a view, and the **venue's** price |
-| `FEED_HTTP_URL` and the `FEED_HTTP_*` family | see [`docs/FEED.md`](docs/FEED.md#the-http-providers-keys) | The HTTP adapter: base URL, resource paths, bearer token or one static header, timeout, in-flight and queue caps, size scale and field maps. **A misconfigured map aborts the launch**, because a map that renames nothing renders an empty board that looks like a quiet Tuesday |
 | `FEED_CREDENTIALS_KEY` | none | 64 hex characters (AES-256-GCM key); generate with `openssl rand -hex 32`. **If unset, credentials are refused and never stored in plaintext** |
 | `FEED_RUNNER_ENABLED` | `false` | Supervise the collector (spawn and restart) instead of running it separately |
 | `FEED_COLLECTOR_CMD` | `betfeed collect` | Collector command, split on whitespace; an absolute path or wrapper works |
@@ -454,9 +376,10 @@ failing later.
 | `DEPOSIT_DAILY_MAX_CENTS` | `500000` | Per-user-per-day cap on confirmed deposits |
 | `BACKUP_DIR` / `BACKUP_RETENTION` | none / `24` | Scheduled snapshots; unset means **backups are off**, and boot says so. The destination is config-only — it cannot be set per request |
 | `RECONCILE_INTERVAL_MS` | `900000` | Scheduled reconciliation cadence |
-| `RESULTS_FEED_URL` | unset | Endpoint polled for outcomes; unset means settle by hand or webhook |
+| `RESULTS_FEED_URL` | unset | Endpoint **polled** for outcomes. Unset means nothing is polled — and the boot log says which transport, if any, is live |
 | `RESULTS_FEED_SECRET` | unset | Sent as `Authorization: Bearer`; boot warns if the URL is set without it |
 | `RESULTS_FEED_TIMEOUT_MS` | `10000` | Per-poll timeout, so a hung feed cannot stall the job |
+| `RESULTS_WEBHOOK_SECRET` | none | HMAC secret for `POST /api/results/webhook` — the **push** transport, and the only route a pre-off withdrawal can arrive on. Unset means the route is `404`; an unsigned POST to it would be a remote "settle this market" control |
 
 ### Responsible gambling
 
@@ -467,115 +390,28 @@ failing later.
 | `RG_REALITY_CHECK_MINUTES` | `0` | Reality-check interval; `0` means not configured |
 | `RG_DEPOSIT_DAILY_CENTS` | `0` | Rolling 24-hour deposit limit; `0` means not configured |
 
-### Compliance
+## Odds feed (display only)
 
-Every key here is a **posture** switch, not a feature toggle. The defaults are
-off because they are off on a paper-money install, and the server says loudly at
-boot which of them your deployment is not enforcing. Details in
-[`docs/COMPLIANCE.md`](docs/COMPLIANCE.md).
+With `FEED_ENABLED=true`, the board shows real fixtures and prices from the
+[feed collector](https://github.com/wippa-studios/OpenBettingExchangeDataFeed).
+**Those markets cannot be traded.** This is enforced by the engine, not only by
+the client:
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `REGULATED_DEPLOYMENT` | `false` | "This venue holds a licence and serves real customers." The funding gate and the threshold obligation hang off it; with it off there are no payment instruments to inspect |
-| `IDENTITY_REQUIRED` | `false` | Enforce customer pre-verification. **Turning it on with no real provider aborts the launch** — a mock that passes anybody must never sit behind a live onboarding flow |
-| `IDENTITY_PROVIDER` | `''` | Which registered provider to select at boot |
-| `IDENTITY_CALLBACK_SECRET` | unset | HMAC secret for the decision callback; unset means the callback route 404s |
-| `AML_MONITORING_ENABLED` | `false` | Run the rule pass, on a timer and on demand |
-| `AML_SCAN_INTERVAL_MS` | `3600000` | How often the scheduled pass runs; `0` disables the timer |
-| `AML_THRESHOLD_CENTS` | `500000` | The AUD 5,000 customer-due-diligence exemption threshold |
-| `AML_RESTRICTED_JURISDICTIONS` | `''` | Comma-separated ISO-3166 alpha-2. **Blank is a real state**, and the boot log says which state you are in |
-| `FUNDING_REFUSE_UNREGISTERED` | `true` | Refuse a deposit whose funding instrument is not registered |
-| `DATA_SOURCE_EXPIRY_WARN_DAYS` | `30` | When the licensed data-source register starts warning about an expiry |
+- A feed market has no row in this venue's database (the collector's catalogue
+  lives in its own Postgres), so naming a feed selection id returns `404` before
+  any collateral is taken.
+- The client also refuses, with the message "Feed markets are display-only".
 
-## Odds feed and the venue's own book
+Enabling the feed force-disables the bots and the drift engine (`BOTS_ON` and
+`DRIFT_ON` in `server.js`), because a bot requoting a ladder over the observed
+Betfair book would have the venue fighting its own price source. In feed mode,
+the venue's own markets are therefore unquoted.
 
-`FEED_ENABLED=true` puts a live odds feed behind the board. There are two
-adapters and they answer the same contract, so nothing above them knows which is
-running:
-
-| `FEED_PROVIDER` | What it reads |
-| --- | --- |
-| `postgres` (default) | The [OpenBettingExchangeDataFeed](https://github.com/wippa-studios/OpenBettingExchangeDataFeed) collector's Postgres views — unchanged behaviour |
-| `http` | **Your own licensed feed API**, over JSON, with no code change. `FEED_HTTP_*` carries the base URL, the resource paths, a bearer token or one static header, the timeout, and field maps that rename a vendor's JSON onto the canonical shape |
-
-The `http` adapter exists because the alternative was a fork. The price feed used
-to be hard-wired to the collector's `v_feed1`/`v_feed2`, so an operator with their
-own feed could use this venue only if their feed happened to be Betfair's Postgres
-views — and a fork is not a seam, it is a copy that drifts.
-
-**The seam came with a contract suite, because it had to.**
-`tests/feedprovider-conformance.test.js` runs a battery against both shipped
-adapters — the HTTP one against a real `node:http` server serving vendor-shaped
-JSON — and includes a deliberately broken provider asserted to **fail** it, so the
-suite cannot pass vacuously. `STATE.md` §2.7 is the design brief: *"an adapter
-that half-works does not crash, it produces wrong prices or wrong market state,
-which the engine cannot detect. Any adapter story needs a conformance suite
-before it needs adapters."*
-
-The honest caveat, because it is the one a reader would act on: `assertProvider`
-**does not run the battery, and never will**. It checks the six method names and
-that the provider's name is declared; registering a provider does not cause the
-suite to run. Running an offline fixture suite at production startup would make
-a boot a test run, and make the venue refuse to start because an assertion about
-a synthetic fixture drifted. It is a **review gate** — CI plus the review that
-accepts a declaration — and the code says so rather than claiming a control it
-does not have.
-
-Three properties from the security review are worth knowing before you point it
-at a licensed API: a configured credential is never put in a log line or an
-error (every word of every thrown message is one this codebase wrote), requests
-are bounded by a concurrency semaphore with a bounded queue, and `/api/feed/*` is
-rate-limited. Read `lib/feed/http.js` and [`docs/FEED.md`](docs/FEED.md).
-
-### The venue quotes its own book
-
-`POST /api/admin/feed/sync` materialises the feed's catalogue — local `sports`,
-`competitions`, `events`, `markets` and `selections` — into this venue's rows,
-recording every id it maps in `feed_map`. From then on those markets are the
-venue's own, the bots quote them, and `POST /api/orders` accepts them. It is an
-explicit, audited, rate-limited operator action: never automatic, not at boot, not
-on a timer, not on a feed event.
-
-**No feed price is ever written into `fair_price` or `ltp`.** A new selection is
-seeded with the venue's own even money (`FEED_BOOK_SEED_PRICE`), and a re-sync may
-rename a runner but never re-price one. `docs/FEED.md` names the hazard exactly:
-the failure is not a bad price, it is *a good price that a sharp client takes
-from you*. What a materialised market's price should actually be is a product
-decision this repository has not made — the launch price model belongs to the
-operator.
-
-The bots are **not** suppressed in feed mode any more. They used to be, on the
-premise that a bot would "requote over the observed Betfair book". That premise
-never held: the observed market has no row here, so there is nothing for a bot to
-quote over, while the suppression switched off the venue's only source of
-liquidity — a board of real fixtures and not one bettable market in it. The
-disjointness is now structural rather than a flag: the reference board has no
-local row to name, and the venue's own book is quoted from the venue's own
-`fair_price`. Drift, which is the venue's own price *moving*, is unchanged.
-
-### The boundary that survives
-
-A feed market that has **not** been materialised still has no local row, is
-untradeable and unquotable, and `POST /api/orders` naming its selection id is
-`404` — refused before any collateral is taken. The client refuses too, with the
-message "Feed markets are display-only". That is enforced by the engine, not by
-the client, and `tests/feed-display-only.test.js` pins all three legs, while
-`tests/feedbook.test.js` pins the line from the other side: a materialised
-neighbour of the same feed market *is* tradeable. The feed stays a reference
-surface; materialisation is opt-in.
-
-### Two id spaces, translated in both directions
-
-A materialised market exists in the feed's id space *and* this venue's, and the
-results protocol speaks integers in both. Before this, every outcome arrived
-naming selections the market did not have: the withdrawal path held as
-`non_runner_foreign`, the outcome path took the empty-winner hold branch, and
-money sat in a held market with a withdrawn runner still quoted. `lib/feedcat.js`
-translates in both directions and records which space a signal arrived in. An id
-in neither space, or one that reads as two different runners of the same market,
-is **held by name** rather than guessed at — local ids and a feed's runner ids are
-both small integers, so the collision is ordinary rather than theoretical, and
-settling it either way would be a coin flip with somebody's money on it.
+This is a deliberate design: a price-observation tool attached to an engine, not
+a merged product. The behaviour is pinned by `tests/feed-display-only.test.js`.
+Making feed markets tradeable requires a market mapping and a liquidity source;
+[`docs/ROADMAP.md`](docs/ROADMAP.md) explains why, including why a staleness
+guard was built and then removed.
 
 ### Betfair credentials
 
@@ -612,7 +448,7 @@ weight.
 ```bash
 
 
-npm test            # 1282 checks: unit and API integration, fully offline
+npm test            # 1284 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 220 checks: real Chromium via Playwright (board and admin desk)
@@ -645,38 +481,22 @@ worse than no assertion, since it reads as coverage.
 ```text
 lib/       engine and domain modules      server.js   HTTP and SSE wiring
 public/    frontend (no build step)       tests/      unit/API suites, smoke, browser, guards
-  js/      eight UI modules               docs/       architecture, rules, API, feed
+  js/      seven UI modules               docs/       architecture, rules, API, feed
 scripts/   tooling (screenshots, load)    data/       SQLite database (gitignored)
 ```
 
 ## Known limitations
 
 **No real-money execution.** The payments machinery ships, but no PSP is
-integrated and the reference provider moves no money.
+integrated and the reference provider moves no money. There is no KYC/AML, age
+verification or licensing path, and no software can supply a licence.
 
-**The compliance mechanism ships; the vendor and the judgement do not.** Those are
-different claims and only one of them is true here. What exists: an identity
-provider contract with a reference implementation, customer pre-verification
-enforced at four points before any collateral is taken, an age-assurance record
-that is destroyed once used rather than retained on the user, an AML/CTF rule
-engine calibrated against this venue's own ledger, the AUD 5,000 threshold as a
-durable obligation, cross-account link analysis across tenants, a
-registered-instrument gate that refuses third-party funding, tipping-off controls
-on the reporting surfaces, and the licensed data-source register. What does
-**not** exist is any vendor adapter. `lib/payments/provider.js` states that
-boundary, and it was restated deliberately rather than quietly: which PSP and
-which screening vendor a licensed venue may use is a question with legal review
-behind it, and shipping an answer would be shipping this repository's guess at
-somebody else's compliance position.
-
-**In-play is a deliberate omission, not a gap** — and it agrees with Australian
-law, which does not permit online in-run betting except by voice telephone or in
-licensed physical venues. The venue closes bets and cash-out at the event's off
-time (`lib/offtime.js`). Separately from the law, an in-play price is a forecast
-of a future event while the book reacts to what everyone can see, so a venue that
-publishes instantly is systematically slower than its own liquidity. Established
-venues delay in-play prices for this reason, and removing in-play removes that
-class of sharp. See
+**In-play is a deliberate omission, not a gap.** The venue closes bets and
+cash-out at the event's off time (`lib/offtime.js`). An in-play price is a
+forecast of a future event while the book reacts to what everyone can see, so a
+venue that publishes instantly is systematically slower than its own liquidity.
+Established venues delay in-play prices for this reason, and removing in-play
+removes that class of sharp. See
 [`docs/EXCHANGE_RULES.md`](docs/EXCHANGE_RULES.md#pre-off-only).
 
 **Not implemented:** accumulators and each-way betting. Dead-heat joint-favourite
@@ -710,31 +530,19 @@ The full list and rationale are in
 
 ## Compliance
 
-An Australian deployment has obligations this repository implements the
-**mechanism** for and deliberately does not decide for you: customer
-pre-verification before an account is created, AML/CTF monitoring against the
-published online-betting indicators, the AUD 5,000 threshold, the racing-data
-approvals that apply regardless of where you are licensed, and the question of
-whose money a deposit is.
-
-The distinction that is easy to get wrong, so it is worth stating flatly:
-**the enforcement is here and the vendor is not.** Identity refuses at four
-points in the engine and the money path; the AML pass runs on a timer and on
-demand; a deposit whose funding instrument is unregistered is refused at intake
-on a rail where accepting it wrongly is irreversible; an outcome naming a data
-source whose licence does not permit settling is refused. What is missing is an
-adapter for any of them, because the adapter is the part that needs somebody's
-licence and their counsel.
+An Australian deployment has obligations this repository implements the **seams**
+for and deliberately does not decide for you: customer pre-verification before an
+account is created, AML/CTF monitoring against the published online-betting
+indicators, the AUD 5,000 threshold, and the racing-data approvals that apply
+regardless of where you are licensed.
 
 Every one of them follows the two precedents already in the codebase — the
 `lib/payments/provider.js` boundary (**no vendor is built in, and that is the
 deliverable**) and the `lib/jobs.js` findings pattern (**a discrepancy has to
 survive being ignored**). Start at
-[`docs/COMPLIANCE.md`](docs/COMPLIANCE.md), and read its §7 — *what this
-repository does not do* — before anything else, because it is a list of decisions
-that are yours.
+[`docs/COMPLIANCE.md`](docs/COMPLIANCE.md).
 
-The one thing worth doing before you deploy: the server says **loudly at boot**
+The one thing worth reading before anything else: the server says **loudly at boot**
 which of these are not enforced on your deployment.
 
 ## Roadmap
@@ -743,9 +551,10 @@ which of these are not enforced on your deployment.
 - Integrate a real KYC/screening provider against the `lib/identity` interface —
   the seam and the contract ship; the adapter does not
 - Accumulators and each-way markets
-- Decide the launch price model for a materialised market (`FEED_BOOK_SEED_PRICE`
-  seeds even money so the market is tradeable at all; what it should actually be
-  is the operator's)
+- Odds-history charts and a market-mover view on the board
+- Complete `.env.example` coverage with a CI guard, matching the collector
+- Per-tenant currency: `fmt` is hard-coded to a dollar sign, so a white-label
+  venue renders another currency's amounts with a `$`
 
 Completed items are recorded in the [changelog](CHANGELOG.md).
 

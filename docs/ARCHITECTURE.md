@@ -26,7 +26,7 @@ browser   public/    index.html, style.css, classic scripts — no build step
              admin.js, admin-risk.js, ladder.js
    │      fetch() + EventSource          same-origin, httpOnly cookie session
    ▼
-server    server.js  4061 lines, 125 routes
+server    server.js  4742 lines, 127 routes
              1. baseline security headers
              2. origin guard — BEFORE any body parsing
              3. express.json({ limit: 256kb })
@@ -78,7 +78,7 @@ The dependency direction is strictly one way: `match → ledger → tx`, with
 | `lib/inplay.js` | suspension and the in-play bet delay gates | unfreeze a market on its own authority |
 | `lib/offtime.js` | the pre-off cut-off | be bypassed by a route |
 | `lib/reports.js` | reporting: aggregate, state definitions, render CSV | settle anything or write to the ledger |
-| `lib/userrules.js` | player-authored betting rules: the record, the per-user cap, and evaluation on the price stream | bypass `placeOrder`, or interpret anything a player wrote — there is nothing to interpret |
+| `lib/userrules.js` | player-authored betting rules: the record, the per-user cap, and evaluation on the venue's own price — from the price walk AND from a real crossing, neither behind a config gate (#87) | bypass `placeOrder`, or interpret anything a player wrote — there is nothing to interpret |
 | `lib/bots.js` | MarketMakers ladders, requote, withdraw-all | match itself (the engine's self-match guard covers it), or fill an automated order — the engine refuses that |
 | `lib/drift.js` | fair-price random walk; also where player rules are evaluated | move LTP (only real trades do) |
 | `lib/tenants.js` | multi-tenancy, per-tenant commission, jurisdictions, **tenant suspension**, trusted-country extraction | decide a bet's outcome |
@@ -297,7 +297,7 @@ Deliberately narrow, and asserted by tests rather than assumed:
 
 ## Testing strategy
 
-1282 checks across 76 suites, plus a 220-check browser suite and a live smoke script.
+1284 checks across 77 suites, plus a 220-check browser suite and a live smoke script.
 | Layer | Where | What it proves |
 | --- | --- | --- |
 | Pure maths | `tests/odds.test.js`, `tests/tx.test.js` | ladder, conversions, transaction depth |

@@ -361,14 +361,45 @@ if (sessionSweeper.unref) sessionSweeper.unref();
 // DRIFT IS UNCHANGED, and deliberately so. Drift is the venue's own price
 // MOVING; this change is about a price existing at all, and how a launch price
 // model is derived is a product decision the operator owns (#110/#108) rather
-// than a side effect of materialising a catalogue. lib/userrules.js's only
-// production caller sits behind DRIFT_ON and is inert in feed mode — #87, a
-// separate workstream, deliberately untouched here.
+// than a side effect of materialising a catalogue. It stays force-disabled while
+// the feed is on: a random walk must not reprice a book whose prices it cannot
+// see.
+//
+// #87 IS NO LONGER A CONSEQUENCE OF THAT. This comment used to end with "lib/
+// userrules.js's only production caller sits behind DRIFT_ON and is inert in
+// feed mode — #87, a separate workstream, deliberately untouched here", which
+// described a shipped feature that did nothing in exactly this configuration:
+// no order placed, nothing logged, and the rule row still reading `armed=1`.
+//
+// It was true then and it is false now, and the reason matters more than the
+// fix. Rule evaluation was a property of the DRIFT ENGINE rather than of the
+// VENUE'S OWN PRICE, so switching off the engine switched off a player's
+// automation with it. It is now called from both places this venue's own price
+// moves — lib/drift.js and lib/match.js's `recordTrades`, where a real crossing
+// between two of the venue's own participants writes `selections.ltp` and the
+// trade tape. Neither call site is behind a configuration gate.
+//
+// Which also settles what a feed-mode rule watches. Drift is off there, so
+// `fair_price` on a materialised market is CONSTANT (FEED_BOOK_SEED_PRICE) and a
+// rule watching only that column could never fire whatever the hook. The traded
+// price is the one price a feed-mode venue can prove it produced, so that is the
+// observation. It is not a second price source for rules to drift out of step
+// with: both call sites are the WRITE of a price, and lib/userrules.js holds the
+// crossing state machine that makes a re-observation on the same side of a
+// threshold a no-op.
 //
 // Hoisted above every use (the admin selections route AND main()) so no code
 // path can consult the raw config flag and quote over a feed-owned market.
 const BOTS_ON = config.BOT_ENABLED;
 const DRIFT_ON = config.DRIFT_ENABLED && !config.FEED_ENABLED;
+
+// WHAT THIS COMPOSITION ROOT ACTUALLY DECIDED TO START, frozen at the decision
+// rather than re-derived on demand. Exported so a test can assert the gate a
+// shipped feature was hiding behind instead of asserting its own arithmetic — the
+// check `tests/userrules.test.js` never had, and the reason `lib/userrules.js`
+// could sit behind `DRIFT_ON` for a whole release with a green suite. See the
+// note on the module.exports below.
+const engineSwitches = Object.freeze({ BOTS_ON, DRIFT_ON });
 
 // ── Session (httpOnly cookie + Bearer fallback) ───────────────────────────
 // Cookies are host-scoped, not port-scoped: a sibling app on localhost:3000
@@ -1004,6 +1035,11 @@ const VOLUME_BUCKETS = {
   admin: { limit: config.RATE_LIMIT_ADMIN, windowMs: 60_000 },
   wallet: { limit: config.RATE_LIMIT_WALLET, windowMs: 60_000 },
   read: { limit: config.RATE_LIMIT_READ, windowMs: 60_000 },
+  // The results webhook. Its own bucket, keyed on the SOURCE ADDRESS because the
+  // caller has no session — the same reasoning as `auth`, and the reason a signed
+  // push cannot borrow the wallet bucket the payments webhook uses: a delivery
+  // budget spent by somebody else's address is a budget the venue does not have.
+  resultsWebhook: { limit: config.RATE_LIMIT_RESULTS_WEBHOOK, windowMs: 60_000 },
 };
 const volumeHits = new Map(); // key -> number[] of timestamps
 
@@ -2483,19 +2519,58 @@ app.post('/api/wallet/deposit-intent', requireAuth, limit('wallet'), (req, res, 
 // docs/API.md.
 const crypto = require('crypto');
 const WEBHOOK_REPLAY_WINDOW_SECONDS = 300;
-app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
-  if (!config.PAYMENTS_WEBHOOK_SECRET) return apiError(res, 404, 'Not found');
 
-  // Shape first: the timestamp is an input to the MAC, so a malformed one is a
-  // protocol error and is reported as one rather than as a bad signature.
+/**
+ * Verify a signed webhook delivery, or produce the refusal.
+ *
+ * ONE scheme, TWO routes. The results webhook (`POST /api/results/webhook`)
+ * authenticates exactly the way the payments webhook does — same headers, same MAC
+ * construction, same window, same failure codes — so the rules live here rather
+ * than being typed out a second time. A copy would be a second answer to "how is
+ * a webhook signed on this venue", and the two are exactly as likely to stay the
+ * same as any other duplicated rule: right until the day one of them changes.
+ *
+ * The scheme:
+ *
+ *   x-obx-timestamp   unix seconds. REQUIRED — an optional one is a control the
+ *                     caller bypasses by omitting the header, which is worse than
+ *                     no control because it reads as one.
+ *   x-obx-signature   hex(HMAC-SHA256(secret, "<timestamp>." + rawBody))
+ *
+ * THE TIMESTAMP IS INSIDE THE MAC, which is the whole point. A MAC over the body
+ * alone means a captured valid request is replayable FOREVER: the sender just
+ * attaches a fresh timestamp, which the route would then read as fresh and never
+ * authenticate. Binding it means an attacker who captures one delivery cannot
+ * manufacture another without the secret, and the window bounds the rest.
+ *
+ * ORDER MATTERS and is the payments webhook's, unchanged:
+ *
+ *   1. no secret configured -> 404. Not 401. A scanner must not learn the route
+ *      exists, and a 401 says "there is something here, you are not allowed".
+ *   2. malformed timestamp -> 400. It is an INPUT TO THE MAC, so getting it
+ *      wrong is a protocol error and is reported as one rather than as a bad
+ *      signature.
+ *   3. signature -> 401, in constant time, after a length check because
+ *      `timingSafeEqual` throws on a mismatch. A plain `===` would leak the
+ *      correct signature's length through early-exit timing.
+ *   4. freshness -> 400. Checked AFTER the signature deliberately: an unsigned
+ *      caller learns nothing about the window, and a replay of a genuinely
+ *      captured request is caught here with its signature still valid.
+ *
+ * Returns `{ ok: true }`, or `{ ok: false, status, error }` for the caller to
+ * hand straight to `apiError`.
+ */
+function verifySignedWebhook(req, secret) {
+  if (!secret) return { ok: false, status: 404, error: 'Not found' };
+
   const ts = String(req.headers['x-obx-timestamp'] || '');
   if (!/^\d{1,15}$/.test(ts)) {
-    return apiError(res, 400, 'x-obx-timestamp is required and must be unix seconds');
+    return { ok: false, status: 400, error: 'x-obx-timestamp is required and must be unix seconds' };
   }
 
   const sig = String(req.headers['x-obx-signature'] || '');
   const expected = crypto
-    .createHmac('sha256', config.PAYMENTS_WEBHOOK_SECRET)
+    .createHmac('sha256', secret)
     .update(`${ts}.`)
     .update(req.rawBody || Buffer.alloc(0))
     .digest('hex');
@@ -2504,18 +2579,25 @@ app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
   // timingSafeEqual throws on length mismatch, so check first. A plain ===
   // compare would leak the correct signature's length and early-exit timing.
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-    return apiError(res, 401, 'Bad signature');
+    return { ok: false, status: 401, error: 'Bad signature' };
   }
 
   // Authenticated, so the freshness of THIS request is a fact about the signed
   // payload rather than anything the caller could have asserted on its own.
-  // Checked after the signature deliberately: an unsigned caller learns nothing
-  // about the window, and a replay of a genuinely captured request is caught
-  // here with its signature still valid.
   const age = Math.abs(Math.floor(Date.now() / 1000) - Number(ts));
   if (age > WEBHOOK_REPLAY_WINDOW_SECONDS) {
-    return apiError(res, 400, `Webhook timestamp is outside the ${WEBHOOK_REPLAY_WINDOW_SECONDS}s replay window`);
+    return {
+      ok: false,
+      status: 400,
+      error: `Webhook timestamp is outside the ${WEBHOOK_REPLAY_WINDOW_SECONDS}s replay window`,
+    };
   }
+  return { ok: true };
+}
+
+app.post('/api/payments/webhook', limit('wallet'), (req, res) => {
+  const auth = verifySignedWebhook(req, config.PAYMENTS_WEBHOOK_SECRET);
+  if (!auth.ok) return apiError(res, auth.status, auth.error);
 
   const body = req.body || {};
   try {
@@ -2603,6 +2685,263 @@ function recordFundingRefusal(e, externalId) {
 // NOTHING in the system could complete or refund it — the money sat in
 // gateway_clearing forever. These two routes close the lifecycle, and both
 // are audited with a written reason.
+// ── Results webhook (the PUSH transport) ────────────────────────────────────
+//
+// WHY THIS EXISTS, AND WHY IT IS NOT OPTIONAL ANY MORE. The boot log used to say
+// "Markets settle by webhook or by an operator settling them by hand" and
+// docs/API.md said a pre-off withdrawal "reaches the engine through a webhook or
+// the admin selection-void route". Neither was true: there was no webhook. The
+// only external entry points were POST /api/admin/results/poll — an operator
+// pressing a button, which is not automation — and POST /api/admin/markets/:id/
+// settle. A venue operator reading either document believed they had an
+// automated settlement path and had a manual one.
+//
+// It matters most to a licensed data feed, which is the deployment this
+// repository's compliance work is aimed at. A feed PUBLISHES outcomes. A venue
+// that polls it is asking a publisher to serve a queue it already had, at a
+// cadence it chose, and a feed with a push endpoint — which every licensed
+// sports-data provider has — is waiting to be called. And the pre-off withdrawal
+// has no route through the timer at all, because `results.pendingMarkets` only
+// ever asks about markets whose event is already OFF, while a racing withdrawal
+// arrives before the off.
+//
+// THE SIGNAL SHAPE IS NOT FORKED. `lib/resultsfeed.js` `parseOutcomes` is the
+// same function the poll's response goes through: it accepts the map keyed by
+// market id, the `{outcomes: …}` wrapper and the array-of-entries form, it
+// normalises every entry with `normaliseSignal`, and it raises the same
+// `unrecognised_shape` when a readable body turns out to mean something else. A
+// second shape would be a second set of rules for the same words, and this
+// repository has shipped that bug shape repeatedly: three redundant spellings of
+// `status` were carried through normalisation, arrived unchanged, matched no
+// void rule, and held markets as `unrecognised` while the provider was blamed for
+// a payload the transport had already declared valid.
+//
+// EVERY OUTCOME GOES THROUGH `results.applySignal` — the same function
+// `pollOnce` calls per market. So id translation (`feedcat.admitSignal`), the
+// re-delivery guard, the void rules, the place-market refusal, the dead-heat
+// rules, the holds and the provenance row are all the ordinary path. This route
+// adds transport and authentication; it does not add a decision.
+//
+// `RESULTS_WEBHOOK_SECRET` unset => 404, through `verifySignedWebhook` — the
+// payments webhook's own scheme, extracted so both routes answer "how is a
+// webhook signed here" identically. Signed, timestamped, default-deny, with a
+// 300 s replay window. An unsigned POST to this route is not a results feed, it
+// is a remote "settle this market" control.
+app.post('/api/results/webhook', limit('resultsWebhook'), (req, res) => {
+  const auth = verifySignedWebhook(req, config.RESULTS_WEBHOOK_SECRET);
+  if (!auth.ok) {
+    // Counted, because an integration signing with the wrong secret looks exactly
+    // like one that is not being called at all, and the difference is somebody's
+    // afternoon. `detail` never carries the presented signature.
+    RFEED.noteWebhookRefusal(
+      auth.status === 401 ? 'bad_signature' : auth.status === 404 ? 'not_configured' : 'bad_timestamp',
+      auth.error
+    );
+    return apiError(res, auth.status, auth.error);
+  }
+
+  // ── READ THE DELIVERY, AND REFUSE A BODY THIS TRANSPORT CANNOT READ ───────
+  //
+  // `parseDelivery`, NOT `parseOutcomes`, and the reason is in that function's
+  // note: the poll's key rule is `Number(key)` is a positive integer, because
+  // the venue asked with ids it invented and the provider answers with them. A
+  // push has no request to answer, so the sender names the market in its own id
+  // space — `'1.234567890'` — and that key under `parseOutcomes` is dropped and
+  // the whole delivery reported as an unrecognised shape. Every entry is still
+  // normalised by `normaliseSignal`, so the SIGNAL shape is one definition; only
+  // the key rule is widened.
+  let parsed;
+  try {
+    parsed = RFEED.parseDelivery(req.body);
+  } catch (e) {
+    // `parseDelivery` raises for a body it cannot interpret at all, and for a
+    // body that CONTAINED entries and produced none — which is a provider whose
+    // contract moved, the one worth paging somebody about. Either way the venue
+    // did not apply anything, so it says so rather than answering 200 and
+    // settling nothing.
+    RFEED.noteWebhookRefusal('unreadable_body', e && e.reason ? e.reason : 'unreadable');
+    return apiError(res, 400, e && e.message ? e.message : 'Results delivery could not be read');
+  }
+  const outcomes = parsed.outcomes;
+
+  // WHICH LICENSED SOURCE, validated ONCE before any market is touched. Same
+  // reasoning as lib/results.js's `pollOnce`: a licence that expired must not
+  // settle the first fifty markets and then refuse the fifty-first, and an
+  // expired licence is a fact about the SOURCE rather than about fifty separate
+  // outcomes.
+  //
+  // `req.body` is guarded for undefined rather than read blind: Express 5 leaves
+  // it undefined when no parser matched the content-type, and a bare read here
+  // would be a 500 for what is a malformed request (tests/express5.test.js E5b).
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  const declaredSource = Number(body.data_source_id);
+  const dataSourceId = Number.isInteger(declaredSource) && declaredSource > 0 ? declaredSource : null;
+  try {
+    RESULTS.assertDataSourceUsable(db, dataSourceId, 'settle');
+  } catch (e) {
+    RFEED.noteWebhookRefusal('data_source_unusable', e && e.message ? String(e.message).slice(0, 200) : null);
+    return apiError(res, 400, e && e.message ? e.message : 'Data source is not cleared to settle from');
+  }
+
+  const feedcat = require('./lib/feedcat');
+  // ── RESOLVE EACH ENTRY TO A LOCAL MARKET, IN BOTH ID SPACES (#101) ────────
+  //
+  // The poll path never needed this: `pendingMarkets` enumerates the venue's own
+  // markets and asks `outcomes[m.id]`, so the answer arrives keyed by an id the
+  // venue put there. A PUSHED outcome is the other way round — the sender names
+  // the market in whatever id space it has, which for a licensed feed is its own.
+  // An untranslated id reaches `applyOutcome`'s membership test as foreign for
+  // every winner, takes the empty-winner HOLD branch, and parks real money in a
+  // market nothing settles.
+  //
+  // LOCAL FIRST. See lib/feedcat.js's `resolveMarketId` for why: this venue's
+  // autoincrement ids and every exchange's own ids start at 1, so the two spaces
+  // collide constantly and the local reading is the right one.
+  //
+  // ONE `externalRefs` READ FOR THE WHOLE BATCH, not one per entry. That call is
+  // two chunked queries for the entire set and is on the poll path for every
+  // pending market already; doing it per entry would make a 250-market delivery
+  // 250 times more expensive than the same batch arriving by poll.
+  const keys = Object.keys(outcomes);
+  const resolved = new Map(); // local market id -> { key, signal }
+  const unknown = [];
+  for (const key of keys) {
+    const asLocal = Number(key);
+    let localId = Number.isInteger(asLocal) && asLocal > 0 ? asLocal : null;
+    if (localId !== null && !db.prepare('SELECT 1 FROM markets WHERE id = ?').get(localId)) localId = null;
+    if (localId === null) localId = feedcat.resolveMarketId(db, key);
+    if (localId === null) {
+      unknown.push(key);
+      continue;
+    }
+    resolved.set(localId, { key, signal: outcomes[key] });
+  }
+  const refs = resolved.size ? feedcat.externalRefs(db, [...resolved.keys()]) : new Map();
+
+  // ── APPLY, ONE MARKET AT A TIME, THROUGH THE ORDINARY CONSUMER ────────────
+  const results = [];
+  for (const [marketId, entry] of resolved) {
+    const market = db.prepare('SELECT id, settlement_hold, hold_reason, status FROM markets WHERE id = ?').get(marketId);
+    // Re-read above rather than trusting `externalRefs` to have found a live
+    // market: it reports MAPPED markets, including one that has since settled.
+    if (!market) {
+      unknown.push(entry.key);
+      continue;
+    }
+    // A MARKET ALREADY ON A HOLD is answered as held, here rather than by
+    // `applyOutcome`. That path would reach `settleMarket`, which refuses a held
+    // market, and `applyOutcome` absorbs a 409 as `already_settled` — a sentence
+    // that is false, told to a feed operator about a market that is explicitly
+    // parked awaiting a human. Naming the prior hold costs one indexed read and
+    // is the difference between "we already decided not to" and "that is done".
+    if (market.settlement_hold) {
+      results.push({
+        market_id: marketId,
+        outcome: 'held',
+        rule: 'prior_hold',
+        reason: market.hold_reason || 'market is held pending review',
+      });
+      continue;
+    }
+    // ONE MARKET AT A TIME, AND ONE FAILURE AT A TIME. `applyOutcome` documents
+    // that it returns rather than throws precisely so a feed processing many
+    // markets does not abort on one bad one, and a push has the same shape with
+    // the same exposure. A throw here would otherwise reach the error handler as
+    // a 500 — telling a provider its whole batch failed when, in the worst case,
+    // one market in it did — and it would take every OTHER outcome in the
+    // delivery with it.
+    const ref = refs.get(marketId);
+    try {
+      results.push(
+        RESULTS.applySignal(db, { id: marketId, feed_refs: ref || null }, entry.signal, {
+          source: 'webhook',
+          dataSourceId,
+        })
+      );
+    } catch (e) {
+      results.push({
+        market_id: marketId,
+        outcome: 'error',
+        rule: 'consumer_failed',
+        reason: String((e && e.message) || e).slice(0, 200),
+      });
+    }
+  }
+  for (const key of unknown) {
+    results.push({ market_id: null, outcome: 'unmapped', sent_as: key, reason: 'no market on this venue has that id' });
+  }
+
+  // ── ANSWER THE SENDER HONESTLY ────────────────────────────────────────────
+  //
+  // A webhook that answers 200 while the market was held for review is a lie a
+  // feed operator acts on: they mark the outcome delivered, stop re-sending it,
+  // and the venue's players sit in an unsettleable market with the reason on a
+  // page they never read. So the status says what happened:
+  //
+  //   200  every outcome was settled, voided, withdrawn, ignored, or was already
+  //        applied. This is also what a RE-DELIVERY of an already-recorded signal
+  //        answers, with the first delivery's decision echoed back — a retry is a
+  //        normal event and must not be an error.
+  //   202  at least one outcome was HELD for review. Deliberately NOT 200, and
+  //        deliberately NOT 4xx: the delivery was received and recorded, so
+  //        retrying it cannot change the decision, and a 4xx would have the
+  //        provider retry until it was throttled — for a dispute that only a human
+  //        can settle. 202 says "received, not resolved", which is the truth, and
+  //        `held` names how many.
+  //   422  at least one outcome named a market this venue does not have. Not a
+  //        hold and not a transport error: the sender described a fixture that was
+  //        never materialised, or used an id space we cannot place, and retrying
+  //        will not materialise it. A held entry still reports as held in the body.
+  const held = results.filter((r) => r.outcome === 'held');
+  const unmapped = results.filter((r) => r.outcome === 'unmapped');
+  const applied = results.filter((r) => r.outcome !== 'unmapped');
+  const status = held.length > 0 ? 202 : unmapped.length > 0 ? 422 : 200;
+
+  RFEED.noteWebhookDelivery({ outcomes: results.length, held: held.length });
+  // THE AUDIT ROWS. See lib/audit.js on both actions: one per accepted batch,
+  // and one per held outcome because a hold is the one thing here a machine
+  // could not decide. `actor` is null, which that module's header defines as "no
+  // human did this" — a feed settled this, and an operator did not.
+  AUDIT.record(db, null, AUDIT.ACTIONS.RESULTS_DELIVERED, 'results:webhook', null, {
+    outcomes: results.length,
+    settled: results.filter((r) => r.outcome === 'settled').length,
+    voided: results.filter((r) => r.outcome === 'voided').length,
+    withdrawn: results.filter((r) => r.outcome === 'withdrawn').length,
+    held: held.length,
+    already_applied: results.filter((r) => r.outcome === 'already_applied').length,
+    unmapped: unmapped.length,
+    data_source_id: dataSourceId,
+    // HOW it arrived, for the same reason `result_events.source` records it: an
+    // operator disputing this outcome months later has to be able to tell a push
+    // from a poll, and this row is the one that says a delivery happened at all.
+    transport: 'webhook',
+  });
+  for (const h of held) {
+    AUDIT.record(db, null, AUDIT.ACTIONS.RESULTS_HELD, `market:${h.market_id}`, null, {
+      rule: h.rule,
+      reason: h.reason,
+      transport: 'webhook',
+    });
+  }
+
+  res.status(status).json({
+    delivered: keys.length,
+    applied: applied.length,
+    held: held.length,
+    unmapped: unmapped.length,
+    // Entries the sender named that carried no readable outcome. Published rather
+    // than swallowed: a feed that has quietly started sending a shape we ignore
+    // looks identical to a feed with nothing to say, and the difference is a
+    // venue that never settles.
+    unreadable_entries: parsed.unreadable_entries,
+    // Every entry, with its own outcome and its own reason. A sender that gets
+    // only a count has to come back and ask again, and the next delivery is a
+    // re-delivery — which is to say it learns nothing by asking.
+    results,
+    feed: RFEED.health({ staleAfterMs: 0 }).webhook,
+  });
+});
+
 app.post('/api/admin/payments/intents/:id/complete', requireAdmin, limit('admin'), (req, res) => {
   const reason = (req.body || {}).reason;
   if (!reason || String(reason).trim().length < 5) return apiError(res, 400, 'A written reason is required');
@@ -4147,7 +4486,7 @@ async function main() {
   // FIXTURES, and the venue quotes its own book.
   if (config.FEED_ENABLED) {
     if (config.BOT_ENABLED) console.log('[feed] on — the venue book is quoted at its own prices; the reference board stays display-only');
-    if (config.DRIFT_ENABLED) console.log('[drift] suppressed while the feed is on — drift is a separate workstream (#87)');
+    if (config.DRIFT_ENABLED) console.log('[drift] suppressed while the feed is on — a random walk must not reprice a book it cannot see; user rules now follow real trades instead (#87)');
   }
   if (BOTS_ON) {
     try {
@@ -4281,15 +4620,22 @@ async function main() {
     );
   }
 
-  // The results feed is off unless configured. That is a legitimate way to run
-  // (settle by hand or by webhook), so it is not an error — but it is worth
-  // one line, because the alternative reading is "results are automatic", and
-  // on a venue that reading means nobody notices markets not settling.
-  if (!config.RESULTS_FEED_URL) {
-    console.warn(
-      '[results] RESULTS_FEED_URL unset — no automatic results feed. Markets settle\n' +
-      '[results] by webhook or by an operator settling them by hand.'
-    );
+  // What the venue says about RESULTS, in whatever configuration it is actually
+  // running. Extracted into lib/resultsfeed.js as a pure function for the reason
+  // `feedBootStatus` is: a line built inside main() cannot be read by anything
+  // offline, and this one is a claim about whether markets settle WITHOUT an
+  // operator, which is the claim a venue has to check before going live.
+  //
+  // The previous version warned only when RESULTS_FEED_URL was unset, and said
+  // markets settle "by webhook or by an operator settling them by hand". There
+  // was no webhook. It told every venue with no poll configured that they had an
+  // automated settlement path they did not have — printed at every boot, to
+  // everyone, and it was in docs/API.md too.
+  {
+    const r = RFEED.resultsBootStatus(config);
+    if (r.level === 'error') console.error(r.message);
+    else if (r.level === 'warn') console.warn(r.message);
+    else console.log(r.message);
   }
 
   // Both verify a stored hash, so both are async now that key derivation runs
@@ -4393,7 +4739,15 @@ if (require.main === module) {
 // `ready` is exported so anything that requires this module can await the
 // seed before assuming the catalogue exists. tests/api.test.js, feed.test.js,
 // feed_nav.test.js and feedadmin.test.js all listen on `app` themselves.
-module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, feedBootStatus, streamAdmission, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, ready, OPS,
+//
+// `engineSwitches` is exported for the same reason `feedBootStatus` is. A test
+// that re-derived `DRIFT_ON` from the config itself would be reading its own
+// arithmetic rather than this composition root's, and would therefore pass
+// against a gate that had been changed — which is exactly the failure #87 was:
+// `lib/drift.js` being unreachable while every test that exercised user rules
+// called `evaluateSelection` directly. A suite that can read what the server
+// actually decided to start has a control the old one did not.
+module.exports = { app, db, broadcast, errorHandler, clampFeedLimit, feedBootStatus, engineSwitches, streamAdmission, resetLoginLimiter, resetVolumeLimits, limit, volumeExceeded, jobTimers, ready, OPS,
   // The response shaper, exposed for tests. NOT for production callers: every
   // route should reach the error contract by throwing (so status and details
   // travel together) or by calling this directly with an explicit status, and
