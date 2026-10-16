@@ -289,6 +289,86 @@ Two consequences for a feed integration:
   fixture changes nothing (there is no such outcome in football), and a
   withdrawal NOTICE alone holds such a market for a human rather than inventing a
   racing rule for it.
+- **A withdrawal may CARRY a declared deduction, and it is not optional to
+  declare one.** See the next section. This is the second half of the Australian
+  racing rule and the half that costs money when it is missing.
+
+### The `deductions` field: what a feed may declare, and what it may not
+
+A late scratching does two things to a bet, not one. The scratched runner's bets
+are refunded and **declared off** — which this feed has always carried. The bets on
+the runners that **survived** are then reduced by a **deduction**, scaled by the
+withdrawn runner's odds. WA rule 4A, betr's *Scale of Deductions* v1.1 and the GRV
+Deduction Schedule all require it. A feed that sends `non_runners` and nothing else
+leaves the venue **overpaying the survivors' backers** on every race it does that
+on.
+
+**THE VENUE DOES NOT COMPUTE THE SCALE, AND A FEED MUST NOT EXPECT IT TO.** The
+scale is published per racing authority and per jurisdiction, it is versioned, and
+the stewards declare it in a particular race — WA 4A says so explicitly, including
+the case where the withdrawn runner is shorter than the table covers and the
+outcome becomes a steward decision to void all wagers and re-open the race. So the
+feed **declares** and the venue **applies**:
+
+```jsonc
+{
+  "market_id": 41,
+  "status": "completed",
+  "winners": [7],
+  "non_runners": [3],
+  "deductions": [
+    { "selection_id": 3, "unit": "percent", "value": 27, "declared_by": "stewards, race 4" }
+  ]
+}
+```
+
+| Field | Rule |
+| --- | --- |
+| `selection_id` | the **withdrawn** runner the deduction is declared against. Must appear in this outcome's `non_runners`; anything else is refused. |
+| `unit` | **required**, `"percent"` or `"fraction"`. A missing or unrecognised unit is **refused and named**, never inferred. |
+| `value` | a number in the unit's range — 0–100 for `percent`, 0–1 for `fraction`. |
+| `scope` | optional, `"win"` (default) or `"place"`. `"place"` is accepted as a declaration and then **refused on a win market**, because the schedules carry separate tables and the figures are not interchangeable. |
+| `declared_by` | optional free text naming the authority. Recorded on the provenance row and never interpreted. |
+
+**CARRIED VERBATIM, NEVER COERCED.** Every other racing field on a signal is
+coerced by `normaliseSignal` — `winners` and `non_runners` through `Number`, the
+flags through `Boolean`. `deductions` is the exception, and the reason is the unit:
+`Number("27") === 27`, so a quoted percentage that was coerced would pass a range
+check and be applied as though the stewards had declared it in the declared unit.
+A malformed element is **refused at the seam, named, and counted** — not repaired,
+not dropped, and never allowed to become "no deduction".
+
+**A deduction with no withdrawal attached is a named hold**
+(`deduction_without_withdrawal`). A valid 20% on a race where nothing was scratched
+has nothing to charge, and letting it through silently would settle that race at
+full payout with a declaration sitting unread — the same failure as not handling it
+at all.
+
+**A DEDUCTION MAY RIDE THE PRE-OFF NOTICE**, which is usually where the stewards
+declare it. There the declaration is validated and **recorded**, and the runner is
+still removed and refunded. The result that settles the market carries its own
+`deductions` and is validated again against the market as it actually finished, so
+a figure recorded pre-off cannot silently become the figure applied at settlement.
+
+**WHAT THE FEED GETS BACK, AND WHAT TO DO ABOUT EACH ANSWER.** Three answers, and
+they must stay visibly different:
+
+| The declaration | Answer | What an operator does |
+| --- | --- | --- |
+| absent | the market settles **in full**, and the absence is recorded and counted | chase the feed: `deduction_state = 'undeclared'` on the provenance row, counted by `lib/deductions.js` `undeclaredCount()` |
+| declared and valid | applied to the **winner's winnings**, scaled by that runner's odds against the shortest survivor, capped at 100% and clamped at the payout | nothing; the applied figure, its declarer and its clamping are on the provenance row |
+| refused | the **market is held** with a named code, not settled at a payout nobody authorised | fix the feed; the refusals are listed by `rejectedDeclarations()` |
+
+The one thing this feed must not do is send a bare number. There is no scale table
+to fall back on anywhere in this venue, and a figure whose unit is ambiguous
+differs from the intended one by a factor of a hundred.
+
+**AND THE HONEST LIMIT.** A deduction applies to a **win** payout. A `place` market
+is **held** by this venue — see
+[EXCHANGE_RULES.md](EXCHANGE_RULES.md#place-markets-and-what-the-venue-refuses) —
+and each-way is not implemented at all, so on a racing launch most markets never
+reach a settlement this feed can price. The arithmetic and the provenance are
+correct on the markets the venue can settle; the shape is `#95`.
 
 ### Feed 1 is supported, and it loads
 
@@ -1105,6 +1185,8 @@ The things a reader is most likely to assume, and the code for each.
 | move a venue price | drift (`DRIFT_ON`) is still suppressed while the feed is on, and user rules are inert for the same reason — #87, a separate workstream |
 | delete a market the feed dropped | it is suspended, never deleted, and a market that left the feed after going off is left open so it can still settle |
 | settle anything from the collector's results | settlement runs through `lib/settle.js`, from an operator's intent or from the HTTP results transport |
+| compute a racing deduction from a published scale | there is no scale table in this venue. The feed **declares** the figure and the venue **applies** it — see [The `deductions` field](#the-deductions-field-what-a-feed-may-declare-and-what-it-may-not). WA rule 4A makes the short-price case a steward decision, so guessing it would be inventing a racing rule |
+| price a place or each-way market | `payout_shape: 'place'` is **held**, and each-way is not implemented. A deduction applies to a **win** payout, so on a racing launch most markets never reach a settlement this feed can price |
 | write to the collector's database | `lib/feed.js` only ever reads |
 | run on its own | materialisation is an explicit, audited `POST /api/admin/feed/sync`. Nothing happens at boot or on a timer |
 
