@@ -1390,19 +1390,37 @@ that.
 
 ### Where it runs
 
-Server-side, in `lib/drift.js`, immediately after a selection's fair price
-changes and **before** the bot requote, inside the drift transaction.
+Server-side, on the **venue's own price** — every write of it, and there are two.
+Both call sites are inside the transaction that writes the price.
 
-- It is the **only** place in the codebase that moves a fair price, so there is
-  no second price source for rules to drift out of step with.
+| | What moved it | Where |
+| --- | --- | --- |
+| the price walk | `lib/drift.js` wrote a new `selections.fair_price`, and rules evaluate **before** the bot requotes, so a rule crosses the book as it stood before the desk reacted | [`lib/drift.js`](../lib/drift.js) |
+| a real crossing | two of the venue's own participants traded and `lib/match.js` `recordTrades` wrote `selections.ltp` and the trade tape | [`lib/match.js`](../lib/match.js) |
+
+- Both are the **write** of a price, not a reader of one, so there is still no
+  second price source for rules to drift out of step with.
+- **Neither is behind a configuration gate** (#87). Until the second one existed,
+  the only call site was inside `lib/drift.js`, and that only *runs* when
+  `DRIFT_ON` — so with a licensed feed on, a rule could never be evaluated at
+  all: no order, no error, no log line, and a rule row still reading `armed=1`.
+  With the feed on, drift is deliberately off and a materialised market's
+  `fair_price` is the constant `FEED_BOOK_SEED_PRICE`, so the **traded price is
+  the only price a feed-mode venue can prove it produced** — which is why it is
+  the second hook rather than an afterthought.
 - It is **not** hooked to the SSE stream. An SSE client is a viewer; hooking
   there would make evaluation depend on somebody having a browser tab open.
 - Killing the process stops evaluation by definition. There is nothing to
   disable and no client-side copy to fall back to.
+- One price event produces **at most one** evaluation. A crossing places an
+  order, that order sweeps the book, and the sweep can land back in the hook —
+  so `lib/userrules.js` holds a re-entry guard that makes the nested evaluation a
+  reported no-op.
 - If no price event arrives, no evaluation happens. A rule on a market that has
   stopped moving waits, still armed. This is asserted as a decision
-  (`tests/userrules.test.js` V32) rather than left as an accident: a periodic
-  re-scan would place orders on observations the venue never made.
+  (`tests/userrules.test.js` V32, and `tests/rules-feedmode.test.js` F4) rather
+  than left as an accident: a periodic re-scan would place orders on
+  observations the venue never made.
 
 ### One-shot per crossing — not the continuous semantics
 

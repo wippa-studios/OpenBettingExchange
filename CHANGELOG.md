@@ -18,74 +18,84 @@ must agree with the highest released heading.
 
 ### Added
 
-- **A declared deduction on the runners that survived a late scratching.** This
-  closes a money-path defect on the Australian racing launch. `applyWithdrawal`
-  and `voidSelection` refund the scratch — WA rule 4A's "refund all bets on the
-  late scratched runner and those bets are, by operation of this rule, declared
-  off" — and that half was always right. The half that was missing is the other
-  half of the same rule: the bets on the runners that SURVIVED are reduced by a
-  **deduction**, scaled by the withdrawn runner's odds. betr's *Scale of
-  Deductions* v1.1 (18 September 2026), the GRV greyhound *Deduction Schedule*
-  and WA rule 4A all require one, so the venue was **overpaying the backers of
-  every surviving runner** by the deduction it never applied — on every race with a
-  late scratching. Conservation was green throughout, because the money went to a
-  real bettor in a real account; this is the `greyhounds`/`greyhound` slug
-  mismatch blind spot again, on the racing path.
+- **A results webhook — the PUSH transport** (`POST /api/results/webhook`). The
+  boot log used to say markets "settle by webhook or by an operator settling
+  them by hand" and `docs/API.md` said a pre-off withdrawal "reaches the engine
+  through a webhook or the admin selection-void route". **There was no webhook.**
+  The only external entry points were `POST /api/admin/results/poll` — an
+  operator pressing a button — and the admin settle route, so an operator reading
+  either document believed they had an automated settlement path and had a manual
+  one. It matters most to a licensed data feed, which *publishes* outcomes: a
+  venue that polls is asking a publisher to serve a queue it already had. And a
+  pre-off withdrawal has no route through the timer at all, because
+  `results.pendingMarkets` only ever asks about markets already OFF.
 
-  **THE VENUE COMPUTES NO SCALE, BY DESIGN.** The scale is published per racing
-  authority and per jurisdiction, it is versioned, and the **stewards declare it
-  in a particular race** — WA rule 4A says explicitly that where the withdrawn
-  runner is shorter than the table covers, the stewards may declare all wagers
-  void and order the race re-opened, which is a steward decision and not a
-  formula. So the shape is the one this repository already uses for every other
-  provider-shaped fact: **the venue is the mechanism, the feed is the authority.**
-  A withdrawal signal may carry `deductions`; the venue applies what is declared,
-  records what it applied, and refuses to invent one. There is no scale table in
-  `lib/deductions.js`, and its absence is the feature.
+  Signed, timestamped, replay-windowed and **default-deny**, through the payments
+  webhook's own scheme extracted into one shared `verifySignedWebhook` so the two
+  routes cannot drift apart; no `RESULTS_WEBHOOK_SECRET` means `404`, not `401`.
+  Every outcome goes through `lib/results.js` `applySignal` — the same function
+  `pollOnce` calls — so id translation, the re-delivery guard, the void rules,
+  the place-market refusal, the dead-heat rules and the holds are the ordinary
+  consumer's, and a re-delivery moves no money. The signal shape is
+  `normaliseSignal`'s. **A held outcome answers `202`, not `200`,** with its rule
+  and reason: a feed operator told `200` stops resending, and the venue's players
+  sit in an unsettleable market. Audited (`results.delivered` per batch,
+  `results.held` per hold), rate-limited on its own `RATE_LIMIT_RESULTS_WEBHOOK`,
+  and reported on `/api/admin/results/feed` and `/readyz` beside the poll
+  transport.
 
-  - The figure is taken off the winner's **winnings**, never the stake, and the
-    **layer keeps the difference** — the winner's dividend is the layer's
-    liability, so the two sides are moved by the same number and conservation
-    holds per match with no hand-written balancing entry. It goes through
-    `ledger.settleUser` inside the settlement's own transaction;
-    `tests/guard.test.js` still holds, because no module outside `ledger.js`
-    writes the wallet columns and there is no `UPDATE users` on this path.
-  - The applied figure is **scaled by the odds** per WA 4A — proportional to the
-    odds against each remaining runner, anchored on the shortest survivor —
-    capped at 100% and **clamped at the payout**, so a payout can never go
-    negative and nobody who won is charged. The clamp is recorded, because a
-    clamp that leaves no trace is indistinguishable from the declared value.
-  - **The unit is required** and drawn from a closed vocabulary (`percent`,
-    `fraction`). A bare number is refused: `27` and `0.27` differ by a factor of
-    a hundred depending on which was meant, and the venue cannot tell. This is
-    `lib/aml/rules.js`'s convention — a unit declaration checked at write time,
-    so the error arrives while the operator is still looking at the signal.
-  - **Three answers, visibly different.** Absent: the market settles in full and
-    the absence is recorded (`deduction_state = 'undeclared'`) and **counted**
-    (`lib/deductions.js` `undeclaredCount` / `overview`) — the total the venue
-    overpaid, as a query rather than a promise. Declared: applied and recorded in
-    full. Refused: the market is **held** with a named code, because a bad figure
-    that silently became "no deduction" would be a full payout nobody authorised.
-    A re-delivery applies it once, via `alreadyApplied` and the unique index on
-    `(source, source_event_id)`.
-  - Two new nullable, closed columns on `result_events`: `deduction_state` (the
-    counter) and `deductions_json` (the record), with the same facts beside
-    `winners` and `non_runners` in the payload.
+  Three things fell out of building it, each a defect it would otherwise have
+  shipped:
 
-  **WHAT THIS DOES NOT DO, STATED PLAUSIBLY LOUDLY.** It settles **win** payouts
-  only. Place markets are still **held** and each-way is still not implemented, so
-  on an Australian racing launch — where most bets are place or each-way — most
-  markets never reach a settlement this venue can price. The scale is not computed
-  from the withdrawn runner's odds, and multiple withdrawals are **summed** rather
-  than re-based, because re-basing *is* the scale; an operator whose jurisdiction
-  re-bases declares the composed figure. See `STATE.md` §3a and the "What a racing
-  launch still cannot do" table in `docs/EXCHANGE_RULES.md`.
+  - **A pre-off RESULT is now held** (`rule: pre_off_result`). The poll path gets
+    that from `pendingMarkets`' filter; a push has no such filter, and
+    `lib/settle.js` has no off-time check of its own — so a feed could announce a
+    result for a race that had not started and the venue would pay out on it. A
+    **withdrawal** is exempt: it is announced before the off by design.
+  - **`normaliseSignal` now carries a feed's composite runner id**
+    (`"1.234567890:58805"` — the spelling `feed_map` stores and `requestBody`
+    POSTs). `Number(...)` on it is `NaN`, so every winner was being dropped and
+    the market HELD as `completed_no_winner`, with the provider blamed for a
+    payload the transport had just thrown away.
+  - **A re-delivery reports the FIRST delivery's decision.** "Already applied" is a
+    sentence about the first delivery and the sender is reading the second; a
+    re-delivery of a signal that was *held* used to answer `already_applied` and
+    nothing else, which reads as settled.
 
-  *Tests:* `tests/deductions.test.js` (D1–D11). Every case asserts its control
-  beside it — the identical race with no declaration, the identical declaration
-  attached to the wrong runner, the same market with the winner at a different
-  price — because a deduction feature that cannot show what it changed has not
-  been tested.
+  **The boot log now tells the truth in every configuration.** With neither
+  transport configured it says there is **no automatic settlement** and names the
+  route that is the settlement path; with a webhook it says the webhook is live
+  and that it is the only route a pre-off withdrawal can arrive on; with a poll it
+  says the poll cannot carry a withdrawal. It is a pure function
+  (`lib/resultsfeed.js` `resultsBootStatus`), so it is asserted rather than prose.
+
+- **User rules evaluate with the licensed feed on** (#87). `lib/userrules.js` had
+  exactly **one** production caller — inside `lib/drift.js` — and `lib/drift.js`
+  only runs when `DRIFT_ON`, which is `config.DRIFT_ENABLED && !config.FEED_ENABLED`.
+  So on any venue running a feed, a player's rule could never be evaluated at all:
+  no order placed, nothing thrown, nothing logged, and the `user_rules` row still
+  reading `armed=1` forever. The feature looked armed and did nothing, on the
+  configuration a licensed venue actually runs. `tests/userrules.test.js` stayed
+  green because it called `evaluateSelection` **directly**, bypassing the gate
+  entirely.
+
+  Evaluation is now a property of the **venue's own price**, not of the drift
+  engine, and is called from both places that price moves: the walk
+  (`lib/drift.js`) and a **real crossing** (`lib/match.js` `recordTrades`, where a
+  match writes `selections.ltp` and the trade tape). The second is the only price
+  a feed-mode venue can prove it produced — with drift deliberately off there,
+  `fair_price` on a materialised market is the constant `FEED_BOOK_SEED_PRICE` —
+  and neither call site is behind a configuration gate.
+
+  **Drift is still suppressed with the feed on.** Nothing here re-enables it: the
+  random walk must not reprice a book whose prices it cannot see. The SSE stream
+  is still not a hook (evaluation must not depend on somebody having a browser tab
+  open, #67), a rule still observes only a real price movement, and
+  `evaluateSelection` now holds a **re-entry guard**, so one price event produces
+  at most one evaluation however deeply its own order nests.
+  `tests/rules-feedmode.test.js` runs with `FEED_ENABLED=true`, asserts `DRIFT_ON`
+  is **false** in the composition root — so a rule firing there cannot be explained
+  by drift — and drives real crossings.
 
 - **The feed now drives a real, tradeable, venue-priced book** (#101). With
   `FEED_ENABLED=true` the venue had a board of real fixtures and **not one

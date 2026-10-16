@@ -1,7 +1,7 @@
 # API reference
 
-Base URL `http://127.0.0.1:7777`, loopback only. `server.js` registers **125
-routes** — 122 under `/api` and the three operational endpoints below — and this
+Base URL `http://127.0.0.1:7777`, loopback only. `server.js` registers **127
+routes** — 124 under `/api` and the three operational endpoints below — and this
 file documents all of them. Each route's status codes, field names and error
 shapes were read from the handler that serves it; where a handler is thin, the
 table points at the module that does the work rather than guessing at it.
@@ -138,6 +138,7 @@ are not rate limits and cannot be retried.
 | Admin | `401` without a session; `403 Admin only` for a signed-in non-admin. `role` is authoritative, with `is_admin` accepted as a legacy mirror |
 | Ops token | `/metrics` and `POST /api/admin/backup` are additionally gated on `OPS_TOKEN` (`x-ops-token` header or `Authorization: Bearer`). Unset token ⇒ `404 Not found`; wrong token ⇒ `401 Unauthorized`. `/healthz` and `/readyz` are always public |
 | Payments webhook | HMAC-SHA256 over `"<x-obx-timestamp>." + rawBody`, hex in `x-obx-signature`, compared in constant time. `x-obx-timestamp` is **required** and **part of the MAC**, and a request outside a 300 s window is refused — see the webhook signing note below. Without `PAYMENTS_WEBHOOK_SECRET` the route is `404` |
+| Results webhook | The **same** scheme, through one shared implementation (`verifySignedWebhook`), so the two webhooks cannot drift apart. `POST /api/results/webhook` has no session and authenticates by HMAC alone; without `RESULTS_WEBHOOK_SECRET` it is `404`, not `401` |
 
 **The first-run lock.** An account still on a seeded demo password (`admin` /
 `admin123`, `demo` / `demo123`) can sign in but is refused `403` on every route
@@ -763,9 +764,13 @@ pay them twice.
 | `POST /api/payments/webhook` | `{ provider, external_id, amount_cents }` + `x-obx-timestamp` + `x-obx-signature` | `200` confirms the matching deposit intent. A **redelivery** of an already-confirmed intent is `200 { already_confirmed: true }`, not a `404` — at-least-once delivery is the normal case, not an error | `404` no `PAYMENTS_WEBHOOK_SECRET`, or an external id no deposit intent has; `401 Bad signature`; `400` missing/malformed `x-obx-timestamp`, outside the 300 s replay window, provider mismatch, or amount disagreeing with the recorded intent; `429` abuse counter |
 
 **Webhook signing and the replay window.** The signature is
-`hex(HMAC-SHA256(PAYMENTS_WEBHOOK_SECRET, "<timestamp>." + rawBody))`, where
-`<timestamp>` is `x-obx-timestamp` in unix seconds, compared in constant time
-against `x-obx-signature`.
+`hex(HMAC-SHA256(SECRET, "<timestamp>." + rawBody))`, where `<timestamp>` is
+`x-obx-timestamp` in unix seconds, compared in constant time against
+`x-obx-signature`. `SECRET` is `PAYMENTS_WEBHOOK_SECRET` for the payments webhook
+and `RESULTS_WEBHOOK_SECRET` for the results webhook, and **both routes run the
+same verification** (`verifySignedWebhook` in `server.js`) — the scheme is defined
+once, so the two cannot come to answer "how is a webhook signed here"
+differently.
 
 The timestamp is **required** and is **inside the MAC**, and both matter. It was
 neither before: the MAC covered the raw body alone, so a captured valid request
@@ -1107,12 +1112,50 @@ executed buyouts, which resolve at settlement.
 
 ---
 
+## Results: the push transport
+
+`POST /api/results/webhook` is how a licensed data feed actually delivers
+outcomes: it publishes them, and a venue that polls is asking a publisher to
+serve a queue it already had. It is also the **only** route a pre-off withdrawal
+can arrive on, because `results.pendingMarkets` only ever asks about markets
+whose event is already off.
+
+| Route | Request | Success | Errors |
+| --- | --- | --- | --- |
+| `POST /api/results/webhook` |
+- **Default-deny.** No `RESULTS_WEBHOOK_SECRET` ⇒ `404`, not `401`: an
+  unauthenticated POST here would be a remote "settle this market" control.
+- **Signed, timestamped, replay-windowed** — the payments webhook's scheme, one
+  implementation. The timestamp is required and is **inside the MAC**.
+- **Idempotent.** A re-delivery answers `already_settled` / `already_applied` /
+  `held` (with the first delivery's decision echoed back) and moves no money.
+  Inside the replay window this is deliberately a *2xx*: delivery is at-least-once,
+  and a `401` there would teach a correctly-configured feed it had been banned.
+- **One code path.** Every outcome goes through `lib/results.js` `applySignal` —
+  the same function `pollOnce` calls — so id translation, the re-delivery guard,
+  the void rules, the place-market refusal, the dead-heat rules and the holds are
+  the ordinary consumer's. The route adds transport and authentication; it adds
+  no decision.
+- **A result for a market that has not gone off is HELD.** The poll path gets that
+  from `pendingMarkets`' filter; a push has no such filter, so `applySignal` holds
+  it (`rule: pre_off_result`). A **withdrawal** is exempt — it is announced before
+  the off by design.
+- **One market at a time.** A market whose outcome throws is reported
+  `outcome: "error"` and the rest of the delivery still applies.
+- **Audited.** One `results.delivered` row per accepted batch and one
+  `results.held` row per hold, both with `actor_id` NULL (the feed did this, an
+  operator did not).
+- **Rate-limited** on `RATE_LIMIT_RESULTS_WEBHOOK`, keyed on the source address —
+  the one ingress with no session behind it.
+
+---
+
 ## Admin: results, disputes and the in-play desk
 
 | Route | Request | Success | Errors |
 | --- | --- | --- | --- |
-| `GET /api/admin/results/feed` | — | `200 { configured, target, status, last_poll_at, last_ok_at, last_error, consecutive_failures, polls, ok_polls, signals_received, dropped_entries, last_dropped, age_ms, stale }`. `status` is `not_configured` \| `failing` \| `stale` \| `ok` | `401`/`403` |
-| `POST /api/admin/results/poll` | — | `200 { considered, applied, results, error, feed }` — runs one cycle through the same fetcher the scheduled job uses, including `RESULTS_FEED_SECRET`. `results[].outcome` is one of `settled`, `voided`, `withdrawn`, `held`, `already_settled`, `already_applied`, `ignored`, `not_found`. `withdrawn` is a **pre-off withdrawal**: the runner was removed and refunded and the market is still open. The poll itself only asks about markets that are already **off**, so a pre-off withdrawal reaches the engine through a webhook or the admin selection-void route, not this timer | `401`/`403`; a transport failure is reported inside the payload, not as a status |
+| `GET /api/admin/results/feed` | — | `200 { configured, target, status, last_poll_at, last_ok_at, last_error, consecutive_failures, polls, ok_polls, signals_received, dropped_entries, last_dropped, webhook, age_ms, stale }`. `status` is `not_configured` \| `failing` \| `stale` \| `ok`. `webhook` is the PUSH transport's own block — `{ configured, status, deliveries, outcomes, held, refused, last_delivery_at, last_error, consecutive_failures }` — and it is on the same page because a push-configured venue never polls, so `polls: 0` and `last_ok_at: null` would otherwise read as "configured and failing" for a feed that is answering perfectly | `401`/`403` |
+| `POST /api/admin/results/poll` | — | `200 { considered, applied, results, error, feed }` — runs one cycle through the same fetcher the scheduled job uses, including `RESULTS_FEED_SECRET`. `results[].outcome` is one of `settled`, `voided`, `withdrawn`, `held`, `already_settled`, `already_applied`, `ignored`, `not_found`. `withdrawn` is a **pre-off withdrawal**: the runner was removed and refunded and the market is still open. The poll itself only asks about markets that are already **off**, so a **pre-off withdrawal reaches the engine through `POST /api/results/webhook`** (the push transport, above) or the admin selection-void route, never through this timer | `401`/`403`; a transport failure is reported inside the payload, not as a status |
 | `GET /api/admin/results/void-rules` | — | `200 { sports, rules, default }` — the per-sport table from [`lib/voidrules.js`](../lib/voidrules.js). A decision of `settle_with_voids` is **not** a market outcome: the market settles on its winner and the withdrawn runners' selections are voided on the way (see [`EXCHANGE_RULES.md`](EXCHANGE_RULES.md#withdrawn-runners-non-runners)) | `401`/`403` |
 | `GET /api/admin/results/held` | — | `200 { markets }` — every market with `settlement_hold = 1`, with its `hold_reason` | `401`/`403` |
 | `POST /api/admin/results/held/:id/release` | `{ decision: "settle" \| "void", winner_selection_id?, dead_heat?, reason }` — reason required, ≥5 chars. Ids pass through **uncoerced**: `winner_selection_id` and every `dead_heat` entry must be a JSON integer, so a quoted `"2"`, `true` or `[2]` is refused rather than parsed | `200` the settlement result, audited | `400` missing reason, unknown `decision`, a `settle` with neither a winner nor a `dead_heat`, a `void` **and** a winner, a `dead_heat` that is not an array or names fewer than two distinct integer ids, a winner id that is not a positive integer, or a non-integer `:id`; `404` unknown market; `409` already settled. On refusal the market stays **held and open** — a malformed request must never clear the hold, even to roll it back |
@@ -1322,7 +1365,7 @@ than being refused — forcing one would mean inventing a licence attribution.
 | Route | Auth | Success | Errors |
 | --- | --- | --- | --- |
 | `GET /healthz` | public | `200 { status: "ok", uptime_seconds, pid, version }`. Deliberately does **not** touch the database — a liveness probe that queries a dependency turns a database blip into a crash loop | — |
-| `GET /readyz` | public | `200 { status: "ready", checks }` or `503 { status: "not_ready", checks }`. `checks` covers `database`, `ledger`, `cache`, `risk_desk` and `results_feed`. A drifted ledger or a divergent balance cache is **not ready** | `503` |
+| `GET /readyz` | public | `200 { status: "ready", checks }` or `503 { status: "not_ready", checks }`. `checks` covers `database`, `ledger`, `cache`, `risk_desk`, `results_feed` and `results_webhook`. A drifted ledger or a divergent balance cache is **not ready** | `503` |
 | `GET /metrics` | `OPS_TOKEN` | `200 text/plain; version=0.0.4` — match rate, unmatched ratio, matched stake, held markets, open reconciliation findings, ledger drift, users, uptime | `404` token unset; `401` wrong token |
 | `POST /api/admin/backup` | admin **and** `OPS_TOKEN` | `200 { path, bytes, users, integrity: "ok" }`, audited. Takes a `VACUUM INTO` snapshot of the live database, verifies it opens, then prunes | `400` no `BACKUP_DIR` configured; `404` token unset; `401` wrong token; `401`/`403` for the role guards |
 
