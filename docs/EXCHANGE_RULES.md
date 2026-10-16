@@ -13,6 +13,7 @@ each rule so you can check the arithmetic yourself.
 - [Commission](#commission)
 - [Voiding](#voiding)
 - [Withdrawn runners (non-runners)](#withdrawn-runners-non-runners)
+- [The declared deduction on the runners that survived](#the-declared-deduction-on-the-runners-that-survived)
 - [Cash-out](#cash-out)
 - [Tenants and suspension](#tenants-and-suspension)
 - [Markets, events and lifecycle](#markets-events-and-lifecycle)
@@ -714,6 +715,160 @@ than resolving it:
 | a non-runner id that is not in this market | held — the id is the instruction to move money |
 | a withdrawal notice in a sport with no `non_runner` rule | held — applying a racing rule to a football fixture would invent one |
 | a withdrawal on a market declared `payout_shape: 'place'` | held — see below |
+| a declared deduction that is malformed, out of range, or attached to a runner that was not withdrawn | held — see [The declared deduction](#the-declared-deduction-on-the-runners-that-survived) |
+
+### The declared deduction on the runners that survived
+
+Refunding the scratch is **half** of the Australian racing rule. The other half is
+a **deduction** taken off the bets on the runners that survived, scaled by the
+withdrawn runner's odds. WA rule 4A, betr's *Scale of Deductions* v1.1 (18
+September 2026) and the GRV greyhound *Deduction Schedule* all require one: betr
+prints the whole table (80% at 1.01–1.16, 64% at 1.41–1.45, 27% at 3.41–3.50, 22%
+at 4.01–4.20, with separate columns for three-place and two-place), GRV gives
+cents-in-the-dollar tables for WIN and PLACE keyed on the odds on offer of the
+withdrawn dog (15.00 or over = no deduction, 2.00 = 45 cents off a win, 1.20 = 72
+cents), and WA 4A computes it by formula with the deduction applied to each
+remaining runner **proportional to the odds against that runner**.
+
+A venue that refunds and stops **overpays the backers of every surviving runner**
+by the deduction it never applies — on every race with a late scratching.
+
+#### The venue does not compute one
+
+The scale is published **per racing authority and per jurisdiction**, it is
+versioned, and the **stewards declare it in a particular race**. WA 4A is explicit
+that where the withdrawn runner is shorter than the scale covers, the stewards may
+declare **all** wagers void and order the race re-opened — a steward decision no
+formula should guess at. Inventing a racing rule on a licensed venue is not a
+rounding difference.
+
+So this is the same shape as every other provider-shaped fact in the codebase: **the
+venue is the mechanism, the feed is the authority.** A withdrawal signal may *carry*
+a declared deduction. The venue applies what is declared, records what it applied,
+and refuses to invent one. There is no scale table in `lib/deductions.js` and its
+absence is deliberate.
+
+#### The signal
+
+```jsonc
+{
+  "status": "completed",
+  "winners": [7],
+  "non_runners": [3],
+  "deductions": [
+    { "selection_id": 3, "unit": "percent", "value": 27, "declared_by": "stewards, race 4" }
+  ]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `selection_id` | the **withdrawn** runner this deduction is declared against. Must be one of this outcome's `non_runners`. |
+| `unit` | **required.** `"percent"` (whole percentage, `value` in 0–100) or `"fraction"` (`value` in 0–1). Nothing else is accepted. |
+| `value` | the declared deduction. `27` under `percent` and `0.27` under `fraction` are the same 27%. |
+| `scope` | optional, defaults to `"win"`. `"place"` is accepted as a *declaration* and then refused, because this engine settles no place market. |
+| `declared_by` | optional free text naming the authority — the stewards, an operator, a feed. Lands on the provenance row. |
+
+**THE UNIT IS REQUIRED, AND THAT IS THE POINT.** A bare number does not say what it
+is a number *of*: `27` is 27 percent, or 27 cents in the dollar (GRV's phrasing),
+or nonsense if the wrong field was wired. `0.27` is 27 percent read as a fraction
+— or 0.27 percent if the sender meant a percentage. The readings differ by a factor
+of a hundred and the venue cannot tell which the stewards meant, so it refuses
+rather than guessing. This is `lib/aml/rules.js`'s convention — a unit declaration
+checked **at write time**, so the error arrives while the operator is still looking
+at the signal — and the unit table lives on the declaration shape itself, where it
+cannot drift from what it describes.
+
+#### How it is applied
+
+A deduction is a charge on a **winner**, taken from the **winnings** and never from
+the stake: WA 4A applies it to the amount payable to the holder, and taking it from
+the stake would charge a bettor who won. So the backer's stake still comes back in
+full and only the dividend is reduced.
+
+```
+dividend   = round((price − 1) × stake)      ÷ joint winners, floored   (unchanged)
+deduction  = floor(dividend × applied_bp / 10000)
+paid       = dividend − deduction
+```
+
+The applied figure is **scaled by the odds**, per WA 4A:
+
+```
+applied_bp = round(declared_bp × (winner's price ÷ shortest surviving runner's price))
+```
+
+`shorthest surviving runner's price` is the reference — the runner that absorbed
+the least of the withdrawn horse's chance — so a runner at the reference price pays
+the declared figure and a longer one pays proportionally more. Prices come from
+`selections.fair_price` (the price on offer for that runner), which is deliberately
+**not** the match price: a backer who got 3.0 has a 3.0 dividend whatever the
+model says the runner is worth.
+
+**THE LAY SIDE IS NOT OPTIONAL.** The winner's dividend is the layer's liability
+divided among joint winners, so a deduction on a winner is money that never leaves
+the layer: their collateral still comes back whole and they are charged the reduced
+dividend. Taking it off the backer alone would be money from nowhere, and paying it
+to the house would be the venue taxing a published deduction it was told to apply.
+Conservation holds per match because both sides are moved by the same number.
+
+**THE CLAMP.** `applied_bp` is capped at 100% and the resulting deduction is capped
+at the dividend. A clamp and not a refusal, because the clamp only bites when the
+odds scale pushes a declared figure past the payout, and a refusal would **hold a
+race whose winner is known and whose losing backers have all lost**. The clamp is
+recorded (`clamped: true`) rather than applied silently — a clamp that leaves no
+trace is indistinguishable from the declared value, and this row is what an auditor
+reads when the numbers do not add up. At 100% the backer receives their stake back
+and nothing else; nobody is charged for winning, and nobody's collateral is eaten.
+
+**NO PRICES, NO SCALE.** A venue that has never run the drift tick has `NULL`
+`fair_price` on every selection and there is no reference to scale by. The declared
+figure is then applied **flat**, `scaled: false` is recorded, and
+`overview().counts.applied_without_odds_scale` counts it — because "we applied the
+flat figure because we had no prices" is an answer an operator needs.
+
+**TWO RUNNERS AT ONCE.** Both scratches are voided and refunded exactly as one is,
+and the declared deductions are **summed** onto the winner. The venue does **not**
+re-base the odds after each scratching, because re-basing *is* the scale — it is
+what "published per jurisdiction" means. An operator whose jurisdiction re-bases
+declares the composed figure as a single declaration and this venue applies exactly
+what it was told. The sum is capped at 100% and the cap is on the provenance row
+alongside both halves of the composition.
+
+#### Three answers, and they must stay visibly different
+
+| The declaration | Answer | Where it shows |
+| --- | --- | --- |
+| **absent** | the market **settles in full**. Refusing would strand a finished race with every bettor's money in it. | `deduction_state = 'undeclared'` on the provenance row, and counted by `undeclaredCount()` / `overview()` |
+| **declared and valid** | applied, and recorded in full — declared figure, unit, declarer, the price it was scaled against, and whether it was clamped | `deduction_state = 'declared'`, plus `deductions_json` and `payload.deductions` |
+| **refused** (malformed, negative, over 100%, ambiguous unit, wrong runner, wrong scope, no withdrawal to attach to) | **held**, not settled. A bad figure that silently became "no deduction" would be a full payout nobody authorised. | `deduction_state = 'rejected'` with a named code, counted by `rejectedCount()` and listed by `rejectedDeclarations()` |
+
+**THE PRE-OFF EXCEPTION, STATED RATHER THAN HIDDEN.** A *refused* declaration holds
+a **settlement**. It does **not** hold a **pre-off withdrawal notice**: there, the
+refund still happens. WA 4A declares the bets on the scratched runner off whatever
+the price band says, and holding a notice over a malformed figure would leave a
+bettor's stake frozen against a horse that is not going to start — stranding money
+that is not even due yet to protect a number that will not be due until the race is
+run. The refusal still does everything else: it is recorded, named in the returned
+result, and counted. The finding is loud; the refund is not hostage to it.
+
+**A DECLARATION MAY RIDE THE PRE-OFF NOTICE** — which is usually where the stewards
+declare it, when the horse is pulled. Nothing is settled on that path, so the
+declaration is validated and recorded there, and the result that settles the market
+carries its own `deductions` and is validated again against the market as it
+actually finished. Two declarations, two validations, so a declaration recorded
+pre-off cannot silently become the figure applied at settlement.
+
+*What is refused, with its code:* `deduction_not_a_list`,
+`deduction_entry_not_an_object`, `deduction_selection_id_invalid`,
+`deduction_unit_missing`, `deduction_unit_unknown`, `deduction_value_missing`,
+`deduction_value_not_a_number`, `deduction_value_not_finite`,
+`deduction_value_negative`, `deduction_out_of_range`, `deduction_above_full`,
+`deduction_scope_unknown`, `deduction_scope_not_applicable`,
+`deduction_not_for_a_withdrawn_runner`, `deduction_without_withdrawal`.
+
+*Tests:* `tests/deductions.test.js` (D1–D11, the money path and every refusal,
+each asserted beside its control).
 
 ### Place markets, and what the venue refuses
 
@@ -733,7 +888,37 @@ market this venue has ever created. Modelling the shapes properly is `#95`.
 
 *Tests:* `tests/voidrules.test.js` (V1–V11, the rule table and the signal
 **combinations**), `tests/nonrunner.test.js` (N1–N11, the money path end to end),
+`tests/deductions.test.js` (D1–D11, the declared deduction on the survivors),
 `tests/api.test.js` (the pre-off removal route).
+
+**WHAT A RACING LAUNCH STILL CANNOT DO.** Read this before reading anything above
+it as "racing support". Of the three jobs a late scratching creates — refund the
+scratch, **deduct** from the survivors, and settle the rest of the field — this
+venue does the first and third **on win markets only**, and the second only when
+the stewards declare it:
+
+| | Status |
+| --- | --- |
+| refund a late scratching, market stays open | works |
+| **deduct** from the survivors' winners, declared and recorded | works, **win shape only** |
+| **place** markets | **held.** No place payout, no place deduction, no place terms. |
+| **each-way** | **not implemented at all.** See [What is deliberately not implemented](#what-is-deliberately-not-implemented). |
+| a schedule computed from the withdrawn runner's odds | **not implemented, by design.** The stewards declare the figure. |
+| re-basing the odds after each of several withdrawals | **not implemented.** Declared deductions are summed; declare the composed figure instead. |
+
+Most Australian racing bets are place or each-way. On a racing launch the held
+market is therefore the **common** path, not the edge case, and a green suite on
+this repository is evidence about win-market withdrawal settlements only.
+
+**AND ONE MORE THING, WHICH IS NOT FIXED.** Releasing a **place** market that named
+a withdrawn runner settles the scratched runner as an ordinary **loser**. The place
+guard holds *before* `voidSelection` runs, so at release time the scratch is still
+`open` with its matched legs live; the release route takes a winner and settles, and
+the scratch is charged. The refund half of the withdrawal rule is not applied on
+that path. It is recorded here rather than fixed because the fix is the place payout
+shape (`#95`), not this module — but an operator who releases held races by hand
+should check the provenance row for `non_runners` first, because on that route the
+scratch is charged rather than refunded.
 
 ## Cash-out
 
@@ -1372,7 +1557,14 @@ Three consequences are enforced rather than hoped for:
 Listed so nobody mistakes a scope decision for a bug:
 
 - **Accumulators / parlays.** One selection per order.
-- **Each-way betting.** Win markets only.
+- **Each-way betting.** Win markets only. Most Australian racing bets are place or
+  each-way, so a racing launch is mostly two shapes this venue cannot price — see
+  [What a racing launch still cannot do](#what-a-racing-launch-still-cannot-do).
+- **A deduction computed from a published scale.** The venue **applies** a
+  deduction the stewards declare and computes none of one. WA rule 4A makes the
+  outcome where the withdrawn runner is shorter than the scale covers a steward
+  decision to void all wagers and re-open the race, which is not a formula — see
+  [The declared deduction](#the-declared-deduction-on-the-runners-that-survived).
 - **In-play betting.** Withdrawn — the venue is pre-off only. See
   [Pre-off only](#pre-off-only).
 - **Partial-fill queueing, cross-market matching.** A taker takes resting

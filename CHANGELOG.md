@@ -18,6 +18,75 @@ must agree with the highest released heading.
 
 ### Added
 
+- **A declared deduction on the runners that survived a late scratching.** This
+  closes a money-path defect on the Australian racing launch. `applyWithdrawal`
+  and `voidSelection` refund the scratch — WA rule 4A's "refund all bets on the
+  late scratched runner and those bets are, by operation of this rule, declared
+  off" — and that half was always right. The half that was missing is the other
+  half of the same rule: the bets on the runners that SURVIVED are reduced by a
+  **deduction**, scaled by the withdrawn runner's odds. betr's *Scale of
+  Deductions* v1.1 (18 September 2026), the GRV greyhound *Deduction Schedule*
+  and WA rule 4A all require one, so the venue was **overpaying the backers of
+  every surviving runner** by the deduction it never applied — on every race with a
+  late scratching. Conservation was green throughout, because the money went to a
+  real bettor in a real account; this is the `greyhounds`/`greyhound` slug
+  mismatch blind spot again, on the racing path.
+
+  **THE VENUE COMPUTES NO SCALE, BY DESIGN.** The scale is published per racing
+  authority and per jurisdiction, it is versioned, and the **stewards declare it
+  in a particular race** — WA rule 4A says explicitly that where the withdrawn
+  runner is shorter than the table covers, the stewards may declare all wagers
+  void and order the race re-opened, which is a steward decision and not a
+  formula. So the shape is the one this repository already uses for every other
+  provider-shaped fact: **the venue is the mechanism, the feed is the authority.**
+  A withdrawal signal may carry `deductions`; the venue applies what is declared,
+  records what it applied, and refuses to invent one. There is no scale table in
+  `lib/deductions.js`, and its absence is the feature.
+
+  - The figure is taken off the winner's **winnings**, never the stake, and the
+    **layer keeps the difference** — the winner's dividend is the layer's
+    liability, so the two sides are moved by the same number and conservation
+    holds per match with no hand-written balancing entry. It goes through
+    `ledger.settleUser` inside the settlement's own transaction;
+    `tests/guard.test.js` still holds, because no module outside `ledger.js`
+    writes the wallet columns and there is no `UPDATE users` on this path.
+  - The applied figure is **scaled by the odds** per WA 4A — proportional to the
+    odds against each remaining runner, anchored on the shortest survivor —
+    capped at 100% and **clamped at the payout**, so a payout can never go
+    negative and nobody who won is charged. The clamp is recorded, because a
+    clamp that leaves no trace is indistinguishable from the declared value.
+  - **The unit is required** and drawn from a closed vocabulary (`percent`,
+    `fraction`). A bare number is refused: `27` and `0.27` differ by a factor of
+    a hundred depending on which was meant, and the venue cannot tell. This is
+    `lib/aml/rules.js`'s convention — a unit declaration checked at write time,
+    so the error arrives while the operator is still looking at the signal.
+  - **Three answers, visibly different.** Absent: the market settles in full and
+    the absence is recorded (`deduction_state = 'undeclared'`) and **counted**
+    (`lib/deductions.js` `undeclaredCount` / `overview`) — the total the venue
+    overpaid, as a query rather than a promise. Declared: applied and recorded in
+    full. Refused: the market is **held** with a named code, because a bad figure
+    that silently became "no deduction" would be a full payout nobody authorised.
+    A re-delivery applies it once, via `alreadyApplied` and the unique index on
+    `(source, source_event_id)`.
+  - Two new nullable, closed columns on `result_events`: `deduction_state` (the
+    counter) and `deductions_json` (the record), with the same facts beside
+    `winners` and `non_runners` in the payload.
+
+  **WHAT THIS DOES NOT DO, STATED PLAUSIBLY LOUDLY.** It settles **win** payouts
+  only. Place markets are still **held** and each-way is still not implemented, so
+  on an Australian racing launch — where most bets are place or each-way — most
+  markets never reach a settlement this venue can price. The scale is not computed
+  from the withdrawn runner's odds, and multiple withdrawals are **summed** rather
+  than re-based, because re-basing *is* the scale; an operator whose jurisdiction
+  re-bases declares the composed figure. See `STATE.md` §3a and the "What a racing
+  launch still cannot do" table in `docs/EXCHANGE_RULES.md`.
+
+  *Tests:* `tests/deductions.test.js` (D1–D11). Every case asserts its control
+  beside it — the identical race with no declaration, the identical declaration
+  attached to the wrong runner, the same market with the winner at a different
+  price — because a deduction feature that cannot show what it changed has not
+  been tested.
+
 - **The feed now drives a real, tradeable, venue-priced book** (#101). With
   `FEED_ENABLED=true` the venue had a board of real fixtures and **not one
   bettable market in it**: a feed market has no row in this venue's database, so

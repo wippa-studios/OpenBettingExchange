@@ -58,7 +58,7 @@ unfalsifiable.)*
 | | |
 |---|---|
 
-| Tests | **1269 checks / 75 suites**, plus a **220-check** Playwright browser suite, also runnable in a seeded random order (**#134**). **Dated snapshot, 2026-10-16** — the preamble above says so, but a reader who lands on this cell does not see the preamble, so it says so here too. These two figures are machine-asserted against `npm test` by `check-docs.mjs`, so they cannot quietly rot; see §1a. |
+| Tests | **1282 checks / 76 suites**, plus a **220-check** Playwright browser suite, also runnable in a seeded random order (**#134**). **Dated snapshot, 2026-10-16** — the preamble above says so, but a reader who lands on this cell does not see the preamble, so it says so here too. These two figures are machine-asserted against `npm test` by `check-docs.mjs`, so they cannot quietly rot; see §1a. |
 | CI | **7 jobs, 8 runs** — the `test` matrix runs on node 22 and 24, so there is one more run than job. *(This cell said "8 jobs" for months. It contradicted its own list — which enumerates seven — and `ci.yml` has seven. The 8 is real, but it is runs.)* |
 | Supply chain | every action pinned to a full commit SHA, dependabot configured |
 | Docs | `check-docs.mjs` **fails the build** when documentation contradicts the code |
@@ -220,7 +220,7 @@ So the changelog documents **two releases that never happened**, on the repo's
 first two days, with no tags and no version bump behind them. `[0.2.0]` describes
 
 "a real-browser Playwright suite (24 checks)" — that was true on day 2, when the
-repository had **8 commits**. It is 220 browser checks and 75 suites now.
+repository had **8 commits**. It is 220 browser checks and 76 suites now.
 For an open-source project this is worse than an absent changelog, because it
 answers "is this maintained?" wrongly. A reader concludes there is a release
 history; there is none. `[0.2.0]` also contains **two separate `### Fixed`
@@ -359,6 +359,52 @@ a conformance suite before it needs adapters.
   *is*; engine semantics, needs a product decision.
 - **A bottom tab bar on mobile** (`#68` §2.3). Costs 56px of a screen the ladder
   is already losing, and adds a second navigation metaphor.
+
+### 3a. What an Australian racing launch still cannot do
+
+This deserves its own heading because the green suite is **not** evidence about
+it, and a licensed operator reading a passing test run should not infer
+otherwise.
+
+A late scratching creates three jobs. This venue does two of them, on **win
+markets only**:
+
+| Job | Status |
+|---|---|
+| refund the scratch, market stays open | works — `lib/results.js` `applyWithdrawal`, `lib/settle.js` `voidSelection` |
+| **deduct** from the survivors' winners | works, on a **win** payout, and only when the stewards declare the figure |
+| settle the rest of the field | works, on the runner that ran |
+
+| Gap | Where it lives |
+|---|---|
+| **place** markets | `payout_shape: 'place'` is **held**. No place payout, no place deduction, no place terms. `#95` |
+| **each-way** | not implemented at all |
+| **a scale computed from the withdrawn runner's odds** | not implemented, **by design** — see `lib/deductions.js` |
+| re-basing the odds across several withdrawals | not implemented; declared deductions are summed, and the venue will apply a single composed figure if that is what the jurisdiction requires |
+| accumulators | not implemented |
+
+Most Australian racing bets are place or each-way, so on a racing launch the
+**held** path is the common path and the settle path is the exception. The
+deduction work makes the win-market settlement correct and auditable; it does not
+make this a racing venue, and the difference is one `#95`.
+
+**THE REASON THE VENUE COMPUTES NO DEDUCTION**, stated here because it is the
+decision most likely to look like an omission: the scale is published per racing
+authority and per jurisdiction, and WA rule 4A makes the case where the withdrawn
+runner is shorter than the table covers a **steward decision** to void all wagers
+and re-open the race. That is not a formula. The feed declares and the venue
+applies — and a withdrawal with **no** declaration still settles and is **counted**
+(`lib/deductions.js` `undeclaredCount`), so the total the venue overpaid is a
+number an operator can read rather than an absence they have to notice.
+
+**ONE MORE THING FOUND WHILE DOING IT, AND NOT FIXED.** Releasing a held **place**
+market that named a withdrawn runner settles the scratch as an ordinary **loser**.
+The place guard holds *before* `voidSelection` runs, so at release time the scratch
+is still `open` and live; the release route settles a winner and the scratch is
+charged. This is `#88`'s defect class reachable through a different door, it is
+pre-existing, and it is **not** fixed here because the fix is the place payout shape
+(`#95`). An operator releasing held races by hand must read `non_runners` off the
+provenance row before they release.
 
 ---
 

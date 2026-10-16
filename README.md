@@ -248,6 +248,9 @@ full specification, with worked examples, is in
 | A **declared non-runner** voids that selection alone: its resting orders are cancelled, its matched legs refunded at the match price, and the market settles on the runners that ran | Settling a withdrawn runner charged a bettor a full stake on a horse that never started — and conservation stayed green, because the money went somewhere real | `nonrunner` (N1, N4), `voidrules` (V1) |
 | A withdrawal notice before the off removes the runner while the market keeps trading; a sport with no withdrawal rule **holds** it instead | A racing concept applied to a football fixture would be an invented rule, and ignoring it would leave a player exposed | `nonrunner` (N4, N6), `voidrules` (V5) |
 | A refund that cannot be audited **does not happen** | An unauditable transfer of a player's stake is the thing the audit trail exists to prevent | `nonrunner` (N3) |
+| A **declared deduction** is taken off the winner's *winnings* on the runners that survived a scratching — and the **venue computes none**. The scale is published per jurisdiction and declared by the stewards, so the feed may carry one and the venue applies what it says | Refunding the scratch is *half* the Australian racing rule. The venue that stops there overpays the survivors' backers on every race with a late scratching — and conservation stays green, because the money goes somewhere real | `deductions` (D1, D2, D8) |
+| A deduction is **refused and named** when it is malformed, negative, over 100%, ambiguous about its unit, or attached to a runner nobody withdrew | A bad figure that silently becomes "no deduction" is a full payout nobody authorised | `deductions` (D4, D9, D11) |
+| A withdrawal with **no** declared deduction still settles, and the absence is **counted** | Refusing would strand a finished race; an unmeasured gap is worse than a tolerated one only if nobody is counting it | `deductions` (D3) |
 | Commission applies to **net winnings per user per market**, only if positive | Mirrors the real-world model; never a fee on a loser | `settle` (S7) |
 | A settled market is frozen and cannot settle twice | No double payment | `settle` (S6), `api` |
 | Cash-out is a **venue buyout** priced at `Σ pᵢ·Payoutᵢ` less a margin, not a market hedge | Hedging N runners against a fair book destroys value; derivation in `lib/cashout.js` | `cashout2` (C1–C5) |
@@ -446,7 +449,7 @@ weight.
 ```bash
 
 
-npm test            # 1269 checks: unit and API integration, fully offline
+npm test            # 1282 checks: unit and API integration, fully offline
 
 npm run test:smoke  # live end-to-end against a real server
 npm run test:ui     # 220 checks: real Chromium via Playwright (board and admin desk)
